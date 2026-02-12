@@ -20,19 +20,20 @@ from xrpl.core.addresscodec import decode_seed
 load_dotenv()
 app = FastAPI()
 
-# Configuration from Environment (Set these in Render Dashboard)
+# Configuration (Ensure these are in Render -> Environment)
 XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "change-me")
 XAMAN_ADDRESS = os.getenv("XAMAN_ADDRESS")
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- PERSISTENT STORAGE LOGIC ---
+# Competitive Fee Setting (0.1 XRP = 100,000 drops)
+REFEREE_FEE_DROPS = 100000 
+
+# --- PERSISTENT STORAGE ---
 HASH_FILE = "used_hashes.txt"
 
 def load_used_hashes() -> Set[str]:
-    """Reads processed payment hashes from disk so we don't forget after a restart."""
     if os.path.exists(HASH_FILE):
         try:
             with open(HASH_FILE, "r") as f:
@@ -42,14 +43,12 @@ def load_used_hashes() -> Set[str]:
     return set()
 
 def save_hash_to_disk(tx_hash: str):
-    """Appends a new hash to our permanent list."""
     try:
         with open(HASH_FILE, "a") as f:
             f.write(f"{tx_hash}\n")
     except Exception as e:
         print(f"Disk Write Error: {e}")
 
-# Global state
 USED_HASHES = load_used_hashes()
 AI_FAIL_COUNT = 0
 MAX_FAILS = 3
@@ -58,7 +57,7 @@ MAINTENANCE_MODE = False
 def load_referee_wallet():
     seed = os.getenv("XRPL_SEED")
     if not seed:
-        raise ValueError("XRPL_SEED not found in environment variables!")
+        raise ValueError("XRPL_SEED not found!")
     _, algo = decode_seed(seed)
     return Wallet.from_seed(seed, algorithm=algo)
 
@@ -80,18 +79,15 @@ async def notify_telegram(message: str):
         print(f"Telegram Error: {e}")
 
 async def sweep_profits():
-    """Auto-moves XRP above 10.0 to your Xaman wallet."""
+    """Auto-moves XRP above threshold to your Xaman wallet."""
     if not XAMAN_ADDRESS: return
     client = AsyncJsonRpcClient(XRPL_URL)
     try:
         acct_info = await client.request(AccountInfo(account=referee_wallet.address, ledger_index="validated"))
         balance_xrp = float(drops_to_xrp(acct_info.result["account_data"]["Balance"]))
         
-        threshold = float(os.getenv("SWEEP_THRESHOLD", 20.0))
-        retention = 11.0 # Buffer to stay above the 10 XRP reserve
-        
-        if balance_xrp >= threshold:
-            amount_to_send = balance_xrp - retention
+        if balance_xrp >= 20.0: # Sweep when we hit 20 XRP
+            amount_to_send = balance_xrp - 11.0 # Keep 11 XRP for reserve/fees
             payment = Payment(
                 account=referee_wallet.address,
                 destination=XAMAN_ADDRESS,
@@ -117,33 +113,43 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
     if x_payment_hash in USED_HASHES: raise HTTPException(status_code=403, detail="Payment already used")
 
     # 1. VERIFY PAYMENT
-    verified, customer_address, amount_drops = False, "", ""
+    verified, customer_address, amount_received = False, "", 0
     client = AsyncJsonRpcClient(XRPL_URL)
     
     try:
-        for _ in range(15): # Try for ~30 seconds (XRP ledgers close every 3-4s)
+        # Check the ledger for the transaction
+        for _ in range(15):
             try:
                 tx = await client.request(Tx(transaction=x_payment_hash))
-                if tx.result.get("validated") and tx.result.get("meta").get("TransactionResult") == "tesSUCCESS":
-                    if tx.result.get("Destination") == referee_wallet.address:
-                        verified = True
-                        customer_address = tx.result.get("Account")
-                        amount_drops = tx.result.get("Amount")
-                        break
-            except: pass
+                res = tx.result
+                
+                # Verify it's successful and sent to US
+                if res.get("validated") and res.get("meta").get("TransactionResult") == "tesSUCCESS":
+                    if res.get("Destination") == referee_wallet.address:
+                        
+                        # Handle XRP amount (drops) whether it's a string or int
+                        raw_amt = res.get("Amount")
+                        amount_received = int(raw_amt) if isinstance(raw_amt, (str, int)) else 0
+                        
+                        if amount_received >= REFEREE_FEE_DROPS:
+                            verified = True
+                            customer_address = res.get("Account")
+                            break
+            except: 
+                pass # Wait for next ledger close
             await asyncio.sleep(2)
+            
     except Exception as e:
-        await notify_telegram(f"⚠️ **XRPL Connection Error:** {str(e)}")
-        raise HTTPException(status_code=502, detail="Ledger connection issue")
+        raise HTTPException(status_code=500, detail=f"Ledger verification error: {str(e)}")
 
     if not verified:
-        raise HTTPException(status_code=404, detail="Payment not found or incorrect destination")
+        raise HTTPException(status_code=404, detail="Valid payment not found. Ensure you sent at least 0.1 XRP.")
 
-    # Record the hash so it can't be reused
+    # Prevent Replay Attacks
     USED_HASHES.add(x_payment_hash)
     save_hash_to_disk(x_payment_hash)
     
-    await notify_telegram(f"💸 **Payment Verified:** `{drops_to_xrp(amount_drops)} XRP` received. Starting AI audit...")
+    await notify_telegram(f"💸 **Payment Confirmed!** Received `{drops_to_xrp(str(amount_received))} XRP`. Running AI Audit...")
 
     # 2. AI AUDIT
     try:
@@ -153,7 +159,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
         AI_FAIL_COUNT = 0 
     except Exception as e:
         AI_FAIL_COUNT += 1
-        await notify_telegram(f"🚨 **AI Failure ({AI_FAIL_COUNT}/{MAX_FAILS}):** {str(e)}")
+        await notify_telegram(f"🚨 **AI Failure:** {str(e)}")
         if AI_FAIL_COUNT >= MAX_FAILS: MAINTENANCE_MODE = True
         return {"ai_verdict": "AI Service Error. Please try later.", "status": "error"}
 
