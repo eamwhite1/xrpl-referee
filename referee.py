@@ -34,14 +34,20 @@ HASH_FILE = "used_hashes.txt"
 def load_used_hashes() -> Set[str]:
     """Reads processed payment hashes from disk so we don't forget after a restart."""
     if os.path.exists(HASH_FILE):
-        with open(HASH_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
+        try:
+            with open(HASH_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        except:
+            return set()
     return set()
 
 def save_hash_to_disk(tx_hash: str):
     """Appends a new hash to our permanent list."""
-    with open(HASH_FILE, "a") as f:
-        f.write(f"{tx_hash}\n")
+    try:
+        with open(HASH_FILE, "a") as f:
+            f.write(f"{tx_hash}\n")
+    except Exception as e:
+        print(f"Disk Write Error: {e}")
 
 # Global state
 USED_HASHES = load_used_hashes()
@@ -51,6 +57,8 @@ MAINTENANCE_MODE = False
 
 def load_referee_wallet():
     seed = os.getenv("XRPL_SEED")
+    if not seed:
+        raise ValueError("XRPL_SEED not found in environment variables!")
     _, algo = decode_seed(seed)
     return Wallet.from_seed(seed, algorithm=algo)
 
@@ -74,25 +82,25 @@ async def notify_telegram(message: str):
 async def sweep_profits():
     """Auto-moves XRP above 10.0 to your Xaman wallet."""
     if not XAMAN_ADDRESS: return
-    async with AsyncJsonRpcClient(XRPL_URL) as client:
-        try:
-            acct_info = await client.request(AccountInfo(account=referee_wallet.address, ledger_index="validated"))
-            balance_xrp = float(drops_to_xrp(acct_info.result["account_data"]["Balance"]))
-            
-            threshold = float(os.getenv("SWEEP_THRESHOLD", 20.0))
-            retention = 10.0 # Standard reserve to keep the wallet active
-            
-            if balance_xrp >= threshold:
-                amount_to_send = balance_xrp - retention
-                payment = Payment(
-                    account=referee_wallet.address,
-                    destination=XAMAN_ADDRESS,
-                    amount=xrp_to_drops(Decimal(str(round(amount_to_send, 4))))
-                )
-                await submit_and_wait(payment, client, referee_wallet)
-                await notify_telegram(f"🚀 **Profit Sweep!** Sent `{amount_to_send} XRP` to your Xaman wallet.")
-        except Exception as e:
-            print(f"Sweep Failed: {e}")
+    client = AsyncJsonRpcClient(XRPL_URL)
+    try:
+        acct_info = await client.request(AccountInfo(account=referee_wallet.address, ledger_index="validated"))
+        balance_xrp = float(drops_to_xrp(acct_info.result["account_data"]["Balance"]))
+        
+        threshold = float(os.getenv("SWEEP_THRESHOLD", 20.0))
+        retention = 11.0 # Buffer to stay above the 10 XRP reserve
+        
+        if balance_xrp >= threshold:
+            amount_to_send = balance_xrp - retention
+            payment = Payment(
+                account=referee_wallet.address,
+                destination=XAMAN_ADDRESS,
+                amount=xrp_to_drops(Decimal(str(round(amount_to_send, 4))))
+            )
+            await submit_and_wait(payment, client, referee_wallet)
+            await notify_telegram(f"🚀 **Profit Sweep!** Sent `{amount_to_send} XRP` to your Xaman wallet.")
+    except Exception as e:
+        print(f"Sweep Failed: {e}")
 
 # --- API ENDPOINTS ---
 
@@ -110,8 +118,10 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
 
     # 1. VERIFY PAYMENT
     verified, customer_address, amount_drops = False, "", ""
-    async with AsyncJsonRpcClient(XRPL_URL) as client:
-        for _ in range(10): # Try for ~20 seconds
+    client = AsyncJsonRpcClient(XRPL_URL)
+    
+    try:
+        for _ in range(15): # Try for ~30 seconds (XRP ledgers close every 3-4s)
             try:
                 tx = await client.request(Tx(transaction=x_payment_hash))
                 if tx.result.get("validated") and tx.result.get("meta").get("TransactionResult") == "tesSUCCESS":
@@ -122,24 +132,28 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
                         break
             except: pass
             await asyncio.sleep(2)
+    except Exception as e:
+        await notify_telegram(f"⚠️ **XRPL Connection Error:** {str(e)}")
+        raise HTTPException(status_code=502, detail="Ledger connection issue")
 
     if not verified:
         raise HTTPException(status_code=404, detail="Payment not found or incorrect destination")
 
-    # Permanently record the hash
+    # Record the hash so it can't be reused
     USED_HASHES.add(x_payment_hash)
     save_hash_to_disk(x_payment_hash)
     
-    await notify_telegram(f"💸 **Incoming Payment:** `{drops_to_xrp(amount_drops)} XRP` from `{customer_address[:8]}...`")
+    await notify_telegram(f"💸 **Payment Verified:** `{drops_to_xrp(amount_drops)} XRP` received. Starting AI audit...")
 
     # 2. AI AUDIT
     try:
-        prompt = f"AUDIT TASK: {req.task}\nSUBMITTED WORK: {req.work}\n\nVerdict: APPROVED or REJECTED. Provide 1 sentence reason."
+        prompt = f"AUDIT TASK: {req.task}\nSUBMITTED WORK: {req.work}\n\nVerdict: APPROVED or REJECTED. Provide a 1-2 sentence reason."
         res = await asyncio.to_thread(ai_client.models.generate_content, model="gemini-1.5-flash", contents=prompt)
         verdict = res.text
         AI_FAIL_COUNT = 0 
     except Exception as e:
         AI_FAIL_COUNT += 1
+        await notify_telegram(f"🚨 **AI Failure ({AI_FAIL_COUNT}/{MAX_FAILS}):** {str(e)}")
         if AI_FAIL_COUNT >= MAX_FAILS: MAINTENANCE_MODE = True
         return {"ai_verdict": "AI Service Error. Please try later.", "status": "error"}
 
