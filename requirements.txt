@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+xrpl-py
+python-dotenv
+google-genai
+httpx
