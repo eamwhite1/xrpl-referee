@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "1.0",
+  "name": "XRPL AI Referee",
+  "description": "An independent auditor agent that verifies task completion for a 0.1 XRP fee.",
+  "url": "https://xrpl-referee.onrender.com",
+  "agentVersion": "1.0.0",
+  "protocolVersion": "0.3.0",
+  "provider": {
+    "organization": "Your Name/Brand",
+    "url": "https://xrpl-referee.onrender.com"
+  },
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false
+  },
+  "authentication": {
+    "schemes": ["x-payment-hash"],
+    "description": "Requires an XRPL transaction hash in the header for payment verification."
+  },
+  "skills": [
+    {
+      "id": "task-audit",
+      "name": "Work Verification",
+      "description": "Compares a task description against a worker's output and gives a verdict."
+    }
+  ]
+}
