@@ -130,6 +130,11 @@ def health():
 def get_openapi():
     return FileResponse("openapi.json")
 
+# The A2A Discovery standard route
+@app.get("/.well-known/agent.json")
+def get_a2a_card():
+    return FileResponse("agent.json")
+
 @app.post("/evaluate")
 async def evaluate_work(
     req: AuditRequest, 
@@ -190,3 +195,4 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
+
