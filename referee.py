@@ -44,14 +44,14 @@ class AuditRequest(BaseModel):
 # --- THE INTELLIGENT DISCOVERY ENGINE ---
 async def raw_smart_audit(task: str, work: str):
     """
-    Scouts available models, sorts them by intelligence, and executes the audit.
+    Scouts available models and sorts them by intelligence and version number.
     """
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing.")
 
     async with httpx.AsyncClient() as client:
-        # 1. Ask Google what models this specific API key is authorized to use
+        # 1. Discovery
         list_url = f"https://generativelanguage.googleapis.com/v1/models?key={api_key}"
         try:
             list_res = await client.get(list_url)
@@ -67,7 +67,7 @@ async def raw_smart_audit(task: str, work: str):
         if not discovered:
             discovered = ["models/gemini-1.5-pro", "models/gemini-1.5-flash"]
 
-        # 2. Intelligent Sorting (Pro preference + Version Number)
+        # 2. Ranking (Higher version numbers and 'Pro' models win)
         def model_rank(name):
             version_match = re.findall(r'\d+\.\d+|\d+', name)
             score = float(version_match[0]) if version_match else 0.0
@@ -78,7 +78,7 @@ async def raw_smart_audit(task: str, work: str):
         candidates = sorted(discovered, key=model_rank, reverse=True)
         logger.info(f"🏆 Best model selected: {candidates[0]}")
 
-        # 3. Execution Loop
+        # 3. Execution
         payload = {
             "contents": [{
                 "parts": [{"text": f"TASK: {task}\nWORK: {work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence summary."}]
@@ -106,44 +106,54 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
 
-    # 1. REPLAY PROTECTION
+    # 1. SECURITY: Replay Protection
     if x_payment_hash in USED_HASHES:
         logger.warning(f"🚫 Replay attempt blocked: {x_payment_hash}")
         raise HTTPException(status_code=403, detail="Payment hash already used.")
 
-    # 2. ROBUST XRPL VERIFICATION
+    # 2. THE ULTIMATE XRPL VERIFICATION (Kitchen Sink Edition)
     client = AsyncJsonRpcClient(XRPL_URL)
     try:
         tx_res = await client.request(Tx(transaction=x_payment_hash))
         result = tx_res.result
         
-        # Unpack nested structures (result -> tx/transaction -> Destination)
-        tx_body = result.get("tx") or result.get("transaction") or result
+        # Hunt through all common container names for the transaction data
+        tx_body = result.get("tx") or result.get("transaction") or result.get("tx_json") or result
         meta = result.get("meta") or result.get("meta_data") or tx_body.get("meta") or {}
         
-        # Deep search for Destination
-        dest = tx_body.get("Destination") or result.get("Destination")
+        # Hunt for Destination across case variations and nesting levels
+        dest = (
+            tx_body.get("Destination") or 
+            tx_body.get("destination") or 
+            result.get("Destination") or 
+            result.get("destination")
+        )
+        
+        # Hunt for Amount (delivered_amount is the most reliable)
+        raw_amt = meta.get("delivered_amount") or tx_body.get("Amount") or tx_body.get("amount") or "0"
+        
+        # Normalize fields
         dest = str(dest).strip() if dest else ""
-        
         my_addr = str(referee_wallet.address).strip()
-        
-        # Safe amount extraction
-        raw_amt = meta.get("delivered_amount") or tx_body.get("Amount") or "0"
         delivered = int(raw_amt) if isinstance(raw_amt, str) else int(raw_amt.get("value", 0))
-            
         status = meta.get("TransactionResult") or result.get("status")
 
         logger.info(f"🔎 VERIFYING HASH: {x_payment_hash}")
-        logger.info(f"   Expected: {my_addr}")
-        logger.info(f"   Found:    {dest if dest else 'NOT FOUND'}")
-        logger.info(f"   Amount:   {delivered} drops | Status: {status}")
+        logger.info(f"   Expecting: {my_addr}")
+        logger.info(f"   Found Dest: '{dest}'")
+        logger.info(f"   Amount: {delivered} drops | Status: {status}")
 
+        # Verification Checks
         if dest.lower() != my_addr.lower():
+            # If still missing, log the structure so we can see where the node hid it
+            logger.error(f"DEBUG: Found keys in tx_body: {list(tx_body.keys())}")
             raise Exception(f"Destination mismatch! Found '{dest}', expected '{my_addr}'")
+            
         if delivered < REFEREE_FEE_DROPS:
              raise Exception(f"Insufficient funds! {delivered} < {REFEREE_FEE_DROPS}")
-        if status != "tesSUCCESS":
-            raise Exception(f"Tx not successful. Status: {status}")
+             
+        if status not in ["tesSUCCESS", "success"]:
+            raise Exception(f"Tx failed or unvalidated. Status: {status}")
             
     except Exception as e:
         logger.error(f"❌ XRPL VERIFICATION ERROR: {e}")
@@ -152,6 +162,8 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
     # 3. AI AUDIT
     try:
         verdict, model_used = await raw_smart_audit(req.task, req.work)
+        
+        # 4. COMMIT: Hash is only burned if the AI completes the task
         USED_HASHES.add(x_payment_hash)
         
         return {
