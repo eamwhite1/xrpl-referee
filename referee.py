@@ -2,6 +2,7 @@ import os
 import asyncio
 import httpx
 import logging
+import sys
 from typing import Set
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -10,12 +11,16 @@ from google import genai
 
 from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.wallet import Wallet
-from xrpl.models.requests import Tx, AccountInfo
+from xrpl.models.requests import Tx
 from xrpl.utils import drops_to_xrp
 from xrpl.core.addresscodec import decode_seed
 
-# --- SETUP LOGGING ---
-logging.basicConfig(level=logging.INFO)
+# --- FORCE LOGS TO BE VISIBLE ON RENDER ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger("RefereeBot")
 
 load_dotenv()
@@ -28,40 +33,31 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 
-# --- PERSISTENT STORAGE ---
-HASH_FILE = "used_hashes.txt"
-
-def load_used_hashes() -> Set[str]:
-    if os.path.exists(HASH_FILE):
-        try:
-            with open(HASH_FILE, "r") as f:
-                return set(line.strip() for line in f if line.strip())
-        except: return set()
-    return set()
-
-def save_hash_to_disk(tx_hash: str):
-    try:
-        with open(HASH_FILE, "a") as f:
-            f.write(f"{tx_hash}\n")
-    except: pass
-
-USED_HASHES = load_used_hashes()
-
-# Initialize Wallet
-def load_referee_wallet():
+# Initialize Wallet with Debug Logging
+try:
     seed = os.getenv("XRPL_SEED")
-    if not seed: raise ValueError("XRPL_SEED NOT FOUND")
-    # Deriving algorithm from seed for 2026 compatibility
+    if not seed:
+        raise ValueError("XRPL_SEED is missing from Environment Variables!")
+    
+    # Auto-detect algorithm (ED25519 vs SECP256K1)
     _, algo = decode_seed(seed)
-    return Wallet.from_seed(seed, algorithm=algo)
-
-referee_wallet = load_referee_wallet()
-logger.info(f"Bot Active. Managing Wallet: {referee_wallet.address}")
+    referee_wallet = Wallet.from_seed(seed, algorithm=algo)
+    
+    # These will appear in your Render "Logs" tab
+    print(f"\n🚀 STARTUP SUCCESS")
+    print(f"🤖 BOT IS MONITORING: {referee_wallet.address}")
+    print(f"📡 CONNECTED TO: {XRPL_URL}\n")
+    logger.info(f"Wallet Loaded: {referee_wallet.address}")
+except Exception as e:
+    print(f"\n❌ STARTUP ERROR: {str(e)}\n")
+    logger.error(f"Failed to initialize wallet: {e}")
+    referee_wallet = None
 
 class AuditRequest(BaseModel):
     task: str
     work: str
 
+# --- UTILS ---
 async def notify_telegram(message: str):
     if not TG_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -69,71 +65,83 @@ async def notify_telegram(message: str):
         async with httpx.AsyncClient() as client:
             await client.post(url, json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"})
     except Exception as e:
-        logger.error(f"Telegram error: {e}")
+        logger.error(f"Telegram failed: {e}")
 
-# --- ENDPOINTS ---
+# --- API ENDPOINTS ---
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "referee_address": referee_wallet.address}
+    return {
+        "status": "online",
+        "bot_address": referee_wallet.address if referee_wallet else "NOT_CONFIGURED"
+    }
 
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
-    global USED_HASHES
-    
-    if not x_payment_hash: raise HTTPException(status_code=400, detail="Missing Hash")
-    if x_payment_hash in USED_HASHES: raise HTTPException(status_code=403, detail="Hash used")
+    if not referee_wallet:
+        raise HTTPException(status_code=500, detail="Bot wallet not configured.")
+    if not x_payment_hash:
+        raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
 
-    verified, customer_address, amount_received = False, "", 0
     client = AsyncJsonRpcClient(XRPL_URL)
-    
-    logger.info(f"Verifying Hash: {x_payment_hash}")
+    verified = False
+    customer_address = ""
+    amount_received = 0
+
+    logger.info(f"🔎 Validating Transaction: {x_payment_hash}")
 
     try:
+        # Loop to handle ledger propagation
         for attempt in range(5):
-            tx_res = await client.request(Tx(transaction=x_payment_hash))
-            res = tx_res.result
-            
-            # Look for the payload in all possible return structures
+            response = await client.request(Tx(transaction=x_payment_hash))
+            if not response.is_successful():
+                logger.warning(f"Attempt {attempt+1}: Transaction not found yet.")
+                await asyncio.sleep(2)
+                continue
+
+            res = response.result
+            # Handle nested transaction data (tx or tx_json)
             data = res.get("tx") or res.get("tx_json") or res
             
-            # CASE-INSENSITIVE ADDRESS CHECK
+            # CASE-INSENSITIVE ADDRESS COMPARISON
             ledger_dest = str(data.get("Destination", "")).lower()
             bot_dest = str(referee_wallet.address).lower()
 
-            if ledger_dest == bot_dest:
-                meta = res.get("meta") or res.get("meta_data")
-                status = meta.get("TransactionResult") if meta else "tesSUCCESS"
+            logger.info(f"Comparing Dest: {ledger_dest} == {bot_dest}")
 
-                if status == "tesSUCCESS":
+            if ledger_dest == bot_dest:
+                # Check Metadata for Success
+                meta = res.get("meta") or res.get("meta_data") or {}
+                tx_result = meta.get("TransactionResult", "tesSUCCESS")
+
+                if tx_result == "tesSUCCESS":
+                    # Parse Amount
                     raw_amt = data.get("Amount")
-                    # XRP amounts can be string or int
                     amount_received = int(raw_amt) if isinstance(raw_amt, (str, int)) else 0
                     
                     if amount_received >= REFEREE_FEE_DROPS:
                         verified = True
                         customer_address = data.get("Account")
+                        logger.info(f"✅ Verified {drops_to_xrp(str(amount_received))} XRP from {customer_address}")
                         break
             
-            logger.info(f"Attempt {attempt+1}: Dest mismatch ({ledger_dest} vs {bot_dest}) or amount low.")
-            await asyncio.sleep(1.5)
-            
+            await asyncio.sleep(1)
+
     except Exception as e:
-        logger.error(f"Ledger error: {e}")
+        logger.error(f"XRPL Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Ledger Error.")
 
     if not verified:
-        raise HTTPException(status_code=404, detail="Payment check failed. Check address/amount.")
+        raise HTTPException(status_code=404, detail="Payment verification failed. Check address, amount, or hash.")
 
-    USED_HASHES.add(x_payment_hash)
-    save_hash_to_disk(x_payment_hash)
+    # AI AUDIT SECTION
+    await notify_telegram(f"💸 *Payment Confirmed!*\nReceived `{drops_to_xrp(str(amount_received))} XRP`.\nRunning AI Audit...")
     
-    await notify_telegram(f"💰 **Paid Audit Started!** Received `{drops_to_xrp(str(amount_received))} XRP`.")
-
-    # AI Audit
     try:
-        prompt = f"TASK: {req.task}\nWORK: {req.work}\n\nProvide 1-2 sentence verdict (APPROVED/REJECTED)."
-        ai_res = await asyncio.to_thread(ai_client.models.generate_content, model="gemini-1.5-flash", contents=prompt)
-        return {"ai_verdict": ai_res.text, "status": "success"}
+        prompt = f"AUDIT TASK: {req.task}\nCODE TO REVIEW: {req.work}\n\nProvide a 1-2 sentence verdict (APPROVED/REJECTED)."
+        ai_response = await asyncio.to_thread(ai_client.models.generate_content, model="gemini-1.5-flash", contents=prompt)
+        verdict = ai_response.text
+        return {"ai_verdict": verdict, "status": "success"}
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return {"ai_verdict": "AI Analysis failed. Refund pending.", "status": "error"}
+        return {"ai_verdict": "AI Analysis failed, but payment was received.", "status": "error"}
