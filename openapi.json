@@ -1,0 +1,83 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "XRPL AI Referee",
+    "description": "A trustless AI auditor that verifies task completion for the Agent Economy. Requires a 0.1 XRP fee per audit.",
+    "version": "1.0.0",
+    "x-ai-service-type": "auditor",
+    "x-payment-requirement": {
+      "currency": "XRP",
+      "amount": "0.1",
+      "destination": "YOUR_WALLET_ADDRESS_HERE"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://xrpl-referee.onrender.com",
+      "description": "Production server"
+    }
+  ],
+  "paths": {
+    "/evaluate": {
+      "post": {
+        "summary": "Audit a completed task",
+        "description": "Submits a task description and the completed work for AI verification. Requires an XRPL transaction hash for 0.1 XRP in the headers.",
+        "operationId": "evaluateWork",
+        "parameters": [
+          {
+            "name": "x-payment-hash",
+            "in": "header",
+            "description": "The XRPL transaction hash of the 0.1 XRP fee payment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "task": {
+                    "type": "string",
+                    "description": "The original instructions given to the worker agent.",
+                    "maxLength": 5000
+                  },
+                  "work": {
+                    "type": "string",
+                    "description": "The output/work produced by the worker agent.",
+                    "maxLength": 5000
+                  }
+                },
+                "required": ["task", "work"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful audit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ai_verdict": { "type": "string" },
+                    "model_used": { "type": "string" },
+                    "status": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "402": { "description": "Payment Required - XRPL hash invalid or amount too low." },
+          "403": { "description": "Forbidden - Payment hash already used (Double-spend protection)." },
+          "413": { "description": "Payload Too Large - Exceeds character limit." }
+        }
+      }
+    }
+  }
+}
