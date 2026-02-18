@@ -3,4 +3,3 @@ uvicorn
 xrpl-py
 python-dotenv
 httpx
-google-genai>=1.0.0
