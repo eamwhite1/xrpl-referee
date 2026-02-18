@@ -21,6 +21,7 @@ load_dotenv()
 app = FastAPI()
 
 # --- CONFIGURATION & SECURITY ---
+# Default to Mainnet, but allow override
 XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 USED_HASHES = set()         # Prevents double-spending of transaction hashes
@@ -28,6 +29,8 @@ USED_HASHES = set()         # Prevents double-spending of transaction hashes
 # Initialize Wallet
 try:
     seed = os.getenv("XRPL_SEED")
+    if not seed:
+        raise ValueError("XRPL_SEED not found in environment variables.")
     _, algo = decode_seed(seed)
     referee_wallet = Wallet.from_seed(seed, algorithm=algo)
     print(f"\n🚀 AGENT ACTIVE: Monitoring {referee_wallet.address}\n")
@@ -46,33 +49,40 @@ async def raw_smart_audit(task: str, work: str):
     and version number (e.g., 7.4 > 3.0), and executes the audit.
     """
     api_key = os.getenv('GEMINI_API_KEY')
-    
+    if not api_key:
+        raise Exception("GEMINI_API_KEY is missing.")
+
     async with httpx.AsyncClient() as client:
         # 1. Ask Google what models this specific API key is authorized to use
         list_url = f"https://generativelanguage.googleapis.com/v1/models?key={api_key}"
         try:
             list_res = await client.get(list_url)
             if list_res.status_code != 200:
-                raise Exception(f"Model listing failed: {list_res.text}")
-            
-            available = list_res.json().get('models', [])
-            discovered = [m['name'] for m in available if 'generateContent' in m.get('supportedGenerationMethods', [])]
+                logger.warning(f"Model listing failed ({list_res.status_code}). Using fallbacks.")
+                discovered = []
+            else:
+                available = list_res.json().get('models', [])
+                discovered = [m['name'] for m in available if 'generateContent' in m.get('supportedGenerationMethods', [])]
         except Exception as e:
-            logger.warning(f"Discovery failed, using standard fallbacks. Error: {e}")
-            discovered = ["models/gemini-1.5-flash", "models/gemini-1.5-pro"]
+            logger.warning(f"Discovery network error: {e}")
+            discovered = []
+
+        # If discovery fails, use these standard fallbacks
+        if not discovered:
+            discovered = ["models/gemini-1.5-pro", "models/gemini-1.5-flash"]
 
         # 2. Intelligent Sorting (Pro preference + Version Number extraction)
         def model_rank(name):
             # Extract version (e.g., 'gemini-7.4' -> 7.4)
             version_match = re.findall(r'\d+\.\d+|\d+', name)
             score = float(version_match[0]) if version_match else 0.0
-            # Intelligence multiplier: Always prefer 'Pro' or 'Ultra' over 'Flash'
-            if any(term in name.lower() for term in ['pro', 'ultra', 'deep']):
+            # Intelligence multiplier: Always prefer 'Pro' or 'Ultra' or 'Deep'
+            if any(term in name.lower() for term in ['pro', 'ultra', 'deep', 'think']):
                 score += 100 
             return score
 
         candidates = sorted(discovered, key=model_rank, reverse=True)
-        logger.info(f"🏆 Best model found: {candidates[0] if candidates else 'None'}")
+        logger.info(f"🏆 Best model selected: {candidates[0]}")
 
         # 3. Execution Loop (Tries the best model, falls back if busy)
         payload = {
@@ -108,26 +118,50 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
         logger.warning(f"🚫 Replay attempt blocked for hash: {x_payment_hash}")
         raise HTTPException(status_code=403, detail="Payment hash already used.")
 
-    # 2. XRPL VERIFICATION: Check the ledger for 0.1 XRP
+    # 2. XRPL VERIFICATION (Verbose Debug Mode)
     client = AsyncJsonRpcClient(XRPL_URL)
     try:
         tx_res = await client.request(Tx(transaction=x_payment_hash))
-        tx_data = tx_res.result
-        meta = tx_data.get("meta") or tx_data.get("meta_data") or {}
-
-        # Validate destination, amount, and success status
-        is_dest = str(tx_data.get("Destination", "")).lower() == str(referee_wallet.address).lower()
+        result = tx_res.result
         
-        # Handle different XRP amount formats
+        # 🔍 SMART UNPACKING: Handle different API response structures
+        # Sometimes data is in result['tx'], sometimes in result directly
+        tx_data = result.get("tx") or result.get("transaction") or result
+        meta = result.get("meta") or tx_data.get("meta") or result.get("meta_data") or {}
+        
+        # Extract fields safely and normalize
+        dest = str(tx_data.get("Destination", "")).strip()
+        my_addr = str(referee_wallet.address).strip()
+        
+        # Amount Logic: "delivered_amount" (meta) > "Amount" (tx)
         raw_amt = meta.get("delivered_amount") or tx_data.get("Amount", "0")
-        delivered = int(raw_amt) if isinstance(raw_amt, str) else int(raw_amt.get("value", 0))
+        
+        # Handle XRP (str) vs Tokens (dict)
+        if isinstance(raw_amt, dict):
+            delivered = int(raw_amt.get("value", 0)) # Token
+        else:
+            delivered = int(raw_amt) # XRP drops
+            
+        status = meta.get("TransactionResult", "UNKNOWN")
 
-        if not is_dest or delivered < REFEREE_FEE_DROPS or meta.get("TransactionResult") != "tesSUCCESS":
-            raise Exception("Payment verification failed (wrong address, amount, or status).")
+        # 🛑 DEBUG LOGGING: Print exactly what we found
+        logger.info(f"🔎 VERIFYING HASH: {x_payment_hash}")
+        logger.info(f"   Expecting Dest: {my_addr}")
+        logger.info(f"   Found Dest:     {dest}")
+        logger.info(f"   Amount: {delivered} drops | Status: {status}")
+
+        # The Checks
+        if dest != my_addr:
+            raise Exception(f"Destination mismatch! Found {dest}, expected {my_addr}")
+        if delivered < REFEREE_FEE_DROPS:
+             raise Exception(f"Insufficient funds! Found {delivered} drops")
+        if status != "tesSUCCESS":
+            raise Exception(f"Tx failed on Ledger! Status: {status}")
             
     except Exception as e:
-        logger.error(f"XRPL Error: {e}")
-        raise HTTPException(status_code=402, detail=f"XRP Verification Error: {str(e)}")
+        logger.error(f"❌ XRPL CHECK FAILED: {e}")
+        # Return the EXACT error to the client so we can see it in Swagger/Curl
+        raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
 
     # 3. AI AUDIT: Perform the intelligence-ranked audit
     try:
