@@ -29,7 +29,7 @@ try:
     seed = os.getenv("XRPL_SEED")
     _, algo = decode_seed(seed)
     referee_wallet = Wallet.from_seed(seed, algorithm=algo)
-    print(f"\n🚀 STARTUP: Monitoring {referee_wallet.address}\n")
+    print(f"\n🚀 STARTUP SUCCESS: Monitoring {referee_wallet.address}\n")
 except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
@@ -40,7 +40,7 @@ class AuditRequest(BaseModel):
 
 # --- THE RAW HTTP AUDIT ENGINE ---
 async def raw_smart_audit(task: str, work: str):
-    """Bypasses all SDKs to talk directly to the Google API via HTTP."""
+    """Direct HTTP call to Google API - No library needed."""
     api_key = os.getenv('GEMINI_API_KEY')
     # Core production endpoint
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
@@ -52,7 +52,7 @@ async def raw_smart_audit(task: str, work: str):
     }
 
     async with httpx.AsyncClient() as client:
-        logger.info("📡 Sending raw HTTP POST to Google...")
+        logger.info("📡 Sending direct HTTP request to Gemini...")
         try:
             response = await client.post(url, json=payload, timeout=30.0)
             
@@ -60,9 +60,9 @@ async def raw_smart_audit(task: str, work: str):
                 data = response.json()
                 return data['candidates'][0]['content']['parts'][0]['text']
             
-            # Auto-fallback to v1beta if v1 rejects the model name
+            # Fallback to v1beta if v1 fails
             elif response.status_code == 404:
-                logger.warning("Standard v1 404'd. Trying v1beta fallback...")
+                logger.warning("v1 404'd. Trying v1beta fallback...")
                 alt_url = url.replace("/v1/", "/v1beta/")
                 alt_res = await client.post(alt_url, json=payload, timeout=30.0)
                 if alt_res.status_code == 200:
@@ -71,17 +71,17 @@ async def raw_smart_audit(task: str, work: str):
             raise Exception(f"Google API Error {response.status_code}: {response.text}")
             
         except Exception as e:
-            logger.error(f"Connection Error: {str(e)}")
+            logger.error(f"Network Error: {str(e)}")
             raise e
 
-# --- ENDPOINT ---
+# --- ENDPOINTS ---
+@app.get("/")
+def health(): return {"status": "online", "address": referee_wallet.address if referee_wallet else "Error"}
+
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
     if not referee_wallet: raise HTTPException(status_code=500, detail="Wallet config error")
     if not x_payment_hash: raise HTTPException(status_code=400, detail="Missing hash")
-    
-    # 🧪 TEST CHEAT: Re-use enabled for testing. 
-    # To lock security, add: if x_payment_hash in USED_HASHES: raise ...
 
     client = AsyncJsonRpcClient(XRPL_URL)
     verified = False
@@ -96,7 +96,6 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
         if str(data.get("Destination", "")).lower() == str(referee_wallet.address).lower():
             raw_amt = meta.get("delivered_amount") or data.get("Amount")
             amount_received = int(raw_amt) if isinstance(raw_amt, (str, int)) else int(raw_amt.get("value", 0))
-            
             if amount_received >= REFEREE_FEE_DROPS and meta.get("TransactionResult") == "tesSUCCESS":
                 verified = True
     except Exception as e:
@@ -115,6 +114,3 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
         }
     except Exception as e:
         return {"ai_verdict": f"API Connection Error: {str(e)}", "status": "error"}
-
-@app.get("/")
-def health(): return {"status": "online"}
