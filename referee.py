@@ -43,7 +43,7 @@ async def raw_smart_audit(task: str, work: str):
     """Direct HTTP call to Google API - No library needed."""
     api_key = os.getenv('GEMINI_API_KEY')
     # Core production endpoint
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
     
     payload = {
         "contents": [{
@@ -114,3 +114,4 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
         }
     except Exception as e:
         return {"ai_verdict": f"API Connection Error: {str(e)}", "status": "error"}
+
