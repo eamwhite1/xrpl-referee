@@ -33,6 +33,25 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 
+# --- PERSISTENT STORAGE ---
+HASH_FILE = "used_hashes.txt"
+
+def load_used_hashes() -> Set[str]:
+    if os.path.exists(HASH_FILE):
+        try:
+            with open(HASH_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        except: return set()
+    return set()
+
+def save_hash_to_disk(tx_hash: str):
+    try:
+        with open(HASH_FILE, "a") as f:
+            f.write(f"{tx_hash}\n")
+    except: pass
+
+USED_HASHES = load_used_hashes()
+
 # Initialize Wallet
 try:
     seed = os.getenv("XRPL_SEED")
@@ -63,10 +82,15 @@ def health_check():
 
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
+    global USED_HASHES
     if not referee_wallet:
         raise HTTPException(status_code=500, detail="Wallet not configured")
     if not x_payment_hash:
         raise HTTPException(status_code=400, detail="Missing hash")
+    
+    # REPLAY PROTECTION (Option 2: Active)
+    if x_payment_hash in USED_HASHES:
+        raise HTTPException(status_code=403, detail="This payment hash has already been used for an audit.")
 
     client = AsyncJsonRpcClient(XRPL_URL)
     verified = False
@@ -78,17 +102,13 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
         response = await client.request(Tx(transaction=x_payment_hash))
         res = response.result
         
-        # Look in all possible locations for transaction data
         data = res.get("tx") or res.get("tx_json") or res
         meta = res.get("meta") or res.get("meta_data") or {}
 
-        # 1. Address Check
         ledger_dest = str(data.get("Destination", "")).lower()
         bot_dest = str(referee_wallet.address).lower()
-        logger.info(f"Comparing Dest: {ledger_dest} == {bot_dest}")
 
         if ledger_dest == bot_dest:
-            # 2. Amount Check - Priority: meta.delivered_amount -> data.Amount
             raw_amt = meta.get("delivered_amount") or data.get("Amount")
             
             if isinstance(raw_amt, (str, int)):
@@ -98,7 +118,6 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
 
             logger.info(f"💰 Amount verified: {amount_received} drops")
 
-            # 3. Final Verification
             if amount_received >= REFEREE_FEE_DROPS:
                 if meta.get("TransactionResult") == "tesSUCCESS" or res.get("validated"):
                     verified = True
@@ -110,13 +129,24 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
     if not verified:
         raise HTTPException(status_code=404, detail="Payment check failed.")
 
-    # --- AI AUDIT ---
-    await notify_telegram(f"💸 **Audit Paid!** Received `{drops_to_xrp(str(amount_received))} XRP`.")
-    
+    # Save hash to prevent reuse
+    USED_HASHES.add(x_payment_hash)
+    save_hash_to_disk(x_payment_hash)
+
+    # --- AI AUDIT SECTION ---
     try:
-        prompt = f"AUDIT TASK: {req.task}\nSUBMITTED WORK: {req.work}\n\nVerdict: APPROVED or REJECTED. 1-2 sentence reason."
-        ai_res = await asyncio.to_thread(ai_client.models.generate_content, model="gemini-1.5-flash", contents=prompt)
-        return {"ai_verdict": ai_res.text, "status": "success"}
+        logger.info("Calling Gemini AI...")
+        # Note the "models/" prefix below for the 2026 stable API path
+        ai_res = await asyncio.to_thread(
+            ai_client.models.generate_content, 
+            model="models/gemini-1.5-flash", 
+            contents=f"TASK: {req.task}\nCODE: {req.work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence."
+        )
+        
+        verdict = ai_res.text
+        await notify_telegram(f"✅ **Audit Complete!** Paid {drops_to_xrp(str(amount_received))} XRP.")
+        return {"ai_verdict": verdict, "status": "success"}
+        
     except Exception as e:
-        logger.error(f"AI Error: {e}")
-        return {"ai_verdict": "AI Audit failed, but payment received.", "status": "error"}
+        logger.error(f"AI Final Error: {e}")
+        return {"ai_verdict": f"AI Error: {str(e)}", "status": "error"}
