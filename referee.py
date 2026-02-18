@@ -31,7 +31,6 @@ app = FastAPI(title="XRPL Referee Pro")
 
 # --- 2. DATABASE CONFIGURATION ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-# Fix for Render/Heroku postgres dialect
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -50,7 +49,6 @@ class PaymentLog(Base):
     model_used = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# Initialize tables
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -60,19 +58,20 @@ def get_db():
     finally:
         db.close()
 
-# --- 3. XRPL WALLET CONFIG ---
+# --- 3. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
+DATA_CAP = 10000            # Max characters allowed (Task + Work)
 
 try:
     seed = os.getenv("XRPL_SEED")
     if not seed:
-        raise ValueError("XRPL_SEED not found in environment variables.")
+        raise ValueError("XRPL_SEED not found.")
     _, algo = decode_seed(seed)
     referee_wallet = Wallet.from_seed(seed, algorithm=algo)
     logger.info(f"🚀 AGENT ACTIVE: Monitoring {referee_wallet.address}")
 except Exception as e:
-    logger.error(f"STARTUP ERROR: Wallet configuration failed: {e}")
+    logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
 
 class AuditRequest(BaseModel):
@@ -82,36 +81,27 @@ class AuditRequest(BaseModel):
 # --- 4. INTELLIGENT DISCOVERY ENGINE ---
 async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        raise Exception("GEMINI_API_KEY is missing.")
-
     async with httpx.AsyncClient() as client:
-        # 1. Discovery
         list_url = f"https://generativelanguage.googleapis.com/v1/models?key={api_key}"
         try:
             list_res = await client.get(list_url)
             discovered = [m['name'] for m in list_res.json().get('models', []) 
                           if 'generateContent' in m.get('supportedGenerationMethods', [])] if list_res.status_code == 200 else []
-        except Exception:
+        except:
             discovered = []
 
         if not discovered:
             discovered = ["models/gemini-1.5-pro", "models/gemini-1.5-flash"]
 
-        # 2. Ranking
         def model_rank(name):
             version_match = re.findall(r'\d+\.\d+|\d+', name)
             score = float(version_match[0]) if version_match else 0.0
-            if any(term in name.lower() for term in ['pro', 'ultra', 'deep', 'think']):
+            if any(term in name.lower() for term in ['pro', 'ultra', 'deep']):
                 score += 100 
             return score
 
         candidates = sorted(discovered, key=model_rank, reverse=True)
-        
-        # 3. Execution
-        payload = {
-            "contents": [{"parts": [{"text": f"TASK: {task}\nWORK: {work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence summary."}]}]
-        }
+        payload = {"contents": [{"parts": [{"text": f"TASK: {task}\nWORK: {work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence summary."}]}]}
 
         for model_path in candidates:
             clean_id = model_path.split('/')[-1]
@@ -132,15 +122,16 @@ async def evaluate_work(
     x_payment_hash: str = Header(None), 
     db: Session = Depends(get_db)
 ):
-    if not referee_wallet: 
-        raise HTTPException(status_code=500, detail="Referee wallet not initialized.")
+    # PROTECTOR: Data Cap Check
+    if len(req.task) + len(req.work) > DATA_CAP:
+        raise HTTPException(status_code=413, detail=f"Payload too large. Max {DATA_CAP} chars.")
+
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
 
-    # A. DATABASE SECURITY: Check for used hashes (Replaces the old 'set')
+    # A. REPLAY PROTECTION
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if already_used:
-        logger.warning(f"🚫 Replay attempt blocked: {x_payment_hash}")
         raise HTTPException(status_code=403, detail="Payment hash already used.")
 
     # B. XRPL VERIFICATION
@@ -148,29 +139,28 @@ async def evaluate_work(
     try:
         tx_res = await client.request(Tx(transaction=x_payment_hash))
         result = tx_res.result
-        tx_body = result.get("tx") or result.get("transaction") or result.get("tx_json") or result
-        meta = result.get("meta") or result.get("meta_data") or tx_body.get("meta") or {}
+        tx_body = result.get("tx") or result.get("transaction") or result
+        meta = result.get("meta") or tx_body.get("meta") or {}
         
-        dest = tx_body.get("Destination") or tx_body.get("destination") or result.get("Destination") or ""
-        raw_amt = meta.get("delivered_amount") or tx_body.get("Amount") or "0"
-        
-        dest = str(dest).strip()
-        my_addr = str(referee_wallet.address).strip()
-        delivered = int(raw_amt) if isinstance(raw_amt, str) else int(raw_amt.get("value", 0))
+        dest = str(tx_body.get("Destination", "")).strip()
+        delivered = int(meta.get("delivered_amount", tx_body.get("Amount", 0)))
         status = meta.get("TransactionResult") or result.get("status")
 
-        if dest.lower() != my_addr.lower() or delivered < REFEREE_FEE_DROPS or status not in ["tesSUCCESS", "success"]:
-             raise Exception(f"Verification failed. Dest: {dest}, Amt: {delivered}, Status: {status}")
+        if dest.lower() != referee_wallet.address.lower():
+             raise Exception("Wrong destination.")
+        if delivered < REFEREE_FEE_DROPS:
+             raise Exception("Payment too low.")
+        if status not in ["tesSUCCESS", "success"]:
+            raise Exception("Transaction failed on-chain.")
              
     except Exception as e:
-        logger.error(f"❌ XRPL ERROR: {e}")
         raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
 
-    # C. AI AUDIT & COMMIT
+    # C. AI AUDIT
     try:
         verdict, model_used = await raw_smart_audit(req.task, req.work)
         
-        # SAVE TO DATABASE: Burn the hash permanently
+        # D. COMMIT (Burn the hash only after AI succeeds)
         new_log = PaymentLog(
             payment_hash=x_payment_hash,
             sender=tx_body.get("Account"),
@@ -182,15 +172,9 @@ async def evaluate_work(
         db.add(new_log)
         db.commit()
         
-        return {
-            "ai_verdict": verdict,
-            "model_used": model_used,
-            "status": "success",
-            "payment_verified": f"{new_log.amount_xrp} XRP"
-        }
+        return {"ai_verdict": verdict, "model_used": model_used, "status": "success"}
     except Exception as e:
         db.rollback()
-        logger.error(f"Audit Failure: {e}")
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
 
 @app.get("/")
