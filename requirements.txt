@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-xrpl-py
-python-dotenv
-httpx
 sqlalchemy
 psycopg2-binary
+httpx
+xrpl-py
+python-dotenv
+requests
