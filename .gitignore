@@ -1,0 +1,19 @@
+# --- Security (CRITICAL) ---
+.env
+.env.local
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# --- Database ---
+*.sqlite
+*.db
+
+# --- Logs ---
+*.log
