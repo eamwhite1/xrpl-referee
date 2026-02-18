@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends, Body
-from fastapi.responses import FileResponse  # Added for serving the JSON map
+from fastapi.responses import FileResponse 
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -28,7 +28,9 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
-app = FastAPI(title="XRPL Referee Pro")
+# We set openapi_url=None to stop FastAPI from generating its own generic map.
+# This forces the app to use YOUR custom openapi.json file.
+app = FastAPI(title="XRPL Referee Pro", openapi_url=None)
 
 # --- 2. DATABASE CONFIGURATION ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -118,11 +120,12 @@ async def raw_smart_audit(task: str, work: str):
 
 # --- 5. ENDPOINTS ---
 
-@app.get("/")
+# FIXED: We use api_route to allow HEAD requests from UptimeRobot
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "online", "referee_address": referee_wallet.address if referee_wallet else "Error"}
 
-# New route to serve your openapi.json file to other agents
+# Serves your custom openapi.json file
 @app.get("/openapi.json")
 def get_openapi():
     return FileResponse("openapi.json")
