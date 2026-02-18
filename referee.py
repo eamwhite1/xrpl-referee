@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import logging
 import sys
-from typing import Set
+from typing import Set, List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -29,36 +29,14 @@ app = FastAPI()
 # Configuration
 XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
-
-# --- PERSISTENT STORAGE ---
-HASH_FILE = "used_hashes.txt"
-
-def load_used_hashes() -> Set[str]:
-    if os.path.exists(HASH_FILE):
-        try:
-            with open(HASH_FILE, "r") as f:
-                return set(line.strip() for line in f if line.strip())
-        except: return set()
-    return set()
-
-def save_hash_to_disk(tx_hash: str):
-    try:
-        with open(HASH_FILE, "a") as f:
-            f.write(f"{tx_hash}\n")
-    except: pass
-
-USED_HASHES = load_used_hashes()
 
 # Initialize Wallet
 try:
     seed = os.getenv("XRPL_SEED")
     _, algo = decode_seed(seed)
     referee_wallet = Wallet.from_seed(seed, algorithm=algo)
-    print(f"\n🚀 STARTUP SUCCESS")
-    print(f"🤖 BOT IS MONITORING: {referee_wallet.address}\n")
+    print(f"\n🚀 STARTUP SUCCESS: Bot is monitoring {referee_wallet.address}\n")
 except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
@@ -67,86 +45,105 @@ class AuditRequest(BaseModel):
     task: str
     work: str
 
-async def notify_telegram(message: str):
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+# --- DYNAMIC AI ENGINE ---
+
+async def get_best_available_models() -> List[str]:
+    """Scouts the Google API for all generation-capable models, prioritizing Flash."""
     try:
-        async with httpx.AsyncClient() as client:
-            await client.post(url, json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"})
-    except: pass
+        # Query Google for what is currently available for your API key
+        available = await asyncio.to_thread(ai_client.models.list)
+        
+        # Filter for models that support generating content
+        # We look for 'flash' first (fast/cheap), then 'pro' (smart/expensive)
+        gen_models = [
+            m.name for m in available 
+            if "generateContent" in m.supported_generation_methods
+        ]
+        
+        flash = sorted([m for m in gen_models if "flash" in m.lower()], reverse=True)
+        pro = sorted([m for m in gen_models if "pro" in m.lower()], reverse=True)
+        
+        return flash + pro
+    except Exception as e:
+        logger.warning(f"Discovery failed, using hardcoded fallbacks: {e}")
+        return ["models/gemini-1.5-flash", "models/gemini-1.0-pro"]
+
+async def smart_audit(task: str, work: str):
+    """Discovers models and attempts the audit, falling back automatically on error."""
+    models = await get_best_available_models()
+    logger.info(f"Discovered models in order of preference: {models}")
+
+    last_err = ""
+    for model_name in models:
+        try:
+            logger.info(f"🚀 Auditing with {model_name}...")
+            response = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model=model_name,
+                contents=f"TASK: {task}\nWORK: {work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence reason."
+            )
+            return response.text, model_name
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(f"⚠️ {model_name} failed: {last_err}")
+            continue
+            
+    raise Exception(f"All AI discovery paths failed. Last error: {last_err}")
+
+# --- MAIN ENDPOINT ---
 
 @app.get("/")
-def health_check():
-    addr = referee_wallet.address if referee_wallet else "Not Configured"
-    return {"status": "online", "bot_address": addr}
+def health():
+    return {"status": "online", "address": referee_wallet.address if referee_wallet else "Error"}
 
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None)):
-    global USED_HASHES
-    if not referee_wallet:
-        raise HTTPException(status_code=500, detail="Wallet not configured")
-    if not x_payment_hash:
-        raise HTTPException(status_code=400, detail="Missing hash")
-    
-    # REPLAY PROTECTION (Option 2: Active)
-    if x_payment_hash in USED_HASHES:
-        raise HTTPException(status_code=403, detail="This payment hash has already been used for an audit.")
+    if not referee_wallet: raise HTTPException(status_code=500, detail="Wallet config error")
+    if not x_payment_hash: raise HTTPException(status_code=400, detail="Missing hash")
+
+    # 🧪 TEST CHEAT: Re-using your hash is allowed for now!
+    # To go live, uncomment the lines below:
+    # if x_payment_hash in getattr(app, 'used_hashes', set()):
+    #     raise HTTPException(status_code=403, detail="Hash already used")
 
     client = AsyncJsonRpcClient(XRPL_URL)
     verified = False
     amount_received = 0
 
-    logger.info(f"🔎 Validating Hash: {x_payment_hash}")
-
     try:
-        response = await client.request(Tx(transaction=x_payment_hash))
-        res = response.result
-        
+        # Verify Payment on XRPL
+        tx_res = await client.request(Tx(transaction=x_payment_hash))
+        res = tx_res.result
         data = res.get("tx") or res.get("tx_json") or res
         meta = res.get("meta") or res.get("meta_data") or {}
 
-        ledger_dest = str(data.get("Destination", "")).lower()
-        bot_dest = str(referee_wallet.address).lower()
-
-        if ledger_dest == bot_dest:
+        if str(data.get("Destination", "")).lower() == str(referee_wallet.address).lower():
             raw_amt = meta.get("delivered_amount") or data.get("Amount")
-            
-            if isinstance(raw_amt, (str, int)):
-                amount_received = int(raw_amt)
-            elif isinstance(raw_amt, dict):
-                amount_received = int(raw_amt.get("value", 0))
+            amount_received = int(raw_amt) if isinstance(raw_amt, (str, int)) else int(raw_amt.get("value", 0))
 
-            logger.info(f"💰 Amount verified: {amount_received} drops")
-
-            if amount_received >= REFEREE_FEE_DROPS:
-                if meta.get("TransactionResult") == "tesSUCCESS" or res.get("validated"):
-                    verified = True
-                    logger.info("✅ Payment check PASSED.")
+            if amount_received >= REFEREE_FEE_DROPS and meta.get("TransactionResult") == "tesSUCCESS":
+                verified = True
+                logger.info(f"✅ Payment of {amount_received} drops verified.")
 
     except Exception as e:
-        logger.error(f"Verification Logic Error: {e}")
+        logger.error(f"XRPL Check Error: {e}")
 
     if not verified:
-        raise HTTPException(status_code=404, detail="Payment check failed.")
+        raise HTTPException(status_code=404, detail="Payment verification failed.")
 
-    # Save hash to prevent reuse
-    USED_HASHES.add(x_payment_hash)
-    save_hash_to_disk(x_payment_hash)
-
-    # --- AI AUDIT SECTION ---
+    # Execute Dynamic Audit
     try:
-        logger.info("Calling Gemini AI...")
-        # Note the "models/" prefix below for the 2026 stable API path
-        ai_res = await asyncio.to_thread(
-            ai_client.models.generate_content, 
-            model="models/gemini-1.5-flash", 
-            contents=f"TASK: {req.task}\nCODE: {req.work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence."
-        )
+        verdict, final_model = await smart_audit(req.task, req.work)
         
-        verdict = ai_res.text
-        await notify_telegram(f"✅ **Audit Complete!** Paid {drops_to_xrp(str(amount_received))} XRP.")
-        return {"ai_verdict": verdict, "status": "success"}
+        # Track hash only after successful audit
+        if not hasattr(app, 'used_hashes'): app.used_hashes = set()
+        # app.used_hashes.add(x_payment_hash) # Uncomment to prevent reuse
         
+        return {
+            "ai_verdict": verdict,
+            "model_used": final_model,
+            "status": "success",
+            "payment_confirmed": f"{drops_to_xrp(str(amount_received))} XRP"
+        }
     except Exception as e:
-        logger.error(f"AI Final Error: {e}")
         return {"ai_verdict": f"AI Error: {str(e)}", "status": "error"}
