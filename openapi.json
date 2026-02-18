@@ -8,7 +8,7 @@
     "x-payment-requirement": {
       "currency": "XRP",
       "amount": "0.1",
-      "destination": "YOUR_WALLET_ADDRESS_HERE"
+      "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
     }
   },
   "servers": [
