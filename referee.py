@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends, Body
+from fastapi.responses import FileResponse  # Added for serving the JSON map
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -115,7 +116,17 @@ async def raw_smart_audit(task: str, work: str):
                     continue
         raise Exception("AI Gateway Failure")
 
-# --- 5. MAIN ENDPOINT ---
+# --- 5. ENDPOINTS ---
+
+@app.get("/")
+def health():
+    return {"status": "online", "referee_address": referee_wallet.address if referee_wallet else "Error"}
+
+# New route to serve your openapi.json file to other agents
+@app.get("/openapi.json")
+def get_openapi():
+    return FileResponse("openapi.json")
+
 @app.post("/evaluate")
 async def evaluate_work(
     req: AuditRequest, 
@@ -176,7 +187,3 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
-
-@app.get("/")
-def health():
-    return {"status": "online", "referee_address": referee_wallet.address if referee_wallet else "Error"}
