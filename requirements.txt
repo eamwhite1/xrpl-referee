@@ -2,5 +2,5 @@ fastapi
 uvicorn
 xrpl-py
 python-dotenv
-google-genai
 httpx
+google-genai>=1.0.0
