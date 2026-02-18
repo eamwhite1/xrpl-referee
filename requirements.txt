@@ -3,3 +3,5 @@ uvicorn
 xrpl-py
 python-dotenv
 httpx
+sqlalchemy
+psycopg2-binary
