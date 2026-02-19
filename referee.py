@@ -196,6 +196,31 @@ def get_mcp_card():
 @app.get("/mcp")
 async def mcp_handshake():
     return {"status": "connected", "protocol": "mcp-http", "capabilities": ["resources", "tools"]}
+
+async def send_telegram_notification(tx_hash: str, amount: str, verdict: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    
+    # If variables aren't set, just skip silently
+    if not token or not chat_id:
+        logger.warning("Telegram credentials not set. Skipping notification.")
+        return
+
+    message = (
+        f"💰 **New Audit Paid!**\n\n"
+        f"**Amount:** {amount} XRP\n"
+        f"**Hash:** `{tx_hash}`\n"
+        f"**Verdict:** {verdict}\n\n"
+        f"🚀 *Agent is working!*"
+    )
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"})
+    except Exception as e:
+        logger.error(f"Failed to send Telegram alert: {e}")
 # -----------------------------------------------------------
 @app.post("/evaluate")
 async def evaluate_work(
@@ -252,11 +277,14 @@ async def evaluate_work(
         )
         db.add(new_log)
         db.commit()
+
+        await send_telegram_notification(x_payment_hash, drops_to_xrp(str(delivered)), verdict)
         
         return {"ai_verdict": verdict, "model_used": model_used, "status": "success"}
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
+
 
 
 
