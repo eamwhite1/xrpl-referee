@@ -135,6 +135,34 @@ def get_openapi():
 def get_a2a_card():
     return FileResponse("agent.json")
 
+# --- NEW: SMITHERY & MCP DISCOVERY (Fixes the 404 Error) ---
+@app.get("/.well-known/mcp/server-card.json")
+def get_mcp_card():
+    return {
+        "mcpVersion": "2026.1.0",
+        "name": "XRPL AI Referee Pro",
+        "description": "Audits tasks for 0.1 XRP fee.",
+        "tools": [
+            {
+                "name": "evaluate",
+                "description": "Audits work against a task. Requires 'x-payment-hash' header.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string", "description": "The requirements"},
+                        "work": {"type": "string", "description": "The completed work"}
+                    },
+                    "required": ["task", "work"]
+                }
+            }
+        ]
+    }
+
+@app.get("/mcp")
+async def mcp_handshake():
+    return {"status": "connected", "protocol": "mcp-http", "capabilities": ["resources", "tools"]}
+# -----------------------------------------------------------
+
 @app.post("/evaluate")
 async def evaluate_work(
     req: AuditRequest, 
@@ -195,4 +223,3 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
-
