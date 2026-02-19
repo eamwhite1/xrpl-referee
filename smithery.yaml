@@ -1,0 +1,9 @@
+runtime: python
+target: remote
+url: https://xrpl-referee.onrender.com/mcp  # Your Render URL
+config:
+  x-payment-hash:
+    type: string
+    description: "🔑 Enter the XRPL Transaction Hash (0.1 XRP)"
+    placeholder: "31735708FC234D19B527..."
+    required: true
