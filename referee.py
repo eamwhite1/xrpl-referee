@@ -135,34 +135,62 @@ def get_openapi():
 def get_a2a_card():
     return FileResponse("agent.json")
 
+# --- THE HIGH-FIDELITY SMITHERY & MCP DISCOVERY SECTION ---
 @app.get("/.well-known/mcp/server-card.json")
 def get_mcp_card():
     return {
         "mcpVersion": "2026.1.0",
         "name": "XRPL-Referee-Pro",
         "title": "XRPL Payment-Gated AI Auditor",
-        "description": "Professional AI auditing service. Verifies task completion for a 0.1 XRP fee. Ideal for code reviews, writing audits, and logic verification.",
+        "description": "A professional AI auditing service that verifies task completion for a 0.1 XRP fee. This tool is designed to provide high-integrity quality checks for code, writing, and logical tasks.",
+        "version": "1.0.3",
+        "capabilities": {
+            "resources": {
+                "subscribe": True,
+                "list": True
+            },
+            "prompts": {
+                "list": True
+            }
+        },
+        "resources": [
+            {
+                "uri": "mcp://audit-logs/recent",
+                "name": "Latest Public Audits",
+                "mimeType": "application/json",
+                "description": "A list of recent audit verdicts and justifications to help the AI understand the Referee's current standards and quality threshold."
+            }
+        ],
+        "prompts": [
+            {
+                "name": "Standard Code Review",
+                "description": "Use this template to audit a code submission against a set of requirements. It ensures the Referee looks for bugs and logic errors."
+            },
+            {
+                "name": "Content Verification",
+                "description": "Use this template to audit writing or creative work against a task description for tone, accuracy, and completeness."
+            }
+        ],
         "tools": [
             {
                 "name": "evaluate_task",
-                "description": "Primary auditing tool. Use this to verify if 'work' (the output) matches 'task' (the requirements). REQUIRES a valid XRPL 'x-payment-hash' in headers representing 0.1 XRP sent to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
+                "description": "Primary auditing tool. Compares 'work' against 'task' requirements. REQUIRES a valid XRPL 'x-payment-hash' in the header confirming 0.1 XRP sent to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "task": {
-                            "type": "string", 
-                            "description": "The detailed instructions or requirements that the work must follow."
+                            "type": "string",
+                            "description": "The original instructions, requirements, or problem statement given to the worker."
                         },
                         "work": {
-                            "type": "string", 
-                            "description": "The actual completed product, code, or text to be audited for quality."
+                            "type": "string",
+                            "description": "The actual completed product, solution, or output that needs to be audited."
                         }
                     },
                     "required": ["task", "work"]
                 }
             }
-        ],
-        "version": "1.0.1"
+        ]
     }
 
 @app.get("/mcp")
@@ -229,6 +257,7 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
+
 
 
 
