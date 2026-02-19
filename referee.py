@@ -177,9 +177,9 @@ async def evaluate_work(
         raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
 
     # A. REPLAY PROTECTION
-    already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
-    if already_used:
-        raise HTTPException(status_code=403, detail="Payment hash already used.")
+    #already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
+    #if already_used:
+        #raise HTTPException(status_code=403, detail="Payment hash already used.")
 
     # B. XRPL VERIFICATION
     client = AsyncJsonRpcClient(XRPL_URL)
@@ -223,3 +223,4 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
+
