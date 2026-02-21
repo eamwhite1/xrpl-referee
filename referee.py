@@ -8,6 +8,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends, Body
 from fastapi.responses import FileResponse 
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -29,10 +30,18 @@ logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
 # We set openapi_url=None to stop FastAPI from generating its own generic map.
-# This forces the app to use YOUR custom openapi.json file.
 app = FastAPI(title="XRPL Referee Pro", openapi_url=None)
 
-# --- 2. DATABASE CONFIGURATION ---
+# --- 2. CORS MIDDLEWARE (NEW: Connects AgentTrust Website) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 3. DATABASE CONFIGURATION ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -61,7 +70,7 @@ def get_db():
     finally:
         db.close()
 
-# --- 3. CONFIGURATION ---
+# --- 4. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 DATA_CAP = 10000            # Max characters allowed (Task + Work)
@@ -81,7 +90,7 @@ class AuditRequest(BaseModel):
     task: str
     work: str
 
-# --- 4. INTELLIGENT DISCOVERY ENGINE ---
+# --- 5. INTELLIGENT DISCOVERY ENGINE ---
 async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
     async with httpx.AsyncClient() as client:
@@ -118,24 +127,20 @@ async def raw_smart_audit(task: str, work: str):
                     continue
         raise Exception("AI Gateway Failure")
 
-# --- 5. ENDPOINTS ---
+# --- 6. ENDPOINTS ---
 
-# FIXED: We use api_route to allow HEAD requests from UptimeRobot
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "online", "referee_address": referee_wallet.address if referee_wallet else "Error"}
 
-# Serves your custom openapi.json file
 @app.get("/openapi.json")
 def get_openapi():
     return FileResponse("openapi.json")
 
-# The A2A Discovery standard route
 @app.get("/.well-known/agent.json")
 def get_a2a_card():
     return FileResponse("agent.json")
 
-# --- THE HIGH-FIDELITY SMITHERY & MCP DISCOVERY SECTION ---
 @app.get("/.well-known/mcp/server-card.json")
 def get_mcp_card():
     return {
@@ -198,10 +203,9 @@ async def mcp_handshake():
     return {"status": "connected", "protocol": "mcp-http", "capabilities": ["resources", "tools"]}
 
 async def send_telegram_notification(tx_hash: str, amount: str, verdict: str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_TOKEN") # Fixed variable name to match typical Render setup
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
-    # If variables aren't set, just skip silently
     if not token or not chat_id:
         logger.warning("Telegram credentials not set. Skipping notification.")
         return
@@ -221,14 +225,13 @@ async def send_telegram_notification(tx_hash: str, amount: str, verdict: str):
             await client.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"})
     except Exception as e:
         logger.error(f"Failed to send Telegram alert: {e}")
-# -----------------------------------------------------------
+
 @app.post("/evaluate")
 async def evaluate_work(
     req: AuditRequest, 
     x_payment_hash: str = Header(None), 
     db: Session = Depends(get_db)
 ):
-    # PROTECTOR: Data Cap Check
     if len(req.task) + len(req.work) > DATA_CAP:
         raise HTTPException(status_code=413, detail=f"Payload too large. Max {DATA_CAP} chars.")
 
@@ -266,7 +269,7 @@ async def evaluate_work(
     try:
         verdict, model_used = await raw_smart_audit(req.task, req.work)
         
-        # D. COMMIT (Burn the hash only after AI succeeds)
+        # D. COMMIT
         new_log = PaymentLog(
             payment_hash=x_payment_hash,
             sender=tx_body.get("Account"),
@@ -284,8 +287,3 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
-
-
-
-
-
