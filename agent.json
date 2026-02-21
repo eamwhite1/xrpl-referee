@@ -6,7 +6,7 @@
   "agentVersion": "1.0.0",
   "protocolVersion": "0.3.0",
   "provider": {
-    "organization": "Your Name/Brand",
+    "organization": "XRPL AI Referee",
     "url": "https://xrpl-referee.onrender.com"
   },
   "capabilities": {
