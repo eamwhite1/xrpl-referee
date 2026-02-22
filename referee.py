@@ -29,10 +29,9 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
-# We set openapi_url=None to stop FastAPI from generating its own generic map.
 app = FastAPI(title="XRPL Referee Pro", openapi_url=None)
 
-# --- 2. CORS MIDDLEWARE (NEW: Connects AgentTrust Website) ---
+# --- 2. CORS MIDDLEWARE ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -71,9 +70,9 @@ def get_db():
         db.close()
 
 # --- 4. CONFIGURATION ---
-XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
+XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
-DATA_CAP = 10000            # Max characters allowed (Task + Work)
+DATA_CAP = 10000            # Max characters allowed
 
 try:
     seed = os.getenv("XRPL_SEED")
@@ -137,79 +136,11 @@ def health():
 def get_openapi():
     return FileResponse("openapi.json")
 
-@app.get("/.well-known/agent.json")
-def get_a2a_card():
-    return FileResponse("agent.json")
-
-@app.get("/.well-known/mcp/server-card.json")
-def get_mcp_card():
-    return {
-        "mcpVersion": "2026.1.0",
-        "name": "XRPL-Referee-Pro",
-        "title": "XRPL Payment-Gated AI Auditor",
-        "description": "A professional AI auditing service that verifies task completion for a 0.1 XRP fee. This tool is designed to provide high-integrity quality checks for code, writing, and logical tasks.",
-        "version": "1.0.3",
-        "capabilities": {
-            "resources": {
-                "subscribe": True,
-                "list": True
-            },
-            "prompts": {
-                "list": True
-            }
-        },
-        "resources": [
-            {
-                "uri": "mcp://audit-logs/recent",
-                "name": "Latest Public Audits",
-                "mimeType": "application/json",
-                "description": "A list of recent audit verdicts and justifications to help the AI understand the Referee's current standards and quality threshold."
-            }
-        ],
-        "prompts": [
-            {
-                "name": "Standard Code Review",
-                "description": "Use this template to audit a code submission against a set of requirements. It ensures the Referee looks for bugs and logic errors."
-            },
-            {
-                "name": "Content Verification",
-                "description": "Use this template to audit writing or creative work against a task description for tone, accuracy, and completeness."
-            }
-        ],
-        "tools": [
-            {
-                "name": "evaluate_task",
-                "description": "Primary auditing tool. Compares 'work' against 'task' requirements. REQUIRES a valid XRPL 'x-payment-hash' in the header confirming 0.1 XRP sent to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "task": {
-                            "type": "string",
-                            "description": "The original instructions, requirements, or problem statement given to the worker."
-                        },
-                        "work": {
-                            "type": "string",
-                            "description": "The actual completed product, solution, or output that needs to be audited."
-                        }
-                    },
-                    "required": ["task", "work"]
-                }
-            }
-        ]
-    }
-
-@app.get("/mcp")
-async def mcp_handshake():
-    return {"status": "connected", "protocol": "mcp-http", "capabilities": ["resources", "tools"]}
-
 async def send_telegram_notification(tx_hash: str, amount: str, verdict: str):
-    token = os.getenv("TELEGRAM_TOKEN") # Fixed variable name to match typical Render setup
+    token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
     if not token or not chat_id:
-        logger.warning("Telegram credentials not set. Skipping notification.")
         return
-
     message = (
         f"💰 **New Audit Paid!**\n\n"
         f"**Amount:** {amount} XRP\n"
@@ -217,14 +148,12 @@ async def send_telegram_notification(tx_hash: str, amount: str, verdict: str):
         f"**Verdict:** {verdict}\n\n"
         f"🚀 *Agent is working!*"
     )
-    
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    
     try:
         async with httpx.AsyncClient() as client:
             await client.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"})
     except Exception as e:
-        logger.error(f"Failed to send Telegram alert: {e}")
+        logger.error(f"Failed Telegram: {e}")
 
 @app.post("/evaluate")
 async def evaluate_work(
@@ -233,7 +162,7 @@ async def evaluate_work(
     db: Session = Depends(get_db)
 ):
     if len(req.task) + len(req.work) > DATA_CAP:
-        raise HTTPException(status_code=413, detail=f"Payload too large. Max {DATA_CAP} chars.")
+        raise HTTPException(status_code=413, detail=f"Payload too large.")
 
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
@@ -248,6 +177,7 @@ async def evaluate_work(
     try:
         tx_res = await client.request(Tx(transaction=x_payment_hash))
         result = tx_res.result
+        
         tx_body = result.get("tx") or result.get("transaction") or result
         meta = result.get("meta") or tx_body.get("meta") or {}
         
@@ -255,22 +185,28 @@ async def evaluate_work(
         delivered = int(meta.get("delivered_amount", tx_body.get("Amount", 0)))
         status = meta.get("TransactionResult") or result.get("status")
 
-        if dest.lower() not in [referee_wallet.address.lower(), "rmcsrkpz2i2kuvtcpetevee9sixp4djr"]:
-    logger.error(f"Mismatch: Ledger says {dest} but I expected {referee_wallet.address}")
-    raise Exception(f"Wrong destination. Ledger saw: {dest}")
+        # Destination Check
+        allowed_addresses = [referee_wallet.address.lower(), "rmcsrkpz2i2kuvtcpetevee9sixp4djr"]
+        if dest.lower() not in allowed_addresses:
+            raise Exception(f"Wrong destination. Ledger saw: {dest}")
+        
+        # Amount Check
         if delivered < REFEREE_FEE_DROPS:
-             raise Exception("Payment too low.")
+            raise Exception(f"Payment too low. Got {delivered}")
+
+        # Status Check
         if status not in ["tesSUCCESS", "success"]:
-            raise Exception("Transaction failed on-chain.")
+            raise Exception(f"Transaction failed: {status}")
              
+        logger.info(f"✅ Verified: {delivered} drops to {dest}")
+
     except Exception as e:
         raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
 
-    # C. AI AUDIT
+    # C. AI AUDIT & COMMIT
     try:
         verdict, model_used = await raw_smart_audit(req.task, req.work)
         
-        # D. COMMIT
         new_log = PaymentLog(
             payment_hash=x_payment_hash,
             sender=tx_body.get("Account"),
@@ -288,4 +224,3 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
-
