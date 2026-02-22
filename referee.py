@@ -3,6 +3,7 @@ import re
 import httpx
 import logging
 import sys
+import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -132,10 +133,6 @@ async def raw_smart_audit(task: str, work: str):
 def health():
     return {"status": "online", "referee_address": referee_wallet.address if referee_wallet else "Error"}
 
-@app.get("/openapi.json")
-def get_openapi():
-    return FileResponse("openapi.json")
-
 async def send_telegram_notification(tx_hash: str, amount: str, verdict: str):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -161,9 +158,6 @@ async def evaluate_work(
     x_payment_hash: str = Header(None), 
     db: Session = Depends(get_db)
 ):
-    if len(req.task) + len(req.work) > DATA_CAP:
-        raise HTTPException(status_code=413, detail=f"Payload too large.")
-
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
 
@@ -172,44 +166,62 @@ async def evaluate_work(
     if already_used:
         raise HTTPException(status_code=403, detail="Payment hash already used.")
 
-    # B. XRPL VERIFICATION
+    # B. XRPL VERIFICATION (RETRY & ROBUST PARSING)
     client = AsyncJsonRpcClient(XRPL_URL)
-    try:
-        tx_res = await client.request(Tx(transaction=x_payment_hash))
-        result = tx_res.result
-        
-        tx_body = result.get("tx") or result.get("transaction") or result
-        meta = result.get("meta") or tx_body.get("meta") or {}
-        
-        dest = str(tx_body.get("Destination", "")).strip()
-        delivered = int(meta.get("delivered_amount", tx_body.get("Amount", 0)))
-        status = meta.get("TransactionResult") or result.get("status")
+    tx_data = None
 
-        # Destination Check
+    for attempt in range(3):
+        try:
+            tx_res = await client.request(Tx(transaction=x_payment_hash))
+            if tx_res.is_successful():
+                tx_data = tx_res.result
+                if "error" not in tx_data:
+                    break
+            logger.warning(f"Attempt {attempt+1}: Tx not yet validated or structural error.")
+        except Exception as e:
+            logger.error(f"Attempt {attempt+1} connection error: {e}")
+        await asyncio.sleep(2)
+
+    if not tx_data or "error" in tx_data:
+        raise HTTPException(status_code=402, detail=f"Ledger Error: {tx_data.get('error', 'Transaction not found')}")
+
+    try:
+        # Robust extraction
+        tx_details = tx_data.get("tx") or tx_data.get("transaction") or tx_data
+        meta = tx_data.get("meta") or tx_data.get("metaData") or {}
+        
+        dest = str(tx_details.get("Destination", "")).strip()
+        delivered = int(meta.get("delivered_amount", tx_details.get("Amount", 0)))
+        status = meta.get("TransactionResult") or tx_data.get("status")
+
+        # Validation Logic
         allowed_addresses = [referee_wallet.address.lower(), "rmcsrkpz2i2kuvtcpetevee9sixp4djr"]
+        
+        if not dest:
+            raise Exception("No destination found in ledger response.")
+
         if dest.lower() not in allowed_addresses:
             raise Exception(f"Wrong destination. Ledger saw: {dest}")
         
-        # Amount Check
         if delivered < REFEREE_FEE_DROPS:
-            raise Exception(f"Payment too low. Got {delivered}")
+            raise Exception(f"Payment too low. Got {delivered} drops.")
 
-        # Status Check
         if status not in ["tesSUCCESS", "success"]:
-            raise Exception(f"Transaction failed: {status}")
+            raise Exception(f"Transaction failed on-chain: {status}")
              
         logger.info(f"✅ Verified: {delivered} drops to {dest}")
 
     except Exception as e:
         raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
 
-    # C. AI AUDIT & COMMIT
+    # C. AI AUDIT
     try:
         verdict, model_used = await raw_smart_audit(req.task, req.work)
         
+        # D. COMMIT
         new_log = PaymentLog(
             payment_hash=x_payment_hash,
-            sender=tx_body.get("Account"),
+            sender=tx_details.get("Account"),
             amount_xrp=float(drops_to_xrp(str(delivered))),
             task_summary=req.task[:100],
             ai_verdict=verdict,
