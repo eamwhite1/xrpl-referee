@@ -1,5 +1,4 @@
 import os
-import re
 import httpx
 import logging
 import sys
@@ -7,7 +6,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Body
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -89,23 +88,46 @@ class AuditRequest(BaseModel):
     task: str
     work: str
 
-# --- 5. AI AUDIT ENGINE ---
+# --- 5. AI AUDIT ENGINE (DYNAMIC BRAIN) ---
 async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
-    async with httpx.AsyncClient() as client:
-        # Simple model fallback list
-        candidates = ["gemini-1.5-pro", "gemini-1.5-flash"]
-        payload = {"contents": [{"parts": [{"text": f"TASK: {task}\nWORK: {work}\n\nVerdict (APPROVED/REJECTED) + 1 sentence summary."}]}]}
+    if not api_key:
+        raise Exception("GEMINI_API_KEY is missing")
 
+    # Dynamic Model List: Updated for 2026 availability
+    # Priorities: Gemini 3 Flash (Fastest) -> Gemini 2.5 Pro (Best) -> Fallbacks
+    candidates = [
+        "gemini-3-flash", 
+        "gemini-2.5-flash", 
+        "gemini-2.5-pro", 
+        "gemini-1.5-flash"
+    ]
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": f"You are a strict autonomous escrow auditor.\nTASK: {task}\nWORK SUBMITTED: {work}\n\nProvide a verdict: APPROVED or REJECTED followed by a 1-sentence explanation."}]
+        }]
+    }
+
+    async with httpx.AsyncClient() as client:
         for model_id in candidates:
             try:
+                # We try v1beta as it usually has the newest models
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-                res = await client.post(url, json=payload, timeout=30.0)
+                res = await client.post(url, json=payload, timeout=20.0)
+                
                 if res.status_code == 200:
-                    return res.json()['candidates'][0]['content']['parts'][0]['text'], model_id
-            except:
+                    data = res.json()
+                    verdict_text = data['candidates'][0]['content']['parts'][0]['text']
+                    logger.info(f"✅ AI Success using {model_id}")
+                    return verdict_text, model_id
+                else:
+                    logger.warning(f"⚠️ Model {model_id} failed with {res.status_code}")
+            except Exception as e:
+                logger.warning(f"🔄 Error with {model_id}: {str(e)}")
                 continue
-        raise Exception("AI Gateway Failure")
+
+        raise Exception("AI Gateway Failure: All model candidates returned errors.")
 
 # --- 6. ENDPOINTS ---
 
@@ -131,11 +153,10 @@ async def evaluate_work(
     if already_used:
         raise HTTPException(status_code=403, detail="Payment hash already used.")
 
-    # B. AGGRESSIVE XRPL VERIFICATION
+    # B. XRPL VERIFICATION
     client = AsyncJsonRpcClient(XRPL_URL)
     tx_data = None
     
-    # Retry loop to wait for ledger validation
     for i in range(6): 
         try:
             tx_res = await client.request(Tx(transaction=x_payment_hash))
@@ -144,37 +165,36 @@ async def evaluate_work(
                 if tx_data.get("validated") == True:
                     break
         except Exception as e:
-            logger.warning(f"Connection attempt {i+1} failed: {e}")
+            logger.warning(f"Ledger check attempt {i+1} failed: {e}")
         await asyncio.sleep(2)
 
     if not tx_data:
-        raise HTTPException(status_code=402, detail="Transaction not found or not validated by Ledger.")
+        raise HTTPException(status_code=402, detail="Transaction not found or not validated.")
 
     try:
-        # 1. PEEL THE ONION: Look for the actual transaction body
-        # Some nodes return it in 'tx_json', others in 'tx', others at root
+        # Peel the onion for the Destination field
         body = tx_data.get("tx_json") or tx_data.get("tx") or tx_data.get("transaction") or tx_data
-        
         meta = tx_data.get("meta") or tx_data.get("metaData") or {}
         
-        # 2. EXTRACT CORE FIELDS
         dest = body.get("Destination")
-        
-        # Amount can be in meta (delivered_amount) or body (Amount)
         delivered = meta.get("delivered_amount") or body.get("Amount")
-        
-        # Status check
         status = meta.get("TransactionResult") or tx_data.get("status")
 
         if not dest:
-            # This is where it was failing before - we now check body.keys()
-            raise Exception(f"Destination missing. Found keys in body: {list(body.keys())}")
+            raise Exception("Destination field missing from Ledger response.")
 
-        # 3. VERIFICATION
+        # Comparison (Case-insensitive)
         allowed = [referee_wallet.address.lower(), TARGET_ADDRESS.lower()]
-        
         if str(dest).lower() not in allowed:
             raise Exception(f"Wrong destination. Ledger saw: {dest}")
+        
+        if int(str(delivered)) < REFEREE_FEE_DROPS:
+            raise Exception(f"Payment too low.")
+
+        if status not in ["tesSUCCESS", "success"]:
+            raise Exception(f"Transaction status: {status}")
+             
+        logger.info(f"✅ Verified {delivered} drops to {dest}")
 
     except Exception as e:
         raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
@@ -199,4 +219,3 @@ async def evaluate_work(
     except Exception as e:
         db.rollback()
         return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
-
