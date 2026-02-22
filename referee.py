@@ -166,47 +166,44 @@ async def evaluate_work(
     if already_used:
         raise HTTPException(status_code=403, detail="Payment hash already used.")
 
-    # B. XRPL VERIFICATION (RETRY & ROBUST PARSING)
+    # B. XRPL VERIFICATION (With Validation Wait)
     client = AsyncJsonRpcClient(XRPL_URL)
-    tx_data = None
-
-    for attempt in range(3):
+    tx_details = None
+    
+    # We try 5 times with a 2-second sleep to wait for ledger validation
+    for i in range(5):
         try:
             tx_res = await client.request(Tx(transaction=x_payment_hash))
-            if tx_res.is_successful():
-                tx_data = tx_res.result
-                if "error" not in tx_data:
-                    break
-            logger.warning(f"Attempt {attempt+1}: Tx not yet validated or structural error.")
-        except Exception as e:
-            logger.error(f"Attempt {attempt+1} connection error: {e}")
+            if tx_res.is_successful() and "error" not in tx_res.result:
+                tx_details = tx_res.result
+                break
+        except:
+            pass
         await asyncio.sleep(2)
 
-    if not tx_data or "error" in tx_data:
-        raise HTTPException(status_code=402, detail=f"Ledger Error: {tx_data.get('error', 'Transaction not found')}")
+    if not tx_details:
+        raise HTTPException(status_code=402, detail="Transaction not found or not yet validated by Ledger.")
 
     try:
-        # Robust extraction
-        tx_details = tx_data.get("tx") or tx_data.get("transaction") or tx_data
-        meta = tx_data.get("meta") or tx_data.get("metaData") or {}
+        # Extract data from the result
+        # Note: XRPL can return details in 'tx' or at root level
+        body = tx_details.get("tx") or tx_details.get("transaction") or tx_details
+        meta = tx_details.get("meta") or tx_details.get("metaData") or {}
         
-        dest = str(tx_details.get("Destination", "")).strip()
-        delivered = int(meta.get("delivered_amount", tx_details.get("Amount", 0)))
-        status = meta.get("TransactionResult") or tx_data.get("status")
+        dest = str(body.get("Destination", "")).strip()
+        delivered = int(meta.get("delivered_amount", body.get("Amount", 0)))
+        status = meta.get("TransactionResult", "")
 
-        # Validation Logic
-        allowed_addresses = [referee_wallet.address.lower(), "rmcsrkpz2i2kuvtcpetevee9sixp4djr"]
+        # The "Big Three" Checks
+        allowed = [referee_wallet.address.lower(), "rmcsrkpz2i2kuvtcpetevee9sixp4djr"]
         
-        if not dest:
-            raise Exception("No destination found in ledger response.")
-
-        if dest.lower() not in allowed_addresses:
+        if dest.lower() not in allowed:
             raise Exception(f"Wrong destination. Ledger saw: {dest}")
         
         if delivered < REFEREE_FEE_DROPS:
-            raise Exception(f"Payment too low. Got {delivered} drops.")
+            raise Exception(f"Payment too low. Got {delivered}")
 
-        if status not in ["tesSUCCESS", "success"]:
+        if status != "tesSUCCESS":
             raise Exception(f"Transaction failed on-chain: {status}")
              
         logger.info(f"✅ Verified: {delivered} drops to {dest}")
@@ -214,14 +211,13 @@ async def evaluate_work(
     except Exception as e:
         raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
 
-    # C. AI AUDIT
+    # C. AI AUDIT & COMMIT
     try:
         verdict, model_used = await raw_smart_audit(req.task, req.work)
         
-        # D. COMMIT
         new_log = PaymentLog(
             payment_hash=x_payment_hash,
-            sender=tx_details.get("Account"),
+            sender=body.get("Account"),
             amount_xrp=float(drops_to_xrp(str(delivered))),
             task_summary=req.task[:100],
             ai_verdict=verdict,
