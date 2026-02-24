@@ -3,6 +3,8 @@ import httpx
 import logging
 import sys
 import asyncio
+import hmac
+import hashlib
 from datetime import datetime
 from typing import Optional
 
@@ -70,7 +72,9 @@ def get_db():
 
 # --- 4. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
-REFEREE_FEE_DROPS = 100000  # 0.1 XRP
+BANKER_URL = os.getenv("BANKER_URL") # Ensure this is in your Render Env
+SHARED_SECRET = os.getenv("SHARED_SECRET", "default-secret").encode()
+REFEREE_FEE_DROPS = 100000  
 TARGET_ADDRESS = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 
 try:
@@ -87,22 +91,15 @@ except Exception as e:
 class AuditRequest(BaseModel):
     task: str
     work: str
+    escrow_id: str # Added so we know which job to payout
 
-# --- 5. AI AUDIT ENGINE (DYNAMIC BRAIN) ---
+# --- 5. AI AUDIT ENGINE ---
 async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing")
 
-    # Dynamic Model List: Updated for 2026 availability
-    # Priorities: Gemini 3 Flash (Fastest) -> Gemini 2.5 Pro (Best) -> Fallbacks
-    candidates = [
-        "gemini-3-flash", 
-        "gemini-2.5-flash", 
-        "gemini-2.5-pro", 
-        "gemini-1.5-flash"
-    ]
-    
+    candidates = ["gemini-3-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash"]
     payload = {
         "contents": [{
             "parts": [{"text": f"You are a strict autonomous escrow auditor.\nTASK: {task}\nWORK SUBMITTED: {work}\n\nProvide a verdict: APPROVED or REJECTED followed by a 1-sentence explanation."}]
@@ -112,32 +109,17 @@ async def raw_smart_audit(task: str, work: str):
     async with httpx.AsyncClient() as client:
         for model_id in candidates:
             try:
-                # We try v1beta as it usually has the newest models
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
                 res = await client.post(url, json=payload, timeout=20.0)
-                
                 if res.status_code == 200:
                     data = res.json()
                     verdict_text = data['candidates'][0]['content']['parts'][0]['text']
-                    logger.info(f"✅ AI Success using {model_id}")
                     return verdict_text, model_id
-                else:
-                    logger.warning(f"⚠️ Model {model_id} failed with {res.status_code}")
-            except Exception as e:
-                logger.warning(f"🔄 Error with {model_id}: {str(e)}")
+            except:
                 continue
-
-        raise Exception("AI Gateway Failure: All model candidates returned errors.")
+        raise Exception("AI Gateway Failure")
 
 # --- 6. ENDPOINTS ---
-
-@app.get("/")
-def health():
-    return {
-        "status": "online", 
-        "referee_address": referee_wallet.address if referee_wallet else "Config Error",
-        "target_match": TARGET_ADDRESS
-    }
 
 @app.post("/evaluate")
 async def evaluate_work(
@@ -146,76 +128,69 @@ async def evaluate_work(
     db: Session = Depends(get_db)
 ):
     if not x_payment_hash: 
-        raise HTTPException(status_code=400, detail="Missing x-payment-hash header.")
+        raise HTTPException(status_code=400, detail="Missing payment hash")
 
     # A. REPLAY PROTECTION
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if already_used:
-        raise HTTPException(status_code=403, detail="Payment hash already used.")
+        raise HTTPException(status_code=403, detail="Hash already used")
 
     # B. XRPL VERIFICATION
     client = AsyncJsonRpcClient(XRPL_URL)
     tx_data = None
-    
     for i in range(6): 
         try:
             tx_res = await client.request(Tx(transaction=x_payment_hash))
             if tx_res.is_successful():
                 tx_data = tx_res.result
-                if tx_data.get("validated") == True:
-                    break
-        except Exception as e:
-            logger.warning(f"Ledger check attempt {i+1} failed: {e}")
+                if tx_data.get("validated"): break
+        except: pass
         await asyncio.sleep(2)
 
     if not tx_data:
-        raise HTTPException(status_code=402, detail="Transaction not found or not validated.")
+        raise HTTPException(status_code=402, detail="Transaction not validated")
 
-    try:
-        # Peel the onion for the Destination field
-        body = tx_data.get("tx_json") or tx_data.get("tx") or tx_data.get("transaction") or tx_data
-        meta = tx_data.get("meta") or tx_data.get("metaData") or {}
+    # C. VERIFY DESTINATION & AMOUNT
+    body = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    meta = tx_data.get("meta") or tx_data.get("metaData") or {}
+    dest = body.get("Destination")
+    delivered = meta.get("delivered_amount") or body.get("Amount")
+
+    if str(dest).lower() != TARGET_ADDRESS.lower():
+        raise HTTPException(status_code=402, detail="Wrong destination")
+
+    # D. AI AUDIT
+    verdict, model_used = await raw_smart_audit(req.task, req.work)
+    
+    # E. LOG & PAYOUT LOGIC
+    is_approved = "APPROVED" in verdict.upper()
+    
+    if is_approved:
+        # Generate HMAC Signature for the Banker
+        signature = hmac.new(SHARED_SECRET, req.escrow_id.encode(), hashlib.sha256).hexdigest()
         
-        dest = body.get("Destination")
-        delivered = meta.get("delivered_amount") or body.get("Amount")
-        status = meta.get("TransactionResult") or tx_data.get("status")
+        # Trigger Banker Payout
+        async with httpx.AsyncClient() as bank_client:
+            try:
+                await bank_client.post(
+                    f"{BANKER_URL}/payout/{req.escrow_id}",
+                    headers={"X-Signature": signature},
+                    timeout=10.0
+                )
+                logger.info(f"💰 Payout triggered for {req.escrow_id}")
+            except Exception as e:
+                logger.error(f"❌ Banker Payout Failed: {e}")
 
-        if not dest:
-            raise Exception("Destination field missing from Ledger response.")
+    # F. COMMIT TO DB
+    new_log = PaymentLog(
+        payment_hash=x_payment_hash,
+        sender=body.get("Account"),
+        amount_xrp=float(drops_to_xrp(str(delivered))),
+        task_summary=req.task[:100],
+        ai_verdict=verdict,
+        model_used=model_used
+    )
+    db.add(new_log)
+    db.commit()
 
-        # Comparison (Case-insensitive)
-        allowed = [referee_wallet.address.lower(), TARGET_ADDRESS.lower()]
-        if str(dest).lower() not in allowed:
-            raise Exception(f"Wrong destination. Ledger saw: {dest}")
-        
-        if int(str(delivered)) < REFEREE_FEE_DROPS:
-            raise Exception(f"Payment too low.")
-
-        if status not in ["tesSUCCESS", "success"]:
-            raise Exception(f"Transaction status: {status}")
-             
-        logger.info(f"✅ Verified {delivered} drops to {dest}")
-
-    except Exception as e:
-        raise HTTPException(status_code=402, detail=f"Verification Failed: {str(e)}")
-
-    # C. AI AUDIT
-    try:
-        verdict, model_used = await raw_smart_audit(req.task, req.work)
-        
-        # D. COMMIT TO LOGS
-        new_log = PaymentLog(
-            payment_hash=x_payment_hash,
-            sender=body.get("Account"),
-            amount_xrp=float(drops_to_xrp(str(delivered))),
-            task_summary=req.task[:100],
-            ai_verdict=verdict,
-            model_used=model_used
-        )
-        db.add(new_log)
-        db.commit()
-
-        return {"ai_verdict": verdict, "model_used": model_used, "status": "success"}
-    except Exception as e:
-        db.rollback()
-        return {"ai_verdict": f"Audit Error: {str(e)}", "status": "error"}
+    return {"ai_verdict": verdict, "model_used": model_used, "status": "success" if is_approved else "rejected"}
