@@ -5,7 +5,7 @@ import sys
 import asyncio
 import hmac
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends
@@ -42,9 +42,13 @@ app.add_middleware(
 )
 
 # --- 3. DATABASE CONFIGURATION ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+db_url_raw = os.getenv("DATABASE_URL")
+if not db_url_raw:
+    # This prevents the server from crashing silently with a 'NoneType' error
+    logger.error("❌ DATABASE_URL missing!")
+    DATABASE_URL = "sqlite:///./fallback.db" # Local fallback to keep server alive
+else:
+    DATABASE_URL = db_url_raw.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -59,7 +63,7 @@ class PaymentLog(Base):
     task_summary = Column(String)
     ai_verdict = Column(Text)
     model_used = Column(String)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 Base.metadata.create_all(bind=engine)
 
@@ -72,9 +76,9 @@ def get_db():
 
 # --- 4. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
-BANKER_URL = os.getenv("BANKER_URL") # Ensure this is in your Render Env
+BANKER_URL = os.getenv("BANKER_URL") 
 SHARED_SECRET = os.getenv("SHARED_SECRET", "default-secret").encode()
-REFEREE_FEE_DROPS = 100000  
+REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 TARGET_ADDRESS = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 
 try:
@@ -91,7 +95,7 @@ except Exception as e:
 class AuditRequest(BaseModel):
     task: str
     work: str
-    escrow_id: str # Added so we know which job to payout
+    escrow_id: str 
 
 # --- 5. AI AUDIT ENGINE ---
 async def raw_smart_audit(task: str, work: str):
@@ -120,6 +124,10 @@ async def raw_smart_audit(task: str, work: str):
         raise Exception("AI Gateway Failure")
 
 # --- 6. ENDPOINTS ---
+
+@app.get("/")
+def health():
+    return {"status": "Referee is Online", "address": referee_wallet.address if referee_wallet else "Config Error"}
 
 @app.post("/evaluate")
 async def evaluate_work(
@@ -170,16 +178,19 @@ async def evaluate_work(
         signature = hmac.new(SHARED_SECRET, req.escrow_id.encode(), hashlib.sha256).hexdigest()
         
         # Trigger Banker Payout
-        async with httpx.AsyncClient() as bank_client:
-            try:
-                await bank_client.post(
-                    f"{BANKER_URL}/payout/{req.escrow_id}",
-                    headers={"X-Signature": signature},
-                    timeout=10.0
-                )
-                logger.info(f"💰 Payout triggered for {req.escrow_id}")
-            except Exception as e:
-                logger.error(f"❌ Banker Payout Failed: {e}")
+        if BANKER_URL:
+            async with httpx.AsyncClient() as bank_client:
+                try:
+                    await bank_client.post(
+                        f"{BANKER_URL.strip('/')}/payout/{req.escrow_id}",
+                        headers={"X-Signature": signature},
+                        timeout=10.0
+                    )
+                    logger.info(f"💰 Payout triggered for {req.escrow_id}")
+                except Exception as e:
+                    logger.error(f"❌ Banker Payout Call Failed: {e}")
+        else:
+            logger.warning("⚠️ BANKER_URL not configured. Payout not triggered.")
 
     # F. COMMIT TO DB
     new_log = PaymentLog(
