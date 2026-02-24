@@ -125,9 +125,13 @@ async def raw_smart_audit(task: str, work: str):
 
 # --- 6. ENDPOINTS ---
 
+@app.head("/")
 @app.get("/")
 def health():
-    return {"status": "Referee is Online", "address": referee_wallet.address if referee_wallet else "Config Error"}
+    return {
+        "status": "Referee is Online", 
+        "address": referee_wallet.address if referee_wallet else "Config Error"
+    }
 
 @app.post("/evaluate")
 async def evaluate_work(
@@ -205,3 +209,4 @@ async def evaluate_work(
     db.commit()
 
     return {"ai_verdict": verdict, "model_used": model_used, "status": "success" if is_approved else "rejected"}
+
