@@ -90,7 +90,19 @@ else:
     if "neon.tech" in DATABASE_URL and "sslmode" not in DATABASE_URL:
         DATABASE_URL += "?sslmode=require"
 
-engine = create_engine(DATABASE_URL)
+# Define the engine arguments separately to handle SQLite vs Postgres
+engine_args = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300
+}
+
+# Only add SSL mode if we aren't using the local fallback SQLite database
+if "sqlite" not in DATABASE_URL:
+    engine_args["connect_args"] = {"sslmode": "require"}
+
+# Create the engine once using the unpacked arguments
+engine = create_engine(DATABASE_URL, **engine_args)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -287,5 +299,6 @@ async def evaluate_work(
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
