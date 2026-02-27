@@ -56,10 +56,19 @@ if os.path.isdir("static"):
 else:
     logger.warning("⚠️ 'static' directory not found. UI will not be served.")
 
-@app.get("/health")
-@app.get("/status")
+@app.get("/")
+@app.head("/")
+def serve_ui():
+    """Satisfies UptimeRobot (HEAD) and Users (GET)"""
+    path = "static/index.html"
+    if os.path.exists(path):
+        return FileResponse(path)
+    # CRITICAL: Always return 200 even if the UI file is missing
+    return {"status": "Referee Online", "message": "UI file not found in /static"}
+
+@app.get("/status")  # <--- Added this decorator so this function actually works
 def health_check():
-    """Explicit endpoint for UptimeRobot to ping"""
+    """Explicit secondary endpoint for health checks"""
     return {"status": "online", "timestamp": datetime.now(timezone.utc)}
 
 # Update the main root to ensure it always returns a 200
@@ -278,4 +287,5 @@ async def evaluate_work(
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
