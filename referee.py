@@ -63,21 +63,12 @@ def serve_ui():
     path = "static/index.html"
     if os.path.exists(path):
         return FileResponse(path)
-    # CRITICAL: Always return 200 even if the UI file is missing
     return {"status": "Referee Online", "message": "UI file not found in /static"}
 
-@app.get("/status")  # <--- Added this decorator so this function actually works
+@app.get("/status")
 def health_check():
     """Explicit secondary endpoint for health checks"""
     return {"status": "online", "timestamp": datetime.now(timezone.utc)}
-
-# Update the main root to ensure it always returns a 200
-@app.get("/")
-def serve_ui():
-    if os.path.exists("static/index.html"):
-        return FileResponse('static/index.html')
-    # If UI is missing, still return 200 so UptimeRobot doesn't fail
-    return {"status": "Referee API Online", "ui": "missing"}
 
 # --- 4. DATABASE CONFIGURATION ---
 db_url_raw = os.getenv("DATABASE_URL")
@@ -85,24 +76,15 @@ if not db_url_raw:
     logger.error("❌ DATABASE_URL missing!")
     DATABASE_URL = "sqlite:///./fallback.db"
 else:
-    # Ensure Render/Neon compatibility
     DATABASE_URL = db_url_raw.replace("postgres://", "postgresql://", 1)
     if "neon.tech" in DATABASE_URL and "sslmode" not in DATABASE_URL:
         DATABASE_URL += "?sslmode=require"
 
-# Define the engine arguments separately to handle SQLite vs Postgres
-engine_args = {
-    "pool_pre_ping": True,
-    "pool_recycle": 300
-}
-
-# Only add SSL mode if we aren't using the local fallback SQLite database
+engine_args = {"pool_pre_ping": True, "pool_recycle": 300}
 if "sqlite" not in DATABASE_URL:
     engine_args["connect_args"] = {"sslmode": "require"}
 
-# Create the engine once using the unpacked arguments
 engine = create_engine(DATABASE_URL, **engine_args)
-
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -149,7 +131,6 @@ except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
 
-# XUMM SDK Setup
 xumm_api_key = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
 xumm_sdk = None
@@ -161,7 +142,6 @@ if xumm_api_key and xumm_api_secret and XummSdk:
     except Exception as e:
         logger.error(f"❌ XUMM SDK Failed: {e}")
 
-# --- MODELS ---
 class AuditRequest(BaseModel):
     task: str
     work: str
@@ -169,7 +149,7 @@ class AuditRequest(BaseModel):
 
 class EscrowSetupRequest(BaseModel):
     escrow_id: str
-    fee_hash: Optional[str] = None # For manual siphon verification
+    fee_hash: Optional[str] = None
 
 class XummPayloadRequest(BaseModel):
     txjson: dict
@@ -179,14 +159,8 @@ async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing")
-
     candidates = ["gemini-3-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
-    payload = {
-        "contents": [{
-            "parts": [{"text": f"You are a strict autonomous escrow auditor.\nTASK: {task}\nWORK SUBMITTED: {work}\n\nProvide a verdict: APPROVED or REJECTED followed by a 1-sentence explanation."}]
-        }]
-    }
-
+    payload = {"contents": [{"parts": [{"text": f"You are a strict autonomous escrow auditor.\nTASK: {task}\nWORK SUBMITTED: {work}\n\nProvide a verdict: APPROVED or REJECTED followed by a 1-sentence explanation."}]}]}
     async with httpx.AsyncClient() as client:
         for model_id in candidates:
             try:
@@ -198,73 +172,61 @@ async def raw_smart_audit(task: str, work: str):
                     return verdict_text, model_id
             except:
                 continue
-        raise Exception("AI Gateway Failure")
+    raise Exception("AI Gateway Failure")
 
 # --- 7. PROTOCOL ENDPOINTS ---
 
 @app.post("/escrow/generate")
 async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db)):
-    """Verifies manual fee and generates the cryptographic lock."""
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail="Escrow ID already exists")
 
-    # MANUAL FEE VERIFICATION
     if req.fee_hash:
         already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
         if already_used:
             raise HTTPException(status_code=403, detail="Fee hash already used")
-
         client = AsyncJsonRpcClient(XRPL_URL)
         try:
             tx_res = await client.request(Tx(transaction=req.fee_hash))
             if not tx_res.is_successful():
                 raise HTTPException(status_code=402, detail="Fee transaction not found")
-            
             body = tx_res.result
             dest = body.get("Destination")
             if str(dest).lower() != TARGET_ADDRESS.lower():
                 raise HTTPException(status_code=402, detail="Fee sent to wrong wallet")
-            
-            # Record the hash so it can't be used again
             db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
         except Exception as e:
             logger.error(f"Manual Hash Verify Error: {e}")
             raise HTTPException(status_code=400, detail="Ledger verification failed")
 
-    # Generate Vault Secrets
     fulfillment_bytes = secrets.token_bytes(32)
     fulfillment_hex = fulfillment_bytes.hex().upper()
     condition_hex = hashlib.sha256(fulfillment_bytes).hexdigest().upper()
-    
     vault = EscrowVault(escrow_id=req.escrow_id, condition=condition_hex, fulfillment=fulfillment_hex)
     db.add(vault)
     db.commit()
-    
     return {"escrow_id": req.escrow_id, "condition": condition_hex}
 
 @app.post("/xumm/create-payload")
 async def create_xumm_payload(req: XummPayloadRequest):
     if not xumm_sdk:
-        raise HTTPException(status_code=500, detail="Xumm SDK not configured on server.")
+        logger.error("❌ XUMM SDK not initialized.")
+        raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
     try:
+        logger.info(f"🚀 Sending to Xaman: {req.txjson}")
         result = xumm_sdk.payload.create(req.txjson)
         return {"nextUrl": result.next.always}
     except Exception as e:
-        logger.error(f"Xumm Payload Error: {e}")
+        logger.error(f"❌ XUMM API ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/evaluate")
-async def evaluate_work(
-    req: AuditRequest, 
-    x_payment_hash: str = Header(None), 
-    db: Session = Depends(get_db)
-):
+async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), db: Session = Depends(get_db)):
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing payment hash")
 
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
-    # We allow the hash if it was JUST created in /escrow/generate but not used for an audit yet
     if already_used and already_used.ai_verdict is not None:
         raise HTTPException(status_code=403, detail="Audit fee hash already used")
 
@@ -283,7 +245,6 @@ async def evaluate_work(
             revealed_fulfillment = vault_entry.fulfillment
             vault_entry.status = "RELEASED"
 
-    # Update the existing log or create a new one
     log_entry = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if not log_entry:
         log_entry = PaymentLog(payment_hash=x_payment_hash)
@@ -299,6 +260,3 @@ async def evaluate_work(
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
-
-
-
