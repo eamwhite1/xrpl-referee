@@ -56,11 +56,19 @@ if os.path.isdir("static"):
 else:
     logger.warning("⚠️ 'static' directory not found. UI will not be served.")
 
+@app.get("/health")
+@app.get("/status")
+def health_check():
+    """Explicit endpoint for UptimeRobot to ping"""
+    return {"status": "online", "timestamp": datetime.now(timezone.utc)}
+
+# Update the main root to ensure it always returns a 200
 @app.get("/")
 def serve_ui():
     if os.path.exists("static/index.html"):
         return FileResponse('static/index.html')
-    return {"status": "API is running, but static/index.html is missing"}
+    # If UI is missing, still return 200 so UptimeRobot doesn't fail
+    return {"status": "Referee API Online", "ui": "missing"}
 
 # --- 4. DATABASE CONFIGURATION ---
 db_url_raw = os.getenv("DATABASE_URL")
@@ -270,3 +278,4 @@ async def evaluate_work(
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
