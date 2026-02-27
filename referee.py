@@ -5,6 +5,7 @@ import sys
 import asyncio
 import hmac
 import hashlib
+import secrets
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -44,9 +45,8 @@ app.add_middleware(
 # --- 3. DATABASE CONFIGURATION ---
 db_url_raw = os.getenv("DATABASE_URL")
 if not db_url_raw:
-    # This prevents the server from crashing silently with a 'NoneType' error
     logger.error("❌ DATABASE_URL missing!")
-    DATABASE_URL = "sqlite:///./fallback.db" # Local fallback to keep server alive
+    DATABASE_URL = "sqlite:///./fallback.db"
 else:
     DATABASE_URL = db_url_raw.replace("postgres://", "postgresql://", 1)
 
@@ -59,11 +59,20 @@ class PaymentLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     payment_hash = Column(String, unique=True, index=True, nullable=False)
     sender = Column(String)
-    amount_xrp = Column(Float)
+    amount = Column(Float)       # Updated for Multi-Currency
+    currency = Column(String)    # Updated for Multi-Currency
     task_summary = Column(String)
     ai_verdict = Column(Text)
     model_used = Column(String)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+# NEW: Vault to hold the Escrow Secrets securely
+class EscrowVault(Base):
+    __tablename__ = "escrow_vault"
+    escrow_id = Column(String, primary_key=True, index=True)
+    condition = Column(String, nullable=False)
+    fulfillment = Column(String, nullable=False)
+    status = Column(String, default="LOCKED")
 
 Base.metadata.create_all(bind=engine)
 
@@ -76,7 +85,6 @@ def get_db():
 
 # --- 4. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
-BANKER_URL = os.getenv("BANKER_URL") 
 SHARED_SECRET = os.getenv("SHARED_SECRET", "default-secret").encode()
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 TARGET_ADDRESS = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
@@ -96,6 +104,9 @@ class AuditRequest(BaseModel):
     task: str
     work: str
     escrow_id: str 
+
+class EscrowSetupRequest(BaseModel):
+    escrow_id: str
 
 # --- 5. AI AUDIT ENGINE ---
 async def raw_smart_audit(task: str, work: str):
@@ -133,6 +144,27 @@ def health():
         "address": referee_wallet.address if referee_wallet else "Config Error"
     }
 
+# NEW: Endpoint to generate cryptographic locks for the UI
+@app.post("/escrow/generate")
+def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db)):
+    existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Escrow ID already exists")
+
+    # Generate a secure 32-byte secret (Fulfillment)
+    fulfillment_bytes = secrets.token_bytes(32)
+    fulfillment_hex = fulfillment_bytes.hex().upper()
+    
+    # Hash the secret to create the public Condition (PREIMAGE-SHA-256)
+    condition_hex = hashlib.sha256(fulfillment_bytes).hexdigest().upper()
+    
+    vault = EscrowVault(escrow_id=req.escrow_id, condition=condition_hex, fulfillment=fulfillment_hex)
+    db.add(vault)
+    db.commit()
+    
+    # Only return the condition. The Referee keeps the fulfillment secret until approved.
+    return {"escrow_id": req.escrow_id, "condition": condition_hex}
+
 @app.post("/evaluate")
 async def evaluate_work(
     req: AuditRequest, 
@@ -140,12 +172,12 @@ async def evaluate_work(
     db: Session = Depends(get_db)
 ):
     if not x_payment_hash: 
-        raise HTTPException(status_code=400, detail="Missing payment hash")
+        raise HTTPException(status_code=400, detail="Missing payment hash for audit fee")
 
     # A. REPLAY PROTECTION
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if already_used:
-        raise HTTPException(status_code=403, detail="Hash already used")
+        raise HTTPException(status_code=403, detail="Audit fee hash already used")
 
     # B. XRPL VERIFICATION
     client = AsyncJsonRpcClient(XRPL_URL)
@@ -162,45 +194,46 @@ async def evaluate_work(
     if not tx_data:
         raise HTTPException(status_code=402, detail="Transaction not validated")
 
-    # C. VERIFY DESTINATION & AMOUNT
+    # C. VERIFY DESTINATION & MULTI-CURRENCY AMOUNT
     body = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
     meta = tx_data.get("meta") or tx_data.get("metaData") or {}
     dest = body.get("Destination")
     delivered = meta.get("delivered_amount") or body.get("Amount")
 
     if str(dest).lower() != TARGET_ADDRESS.lower():
-        raise HTTPException(status_code=402, detail="Wrong destination")
+        raise HTTPException(status_code=402, detail="Wrong destination for audit fee")
+
+    # Handle Multi-Currency Logic (XRP drops vs Issued Currency Dict)
+    if isinstance(delivered, dict):
+        amount_val = float(delivered.get("value", 0))
+        currency_val = delivered.get("currency")
+    else:
+        amount_val = float(drops_to_xrp(str(delivered)))
+        currency_val = "XRP"
 
     # D. AI AUDIT
     verdict, model_used = await raw_smart_audit(req.task, req.work)
     
-    # E. LOG & PAYOUT LOGIC
+    # E. LOG & NATIVE PAYOUT LOGIC
     is_approved = "APPROVED" in verdict.upper()
+    revealed_fulfillment = None
     
     if is_approved:
-        # Generate HMAC Signature for the Banker
-        signature = hmac.new(SHARED_SECRET, req.escrow_id.encode(), hashlib.sha256).hexdigest()
-        
-        # Trigger Banker Payout
-        if BANKER_URL:
-            async with httpx.AsyncClient() as bank_client:
-                try:
-                    await bank_client.post(
-                        f"{BANKER_URL.strip('/')}/payout/{req.escrow_id}",
-                        headers={"X-Signature": signature},
-                        timeout=10.0
-                    )
-                    logger.info(f"💰 Payout triggered for {req.escrow_id}")
-                except Exception as e:
-                    logger.error(f"❌ Banker Payout Call Failed: {e}")
+        # Fetch the secret fulfillment from the vault
+        vault_entry = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+        if vault_entry:
+            revealed_fulfillment = vault_entry.fulfillment
+            vault_entry.status = "RELEASED"
+            logger.info(f"🔓 Escrow {req.escrow_id} APPROVED. Fulfillment revealed.")
         else:
-            logger.warning("⚠️ BANKER_URL not configured. Payout not triggered.")
+            logger.error(f"❌ Escrow {req.escrow_id} not found in vault!")
 
     # F. COMMIT TO DB
     new_log = PaymentLog(
         payment_hash=x_payment_hash,
         sender=body.get("Account"),
-        amount_xrp=float(drops_to_xrp(str(delivered))),
+        amount=amount_val,
+        currency=currency_val,
         task_summary=req.task[:100],
         ai_verdict=verdict,
         model_used=model_used
@@ -208,5 +241,9 @@ async def evaluate_work(
     db.add(new_log)
     db.commit()
 
-    return {"ai_verdict": verdict, "model_used": model_used, "status": "success" if is_approved else "rejected"}
-
+    return {
+        "ai_verdict": verdict, 
+        "model_used": model_used, 
+        "status": "success" if is_approved else "rejected",
+        "fulfillment": revealed_fulfillment  # Frontend uses this to trigger EscrowFinish
+    }
