@@ -51,7 +51,6 @@ app.add_middleware(
 )
 
 # --- 3. UI & STATIC FILE ROUTING ---
-# Mounts the static directory to serve your frontend
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 else:
@@ -63,21 +62,16 @@ def serve_ui():
         return FileResponse('static/index.html')
     return {"status": "API is running, but static/index.html is missing"}
 
-@app.head("/")
-@app.get("/")
-def health():
-    return {
-        "status": "Referee is Online", 
-        "address": referee_wallet.address if referee_wallet else "Config Error"
-    }
-
 # --- 4. DATABASE CONFIGURATION ---
 db_url_raw = os.getenv("DATABASE_URL")
 if not db_url_raw:
     logger.error("❌ DATABASE_URL missing!")
     DATABASE_URL = "sqlite:///./fallback.db"
 else:
+    # Ensure Render/Neon compatibility
     DATABASE_URL = db_url_raw.replace("postgres://", "postgresql://", 1)
+    if "neon.tech" in DATABASE_URL and "sslmode" not in DATABASE_URL:
+        DATABASE_URL += "?sslmode=require"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -87,12 +81,12 @@ class PaymentLog(Base):
     __tablename__ = "payment_logs"
     id = Column(Integer, primary_key=True, index=True)
     payment_hash = Column(String, unique=True, index=True, nullable=False)
-    sender = Column(String)
-    amount = Column(Float)       # Multi-currency ready
-    currency = Column(String)    # Multi-currency ready
-    task_summary = Column(String)
-    ai_verdict = Column(Text)
-    model_used = Column(String)
+    sender = Column(String, nullable=True)
+    amount = Column(Float, nullable=True)
+    currency = Column(String, nullable=True)
+    task_summary = Column(String, nullable=True)
+    ai_verdict = Column(Text, nullable=True)
+    model_used = Column(String, nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class EscrowVault(Base):
@@ -113,8 +107,6 @@ def get_db():
 
 # --- 5. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
-SHARED_SECRET = os.getenv("SHARED_SECRET", "default-secret").encode()
-REFEREE_FEE_DROPS = 100000  # 0.1 XRP
 TARGET_ADDRESS = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 
 try:
@@ -128,7 +120,7 @@ except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
 
-# --- XUMM SDK CONFIGURATION ---
+# XUMM SDK Setup
 xumm_api_key = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
 xumm_sdk = None
@@ -136,12 +128,11 @@ xumm_sdk = None
 if xumm_api_key and xumm_api_secret and XummSdk:
     try:
         xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
-        logger.info("🔌 XUMM SDK Initialized successfully")
+        logger.info("🔌 XUMM SDK Initialized")
     except Exception as e:
-        logger.error(f"❌ XUMM SDK Failed to initialize: {e}")
-else:
-    logger.warning("⚠️ XUMM credentials missing or SDK not installed. Mobile signing disabled.")
+        logger.error(f"❌ XUMM SDK Failed: {e}")
 
+# --- MODELS ---
 class AuditRequest(BaseModel):
     task: str
     work: str
@@ -149,6 +140,7 @@ class AuditRequest(BaseModel):
 
 class EscrowSetupRequest(BaseModel):
     escrow_id: str
+    fee_hash: Optional[str] = None # For manual siphon verification
 
 class XummPayloadRequest(BaseModel):
     txjson: dict
@@ -159,7 +151,7 @@ async def raw_smart_audit(task: str, work: str):
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing")
 
-    candidates = ["gemini-3-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash"]
+    candidates = ["gemini-3-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
     payload = {
         "contents": [{
             "parts": [{"text": f"You are a strict autonomous escrow auditor.\nTASK: {task}\nWORK SUBMITTED: {work}\n\nProvide a verdict: APPROVED or REJECTED followed by a 1-sentence explanation."}]
@@ -182,17 +174,38 @@ async def raw_smart_audit(task: str, work: str):
 # --- 7. PROTOCOL ENDPOINTS ---
 
 @app.post("/escrow/generate")
-def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db)):
-    """Generates the cryptographic lock for the XRPL Escrow."""
+async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db)):
+    """Verifies manual fee and generates the cryptographic lock."""
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail="Escrow ID already exists")
 
-    # Generate a secure 32-byte secret (Fulfillment)
+    # MANUAL FEE VERIFICATION
+    if req.fee_hash:
+        already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
+        if already_used:
+            raise HTTPException(status_code=403, detail="Fee hash already used")
+
+        client = AsyncJsonRpcClient(XRPL_URL)
+        try:
+            tx_res = await client.request(Tx(transaction=req.fee_hash))
+            if not tx_res.is_successful():
+                raise HTTPException(status_code=402, detail="Fee transaction not found")
+            
+            body = tx_res.result
+            dest = body.get("Destination")
+            if str(dest).lower() != TARGET_ADDRESS.lower():
+                raise HTTPException(status_code=402, detail="Fee sent to wrong wallet")
+            
+            # Record the hash so it can't be used again
+            db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
+        except Exception as e:
+            logger.error(f"Manual Hash Verify Error: {e}")
+            raise HTTPException(status_code=400, detail="Ledger verification failed")
+
+    # Generate Vault Secrets
     fulfillment_bytes = secrets.token_bytes(32)
     fulfillment_hex = fulfillment_bytes.hex().upper()
-    
-    # Hash the secret to create the public Condition (PREIMAGE-SHA-256)
     condition_hex = hashlib.sha256(fulfillment_bytes).hexdigest().upper()
     
     vault = EscrowVault(escrow_id=req.escrow_id, condition=condition_hex, fulfillment=fulfillment_hex)
@@ -203,7 +216,6 @@ def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db
 
 @app.post("/xumm/create-payload")
 async def create_xumm_payload(req: XummPayloadRequest):
-    """Bridges the web app to Xaman for mobile signing."""
     if not xumm_sdk:
         raise HTTPException(status_code=500, detail="Xumm SDK not configured on server.")
     try:
@@ -219,50 +231,20 @@ async def evaluate_work(
     x_payment_hash: str = Header(None), 
     db: Session = Depends(get_db)
 ):
-    """The Oracle: Verifies the payment, queries the AI, and unlocks the escrow."""
     if not x_payment_hash: 
-        raise HTTPException(status_code=400, detail="Missing payment hash for audit fee")
+        raise HTTPException(status_code=400, detail="Missing payment hash")
 
-    # A. REPLAY PROTECTION
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
-    if already_used:
+    # We allow the hash if it was JUST created in /escrow/generate but not used for an audit yet
+    if already_used and already_used.ai_verdict is not None:
         raise HTTPException(status_code=403, detail="Audit fee hash already used")
 
-    # B. XRPL VERIFICATION
     client = AsyncJsonRpcClient(XRPL_URL)
-    tx_data = None
-    for i in range(6): 
-        try:
-            tx_res = await client.request(Tx(transaction=x_payment_hash))
-            if tx_res.is_successful():
-                tx_data = tx_res.result
-                if tx_data.get("validated"): break
-        except: pass
-        await asyncio.sleep(2)
+    tx_res = await client.request(Tx(transaction=x_payment_hash))
+    if not tx_res.is_successful():
+        raise HTTPException(status_code=402, detail="Transaction not found")
 
-    if not tx_data:
-        raise HTTPException(status_code=402, detail="Transaction not validated")
-
-    # C. VERIFY DESTINATION & MULTI-CURRENCY AMOUNT
-    body = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
-    meta = tx_data.get("meta") or tx_data.get("metaData") or {}
-    dest = body.get("Destination")
-    delivered = meta.get("delivered_amount") or body.get("Amount")
-
-    if str(dest).lower() != TARGET_ADDRESS.lower():
-        raise HTTPException(status_code=402, detail="Wrong destination for audit fee")
-
-    if isinstance(delivered, dict):
-        amount_val = float(delivered.get("value", 0))
-        currency_val = delivered.get("currency")
-    else:
-        amount_val = float(drops_to_xrp(str(delivered)))
-        currency_val = "XRP"
-
-    # D. AI AUDIT
     verdict, model_used = await raw_smart_audit(req.task, req.work)
-    
-    # E. LOG & NATIVE PAYOUT LOGIC
     is_approved = "APPROVED" in verdict.upper()
     revealed_fulfillment = None
     
@@ -271,29 +253,20 @@ async def evaluate_work(
         if vault_entry:
             revealed_fulfillment = vault_entry.fulfillment
             vault_entry.status = "RELEASED"
-            logger.info(f"🔓 Escrow {req.escrow_id} APPROVED. Fulfillment revealed.")
-        else:
-            logger.error(f"❌ Escrow {req.escrow_id} not found in vault!")
 
-    # F. COMMIT TO DB
-    new_log = PaymentLog(
-        payment_hash=x_payment_hash,
-        sender=body.get("Account"),
-        amount=amount_val,
-        currency=currency_val,
-        task_summary=req.task[:100],
-        ai_verdict=verdict,
-        model_used=model_used
-    )
-    db.add(new_log)
+    # Update the existing log or create a new one
+    log_entry = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
+    if not log_entry:
+        log_entry = PaymentLog(payment_hash=x_payment_hash)
+        db.add(log_entry)
+        
+    log_entry.ai_verdict = verdict
+    log_entry.model_used = model_used
     db.commit()
 
     return {
         "ai_verdict": verdict, 
         "model_used": model_used, 
         "status": "success" if is_approved else "rejected",
-        "fulfillment": revealed_fulfillment  # Frontend uses this to trigger EscrowFinish
+        "fulfillment": revealed_fulfillment 
     }
-
-
-
