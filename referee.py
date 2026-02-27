@@ -128,13 +128,17 @@ except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
 
-# XUMM Configuration
+# --- XUMM SDK CONFIGURATION ---
 xumm_api_key = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
 xumm_sdk = None
+
 if xumm_api_key and xumm_api_secret and XummSdk:
-    xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
-    logger.info("🔌 XUMM SDK Initialized")
+    try:
+        xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
+        logger.info("🔌 XUMM SDK Initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ XUMM SDK Failed to initialize: {e}")
 else:
     logger.warning("⚠️ XUMM credentials missing or SDK not installed. Mobile signing disabled.")
 
@@ -290,5 +294,6 @@ async def evaluate_work(
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment  # Frontend uses this to trigger EscrowFinish
     }
+
 
 
