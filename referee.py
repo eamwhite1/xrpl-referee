@@ -11,6 +11,8 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -20,6 +22,12 @@ from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
 from xrpl.utils import drops_to_xrp
 from xrpl.core.addresscodec import decode_seed
+
+# XUMM SDK Import (Graceful fallback if not installed)
+try:
+    from xumm import XummSdk
+except ImportError:
+    XummSdk = None
 
 # Database Imports
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
@@ -31,7 +39,7 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
-app = FastAPI(title="XRPL Referee Pro")
+app = FastAPI(title="AgentTrust Protocol Core")
 
 # --- 2. CORS MIDDLEWARE ---
 app.add_middleware(
@@ -42,7 +50,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. DATABASE CONFIGURATION ---
+# --- 3. UI & STATIC FILE ROUTING ---
+# Mounts the static directory to serve your frontend
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+else:
+    logger.warning("⚠️ 'static' directory not found. UI will not be served.")
+
+@app.get("/")
+def serve_ui():
+    if os.path.exists("static/index.html"):
+        return FileResponse('static/index.html')
+    return {"status": "API is running, but static/index.html is missing"}
+
+@app.head("/health")
+@app.get("/health")
+def health():
+    return {
+        "status": "Referee is Online", 
+        "address": referee_wallet.address if referee_wallet else "Config Error"
+    }
+
+# --- 4. DATABASE CONFIGURATION ---
 db_url_raw = os.getenv("DATABASE_URL")
 if not db_url_raw:
     logger.error("❌ DATABASE_URL missing!")
@@ -59,14 +88,13 @@ class PaymentLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     payment_hash = Column(String, unique=True, index=True, nullable=False)
     sender = Column(String)
-    amount = Column(Float)       # Updated for Multi-Currency
-    currency = Column(String)    # Updated for Multi-Currency
+    amount = Column(Float)       # Multi-currency ready
+    currency = Column(String)    # Multi-currency ready
     task_summary = Column(String)
     ai_verdict = Column(Text)
     model_used = Column(String)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# NEW: Vault to hold the Escrow Secrets securely
 class EscrowVault(Base):
     __tablename__ = "escrow_vault"
     escrow_id = Column(String, primary_key=True, index=True)
@@ -83,7 +111,7 @@ def get_db():
     finally:
         db.close()
 
-# --- 4. CONFIGURATION ---
+# --- 5. CONFIGURATION ---
 XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "default-secret").encode()
 REFEREE_FEE_DROPS = 100000  # 0.1 XRP
@@ -100,6 +128,16 @@ except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
 
+# XUMM Configuration
+xumm_api_key = os.getenv("XUMM_API_KEY")
+xumm_api_secret = os.getenv("XUMM_API_SECRET")
+xumm_sdk = None
+if xumm_api_key and xumm_api_secret and XummSdk:
+    xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
+    logger.info("🔌 XUMM SDK Initialized")
+else:
+    logger.warning("⚠️ XUMM credentials missing or SDK not installed. Mobile signing disabled.")
+
 class AuditRequest(BaseModel):
     task: str
     work: str
@@ -108,7 +146,10 @@ class AuditRequest(BaseModel):
 class EscrowSetupRequest(BaseModel):
     escrow_id: str
 
-# --- 5. AI AUDIT ENGINE ---
+class XummPayloadRequest(BaseModel):
+    txjson: dict
+
+# --- 6. AI AUDIT ENGINE ---
 async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
@@ -134,19 +175,11 @@ async def raw_smart_audit(task: str, work: str):
                 continue
         raise Exception("AI Gateway Failure")
 
-# --- 6. ENDPOINTS ---
+# --- 7. PROTOCOL ENDPOINTS ---
 
-@app.head("/")
-@app.get("/")
-def health():
-    return {
-        "status": "Referee is Online", 
-        "address": referee_wallet.address if referee_wallet else "Config Error"
-    }
-
-# NEW: Endpoint to generate cryptographic locks for the UI
 @app.post("/escrow/generate")
 def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db)):
+    """Generates the cryptographic lock for the XRPL Escrow."""
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail="Escrow ID already exists")
@@ -162,8 +195,19 @@ def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db
     db.add(vault)
     db.commit()
     
-    # Only return the condition. The Referee keeps the fulfillment secret until approved.
     return {"escrow_id": req.escrow_id, "condition": condition_hex}
+
+@app.post("/xumm/create-payload")
+async def create_xumm_payload(req: XummPayloadRequest):
+    """Bridges the web app to Xaman for mobile signing."""
+    if not xumm_sdk:
+        raise HTTPException(status_code=500, detail="Xumm SDK not configured on server.")
+    try:
+        result = xumm_sdk.payload.create(req.txjson)
+        return {"nextUrl": result.next.always}
+    except Exception as e:
+        logger.error(f"Xumm Payload Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/evaluate")
 async def evaluate_work(
@@ -171,6 +215,7 @@ async def evaluate_work(
     x_payment_hash: str = Header(None), 
     db: Session = Depends(get_db)
 ):
+    """The Oracle: Verifies the payment, queries the AI, and unlocks the escrow."""
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing payment hash for audit fee")
 
@@ -203,7 +248,6 @@ async def evaluate_work(
     if str(dest).lower() != TARGET_ADDRESS.lower():
         raise HTTPException(status_code=402, detail="Wrong destination for audit fee")
 
-    # Handle Multi-Currency Logic (XRP drops vs Issued Currency Dict)
     if isinstance(delivered, dict):
         amount_val = float(delivered.get("value", 0))
         currency_val = delivered.get("currency")
@@ -219,7 +263,6 @@ async def evaluate_work(
     revealed_fulfillment = None
     
     if is_approved:
-        # Fetch the secret fulfillment from the vault
         vault_entry = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
         if vault_entry:
             revealed_fulfillment = vault_entry.fulfillment
