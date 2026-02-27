@@ -63,8 +63,8 @@ def serve_ui():
         return FileResponse('static/index.html')
     return {"status": "API is running, but static/index.html is missing"}
 
-@app.head("/health")
-@app.get("/health")
+@app.head("/")
+@app.get("/")
 def health():
     return {
         "status": "Referee is Online", 
@@ -290,3 +290,4 @@ async def evaluate_work(
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment  # Frontend uses this to trigger EscrowFinish
     }
+
