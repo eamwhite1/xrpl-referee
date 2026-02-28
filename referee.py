@@ -197,7 +197,7 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
     if existing:
         raise HTTPException(status_code=400, detail="Escrow ID already exists")
 
-# 2. Fee Verification
+    # 2. Fee Verification
     if req.fee_hash:
         # Check if hash has been used before
         already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
@@ -210,34 +210,35 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
             if not tx_res.is_successful():
                 raise HTTPException(status_code=402, detail="Fee transaction not found on Ledger")
             
-            # The Ledger response can be nested differently depending on the node
+            # The Ledger response is using 'tx_json' based on your Render logs
             body = tx_res.result
             
-            # Extract fields with a fallback for nested structures
-            tx_type = body.get("TransactionType") or body.get("tx", {}).get("TransactionType")
-            dest = body.get("Destination") or body.get("tx", {}).get("Destination")
+            # This covers all bases: Top level, 'tx', or 'tx_json'
+            tx_data = body.get("tx_json") or body.get("tx") or body
             
-            # DEBUG LOGGING: This will show up in Render logs to help us trace
+            tx_type = tx_data.get("TransactionType")
+            dest = tx_data.get("Destination")
+            
+            # DEBUG LOGGING: This will now show the actual Payment data in Render
             logger.info(f"🔍 LEDGER CHECK: Type={tx_type} | Dest={dest} | Target={TARGET_ADDRESS}")
 
-            # TRAP #1: Validate Transaction Type
+            # Validate Transaction Type
             if tx_type != "Payment":
                 raise HTTPException(
                     status_code=400, 
-                    detail=f"Hash is a {tx_type}, not a Payment. Found keys: {list(body.keys())}"
+                    detail=f"Hash provided is a {tx_type}, not a Payment."
                 )
             
-            # TRAP #2: Validate Destination (Case-Insensitive & Trimmed)
+            # Validate Destination (Case-Insensitive & Trimmed)
             if not dest or str(dest).strip().lower() != TARGET_ADDRESS.strip().lower():
                 raise HTTPException(
                     status_code=402, 
                     detail=f"Target mismatch! Ledger says Dest is: {dest}"
                 )
             
-            # If we reached here, the fee is valid. 
-            # Log it immediately to prevent double-spending.
+            # If valid, log it so it can't be reused for another project
             db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
-            db.commit() # Explicitly commit the payment log
+            db.commit() 
             
         except Exception as e:
             logger.error(f"Manual Hash Verify Error: {str(e)}")
@@ -246,15 +247,12 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
             raise HTTPException(status_code=400, detail=f"Ledger verification failed: {str(e)}")
 
     # 3. Generate Perfect XRPL Cryptography
-    # (Generating exactly 32 bytes of secure randomness)
     preimage_bytes = secrets.token_bytes(32)
     preimage_hex = preimage_bytes.hex().upper()
     hash_hex = hashlib.sha256(preimage_bytes).hexdigest().upper()
     
-    # Strict ASN.1 Condition (78 chars)
+    # Strict ASN.1 Condition and Fulfillment
     final_condition = f"A0258020{hash_hex}810120"
-    
-    # Strict ASN.1 Fulfillment (72 chars)
     final_fulfillment = f"A0228020{preimage_hex}"
 
     # 4. Save to Database
@@ -262,11 +260,12 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
         escrow_id=req.escrow_id,
         condition=final_condition,
         fulfillment=final_fulfillment, 
-        status="PENDING"
+        status="LOCKED"
     )
     db.add(new_vault)
     db.commit()
 
+    # This return is what your app.js is waiting for to trigger Xaman
     return {"condition": final_condition, "status": "LOCKED"}
 
 @app.post("/xumm/create-payload")
@@ -321,6 +320,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
