@@ -117,7 +117,7 @@ def get_db():
         db.close()
 
 # --- 5. CONFIGURATION ---
-XRPL_URL = os.getenv("XRPL_URL", "https://s.altnet.rippletest.net:51234/")
+XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com"))
 TARGET_ADDRESS = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 
 try:
@@ -292,6 +292,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
