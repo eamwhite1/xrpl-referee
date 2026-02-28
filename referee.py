@@ -199,6 +199,7 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
 
 # 2. Fee Verification
     if req.fee_hash:
+        # Check if hash has been used before
         already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
         if already_used:
             raise HTTPException(status_code=403, detail="Fee hash already used")
@@ -209,27 +210,40 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
             if not tx_res.is_successful():
                 raise HTTPException(status_code=402, detail="Fee transaction not found on Ledger")
             
+            # The Ledger response can be nested differently depending on the node
             body = tx_res.result
-            tx_type = body.get("TransactionType")
-            dest = body.get("Destination")
             
-            # TRAP #1: Is it actually a payment?
+            # Extract fields with a fallback for nested structures
+            tx_type = body.get("TransactionType") or body.get("tx", {}).get("TransactionType")
+            dest = body.get("Destination") or body.get("tx", {}).get("Destination")
+            
+            # DEBUG LOGGING: This will show up in Render logs to help us trace
+            logger.info(f"🔍 LEDGER CHECK: Type={tx_type} | Dest={dest} | Target={TARGET_ADDRESS}")
+
+            # TRAP #1: Validate Transaction Type
             if tx_type != "Payment":
-                raise HTTPException(status_code=400, detail=f"Hash provided is a {tx_type}, not a Payment.")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Hash is a {tx_type}, not a Payment. Found keys: {list(body.keys())}"
+                )
             
-            # TRAP #2: Does the destination match exactly?
-            if not dest or str(dest).strip() != TARGET_ADDRESS.strip():
-                # This explicitly sends the found destination to your browser console
-                raise HTTPException(status_code=402, detail=f"Target mismatch! Ledger says Dest is: '{dest}'")
+            # TRAP #2: Validate Destination (Case-Insensitive & Trimmed)
+            if not dest or str(dest).strip().lower() != TARGET_ADDRESS.strip().lower():
+                raise HTTPException(
+                    status_code=402, 
+                    detail=f"Target mismatch! Ledger says Dest is: {dest}"
+                )
             
-            # Valid fee!
+            # If we reached here, the fee is valid. 
+            # Log it immediately to prevent double-spending.
             db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
+            db.commit() # Explicitly commit the payment log
             
         except Exception as e:
-            logger.error(f"Manual Hash Verify Error: {e}")
+            logger.error(f"Manual Hash Verify Error: {str(e)}")
             if isinstance(e, HTTPException):
                 raise e
-            raise HTTPException(status_code=400, detail="Ledger verification failed")
+            raise HTTPException(status_code=400, detail=f"Ledger verification failed: {str(e)}")
 
     # 3. Generate Perfect XRPL Cryptography
     # (Generating exactly 32 bytes of secure randomness)
@@ -307,6 +321,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
