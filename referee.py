@@ -173,8 +173,21 @@ async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing")
+        
     candidates = ["gemini-3-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
-    payload = {"contents": [{"parts": [{"text": f"You are a strict autonomous escrow auditor.\nTASK: {task}\nWORK SUBMITTED: {work}\n\nProvide a verdict: APPROVED or REJECTED followed by a 1-sentence explanation."}]}]}
+    
+    # We force the AI to follow a strict "Machine-First" format
+    refined_prompt = (
+        f"You are a strict autonomous escrow auditor.\n"
+        f"TASK: {task}\n"
+        f"WORK SUBMITTED: {work}\n\n"
+        f"INSTRUCTIONS:\n"
+        f"1. You must start your response with exactly 'VERDICT: PASS' or 'VERDICT: FAIL'.\n"
+        f"2. Follow this with a 1-2 sentence detailed explanation for the human worker."
+    )
+    
+    payload = {"contents": [{"parts": [{"text": refined_prompt}]}]}
+    
     async with httpx.AsyncClient() as client:
         for model_id in candidates:
             try:
@@ -182,10 +195,13 @@ async def raw_smart_audit(task: str, work: str):
                 res = await client.post(url, json=payload, timeout=20.0)
                 if res.status_code == 200:
                     data = res.json()
-                    verdict_text = data['candidates'][0]['content']['parts'][0]['text']
+                    verdict_text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    # We return the text as-is, the calling function will handle the 'PASS' check
                     return verdict_text, model_id
-            except:
+            except Exception as e:
+                print(f"Model {model_id} failed: {e}")
                 continue
+                
     raise Exception("AI Gateway Failure")
 
 # --- 7. PROTOCOL ENDPOINTS ---
@@ -320,6 +336,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
