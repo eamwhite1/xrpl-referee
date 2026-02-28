@@ -207,35 +207,38 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
         try:
             tx_res = await client.request(Tx(transaction=req.fee_hash))
             if not tx_res.is_successful():
-                raise HTTPException(status_code=402, detail="Fee transaction not found")
+                raise HTTPException(status_code=402, detail="Fee transaction not found on Ledger")
             
             body = tx_res.result
             dest = body.get("Destination")
-            if str(dest).lower() != TARGET_ADDRESS.lower():
+            
+            # LOGGING: This helps us see the exact strings in the Render logs
+            logger.info(f"🔍 FEE VERIFICATION: Found Dest: {dest} | Expected: {TARGET_ADDRESS}")
+            
+            # Perform a clean, case-sensitive comparison (XRPL addresses are Base58)
+            if not dest or str(dest).strip() != TARGET_ADDRESS.strip():
+                logger.error(f"❌ DESTINATION MISMATCH: {dest} != {TARGET_ADDRESS}")
                 raise HTTPException(status_code=402, detail="Fee sent to wrong wallet")
             
+            # If we got here, the fee is valid. Log it so it can't be reused.
             db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
+            
         except Exception as e:
             logger.error(f"Manual Hash Verify Error: {e}")
+            if isinstance(e, HTTPException):
+                raise e
             raise HTTPException(status_code=400, detail="Ledger verification failed")
 
     # 3. Generate Perfect XRPL Cryptography
-    import secrets
-    import hashlib
-    
-    # Generate exactly 32 bytes of secure randomness
+    # (Generating exactly 32 bytes of secure randomness)
     preimage_bytes = secrets.token_bytes(32)
     preimage_hex = preimage_bytes.hex().upper()
-    
-    # Hash the raw bytes
     hash_hex = hashlib.sha256(preimage_bytes).hexdigest().upper()
     
     # Strict ASN.1 Condition (78 chars)
-    # A025(37 bytes) -> 8020(Hash=32b) -> [HASH] -> 810120(MaxLen=32)
     final_condition = f"A0258020{hash_hex}810120"
     
     # Strict ASN.1 Fulfillment (72 chars)
-    # A022(34 bytes) -> 8020(Preimage=32b) -> [PREIMAGE]
     final_fulfillment = f"A0228020{preimage_hex}"
 
     # 4. Save to Database
@@ -247,6 +250,8 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
     )
     db.add(new_vault)
     db.commit()
+
+    return {"condition": final_condition, "status": "LOCKED"}
 
 @app.post("/xumm/create-payload")
 async def create_xumm_payload(req: XummPayloadRequest):
@@ -300,6 +305,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
