@@ -214,9 +214,17 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
             logger.error(f"Manual Hash Verify Error: {e}")
             raise HTTPException(status_code=400, detail="Ledger verification failed")
 
+    # Generate Vault Secrets
     fulfillment_bytes = secrets.token_bytes(32)
     fulfillment_hex = fulfillment_bytes.hex().upper()
-    condition_hex = hashlib.sha256(fulfillment_bytes).hexdigest().upper()
+    
+    # 1. Hash the fulfillment
+    hash_object = hashlib.sha256(fulfillment_bytes).digest()
+    
+    # 2. Add the PREIMAGE-SHA-256 prefix (A0 25 80 20)
+    # A0 = Type, 25 = Length, 80 = Type (Preimage), 20 = 32 bytes
+    condition_hex = f"A0258020{hash_object.hex()}".upper()
+    
     vault = EscrowVault(escrow_id=req.escrow_id, condition=condition_hex, fulfillment=fulfillment_hex)
     db.add(vault)
     db.commit()
@@ -274,4 +282,5 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
