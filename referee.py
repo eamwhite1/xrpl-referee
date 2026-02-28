@@ -131,16 +131,30 @@ except Exception as e:
     logger.error(f"STARTUP ERROR: {e}")
     referee_wallet = None
 
+# XUMM SDK Setup
 xumm_api_key = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
-xumm_sdk = None
 
+# This will tell us in the logs if the keys are actually being "seen"
+if xumm_api_key:
+    logger.info(f"✅ XUMM_API_KEY found (Starts with: {xumm_api_key[:4]}...)")
+else:
+    logger.error("❌ XUMM_API_KEY is EMPTY in Render environment variables!")
+
+if xumm_api_secret:
+    logger.info("✅ XUMM_API_SECRET found.")
+else:
+    logger.error("❌ XUMM_API_SECRET is EMPTY in Render environment variables!")
+
+xumm_sdk = None
 if xumm_api_key and xumm_api_secret and XummSdk:
     try:
         xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
-        logger.info("🔌 XUMM SDK Initialized")
+        # Check connection to Xumm
+        pong = xumm_sdk.ping()
+        logger.info(f"🔌 XUMM SDK Initialized: {pong.application.name}")
     except Exception as e:
-        logger.error(f"❌ XUMM SDK Failed: {e}")
+        logger.error(f"❌ XUMM SDK Failed to ping: {e}")
 
 class AuditRequest(BaseModel):
     task: str
@@ -260,3 +274,4 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
