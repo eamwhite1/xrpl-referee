@@ -6,4 +6,4 @@ httpx
 xrpl-py
 python-dotenv
 requests
-xumm
+xumm-sdk-py
