@@ -302,25 +302,39 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
     if not x_payment_hash: 
         raise HTTPException(status_code=400, detail="Missing payment hash")
 
+    # 1. Anti-Spam: Check if this hash was already used for a COMPLETED audit
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if already_used and already_used.ai_verdict is not None:
         raise HTTPException(status_code=403, detail="Audit fee hash already used")
 
+    # 2. Ledger Check: Verify the 0.2 XRP fee exists on the XRPL
     client = AsyncJsonRpcClient(XRPL_URL)
     tx_res = await client.request(Tx(transaction=x_payment_hash))
     if not tx_res.is_successful():
-        raise HTTPException(status_code=402, detail="Transaction not found")
+        raise HTTPException(status_code=402, detail="Transaction not found on Ledger")
 
+    # 3. AI Audit: Get the verdict from Gemini
     verdict, model_used = await raw_smart_audit(req.task, req.work)
-    is_approved = "PASS" in verdict.upper() or "APPROVED" in verdict.upper()
+    
+    # --- THE NUCLEAR FIX ---
+    # We clean the text and check for BOTH 'PASS' (new) and 'APPROVED' (old/standalone)
+    clean_verdict = verdict.strip().upper()
+    is_approved = "PASS" in clean_verdict or "APPROVED" in clean_verdict
+    # -----------------------
+
     revealed_fulfillment = None
     
     if is_approved:
+        # Search the Vault for the secret key using the Project ID
         vault_entry = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
         if vault_entry:
             revealed_fulfillment = vault_entry.fulfillment
             vault_entry.status = "RELEASED"
+            logger.info(f"✅ KEY RELEASED for Project: {req.escrow_id}")
+        else:
+            logger.warning(f"⚠️ Audit PASSED but no Vault found for ID: {req.escrow_id}")
 
+    # 4. Log the result to prevent double-spending the fee hash
     log_entry = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if not log_entry:
         log_entry = PaymentLog(payment_hash=x_payment_hash)
@@ -336,10 +350,6 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
-
-
-
-
 
 
 
