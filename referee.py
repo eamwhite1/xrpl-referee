@@ -219,26 +219,34 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
             logger.error(f"Manual Hash Verify Error: {e}")
             raise HTTPException(status_code=400, detail="Ledger verification failed")
 
-    # 3. Generate the 82-Character XRPL Condition
-    import time
-    # Create a unique secret
-    fulfillment_secret = f"REF_SECRET_{req.escrow_id}_{hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]}"
-    # Hash it
-    hash_hex = hashlib.sha256(fulfillment_secret.encode()).hexdigest().upper()
-    # Apply the ASN.1 Envelope (82 chars)
-    final_condition = f"A0228020{hash_hex}"
+    # 3. Generate Perfect XRPL Cryptography
+    import secrets
+    import hashlib
+    
+    # Generate exactly 32 bytes of secure randomness
+    preimage_bytes = secrets.token_bytes(32)
+    preimage_hex = preimage_bytes.hex().upper()
+    
+    # Hash the raw bytes
+    hash_hex = hashlib.sha256(preimage_bytes).hexdigest().upper()
+    
+    # Strict ASN.1 Condition (78 chars)
+    # A025(37 bytes) -> 8020(Hash=32b) -> [HASH] -> 810120(MaxLen=32)
+    final_condition = f"A0258020{hash_hex}810120"
+    
+    # Strict ASN.1 Fulfillment (72 chars)
+    # A022(34 bytes) -> 8020(Preimage=32b) -> [PREIMAGE]
+    final_fulfillment = f"A0228020{preimage_hex}"
 
     # 4. Save to Database
     new_vault = EscrowVault(
         escrow_id=req.escrow_id,
         condition=final_condition,
-        fulfillment=fulfillment_secret,
+        fulfillment=final_fulfillment, 
         status="PENDING"
     )
     db.add(new_vault)
     db.commit()
-
-    return {"condition": final_condition}
 
 @app.post("/xumm/create-payload")
 async def create_xumm_payload(req: XummPayloadRequest):
@@ -292,6 +300,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
