@@ -226,7 +226,7 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
     # Hash it
     hash_hex = hashlib.sha256(fulfillment_secret.encode()).hexdigest().upper()
     # Apply the ASN.1 Envelope (82 chars)
-    final_condition = f"A0278020{hash_hex}8103010400"
+    final_condition = f"A0228020{hash_hex}"
 
     # 4. Save to Database
     new_vault = EscrowVault(
@@ -292,6 +292,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
