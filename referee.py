@@ -312,7 +312,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         raise HTTPException(status_code=402, detail="Transaction not found")
 
     verdict, model_used = await raw_smart_audit(req.task, req.work)
-    is_approved = "APPROVED" in verdict.upper()
+    is_approved = "PASS" in verdict.upper() or "APPROVED" in verdict.upper()
     revealed_fulfillment = None
     
     if is_approved:
@@ -336,6 +336,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
