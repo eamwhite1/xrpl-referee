@@ -197,7 +197,7 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
     if existing:
         raise HTTPException(status_code=400, detail="Escrow ID already exists")
 
-    # 2. Fee Verification
+# 2. Fee Verification
     if req.fee_hash:
         already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
         if already_used:
@@ -210,17 +210,19 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
                 raise HTTPException(status_code=402, detail="Fee transaction not found on Ledger")
             
             body = tx_res.result
+            tx_type = body.get("TransactionType")
             dest = body.get("Destination")
             
-            # LOGGING: This helps us see the exact strings in the Render logs
-            logger.info(f"🔍 FEE VERIFICATION: Found Dest: {dest} | Expected: {TARGET_ADDRESS}")
+            # TRAP #1: Is it actually a payment?
+            if tx_type != "Payment":
+                raise HTTPException(status_code=400, detail=f"Hash provided is a {tx_type}, not a Payment.")
             
-            # Perform a clean, case-sensitive comparison (XRPL addresses are Base58)
+            # TRAP #2: Does the destination match exactly?
             if not dest or str(dest).strip() != TARGET_ADDRESS.strip():
-                logger.error(f"❌ DESTINATION MISMATCH: {dest} != {TARGET_ADDRESS}")
-                raise HTTPException(status_code=402, detail="Fee sent to wrong wallet")
+                # This explicitly sends the found destination to your browser console
+                raise HTTPException(status_code=402, detail=f"Target mismatch! Ledger says Dest is: '{dest}'")
             
-            # If we got here, the fee is valid. Log it so it can't be reused.
+            # Valid fee!
             db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
             
         except Exception as e:
@@ -305,6 +307,7 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
         "status": "success" if is_approved else "rejected",
         "fulfillment": revealed_fulfillment 
     }
+
 
 
 
