@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
@@ -52,6 +52,16 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# 2b. MCP SERVER — mount at /mcp for Smithery + Claude Desktop + Cursor
+# ---------------------------------------------------------------------------
+try:
+    from mcp_server import mcp
+    app.mount("/mcp", mcp.http_app())
+    logger.info("✅ MCP server mounted at /mcp")
+except Exception as e:
+    logger.warning(f"⚠️ MCP server not loaded: {e} — continuing without it")
+
+# ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
 # ---------------------------------------------------------------------------
 # Root redirects to playground. Bots find us via /.well-known/agent.json,
@@ -61,15 +71,36 @@ app.add_middleware(
 
 @app.get("/")
 @app.head("/")
-def serve_ui():
-    return RedirectResponse(url="/playground", status_code=302)
+def serve_ui(request: Request):
+    # Bots and health checkers get JSON 200
+    # Browsers get a soft redirect to /playground
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content="""<!DOCTYPE html>
+<html><head><meta http-equiv="refresh" content="0; url=/playground">
+<title>AgentTrust Referee</title></head>
+<body>Redirecting to <a href="/playground">playground</a>...</body>
+</html>""", status_code=200)
+    return {"status": "online", "version": "5.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
 
 @app.get("/playground")
 def serve_playground():
     path = "playground.html"
     if os.path.exists(path):
         return FileResponse(path, media_type="text/html")
-    return PlainTextResponse("playground.html not found — make sure it is committed to the repo root.", status_code=404)
+    # Graceful fallback — never 404, always something useful
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html><head><title>AgentTrust Referee</title>
+<style>body{font-family:monospace;background:#0d0f14;color:#e0e4f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+.box{text-align:center;padding:2rem;}a{color:#00e5a0;}h1{font-size:1.4rem;margin-bottom:1rem;}</style>
+</head><body><div class="box">
+<h1>AgentTrust Referee</h1>
+<p>API is online. Full playground coming soon.</p>
+<p style="margin-top:1rem"><a href="/docs">API Docs →</a></p>
+<p><a href="https://www.cryptovault.co.uk">AgentTrust App →</a></p>
+</div></body></html>""", status_code=200)
 
 @app.get("/status")
 def health_check():
