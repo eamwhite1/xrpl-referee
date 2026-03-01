@@ -10,7 +10,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -61,13 +61,35 @@ app.add_middleware(
 @app.get("/")
 @app.head("/")
 def serve_ui():
-    # Humans landing here get sent to the AgentTrust app
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url="https://agenttrust.io", status_code=302)
+
+@app.get("/playground", response_class=FileResponse)
+def serve_playground():
+    path = "playground.html"
+    if os.path.exists(path):
+        return FileResponse(path, media_type="text/html")
+    return {"error": "Playground not found"}
 
 @app.get("/status")
 def health_check():
     return {"status": "online", "version": "5.0", "timestamp": datetime.now(timezone.utc)}
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt():
+    return "\n".join([
+        "User-agent: *",
+        "Allow: /",
+        "",
+        "# Agent discovery files",
+        "Allow: /.well-known/",
+        "Allow: /openapi.json",
+        "Allow: /docs",
+        "Allow: /playground",
+        "Allow: /audit",
+        "Allow: /status",
+        "",
+        "Sitemap: https://xrpl-referee.onrender.com/openapi.json",
+    ])
 
 # ---------------------------------------------------------------------------
 # 4. DATABASE
@@ -248,6 +270,8 @@ class AuditRequest(BaseModel):
     work:                str
     worker_attachments:  Optional[list[Attachment]] = None
     callback_url:        Optional[str] = None
+    task_category:       str  = "default"  # creative, code, bug_bounty, legal, supply_chain, etc.
+    require_consensus:   bool = False       # True = two models must agree (high-stakes jobs)
 
 class StandaloneAuditRequest(BaseModel):
     """
@@ -255,10 +279,12 @@ class StandaloneAuditRequest(BaseModel):
     Any agent or human can POST a task + work, pay 0.1 XRP, get a verdict.
     fee_hash can be passed in the body OR as x-payment-hash header.
     """
-    task:                str                            # The original task/spec
-    work:                str                            # The completed work/output
-    fee_hash:            Optional[str] = None           # tx hash of 0.1 XRP payment
-    attachments:         Optional[list[Attachment]] = None  # Optional proof files
+    task:                str
+    work:                str
+    fee_hash:            Optional[str]  = None
+    attachments:         Optional[list[Attachment]] = None
+    task_category:       str  = "default"
+    require_consensus:   bool = False
 
 class XummPayloadRequest(BaseModel):
     txjson: dict
@@ -365,28 +391,103 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
 
 
 # ---------------------------------------------------------------------------
+# 8. DOMAIN-SPECIFIC PROMPT LIBRARY
+# ---------------------------------------------------------------------------
+DOMAIN_PROMPTS = {
+    "bug_bounty": (
+        "You are auditing a security bug bounty submission. Be extremely rigorous. "
+        "A PASS should only be given if: (1) the vulnerability is clearly real and reproducible, "
+        "(2) the proof-of-concept demonstrates actual impact, (3) the submission includes steps to reproduce. "
+        "Treat any vague or unverifiable claims as FAIL. The financial stakes may be very high."
+    ),
+    "legal": (
+        "You are auditing a legal settlement deliverable. Be precise and literal. "
+        "Only evaluate whether the submitted documents/text satisfy the exact criteria stated. "
+        "Do not infer intent. If a requirement is ambiguous, note it in details but do not penalise. "
+        "You are not giving legal advice — you are verifying whether stated conditions have been met."
+    ),
+    "supply_chain": (
+        "You are auditing a supply chain compliance deliverable. "
+        "Check for: document completeness, consistency of dates/quantities/parties, "
+        "presence of required fields (e.g. HS codes, port of entry, consignee details). "
+        "Flag any discrepancies between the task spec and submitted documents. "
+        "Note: you are evaluating submitted documents, not independently verifying against live databases."
+    ),
+    "real_estate": (
+        "You are auditing a real estate transaction milestone. "
+        "Evaluate whether submitted documents (surveys, registry excerpts, inspection reports) "
+        "satisfy the conditions stated in the task spec. "
+        "Flag missing documents, date inconsistencies, or unresolved conditions. "
+        "Note: you are evaluating submitted documents, not independently verifying land registry data."
+    ),
+    "creative": (
+        "You are auditing a creative deliverable (writing, design, code, media). "
+        "Evaluate quality, completeness, and adherence to the stated brief. "
+        "For writing: check word count, tone, structure, and coverage of required topics. "
+        "For design: evaluate based on described requirements and any attached files. "
+        "Be fair but hold the work to the standard the buyer specified."
+    ),
+    "code": (
+        "You are auditing a software development deliverable. "
+        "Evaluate: does the submitted work address the stated requirements? "
+        "Check for: completeness, correctness of described approach, presence of required components. "
+        "If a repo link or code is provided, evaluate its structure and described functionality. "
+        "You cannot execute code, so judge based on what is visible and described."
+    ),
+    "data": (
+        "You are auditing a data or research deliverable. "
+        "Evaluate: completeness of the dataset/report, format compliance, coverage of required fields. "
+        "Check that the volume, structure, and content match what was specified. "
+        "Flag any gaps, missing fields, or format deviations."
+    ),
+    "default": (
+        "You are an autonomous escrow auditor — a neutral, objective third party determining "
+        "whether a worker has fulfilled a task specification well enough to be paid."
+    ),
+}
+
+# ---------------------------------------------------------------------------
 # 8. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
 async def run_ai_audit(
-    task: str,
-    work: str,
-    buyer_attachments: list = None,
+    task:               str,
+    work:               str,
+    buyer_attachments:  list = None,
     worker_attachments: list = None,
+    task_category:      str  = "default",
+    require_consensus:  bool = False,
 ) -> tuple[dict, str]:
     """
     Calls Gemini with a multimodal prompt.
-    Supports text + files (PDF, images) from both buyer (spec) and worker (proof).
-    Response is always structured JSON — no regex needed by agents.
+    - task_category selects a domain-specific system prompt for better verdicts
+    - require_consensus=True runs TWO models and only passes if both agree (for high-stakes use)
+    - Falls back through model chain automatically
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
-    # gemini-2.5-flash and 2.0-flash both support multimodal (PDF + images)
-    candidates = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # Model priority: always try latest first, fall back gracefully
+    # gemini-2.5-pro: best reasoning, use for high-stakes / consensus
+    # gemini-2.5-flash: fast and capable for standard jobs
+    # older models: fallbacks only
+    candidates = [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
+    ]
+
+    domain_context = DOMAIN_PROMPTS.get(task_category, DOMAIN_PROMPTS["default"])
 
     prompt_text = (
-        "You are a strict autonomous escrow auditor. "
+        f"{domain_context}\n\n"
+        "Your analysis must be:\n"
+        "- STRICT: only pass work that genuinely meets the stated requirements\n"
+        "- SPECIFIC: reference exact requirements when citing criteria met or failed\n"
+        "- FAIR: do not penalise for things not stated in the requirements\n"
+        "- HONEST: a low score with clear feedback is more valuable than a generous pass\n\n"
         "Your response must be valid JSON and nothing else — no markdown, no backticks, no preamble.\n\n"
         f"TASK REQUIREMENTS:\n{task}\n"
     )
@@ -476,6 +577,39 @@ async def run_ai_audit(
                         f"✅ AI VERDICT: {verdict_dict['verdict']} | "
                         f"score={verdict_dict.get('score')} | model={model_id}"
                     )
+
+                    # Consensus mode: run a second model and require both to agree
+                    if require_consensus:
+                        second_candidates = [m for m in candidates if m != model_id]
+                        for model_2 in second_candidates:
+                            try:
+                                url2 = (
+                                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                                    f"{model_2}:generateContent?key={api_key}"
+                                )
+                                res2 = await client.post(url2, json=payload, timeout=60.0)
+                                if res2.status_code == 200:
+                                    raw2   = res2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                                    clean2 = raw2.replace("```json","").replace("```","").strip()
+                                    v2     = json.loads(clean2)
+                                    v2["verdict"] = str(v2.get("verdict","FAIL")).strip().upper()
+                                    logger.info(f"🤖 CONSENSUS model {model_2}: {v2['verdict']}")
+
+                                    if v2["verdict"] != verdict_dict["verdict"]:
+                                        # Disagreement — conservative: return FAIL with explanation
+                                        logger.warning(f"⚖️ CONSENSUS SPLIT: {model_id}={verdict_dict['verdict']} vs {model_2}={v2['verdict']} — defaulting FAIL")
+                                        verdict_dict["verdict"]  = "FAIL"
+                                        verdict_dict["summary"]  = f"Models disagreed ({model_id}: {verdict_dict.get('score')}, {model_2}: {v2.get('score')}). Conservative FAIL — buyer and worker should review."
+                                        verdict_dict["consensus"] = False
+                                        verdict_dict["models"]    = [model_id, model_2]
+                                    else:
+                                        verdict_dict["consensus"] = True
+                                        verdict_dict["models"]    = [model_id, model_2]
+                                    break
+                            except Exception as e2:
+                                logger.warning(f"Consensus model {model_2} failed: {e2}")
+                                continue
+
                     return verdict_dict, model_id
 
                 else:
@@ -520,13 +654,15 @@ async def standalone_audit(
 
     # Run the AI audit — same engine as the escrow flow
     verdict_dict, model_used = await run_ai_audit(
-        task_description     = req.task,
-        work_submission      = req.work,
-        buyer_attachments    = [],
-        worker_attachments   = [
+        task               = req.task,
+        work               = req.work,
+        buyer_attachments  = [],
+        worker_attachments = [
             {"filename": a.filename, "mime_type": a.mime_type, "data": a.data}
             for a in (req.attachments or [])
         ],
+        task_category      = req.task_category,
+        require_consensus  = req.require_consensus,
     )
 
     is_approved = verdict_dict.get("verdict", "").upper() == "PASS"
@@ -797,6 +933,8 @@ async def evaluate_work(
         work               = req.work,
         buyer_attachments  = stored_buyer_attachments,
         worker_attachments = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
+        task_category      = req.task_category,
+        require_consensus  = req.require_consensus,
     )
 
     is_approved       = verdict_dict.get("verdict") == "PASS"
