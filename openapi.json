@@ -1,37 +1,36 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "XRPL AI Referee",
-    "description": "A trustless AI auditor that verifies task completion for the Agent Economy. Requires a 0.1 XRP fee per audit.",
-    "version": "1.0.0",
+    "title": "AgentTrust Referee",
+    "description": "A trustless AI verdict engine for the agent economy. POST a task spec and proof of work, pay 0.1 XRP, receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
+    "version": "5.0.0",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
       "currency": "XRP",
       "amount": "0.1",
-      "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+      "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
+      "description": "Send 0.1 XRP to this address before calling /audit. Pass the transaction hash in the x-payment-hash header."
     }
   },
   "servers": [
     {
       "url": "https://xrpl-referee.onrender.com",
-      "description": "Production server"
+      "description": "Production — XRPL Mainnet"
     }
   ],
   "paths": {
-    "/evaluate": {
+    "/audit": {
       "post": {
-        "summary": "Audit a completed task",
-        "description": "Submits a task description and the completed work for AI verification. Requires an XRPL transaction hash for 0.1 XRP in the headers.",
-        "operationId": "evaluateWork",
+        "summary": "Standalone AI verdict — no escrow required",
+        "description": "The simplest integration. Pay 0.1 XRP, get a structured AI verdict on whether work meets spec. No vault, no receipt code, no XRPL escrow needed. Use /escrow/generate if you want funds locked and released automatically.",
+        "operationId": "standaloneAudit",
         "parameters": [
           {
             "name": "x-payment-hash",
             "in": "header",
-            "description": "The XRPL transaction hash of the 0.1 XRP fee payment.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
+            "description": "XRPL transaction hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
+            "required": false,
+            "schema": { "type": "string" }
           }
         ],
         "requestBody": {
@@ -40,42 +39,163 @@
             "application/json": {
               "schema": {
                 "type": "object",
+                "required": ["task", "work"],
                 "properties": {
                   "task": {
                     "type": "string",
-                    "description": "The original instructions given to the worker agent.",
+                    "description": "The original task specification or instructions given to the worker.",
                     "maxLength": 5000
                   },
                   "work": {
                     "type": "string",
-                    "description": "The output/work produced by the worker agent.",
+                    "description": "The completed work or output produced by the worker.",
                     "maxLength": 5000
+                  },
+                  "fee_hash": {
+                    "type": "string",
+                    "description": "Alternative to x-payment-hash header. XRPL tx hash of 0.1 XRP payment."
                   }
-                },
-                "required": ["task", "work"]
+                }
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Successful audit",
+            "description": "Verdict returned",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "ai_verdict": { "type": "string" },
-                    "model_used": { "type": "string" },
-                    "status": { "type": "string" }
+                    "status":           { "type": "string", "enum": ["approved", "rejected"] },
+                    "verdict":          { "type": "string", "enum": ["PASS", "FAIL"] },
+                    "score":            { "type": "number", "description": "0.0–1.0 confidence score" },
+                    "summary":          { "type": "string", "description": "One-sentence verdict summary" },
+                    "details":          { "type": "string", "description": "Full reasoning from the AI" },
+                    "criteria_met":     { "type": "array", "items": { "type": "string" } },
+                    "criteria_failed":  { "type": "array", "items": { "type": "string" } },
+                    "model_used":       { "type": "string" }
                   }
                 }
               }
             }
           },
-          "402": { "description": "Payment Required - XRPL hash invalid or amount too low." },
-          "403": { "description": "Forbidden - Payment hash already used (Double-spend protection)." },
-          "413": { "description": "Payload Too Large - Exceeds character limit." }
+          "402": { "description": "Payment required — fee hash missing or invalid" },
+          "403": { "description": "Forbidden — payment hash already used (anti-replay)" }
+        }
+      }
+    },
+    "/escrow/generate": {
+      "post": {
+        "summary": "Create an AI-gated XRPL escrow vault",
+        "description": "Locks funds in XRPL crypto-condition escrow. The fulfillment key is only released when /evaluate approves the submitted work. Use this for the full trustless payment flow.",
+        "operationId": "generateEscrow",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["escrow_id", "fee_hash", "buyer_name", "buyer_address", "task_description", "worker_address", "amount_xrp"],
+                "properties": {
+                  "escrow_id":        { "type": "string", "description": "Unique receipt code e.g. AT-7X9K-2MQ4" },
+                  "fee_hash":         { "type": "string", "description": "XRPL tx hash of 0.1 XRP protocol fee" },
+                  "project_label":    { "type": "string", "description": "Human-readable job label e.g. Job-01" },
+                  "buyer_name":       { "type": "string" },
+                  "buyer_address":    { "type": "string", "description": "Buyer's XRPL wallet address" },
+                  "task_description": { "type": "string" },
+                  "worker_address":   { "type": "string", "description": "Worker's XRPL wallet — receives funds on approval" },
+                  "amount_xrp":       { "type": "number" },
+                  "cancel_after_hrs": { "type": "integer", "default": 168 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Vault created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "escrow_id":           { "type": "string" },
+                    "condition":           { "type": "string", "description": "SHA-256 crypto-condition for EscrowCreate tx" },
+                    "cancel_after_ripple": { "type": "integer" },
+                    "cancel_after_human":  { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/evaluate": {
+      "post": {
+        "summary": "Submit work proof for escrow-linked AI audit",
+        "description": "Worker submits proof against an existing vault. On PASS, returns the fulfillment key needed to complete EscrowFinish and claim payment.",
+        "operationId": "evaluateWork",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["escrow_id", "work"],
+                "properties": {
+                  "escrow_id": { "type": "string", "description": "Receipt code from /escrow/generate" },
+                  "work":      { "type": "string", "description": "Completed work or proof of completion" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Audit result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status":          { "type": "string", "enum": ["approved", "rejected"] },
+                    "fulfillment":     { "type": "string", "description": "Fulfillment hex — submit in EscrowFinish (PASS only)" },
+                    "condition":       { "type": "string", "description": "Condition hex — required in EscrowFinish" },
+                    "buyer_address":   { "type": "string" },
+                    "escrow_sequence": { "type": "integer" },
+                    "amount_xrp":      { "type": "number" },
+                    "verdict":         { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Service online",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status":    { "type": "string" },
+                    "version":   { "type": "string" },
+                    "timestamp": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
