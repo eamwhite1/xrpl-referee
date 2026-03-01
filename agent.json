@@ -1,27 +1,51 @@
 {
   "schemaVersion": "1.0",
-  "name": "XRPL AI Referee",
-  "description": "An independent auditor agent that verifies task completion for a 0.1 XRP fee.",
+  "name": "AgentTrust Referee",
+  "description": "A trustless AI verdict engine. Pay 0.1 XRP, POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
   "url": "https://xrpl-referee.onrender.com",
-  "agentVersion": "1.0.0",
+  "agentVersion": "5.0.0",
   "protocolVersion": "0.3.0",
   "provider": {
-    "organization": "XRPL AI Referee",
-    "url": "https://xrpl-referee.onrender.com"
+    "organization": "AgentTrust Protocol",
+    "url": "https://agenttrust.io"
   },
   "capabilities": {
     "streaming": false,
-    "pushNotifications": false
+    "pushNotifications": false,
+    "multimodal": true,
+    "escrow": true
   },
   "authentication": {
     "schemes": ["x-payment-hash"],
-    "description": "Requires an XRPL transaction hash in the header for payment verification."
+    "description": "Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet. Include the transaction hash as the x-payment-hash header or fee_hash body field."
+  },
+  "payment": {
+    "currency": "XRP",
+    "amount": "0.1",
+    "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
+    "network": "XRPL Mainnet"
   },
   "skills": [
     {
-      "id": "task-audit",
-      "name": "Work Verification",
-      "description": "Compares a task description against a worker's output and gives a verdict."
+      "id": "standalone-audit",
+      "name": "AI Verdict",
+      "description": "Stateless task verification. POST task + work + fee hash to /audit. Returns PASS/FAIL with score, summary, and criteria breakdown. No escrow required.",
+      "endpoint": "/audit",
+      "method": "POST"
+    },
+    {
+      "id": "escrow-create",
+      "name": "Create Escrow Vault",
+      "description": "Lock XRPL funds in a crypto-condition escrow vault gated by AI verdict. Returns a condition for use in EscrowCreate. For the full trustless payment flow.",
+      "endpoint": "/escrow/generate",
+      "method": "POST"
+    },
+    {
+      "id": "escrow-evaluate",
+      "name": "Submit Work for Escrow Audit",
+      "description": "Worker submits proof of work against an existing vault. On PASS, returns the fulfillment key needed to complete EscrowFinish and claim payment.",
+      "endpoint": "/evaluate",
+      "method": "POST"
     }
   ]
 }
