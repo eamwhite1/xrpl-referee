@@ -718,7 +718,9 @@ async def evaluate_work(
         "verdict":        verdict_dict,
         "model_used":     model_used,
         "fulfillment":    revealed_fulfillment,
+        "condition":      vault.condition if is_approved else None,
         "worker_address": vault.worker_address,
+        "amount_xrp":     vault.amount_xrp,
     }
 
 
