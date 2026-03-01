@@ -112,17 +112,21 @@ class EscrowVault(Base):
     escrow_id       = Column(String, primary_key=True, index=True)
     condition       = Column(String, nullable=False)
     fulfillment     = Column(String, nullable=False)
-    status          = Column(String, default="LOCKED")  # LOCKED | RELEASED | CANCELLED
-    # Job metadata stored at vault creation so the audit endpoint has full context
+    status          = Column(String, default="LOCKED")
+    # Job metadata
+    project_label    = Column(String, nullable=True)   # Human-readable label e.g. "Job-01"
     buyer_name       = Column(String, nullable=True)
+    buyer_address    = Column(String, nullable=True)   # Buyer's XRPL wallet — needed for EscrowFinish
     task_description = Column(Text, nullable=True)
     worker_address   = Column(String, nullable=True)
     amount_xrp       = Column(Float, nullable=True)
     cancel_after_ts  = Column(DateTime, nullable=True)
-    # Buyer's uploaded brief/spec — stored as JSON list of {filename, mime_type, data}
     buyer_attachments = Column(Text, nullable=True)
+    # EscrowCreate tx — stored after buyer signs, used to auto-lookup sequence number
+    escrow_tx_hash   = Column(String, nullable=True)
+    escrow_sequence  = Column(Integer, nullable=True)  # Cached after first lookup
     # Audit result
-    ai_verdict      = Column(Text, nullable=True)       # JSON string
+    ai_verdict      = Column(Text, nullable=True)
     model_used      = Column(String, nullable=True)
     created_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -147,6 +151,10 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS ai_verdict         TEXT",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS model_used         VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS created_at         TIMESTAMP",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS project_label      VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_address      VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_tx_hash     VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_sequence    INTEGER",
         # payment_logs new columns
         "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS purpose   VARCHAR",
         "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS sender    VARCHAR",
@@ -223,12 +231,14 @@ class Attachment(BaseModel):
 class EscrowSetupRequest(BaseModel):
     escrow_id:          str
     fee_hash:           str
+    project_label:      Optional[str] = None   # Human-readable label e.g. "Job-01"
     buyer_name:         str
+    buyer_address:      str                    # Buyer's XRPL wallet address
     task_description:   str
     worker_address:     str
     amount_xrp:         float
     cancel_after_hrs:   int = 168
-    buyer_attachments:  Optional[list[Attachment]] = None  # Spec docs, briefs, etc.
+    buyer_attachments:  Optional[list[Attachment]] = None
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -571,7 +581,9 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         condition         = final_condition,
         fulfillment       = final_fulfillment,
         status            = "LOCKED",
+        project_label     = req.project_label,
         buyer_name        = req.buyer_name,
+        buyer_address     = req.buyer_address,
         task_description  = req.task_description,
         worker_address    = req.worker_address,
         amount_xrp        = req.amount_xrp,
@@ -590,24 +602,57 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     )
 
     return {
-        "escrow_id":           req.escrow_id,
-        "condition":           final_condition,
-        "status":              "LOCKED",
+        "escrow_id":        req.escrow_id,
+        "condition":        final_condition,
+        "status":           "LOCKED",
         "cancel_after_ripple": cancel_after_ripple,
         "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
     }
 
 
-@app.get("/escrow/{escrow_id}")
-async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
+@app.post("/escrow/{escrow_id}/confirm")
+async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(get_db)):
     """
-    WORKER — Called when the worker lands on the portal with a Project ID.
-    Returns non-sensitive job info so the worker can see what they need to deliver.
-    The fulfillment key is never returned here.
+    BUYER — Called automatically after the EscrowCreate is signed in Xaman.
+    Stores the tx hash and buyer address so the worker never needs to look them up.
     """
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
     if not vault:
-        raise HTTPException(status_code=404, detail=f"Project '{escrow_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found.")
+
+    tx_hash = body.get("tx_hash", "").strip().upper()
+    if not tx_hash:
+        raise HTTPException(status_code=400, detail="tx_hash is required.")
+
+    # Look up sequence number from the ledger right now while we have the hash
+    sequence = None
+    try:
+        client = AsyncJsonRpcClient(XRPL_URL)
+        tx_res  = await client.request(Tx(transaction=tx_hash))
+        if tx_res.is_successful():
+            tx_body  = tx_res.result
+            tx_data  = tx_body.get("tx_json") or tx_body.get("tx") or tx_body
+            sequence = tx_data.get("Sequence")
+            logger.info(f"✅ EscrowCreate confirmed: hash={tx_hash[:16]}... seq={sequence}")
+    except Exception as e:
+        logger.warning(f"Could not look up sequence for {tx_hash}: {e}")
+
+    vault.escrow_tx_hash  = tx_hash
+    vault.escrow_sequence = sequence
+    db.commit()
+
+    return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
+
+
+@app.get("/escrow/{escrow_id}")
+async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
+    """
+    WORKER — Returns job info including buyer address and sequence number
+    so the worker never has to look anything up manually.
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Receipt code '{escrow_id}' not found.")
 
     deadline_str = (
         vault.cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC")
@@ -615,13 +660,17 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
     )
 
     return {
-        "escrow_id":       vault.escrow_id,
-        "status":          vault.status,
-        "buyer_name":      vault.buyer_name,
-        "task_description":vault.task_description,
-        "amount_xrp":      vault.amount_xrp,
-        "deadline":        deadline_str,
-        "worker_address":  vault.worker_address,
+        "escrow_id":        vault.escrow_id,
+        "project_label":    vault.project_label,
+        "status":           vault.status,
+        "buyer_name":       vault.buyer_name,
+        "buyer_address":    vault.buyer_address,
+        "task_description": vault.task_description,
+        "amount_xrp":       vault.amount_xrp,
+        "deadline":         deadline_str,
+        "worker_address":   vault.worker_address,
+        "escrow_sequence":  vault.escrow_sequence,
+        "escrow_tx_hash":   vault.escrow_tx_hash,
     }
 
 
@@ -713,14 +762,16 @@ async def evaluate_work(
             logger.warning(f"⚠️ Webhook delivery failed: {e}")
 
     return {
-        "escrow_id":      req.escrow_id,
-        "status":         "approved" if is_approved else "rejected",
-        "verdict":        verdict_dict,
-        "model_used":     model_used,
-        "fulfillment":    revealed_fulfillment,
-        "condition":      vault.condition if is_approved else None,
-        "worker_address": vault.worker_address,
-        "amount_xrp":     vault.amount_xrp,
+        "escrow_id":       req.escrow_id,
+        "status":          "approved" if is_approved else "rejected",
+        "verdict":         verdict_dict,
+        "model_used":      model_used,
+        "fulfillment":     revealed_fulfillment,
+        "condition":       vault.condition if is_approved else None,
+        "worker_address":  vault.worker_address,
+        "buyer_address":   vault.buyer_address,
+        "escrow_sequence": vault.escrow_sequence,
+        "amount_xrp":      vault.amount_xrp,
     }
 
 
