@@ -55,18 +55,24 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # 3. STATIC FILES & HEALTH
 # ---------------------------------------------------------------------------
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+# Repo structure: index.html and js/ folder sit at the root level (no static/ subfolder)
+# Mount js/ so that <script src="js/app.js"> resolves correctly
+if os.path.isdir("js"):
+    app.mount("/js", StaticFiles(directory="js"), name="js")
+    logger.info("✅ Mounted /js static directory")
 else:
-    logger.warning("⚠️ 'static' directory not found.")
+    logger.warning("⚠️ 'js' directory not found — app.js will not load")
+
+for subdir in ["css", "images", "assets"]:
+    if os.path.isdir(subdir):
+        app.mount(f"/{subdir}", StaticFiles(directory=subdir), name=subdir)
 
 @app.get("/")
 @app.head("/")
 def serve_ui():
-    path = "static/index.html"
-    if os.path.exists(path):
-        return FileResponse(path)
-    return {"status": "Referee Online", "message": "UI not found in /static"}
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return {"status": "Referee Online", "message": "index.html not found at root"}
 
 @app.get("/status")
 def health_check():
