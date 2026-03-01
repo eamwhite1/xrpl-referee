@@ -28,7 +28,7 @@ except ImportError:
     XummSdk = None
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -134,6 +134,43 @@ class EscrowVault(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
+
+def run_migrations():
+    """
+    Safely adds any missing columns to existing tables.
+    Uses ALTER TABLE IF NOT EXISTS pattern — safe to run on every startup.
+    This replaces the need for Alembic for a project of this size.
+    """
+    migrations = [
+        # escrow_vault new columns added after initial deploy
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_name       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS task_description  TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_address    VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS amount_xrp        FLOAT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancel_after_ts   TIMESTAMP",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_attachments  TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS ai_verdict         TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS model_used         VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS created_at         TIMESTAMP",
+        # payment_logs new columns
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS purpose   VARCHAR",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS sender    VARCHAR",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS amount_xrp FLOAT",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS escrow_id  VARCHAR",
+    ]
+
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"Migration skipped ({sql[:60]}...): {e}")
+
+    logger.info("✅ Database migrations complete.")
+
+run_migrations()
 
 
 def get_db():
