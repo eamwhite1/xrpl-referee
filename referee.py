@@ -52,23 +52,24 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# 3. HEALTH CHECK
+# 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
 # ---------------------------------------------------------------------------
-# The referee is a pure API server. Frontend lives at AgentTrust.
-# Bots/agents discover this service via agent.json and openapi.json.
+# Root redirects to playground. Bots find us via /.well-known/agent.json,
+# /openapi.json, and Smithery. The inline fallbacks mean these work even
+# if the .well-known/ files aren't committed to the repo yet.
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 @app.head("/")
 def serve_ui():
-    return RedirectResponse(url="https://agenttrust.io", status_code=302)
+    return RedirectResponse(url="/playground", status_code=302)
 
-@app.get("/playground", response_class=FileResponse)
+@app.get("/playground")
 def serve_playground():
     path = "playground.html"
     if os.path.exists(path):
         return FileResponse(path, media_type="text/html")
-    return {"error": "Playground not found"}
+    return PlainTextResponse("playground.html not found — make sure it is committed to the repo root.", status_code=404)
 
 @app.get("/status")
 def health_check():
@@ -79,8 +80,6 @@ def robots_txt():
     return "\n".join([
         "User-agent: *",
         "Allow: /",
-        "",
-        "# Agent discovery files",
         "Allow: /.well-known/",
         "Allow: /openapi.json",
         "Allow: /docs",
@@ -90,6 +89,53 @@ def robots_txt():
         "",
         "Sitemap: https://xrpl-referee.onrender.com/openapi.json",
     ])
+
+@app.get("/.well-known/agent.json")
+def serve_agent_json():
+    path = ".well-known/agent.json"
+    if os.path.exists(path):
+        return FileResponse(path, media_type="application/json")
+    # Inline fallback — always works even without the file
+    return {
+        "schemaVersion": "1.0",
+        "name": "AgentTrust Referee",
+        "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
+        "url": "https://xrpl-referee.onrender.com",
+        "agentVersion": "5.0.0",
+        "protocolVersion": "0.3.0",
+        "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
+        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True},
+        "authentication": {
+            "schemes": ["x-payment-hash"],
+            "description": "Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Pass tx hash as x-payment-hash header."
+        },
+        "payment": {"currency": "XRP", "amount": "0.1", "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR", "network": "XRPL Mainnet"},
+        "skills": [
+            {"id": "standalone-audit", "name": "AI Verdict", "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit", "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow", "legal-tech"]},
+            {"id": "escrow-create",    "name": "Create Escrow Vault",          "description": "Lock XRPL funds in crypto-condition escrow gated by AI verdict.", "endpoint": "/escrow/generate", "method": "POST"},
+            {"id": "escrow-evaluate",  "name": "Submit Work for Escrow Audit", "description": "Worker submits proof. On PASS returns fulfillment key.", "endpoint": "/evaluate", "method": "POST"}
+        ],
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"]
+    }
+
+@app.get("/.well-known/ai-plugin.json")
+def serve_ai_plugin():
+    path = ".well-known/ai-plugin.json"
+    if os.path.exists(path):
+        return FileResponse(path, media_type="application/json")
+    return {
+        "schema_version": "v1",
+        "name_for_human": "AgentTrust Referee",
+        "name_for_model": "agenttrust_referee",
+        "description_for_human": "Trustless AI task verification. Pay 0.1 XRP, get PASS/FAIL verdict.",
+        "description_for_model": "Verify task completion. POST task+work to /audit with x-payment-hash header (0.1 XRP fee). Returns JSON with verdict, score, criteria_met, criteria_failed, details.",
+        "auth": {"type": "none"},
+        "api": {"type": "openapi", "url": "https://xrpl-referee.onrender.com/openapi.json"},
+        "legal_info_url": "https://xrpl-referee.onrender.com"
+    }
+
+
 
 # ---------------------------------------------------------------------------
 # 4. DATABASE
