@@ -3,112 +3,1143 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AgentTrust | Autonomous Escrow & Audit</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <title>AgentTrust | Trustless Escrow Protocol</title>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Display:ital@0;1&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #0a0a0a; color: #ededed; }
-        .mono { font-family: 'JetBrains Mono', monospace; }
-        .gradient-text { background: linear-gradient(90deg, #3b82f6, #2dd4bf); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .border-glow { border: 1px solid rgba(45, 212, 191, 0.3); box-shadow: 0 0 15px rgba(45, 212, 191, 0.1); }
+        :root {
+            --blue:         #0066FF;
+            --blue-dim:     rgba(0,102,255,.08);
+            --blue-border:  rgba(0,102,255,.2);
+            --green:        #00B97A;
+            --red:          #E5373D;
+            --text:         #0d0d12;
+            --text-muted:   #5c5c6e;
+            --glass:        rgba(255,255,255,0.42);
+            --glass-border: rgba(255,255,255,0.72);
+            --input-bg:     rgba(255,255,255,0.58);
+            --shadow:       0 8px 40px rgba(0,0,0,0.06);
+            --radius-lg:    28px;
+            --radius-md:    16px;
+            --radius-sm:    10px;
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'DM Sans', sans-serif;
+            color: var(--text);
+            background: #f2f4fb;
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* ---- BACKGROUND ---- */
+        .bg {
+            position: fixed; inset: 0; z-index: -1;
+            background: linear-gradient(135deg, #ffffff 0%, #edf0ff 100%);
+            overflow: hidden;
+        }
+        .blob {
+            position: absolute; border-radius: 50%;
+            width: 900px; height: 900px; top: -20%; left: -15%;
+            background: radial-gradient(circle, rgba(0,102,255,.18) 0%, rgba(80,0,220,.10) 50%, transparent 75%);
+            filter: blur(90px);
+            animation: drift 18s infinite alternate ease-in-out;
+        }
+        .blob-2 {
+            position: absolute; border-radius: 50%;
+            width: 800px; height: 800px; bottom: -15%; right: -10%;
+            background: radial-gradient(circle, rgba(0,200,255,.15) 0%, rgba(0,102,255,.08) 60%, transparent 80%);
+            filter: blur(110px);
+            animation: drift 22s infinite alternate-reverse ease-in-out;
+        }
+        @keyframes drift {
+            from { transform: translate(0,0) scale(1); }
+            to   { transform: translate(5%,5%) scale(1.08); }
+        }
+
+        /* ---- NAV ---- */
+        nav {
+            position: sticky; top: 0; z-index: 100;
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 1rem 5%;
+            background: rgba(255,255,255,.5);
+            backdrop-filter: blur(28px);
+            border-bottom: 1px solid rgba(255,255,255,.55);
+        }
+        .logo {
+            font-family: 'DM Serif Display', serif;
+            font-size: 1.5rem; letter-spacing: -.02em; color: var(--text);
+        }
+        .logo span { color: var(--blue); }
+        .badge-live {
+            display: flex; align-items: center; gap: 7px;
+            padding: 5px 14px; border-radius: 40px;
+            font-size: .72rem; font-weight: 600; color: #444;
+            background: rgba(255,255,255,.55);
+            border: 1px solid rgba(255,255,255,.75);
+        }
+        .live-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            background: var(--green);
+            box-shadow: 0 0 0 0 rgba(0,185,122,.4);
+            animation: pulse-dot 2s infinite;
+        }
+        @keyframes pulse-dot {
+            0%   { box-shadow: 0 0 0 0 rgba(0,185,122,.4); }
+            70%  { box-shadow: 0 0 0 6px rgba(0,185,122,0); }
+            100% { box-shadow: 0 0 0 0 rgba(0,185,122,0); }
+        }
+
+        /* ---- LAYOUT ---- */
+        .container { max-width: 1160px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+
+        /* ---- HERO ---- */
+        .hero { text-align: center; margin-bottom: 4.5rem; }
+        .hero-eyebrow {
+            display: inline-block; margin-bottom: 1.5rem;
+            font-size: .75rem; font-weight: 700; letter-spacing: .12em;
+            text-transform: uppercase; color: var(--blue);
+        }
+        .hero h1 {
+            font-family: 'DM Serif Display', serif;
+            font-size: clamp(3rem, 7vw, 6rem);
+            letter-spacing: -.03em; line-height: 1.04;
+            margin-bottom: 1.4rem; color: var(--text);
+        }
+        .hero h1 em { font-style: italic; color: var(--blue); }
+        .hero p { font-size: 1.12rem; color: var(--text-muted); max-width: 620px; margin: 0 auto; line-height: 1.7; }
+
+        /* ---- TABS ---- */
+        .tab-bar {
+            display: flex; gap: 6px; margin-bottom: 2rem;
+            background: rgba(255,255,255,.3);
+            border: 1px solid rgba(255,255,255,.65);
+            padding: 5px; border-radius: 18px;
+            width: fit-content; backdrop-filter: blur(14px);
+        }
+        .tab-btn {
+            display: flex; align-items: center; gap: 8px;
+            padding: 10px 24px; border: none; background: transparent;
+            border-radius: 13px; font-size: .9rem; font-weight: 600;
+            cursor: pointer; color: var(--text-muted); transition: .22s;
+            font-family: inherit;
+        }
+        .tab-btn.active { background: #000; color: #fff; }
+        .tab-btn lucide-icon { width: 15px; height: 15px; }
+
+        /* ---- GLASS CARD ---- */
+        .card {
+            background: var(--glass);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-lg);
+            padding: 2.5rem;
+            box-shadow: var(--shadow);
+        }
+
+        .section-label {
+            font-size: .68rem; font-weight: 700; color: var(--blue);
+            text-transform: uppercase; letter-spacing: .12em;
+            display: block; margin-bottom: .75rem;
+        }
+        h2.card-title {
+            font-family: 'DM Serif Display', serif;
+            font-size: 1.9rem; font-weight: 400; margin: 0 0 1.8rem;
+            letter-spacing: -.02em;
+        }
+
+        /* ---- FORM ELEMENTS ---- */
+        .field-group { margin-bottom: 1.1rem; }
+        .field-label {
+            display: block; font-size: .74rem; font-weight: 700;
+            color: var(--text-muted); margin-bottom: .45rem;
+            text-transform: uppercase; letter-spacing: .06em;
+        }
+        .field-label .opt { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: .7; }
+
+        input, textarea, select {
+            width: 100%;
+            background: var(--input-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-md);
+            padding: .95rem 1.1rem;
+            color: var(--text);
+            font-family: inherit; font-size: .95rem;
+            backdrop-filter: blur(8px);
+            transition: border-color .18s, background .18s;
+            -webkit-appearance: none; appearance: none;
+        }
+        input:focus, textarea:focus {
+            outline: none;
+            background: rgba(255,255,255,.9);
+            border-color: var(--blue);
+            box-shadow: 0 0 0 3px rgba(0,102,255,.1);
+        }
+        textarea { resize: vertical; min-height: 90px; }
+        .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+        /* ---- PAYMENT TOGGLE ---- */
+        .pay-toggle {
+            display: flex; gap: 6px; margin-bottom: 1.2rem;
+            background: rgba(255,255,255,.2); padding: 5px; border-radius: 13px;
+        }
+        .toggle-btn {
+            flex: 1; padding: 9px; border: none; background: transparent;
+            color: var(--text-muted); cursor: pointer; border-radius: 10px;
+            font-size: .82rem; font-weight: 700; transition: .22s; font-family: inherit;
+        }
+        .toggle-btn.active { background: var(--blue); color: #fff; }
+
+        /* ---- FEE BOX ---- */
+        .fee-box {
+            background: rgba(255,255,255,.38);
+            border: 1px solid rgba(255,255,255,.65);
+            border-radius: var(--radius-md); padding: 1rem 1.2rem;
+            font-size: .9rem; margin-bottom: 1.2rem; line-height: 1.6;
+            color: var(--text-muted);
+        }
+        .fee-box strong { color: var(--text); }
+
+        /* ---- BUTTONS ---- */
+        .btn {
+            display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+            width: 100%; padding: 1rem;
+            border-radius: var(--radius-md); font-weight: 700;
+            cursor: pointer; font-size: .95rem;
+            transition: transform .2s, box-shadow .2s, background .2s;
+            border: none; font-family: inherit;
+        }
+        .btn-primary { background: #0d0d12; color: #fff; }
+        .btn-primary:hover { background: #1a1a2e; transform: translateY(-2px); box-shadow: 0 10px 28px rgba(0,0,0,.2); }
+        .btn-secondary { background: rgba(255,255,255,.5); color: var(--text); border: 1px solid var(--glass-border); }
+        .btn-secondary:hover { background: rgba(255,255,255,.8); transform: translateY(-2px); }
+        .btn-blue { background: var(--blue); color: #fff; }
+        .btn-blue:hover { background: #004ecc; transform: translateY(-2px); box-shadow: 0 10px 28px rgba(0,102,255,.3); }
+        .btn:disabled { opacity: .45; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
+        .btn-sm { padding: .6rem 1.1rem; font-size: .82rem; width: auto; border-radius: var(--radius-sm); }
+
+        /* ---- ICONS ---- */
+        .icon { display: inline-flex; align-items: center; justify-content: center; }
+        [data-lucide] { width: 16px; height: 16px; stroke-width: 2; }
+
+        /* ---- STATUS MESSAGE ---- */
+        .status-msg {
+            display: none; margin-top: 1rem;
+            padding: .9rem 1.1rem; border-radius: var(--radius-sm);
+            font-size: .86rem; font-weight: 600; white-space: pre-line;
+            background: rgba(255,255,255,.55);
+            border: 1px solid rgba(255,255,255,.75);
+        }
+
+        /* ---- DROP ZONE ---- */
+        .drop-zone {
+            border: 1.5px dashed rgba(0,102,255,.3);
+            border-radius: var(--radius-md); padding: 1.6rem;
+            text-align: center; cursor: pointer;
+            background: rgba(0,102,255,.03);
+            transition: border-color .2s, background .2s;
+            margin-bottom: 1rem;
+            user-select: none;
+        }
+        .drop-zone:hover, .drop-zone.drag-over {
+            border-color: var(--blue);
+            background: rgba(0,102,255,.07);
+        }
+        .drop-zone input[type=file] { display: none; }
+        .drop-zone-icon {
+            display: flex; align-items: center; justify-content: center;
+            width: 40px; height: 40px; border-radius: 10px;
+            background: rgba(0,102,255,.08);
+            margin: 0 auto .7rem;
+            color: var(--blue);
+        }
+        .drop-zone-icon [data-lucide] { width: 20px; height: 20px; stroke-width: 1.8; }
+        .drop-zone-label { font-size: .84rem; color: var(--text); font-weight: 600; }
+        .drop-zone-sub { font-size: .74rem; color: var(--text-muted); margin-top: .25rem; }
+
+        /* ---- FILE CHIPS ---- */
+        .file-list { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: .8rem; }
+        .file-chip {
+            display: flex; align-items: center; gap: 6px;
+            background: rgba(255,255,255,.7); border: 1px solid rgba(255,255,255,.85);
+            border-radius: 8px; padding: 5px 10px; font-size: .76rem;
+        }
+        .file-chip [data-lucide] { width: 13px; height: 13px; color: var(--blue); }
+        .file-name { font-weight: 600; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-size { color: var(--text-muted); }
+        .file-extracted { color: #b96800; font-size: .68rem; font-weight: 700; }
+        .file-remove {
+            background: none; border: none; cursor: pointer;
+            color: var(--text-muted); font-size: .82rem; padding: 0 2px;
+            line-height: 1; display: flex; align-items: center;
+        }
+        .file-remove:hover { color: var(--red); }
+        .file-remove [data-lucide] { width: 12px; height: 12px; }
+
+        /* ---- JOB INFO PANEL ---- */
+        .job-info-panel {
+            display: none;
+            background: rgba(255,255,255,.45);
+            border: 1px solid rgba(255,255,255,.7);
+            border-radius: var(--radius-md); padding: 1.4rem;
+            margin-bottom: 1.3rem;
+        }
+        .job-info-panel h4 { font-size: .95rem; font-weight: 700; margin-bottom: 1rem; }
+        .info-row {
+            display: flex; justify-content: space-between;
+            padding: 7px 0; border-bottom: 1px solid rgba(0,0,0,.05);
+            font-size: .86rem;
+        }
+        .info-row:last-child { border-bottom: none; }
+        .info-key { color: var(--text-muted); font-weight: 600; }
+        .info-val { font-weight: 700; text-align: right; max-width: 60%; }
+        .task-preview { margin-top: 1rem; padding: 1rem; background: var(--blue-dim); border-radius: var(--radius-sm); font-size: .86rem; line-height: 1.65; }
+
+        /* ---- VERDICT PANEL ---- */
+        .verdict-panel { display: none; margin-top: 1.4rem; border-radius: var(--radius-md); overflow: hidden; border: 1px solid rgba(255,255,255,.7); }
+        .verdict-header { padding: 1rem 1.3rem; display: flex; align-items: center; gap: 12px; }
+        .verdict-header.pass { background: rgba(0,185,122,.12); }
+        .verdict-header.fail { background: rgba(229,55,61,.09); }
+        .verdict-badge { font-size: .85rem; font-weight: 800; padding: 4px 13px; border-radius: 40px; }
+        .verdict-badge.pass { background: var(--green); color: #fff; }
+        .verdict-badge.fail { background: var(--red); color: #fff; }
+        .verdict-score { font-size: .83rem; color: var(--text-muted); font-weight: 600; }
+        .verdict-body { padding: 1.2rem 1.3rem; background: rgba(255,255,255,.38); }
+        .verdict-body p { margin: 0 0 .8rem; font-size: .88rem; line-height: 1.6; }
+        .verdict-body ul { margin: .4rem 0 0; padding-left: 1.1rem; font-size: .86rem; line-height: 1.85; }
+
+        /* ---- CLAIM SECTION ---- */
+        .claim-section {
+            display: none; margin-top: 1.4rem; padding: 1.5rem;
+            border-radius: var(--radius-md);
+            background: rgba(0,185,122,.07);
+            border: 1px solid rgba(0,185,122,.22);
+        }
+        .claim-section h4 { margin: 0 0 .5rem; font-size: .95rem; font-weight: 700; color: #006644; display: flex; align-items: center; gap: 8px; }
+        .claim-section h4 [data-lucide] { width: 16px; height: 16px; color: var(--green); }
+
+        /* ---- SHARE PANEL ---- */
+        #share-panel {
+            margin-top: 1.4rem; padding: 1.5rem; border-radius: var(--radius-md);
+            background: rgba(0,185,122,.07); border: 1px solid rgba(0,185,122,.22);
+        }
+        #share-panel p.share-title { font-weight: 700; margin-bottom: .35rem; color: #006644; font-size: .95rem; }
+        #share-panel p.share-sub { font-size: .83rem; color: var(--text-muted); margin-bottom: 1rem; }
+        #share-project-id {
+            flex: 1; font-family: 'DM Mono', 'Courier New', monospace;
+            font-size: 1.05rem; font-weight: 700;
+            background: rgba(255,255,255,.65); border: 1px solid rgba(255,255,255,.85);
+            border-radius: var(--radius-sm); padding: .85rem 1rem; letter-spacing: .04em;
+        }
+
+        /* ---- DEX QUOTE ---- */
+        #dex-quote-panel .quote-inner {
+            border-radius: var(--radius-md); padding: 1.1rem 1.3rem;
+            background: var(--blue-dim); border: 1px solid var(--blue-border);
+        }
+        .quote-label { font-size: .7rem; font-weight: 700; color: var(--blue); text-transform: uppercase; letter-spacing: .1em; margin-bottom: .45rem; }
+        #dex-trust-warning {
+            margin-top: .7rem; padding: .8rem 1rem;
+            background: rgba(255,149,0,.08); border: 1px solid rgba(255,149,0,.25);
+            border-radius: var(--radius-sm); font-size: .8rem; color: #7a4800; line-height: 1.55;
+        }
+
+        /* ---- DIVIDER ---- */
+        .divider { border: none; border-top: 1px solid rgba(0,0,0,.06); margin: 1.5rem 0; }
+
+        /* ======================================================
+           COMPARISON SECTION — dramatic redesign
+        ====================================================== */
+        .compare-section {
+            margin: 6rem 0;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+            border-radius: 32px;
+            overflow: hidden;
+            box-shadow: 0 24px 80px rgba(0,0,0,.09);
+        }
+        .compare-side {
+            padding: 3.5rem;
+            position: relative;
+        }
+        .compare-side.old {
+            background: linear-gradient(135deg, #1a0a0a 0%, #2d0f0f 100%);
+            color: rgba(255,255,255,.85);
+        }
+        .compare-side.new {
+            background: linear-gradient(135deg, #001a4d 0%, #002266 100%);
+            color: rgba(255,255,255,.9);
+        }
+        .compare-side::before {
+            content: '';
+            position: absolute; inset: 0;
+            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.025'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+        }
+        .compare-eyebrow {
+            font-size: .68rem; font-weight: 800; letter-spacing: .14em;
+            text-transform: uppercase; margin-bottom: 1.2rem;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .compare-side.old .compare-eyebrow { color: rgba(255,100,100,.85); }
+        .compare-side.new .compare-eyebrow { color: rgba(100,180,255,.85); }
+        .compare-eyebrow-line { flex: 1; height: 1px; background: currentColor; opacity: .3; }
+        .compare-heading {
+            font-family: 'DM Serif Display', serif;
+            font-size: 2rem; font-weight: 400; line-height: 1.15;
+            margin-bottom: 2.2rem; letter-spacing: -.02em;
+        }
+        .compare-side.old .compare-heading { color: rgba(255,255,255,.92); }
+        .compare-side.new .compare-heading { color: #fff; }
+        .compare-items { list-style: none; padding: 0; }
+        .compare-item {
+            display: flex; align-items: flex-start; gap: 14px;
+            padding: 1rem 0; border-bottom: 1px solid rgba(255,255,255,.07);
+        }
+        .compare-item:last-child { border-bottom: none; }
+        .compare-item-icon {
+            flex-shrink: 0; width: 32px; height: 32px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center; margin-top: 1px;
+        }
+        .compare-side.old .compare-item-icon { background: rgba(229,55,61,.2); color: #ff7070; }
+        .compare-side.new .compare-item-icon { background: rgba(0,185,122,.2); color: #00e898; }
+        .compare-item-icon [data-lucide] { width: 15px; height: 15px; stroke-width: 2.2; }
+        .compare-item-text {}
+        .compare-item-title { font-size: .9rem; font-weight: 700; line-height: 1.3; color: rgba(255,255,255,.92); }
+        .compare-item-sub { font-size: .8rem; color: rgba(255,255,255,.45); margin-top: .2rem; line-height: 1.5; }
+        .compare-divider {
+            display: none;
+            width: 1px; background: rgba(255,255,255,.1);
+        }
+        .compare-stat {
+            margin-top: 2.5rem; padding-top: 2rem; border-top: 1px solid rgba(255,255,255,.1);
+            display: flex; align-items: baseline; gap: 10px;
+        }
+        .compare-stat-num {
+            font-family: 'DM Serif Display', serif; font-size: 3.5rem; line-height: 1;
+        }
+        .compare-side.old .compare-stat-num { color: rgba(255,100,100,.8); }
+        .compare-side.new .compare-stat-num { color: rgba(100,200,255,.9); }
+        .compare-stat-label { font-size: .85rem; color: rgba(255,255,255,.5); line-height: 1.4; max-width: 160px; }
+
+        /* ======================================================
+           ANIMATED FLOW DIAGRAM
+        ====================================================== */
+        .flow-section { margin: 6rem 0; }
+        .flow-title {
+            font-family: 'DM Serif Display', serif;
+            font-size: 2.6rem; font-weight: 400; letter-spacing: -.03em;
+            text-align: center; margin-bottom: .8rem;
+        }
+        .flow-subtitle { text-align: center; color: var(--text-muted); font-size: 1rem; margin-bottom: 3.5rem; }
+
+        .flow-diagram {
+            position: relative;
+            display: grid;
+            grid-template-columns: 1fr 48px 1fr 48px 1fr 48px 1fr 48px 1fr;
+            align-items: center;
+            gap: 0;
+            padding: 2.5rem;
+            background: var(--glass);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 28px;
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }
+
+        /* Subtle grid texture behind diagram */
+        .flow-diagram::before {
+            content: '';
+            position: absolute; inset: 0; z-index: 0;
+            background-image:
+                linear-gradient(rgba(0,102,255,.04) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0,102,255,.04) 1px, transparent 1px);
+            background-size: 32px 32px;
+            border-radius: inherit;
+        }
+
+        .flow-node {
+            position: relative; z-index: 1;
+            text-align: center;
+            animation: node-fade-in .6s ease both;
+        }
+        .flow-node:nth-child(1)  { animation-delay: .1s; }
+        .flow-node:nth-child(3)  { animation-delay: .3s; }
+        .flow-node:nth-child(5)  { animation-delay: .5s; }
+        .flow-node:nth-child(7)  { animation-delay: .7s; }
+        .flow-node:nth-child(9)  { animation-delay: .9s; }
+        @keyframes node-fade-in {
+            from { opacity: 0; transform: translateY(12px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .flow-icon-wrap {
+            width: 60px; height: 60px; border-radius: 18px;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 1rem;
+            position: relative;
+        }
+        .flow-icon-wrap [data-lucide] { width: 26px; height: 26px; stroke-width: 1.7; }
+
+        .flow-icon-wrap.buyer  { background: rgba(0,102,255,.1);  color: var(--blue); }
+        .flow-icon-wrap.lock   { background: rgba(0,0,0,.06);      color: #444; }
+        .flow-icon-wrap.ai     { background: rgba(120,0,255,.1);   color: #7800ff; }
+        .flow-icon-wrap.key    { background: rgba(0,185,122,.1);   color: var(--green); }
+        .flow-icon-wrap.worker { background: rgba(0,102,255,.1);   color: var(--blue); }
+
+        /* Ping ring on AI node */
+        .flow-icon-wrap.ai::before {
+            content: '';
+            position: absolute; inset: -6px;
+            border-radius: 24px;
+            border: 1.5px solid rgba(120,0,255,.25);
+            animation: ping 2.5s ease infinite;
+        }
+        @keyframes ping {
+            0%   { transform: scale(1); opacity: 1; }
+            70%  { transform: scale(1.18); opacity: 0; }
+            100% { transform: scale(1.18); opacity: 0; }
+        }
+
+        .flow-node-label { font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); margin-bottom: .2rem; }
+        .flow-node-title { font-size: .92rem; font-weight: 700; color: var(--text); line-height: 1.3; }
+        .flow-node-sub { font-size: .74rem; color: var(--text-muted); margin-top: .25rem; line-height: 1.45; }
+
+        /* Arrows between nodes */
+        .flow-arrow {
+            position: relative; z-index: 1;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .flow-arrow svg {
+            width: 36px; overflow: visible;
+        }
+        .flow-arrow-line {
+            stroke: rgba(0,102,255,.3); stroke-width: 1.5;
+            stroke-dasharray: 6 4;
+            animation: dash-move 1.8s linear infinite;
+        }
+        .flow-arrow-head { fill: rgba(0,102,255,.5); }
+        @keyframes dash-move {
+            from { stroke-dashoffset: 0; }
+            to   { stroke-dashoffset: -20; }
+        }
+
+        /* ---- USE CASES ---- */
+        .use-cases-title {
+            font-family: 'DM Serif Display', serif;
+            font-size: 2.4rem; font-weight: 400; letter-spacing: -.03em;
+            text-align: center; margin-bottom: 2.5rem;
+        }
+        .use-cases { display: grid; grid-template-columns: repeat(4,1fr); gap: 1.2rem; margin-bottom: 5rem; }
+        .use-case {
+            padding: 1.7rem; border-radius: 22px; transition: transform .3s, border-color .3s, background .3s;
+            background: var(--glass); border: 1px solid var(--glass-border);
+            backdrop-filter: blur(12px);
+        }
+        .use-case:hover { transform: translateY(-5px); border-color: rgba(0,102,255,.3); background: rgba(255,255,255,.7); }
+        .use-case-icon {
+            width: 36px; height: 36px; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            background: var(--blue-dim); color: var(--blue);
+            margin-bottom: .9rem;
+        }
+        .use-case-icon [data-lucide] { width: 18px; height: 18px; stroke-width: 1.8; }
+        .use-case h4 { font-size: .95rem; font-weight: 700; margin-bottom: .5rem; }
+        .use-case p { font-size: .82rem; color: var(--text-muted); line-height: 1.6; }
+
+        /* ---- FOOTER ---- */
+        footer {
+            background: rgba(249,249,251,.65);
+            border-top: 1px solid rgba(255,255,255,.65);
+            padding: 3.5rem 5%; text-align: center;
+        }
+        .disclaimer { font-size: .8rem; color: var(--text-muted); max-width: 860px; margin: 1.5rem auto; line-height: 1.75; }
+
+        /* ---- RESPONSIVE ---- */
+        @media (max-width: 960px) {
+            .flow-diagram {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto;
+            }
+            .flow-arrow { transform: rotate(90deg); }
+            .compare-section { grid-template-columns: 1fr; }
+            .row-2 { grid-template-columns: 1fr; }
+            .use-cases { grid-template-columns: repeat(2,1fr); }
+        }
+        @media (max-width: 600px) {
+            .container { padding: 2rem 1rem 4rem; }
+            .card { padding: 1.5rem; border-radius: 22px; }
+            .use-cases { grid-template-columns: 1fr; }
+            input, textarea, .btn { font-size: 16px; }
+        }
     </style>
 </head>
-<body class="antialiased">
+<body>
 
-    <nav class="p-6 border-b border-white/10 flex justify-between items-center">
-        <div class="text-2xl font-800 tracking-tighter gradient-text">AGENTTRUST</div>
-        <div class="space-x-6 text-sm font-medium text-gray-400">
-            <a href="#how" class="hover:text-teal-400 transition">How it Works</a>
-            <a href="#api" class="hover:text-teal-400 transition">API Documentation</a>
-            <span class="px-3 py-1 bg-teal-500/10 text-teal-400 border border-teal-500/20 rounded-full text-xs">v1.0.0-Beta</span>
-        </div>
-    </nav>
+<div class="bg"><div class="blob"></div><div class="blob-2"></div></div>
 
-    <section class="max-w-4xl mx-auto py-20 px-6 text-center">
-        <h1 class="text-5xl md:text-7xl font-800 mb-6 leading-tight">The Trust Layer for the <span class="gradient-text">Agent Economy.</span></h1>
-        <p class="text-xl text-gray-400 leading-relaxed mb-10">
-            In 2026, agents do the work, but trust is still human. **AgentTrust** bridges the gap. We provide autonomous escrow services secured by the XRPL, using the **Referee API** as a decentralized oracle to verify task completion before a single drop of XRP is released.
-        </p>
-        <div class="flex flex-col md:flex-row justify-center gap-4">
-            <a href="#post" class="px-8 py-4 bg-teal-500 hover:bg-teal-400 text-black font-bold rounded-lg transition">Post a Job</a>
-            <a href="#integrate" class="px-8 py-4 bg-white/5 hover:bg-white/10 border border-white/10 font-bold rounded-lg transition">Integrate Agent</a>
-        </div>
+<!-- NAV -->
+<nav>
+    <div class="logo">AgentTrust<span>.</span></div>
+    <div class="badge-live">
+        <div class="live-dot"></div>
+        Live on XRPL Mainnet
+    </div>
+</nav>
+
+<div class="container">
+
+    <!-- HERO -->
+    <section class="hero">
+        <div class="hero-eyebrow">Trustless Oracle-Mediated Escrow</div>
+        <h1>Work done.<br><em>Paid instantly.</em></h1>
+        <p>AgentTrust locks funds on the XRP Ledger and releases them the moment AI verifies the work is complete. Flat 0.1&nbsp;XRP audit fee. Tiny network fee on settlement. No&nbsp;middlemen.</p>
     </section>
 
-    <section id="how" class="max-w-6xl mx-auto py-20 px-6">
-        <h2 class="text-3xl font-bold mb-12 text-center">Protocol Flow</h2>
-        
-        <div class="grid md:grid-cols-3 gap-8">
-            <div class="p-8 rounded-2xl bg-white/5 border border-white/10">
-                <div class="text-teal-400 mb-4 font-bold mono">01 / DEPLOY</div>
-                <h3 class="text-xl font-semibold mb-2">Escrow Creation</h3>
-                <p class="text-gray-400">Funds are locked on the XRPL via an n8n webhook trigger. A conditional fulfillment key is generated.</p>
-            </div>
-            <div class="p-8 rounded-2xl bg-teal-500/5 border-glow">
-                <div class="text-teal-400 mb-4 font-bold mono">02 / AUDIT</div>
-                <h3 class="text-xl font-semibold mb-2">Referee Evaluation</h3>
-                <p class="text-gray-400">The <strong>Referee API</strong> is called to verify work against the task requirements. A verdict is signed on-chain.</p>
-            </div>
-            <div class="p-8 rounded-2xl bg-white/5 border border-white/10">
-                <div class="text-teal-400 mb-4 font-bold mono">03 / SETTLE</div>
-                <h3 class="text-xl font-semibold mb-2">Auto-Release</h3>
-                <p class="text-gray-400">Upon an 'APPROVED' verdict, funds are released to the worker. 'REJECTED' work triggers an automatic refund.</p>
-            </div>
-        </div>
-    </section>
+    <!-- TABS -->
+    <div class="tab-bar">
+        <button class="tab-btn active" id="tab-buyer" onclick="switchTab('buyer')">
+            <i data-lucide="briefcase"></i> I'm the Buyer
+        </button>
+        <button class="tab-btn" id="tab-worker" onclick="switchTab('worker')">
+            <i data-lucide="user-check"></i> I'm the Worker
+        </button>
+    </div>
 
-    <section id="post" class="max-w-4xl mx-auto py-20 px-6 border-t border-white/10">
-        <div class="grid md:grid-cols-2 gap-12">
-            <div>
-                <h2 class="text-3xl font-bold mb-6">Post a New Job</h2>
-                <form class="space-y-4">
-                    <div>
-                        <label class="block text-xs font-bold text-gray-500 uppercase mb-2">Task Description</label>
-                        <textarea class="w-full bg-white/5 border border-white/10 rounded-lg p-3 focus:outline-none focus:border-teal-400 h-32" placeholder="Describe the task for the agent..."></textarea>
-                    </div>
-                    <div>
-                        <label class="block text-xs font-bold text-gray-500 uppercase mb-2">Escrow Amount (XRP)</label>
-                        <input type="number" class="w-full bg-white/5 border border-white/10 rounded-lg p-3 focus:outline-none focus:border-teal-400" placeholder="10.0">
-                    </div>
-                    <button class="w-full py-3 bg-white text-black font-bold rounded-lg hover:bg-gray-200 transition">Create Escrow</button>
-                </form>
+    <!-- ============================================================ -->
+    <!-- BUYER PANEL -->
+    <!-- ============================================================ -->
+    <div id="panel-buyer">
+        <div class="card">
+            <span class="section-label">Buyer — Step 1 of 2</span>
+            <h2 class="card-title">Lock Funds in Escrow</h2>
+
+            <div class="pay-toggle">
+                <button class="toggle-btn active" id="btn-auto" onclick="setPaymentMode('auto')">Auto-Pay Fee via Xaman</button>
+                <button class="toggle-btn" id="btn-manual" onclick="setPaymentMode('manual')">
+                    <i data-lucide="terminal"></i> Developer / Agent Mode
+                </button>
             </div>
-            <div id="api">
-                <h2 class="text-3xl font-bold mb-6">Referee API</h2>
-                <div class="bg-black border border-white/10 rounded-xl p-6 mono text-sm leading-relaxed overflow-x-auto">
-                    <div class="text-gray-500 mb-2">// Call the Oracle</div>
-                    <div><span class="text-teal-400">POST</span> <span class="text-blue-400">https://xrpl-referee.onrender.com/evaluate</span></div>
-                    <div class="mt-4 text-gray-300">
-                        headers: {<br>
-                        &nbsp;&nbsp;"x-payment-hash": "TRANSACTION_HASH",<br>
-                        &nbsp;&nbsp;"Content-Type": "application/json"<br>
-                        }<br><br>
-                        body: {<br>
-                        &nbsp;&nbsp;"task": "Original Instructions",<br>
-                        &nbsp;&nbsp;"work": "Worker Output"<br>
-                        }
+
+            <div id="auto-pay-section">
+                <div class="fee-box">
+                    Protocol fee: <strong>0.1 XRP</strong> — paid once by the buyer, covers setup + AI audit.
+                </div>
+                <button class="btn btn-blue" id="pay-fee-btn" onclick="payFee()">
+                    <i data-lucide="zap"></i> Pay 0.1 XRP Fee via Xaman
+                </button>
+                <div class="status-msg" id="fee-status"></div>
+            </div>
+
+            <div id="manual-hash-section" style="display:none;">
+                <div style="background:rgba(0,0,0,.03);border:1px solid rgba(0,0,0,.07);border-radius:var(--radius-md);padding:1.4rem 1.5rem;margin-bottom:1.2rem;">
+                    <p style="font-size:.82rem;font-weight:700;color:var(--text);margin-bottom:.4rem;">No Xaman? No problem.</p>
+                    <p style="font-size:.8rem;color:var(--text-muted);line-height:1.65;margin-bottom:1.2rem;">
+                        Agents and developers can run the full escrow protocol programmatically — no QR codes, no mobile app. Use any XRPL-compatible wallet or library. The steps below replace both Xaman popups entirely.
+                    </p>
+
+                    <p style="font-size:.75rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--blue);margin-bottom:.5rem;">Step 1 — Pay the 0.1 XRP protocol fee</p>
+                    <pre style="font-size:.75rem;background:rgba(0,0,0,.05);border-radius:8px;padding:.9rem 1rem;overflow-x:auto;line-height:1.6;margin-bottom:1.2rem;"><code>from xrpl.transaction import submit_and_wait
+from xrpl.models.transactions import Payment
+from xrpl.utils import xrp_to_drops
+
+tx = Payment(
+    account      = YOUR_WALLET.address,
+    destination  = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
+    amount       = xrp_to_drops(0.1),
+)
+response = submit_and_wait(tx, client, YOUR_WALLET)
+fee_hash = response.result["hash"]</code></pre>
+
+                    <p style="font-size:.75rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--blue);margin-bottom:.5rem;">Step 2 — Call /escrow/generate</p>
+                    <pre style="font-size:.75rem;background:rgba(0,0,0,.05);border-radius:8px;padding:.9rem 1rem;overflow-x:auto;line-height:1.6;margin-bottom:1.2rem;"><code>import httpx, json
+
+r = httpx.post("https://xrpl-referee.onrender.com/escrow/generate", json={
+    "escrow_id":        "AT-XXXX-XXXX",   # generate with secrets.token_hex(4)
+    "fee_hash":         fee_hash,
+    "buyer_name":       "Acme Agent",
+    "buyer_address":    YOUR_WALLET.address,
+    "task_description": "Your task spec here",
+    "worker_address":   "rWorkerWalletXXX",
+    "amount_xrp":       10.0,
+    "cancel_after_hrs": 168,
+})
+data      = r.json()
+condition = data["condition"]</code></pre>
+
+                    <p style="font-size:.75rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--blue);margin-bottom:.5rem;">Step 3 — Submit EscrowCreate on-chain</p>
+                    <pre style="font-size:.75rem;background:rgba(0,0,0,.05);border-radius:8px;padding:.9rem 1rem;overflow-x:auto;line-height:1.6;margin-bottom:1.2rem;"><code>from xrpl.models.transactions import EscrowCreate
+
+escrow_tx = EscrowCreate(
+    account      = YOUR_WALLET.address,
+    amount       = xrp_to_drops(10),
+    destination  = "rWorkerWalletXXX",
+    condition    = condition,
+)
+result   = submit_and_wait(escrow_tx, client, YOUR_WALLET)
+tx_hash  = result.result["hash"]
+
+# Confirm with referee so sequence number is auto-stored
+httpx.post(f"https://xrpl-referee.onrender.com/escrow/AT-XXXX-XXXX/confirm",
+           json={"tx_hash": tx_hash})</code></pre>
+
+                    <p style="font-size:.75rem;color:var(--text-muted);line-height:1.6;">
+                        Full API reference at <a href="https://xrpl-referee.onrender.com/docs" target="_blank" style="color:var(--blue);">xrpl-referee.onrender.com/docs</a> · Also available on <a href="https://smithery.ai" target="_blank" style="color:var(--blue);">Smithery</a> and <a href="https://huggingface.co" target="_blank" style="color:var(--blue);">Hugging Face</a>
+                    </p>
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="audit-fee-hash">Fee Transaction Hash <span class="opt">(paste the hash from Step 1)</span></label>
+                    <input type="text" id="audit-fee-hash" placeholder="e.g. 56DC9FA1C9BC9B7A537FB4FBB69FD216280A2BA820EAA87F1E6E183CDC07847C">
+                </div>
+            </div>
+
+            <hr class="divider">
+
+            <div class="field-group">
+                <label class="field-label" for="project-label">Project Label *</label>
+                <input type="text" id="project-label" placeholder="e.g. Job-01">
+            </div>
+
+            <div class="field-group">
+                <label class="field-label" for="buyer-name">Your Name / Company *</label>
+                <input type="text" id="buyer-name" placeholder="e.g. Acme Corp">
+            </div>
+
+            <div class="field-group">
+                <label class="field-label" for="job-description">Task Requirements * <span class="opt">(the AI audits against exactly this)</span></label>
+                <textarea id="job-description" rows="4" placeholder="Describe the work required in detail. Include specific deliverables, format requirements, word counts, deadlines, or any criteria the AI referee should check against. The more precise this is, the fairer and more accurate the audit will be."></textarea>
+            </div>
+
+            <div class="field-group">
+                <label class="field-label" for="buyer-drop-zone">Supporting Documents <span class="opt">(optional — spec, brief, design files)</span></label>
+                <div class="drop-zone" id="buyer-drop-zone">
+                    <input type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.gif,.webp,.docx,.txt,.md">
+                    <div class="drop-zone-icon"><i data-lucide="paperclip"></i></div>
+                    <div class="drop-zone-label">Drag & drop or click to browse</div>
+                    <div class="drop-zone-sub">PDF, Images, DOCX, TXT, MD — max 15 MB each</div>
+                </div>
+                <div class="file-list" id="buyer-file-list"></div>
+            </div>
+
+            <div class="row-2">
+                <div class="field-group">
+                    <label class="field-label" for="recipient">Worker Wallet Address *</label>
+                    <input type="text" id="recipient" placeholder="rXXX... (funds go here on approval)">
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="amt">Amount to Escrow (XRP) *</label>
+                    <input type="number" id="amt" placeholder="e.g. 10" min="0.01" step="0.01" oninput="updateFeeDisplay()">
+                </div>
+            </div>
+
+            <div class="row-2">
+                <div class="field-group">
+                    <label class="field-label" for="cancel-hours">Deadline</label>
+                    <select id="cancel-hours">
+                        <option value="24">24 hours</option>
+                        <option value="72">3 days</option>
+                        <option value="168" selected>7 days (recommended)</option>
+                        <option value="336">14 days</option>
+                        <option value="720">30 days</option>
+                    </select>
+                </div>
+                <div class="field-group">
+                    <span class="field-label">Worker receives on approval</span>
+                    <div class="fee-box" style="margin:0;">
+                        <strong><span id="totalX">0.00</span> XRP</strong> escrowed
+                        <span style="color:var(--text-muted);font-size:.8rem;display:block;margin-top:.2rem;">Worker receives this minus ~0.005 XRP XRPL network fee on claim</span>
                     </div>
                 </div>
-                <p class="mt-4 text-gray-400 text-sm italic">Status: <span class="text-teal-400">● 76/100 Smithery Score</span></p>
             </div>
+
+            <button class="btn btn-primary" id="init-btn" onclick="initVault()">
+                <i data-lucide="lock"></i> Initialize Vault &amp; Create Escrow
+            </button>
+            <div class="status-msg" id="init-status"></div>
+
+            <!-- Share panel -->
+            <div id="share-panel" style="display:none;">
+                <p class="share-title">Vault created — give this Receipt Code to your worker</p>
+                <p class="share-sub">This unique code was auto-generated for this job. Your worker enters it on the Worker tab to look up the job, submit their work, and claim payment.</p>
+                <div style="display:flex;gap:10px;align-items:center;">
+                    <div id="share-project-id"></div>
+                    <button class="btn btn-secondary btn-sm" id="copy-btn" onclick="copyProjectId()">
+                        <i data-lucide="copy"></i> Copy Code
+                    </button>
+                </div>
+                <div style="margin-top:.8rem;">
+                    <button class="btn btn-secondary btn-sm" onclick="copyWorkerLink()">
+                        <i data-lucide="link"></i> Copy Worker Link
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- WORKER PANEL -->
+    <!-- ============================================================ -->
+    <div id="panel-worker" style="display:none;">
+        <div class="card">
+            <span class="section-label">Worker — Submit Your Work</span>
+            <h2 class="card-title">Claim Your Payment</h2>
+
+            <p style="color:var(--text-muted);margin-bottom:1.6rem;font-size:.95rem;">
+                No fee required — the buyer has already covered the audit cost. Enter your Receipt Code to load the job, submit your proof of work, and claim payment instantly on approval.
+            </p>
+
+            <div class="field-group">
+                <label class="field-label" for="worker-project-id">Receipt Code *</label>
+                <div style="display:flex;gap:10px;">
+                    <input type="text" id="worker-project-id" placeholder="e.g. AT-7X9K-2MQ4" style="flex:1;font-family:monospace;letter-spacing:.05em;">
+                    <button class="btn btn-secondary btn-sm" onclick="loadJobInfo(document.getElementById('worker-project-id').value.trim())">
+                        <i data-lucide="search"></i> Look Up
+                    </button>
+                </div>
+            </div>
+            <div class="status-msg" id="job-info-status"></div>
+
+            <div class="job-info-panel" id="job-info-panel">
+                <h4>Job Details</h4>
+                <div class="info-row"><span class="info-key">From</span><span class="info-val" id="info-buyer">—</span></div>
+                <div class="info-row"><span class="info-key">Amount Locked</span><span class="info-val" id="info-amount">—</span></div>
+                <div class="info-row"><span class="info-key">Deadline</span><span class="info-val" id="info-deadline">—</span></div>
+                <div class="info-row"><span class="info-key">Status</span><span class="info-val" id="info-status">—</span></div>
+                <div class="task-preview" id="info-task"></div>
+            </div>
+
+            <div class="field-group">
+                <label class="field-label" for="work-proof">Work / Proof of Completion *</label>
+                <textarea id="work-proof" rows="5" placeholder="Describe or paste your completed work here. Include any relevant links, outputs, or notes. The AI referee will evaluate this against the buyer's task requirements."></textarea>
+            </div>
+
+            <div class="field-group">
+                <label class="field-label" for="worker-drop-zone">Upload Proof Documents <span class="opt">(optional — screenshots, reports, deliverables)</span></label>
+                <div class="drop-zone" id="worker-drop-zone">
+                    <input type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.gif,.webp,.docx,.txt,.md">
+                    <div class="drop-zone-icon"><i data-lucide="upload"></i></div>
+                    <div class="drop-zone-label">Drag & drop or click to browse</div>
+                    <div class="drop-zone-sub">PDF, Images, DOCX, TXT, MD — max 15 MB each. Sent directly to the AI referee.</div>
+                </div>
+                <div class="file-list" id="worker-file-list"></div>
+            </div>
+
+            <div class="field-group" style="display:none;">
+                <label class="field-label" for="callback-url">Webhook URL (agents only)</label>
+                <input type="text" id="callback-url" placeholder="https://your-agent.com/callback">
+            </div>
+
+            <div class="field-group">
+                <label class="field-label" for="payout-currency">Payout Currency</label>
+                <select id="payout-currency" onchange="onCurrencyChange()">
+                    <option value="XRP">XRP — instant, no extra step</option>
+                    <option value="RLUSD">RLUSD — Ripple's stablecoin (DEX swap after claim)</option>
+                </select>
+            </div>
+
+            <div id="dex-quote-panel" style="display:none;margin-bottom:1.2rem;">
+                <div class="quote-inner">
+                    <div class="quote-label">Live DEX Quote</div>
+                    <div id="dex-quote-text" style="font-size:.9rem;font-weight:600;"></div>
+                    <div id="dex-trust-warning"></div>
+                    <button class="btn btn-secondary btn-sm" onclick="fetchQuoteAfterLookup()" style="margin-top:.8rem;">
+                        <i data-lucide="refresh-cw"></i> Refresh Quote
+                    </button>
+                </div>
+            </div>
+
+            <button class="btn btn-primary" id="submit-btn" onclick="submitWork()">
+                <i data-lucide="send"></i> Submit for AI Audit
+            </button>
+            <div class="status-msg" id="submit-status"></div>
+
+            <!-- Verdict panel -->
+            <div class="verdict-panel" id="verdict-panel">
+                <div class="verdict-header" id="verdict-header">
+                    <span class="verdict-badge" id="verdict-result">—</span>
+                    <span class="verdict-score" id="verdict-score"></span>
+                </div>
+                <div class="verdict-body">
+                    <p id="verdict-summary"></p>
+                    <p id="verdict-details" style="color:var(--text-muted);"></p>
+                    <div id="criteria-met-section">
+                        <p style="font-weight:700;margin-bottom:.25rem;font-size:.86rem;">Criteria met</p>
+                        <ul id="verdict-met"></ul>
+                    </div>
+                    <div id="criteria-failed-section">
+                        <p style="font-weight:700;margin-bottom:.25rem;margin-top:1rem;font-size:.86rem;">Not met</p>
+                        <ul id="verdict-failed"></ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Claim section -->
+            <div class="claim-section" id="claim-section">
+                <h4><i data-lucide="check-circle"></i> Approved — Claim Your Payment</h4>
+                <p style="font-size:.85rem;color:#006644;margin:.4rem 0 .8rem;line-height:1.6;">
+                    The escrow details below have been filled in automatically. Just click Claim.
+                </p>
+                <div style="display:flex;align-items:flex-start;gap:10px;padding:.85rem 1rem;background:rgba(255,149,0,.08);border:1px solid rgba(255,149,0,.25);border-radius:10px;margin-bottom:1.1rem;">
+                    <i data-lucide="info" style="width:15px;height:15px;color:#b96800;flex-shrink:0;margin-top:2px;"></i>
+                    <p style="font-size:.8rem;color:#7a4800;margin:0;line-height:1.55;">
+                        <strong>Network fee:</strong> The XRPL charges ~<strong>0.005 XRP</strong> to unlock a crypto-condition escrow. This is deducted from your payout by the network, not by AgentTrust.
+                    </p>
+                </div>
+                <div class="row-2">
+                    <div class="field-group">
+                        <label class="field-label" for="escrow-sequence">Escrow Sequence</label>
+                        <input type="number" id="escrow-sequence" placeholder="Auto-filled on approval" style="background:rgba(255,255,255,.35);">
+                    </div>
+                    <div class="field-group">
+                        <label class="field-label" for="escrow-owner">Buyer Wallet</label>
+                        <input type="text" id="escrow-owner" placeholder="Auto-filled on approval" style="background:rgba(255,255,255,.35);">
+                    </div>
+                </div>
+                <button class="btn btn-blue" onclick="claimFromPanel()">
+                    <i data-lucide="arrow-right-circle"></i> Claim Payment via Xaman
+                </button>
+                <div class="status-msg" id="claim-status"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- ANIMATED FLOW DIAGRAM -->
+    <!-- ============================================================ -->
+    <section class="flow-section">
+        <h2 class="flow-title">How it works</h2>
+        <p class="flow-subtitle">Five steps. Four seconds to settle. Zero intermediaries.</p>
+
+        <div class="flow-diagram">
+
+            <div class="flow-node">
+                <div class="flow-icon-wrap buyer"><i data-lucide="briefcase"></i></div>
+                <div class="flow-node-label">Step 1</div>
+                <div class="flow-node-title">Buyer Locks Funds</div>
+                <div class="flow-node-sub">XRP escrowed on-chain. Funds unreachable without the secret key.</div>
+            </div>
+
+            <div class="flow-arrow">
+                <svg height="2" viewBox="0 0 36 2">
+                    <line x1="0" y1="1" x2="30" y2="1" class="flow-arrow-line"/>
+                    <polygon points="30,0 36,1 30,2" class="flow-arrow-head"/>
+                </svg>
+            </div>
+
+            <div class="flow-node">
+                <div class="flow-icon-wrap lock"><i data-lucide="lock"></i></div>
+                <div class="flow-node-label">Step 2</div>
+                <div class="flow-node-title">Condition Generated</div>
+                <div class="flow-node-sub">Referee creates a SHA-256 crypto-condition. Key stored in vault.</div>
+            </div>
+
+            <div class="flow-arrow">
+                <svg height="2" viewBox="0 0 36 2">
+                    <line x1="0" y1="1" x2="30" y2="1" class="flow-arrow-line"/>
+                    <polygon points="30,0 36,1 30,2" class="flow-arrow-head"/>
+                </svg>
+            </div>
+
+            <div class="flow-node">
+                <div class="flow-icon-wrap ai"><i data-lucide="cpu"></i></div>
+                <div class="flow-node-label">Step 3</div>
+                <div class="flow-node-title">AI Audit</div>
+                <div class="flow-node-sub">Worker submits proof. Gemini evaluates against the buyer's spec.</div>
+            </div>
+
+            <div class="flow-arrow">
+                <svg height="2" viewBox="0 0 36 2">
+                    <line x1="0" y1="1" x2="30" y2="1" class="flow-arrow-line"/>
+                    <polygon points="30,0 36,1 30,2" class="flow-arrow-head"/>
+                </svg>
+            </div>
+
+            <div class="flow-node">
+                <div class="flow-icon-wrap key"><i data-lucide="key"></i></div>
+                <div class="flow-node-label">Step 4</div>
+                <div class="flow-node-title">Key Released</div>
+                <div class="flow-node-sub">On PASS, the fulfillment key is revealed to the worker only.</div>
+            </div>
+
+            <div class="flow-arrow">
+                <svg height="2" viewBox="0 0 36 2">
+                    <line x1="0" y1="1" x2="30" y2="1" class="flow-arrow-line"/>
+                    <polygon points="30,0 36,1 30,2" class="flow-arrow-head"/>
+                </svg>
+            </div>
+
+            <div class="flow-node">
+                <div class="flow-icon-wrap worker"><i data-lucide="wallet"></i></div>
+                <div class="flow-node-label">Step 5</div>
+                <div class="flow-node-title">Worker Paid</div>
+                <div class="flow-node-sub">EscrowFinish on XRPL. Funds arrive in 4 seconds. XRP or RLUSD.</div>
+            </div>
+
         </div>
     </section>
 
-    <section id="integrate" class="max-w-4xl mx-auto py-20 px-6 text-center">
-        <div class="p-12 rounded-3xl bg-gradient-to-b from-teal-500/10 to-transparent border border-teal-500/20">
-            <h2 class="text-4xl font-bold mb-4">Integrate your Agent</h2>
-            <p class="text-gray-400 mb-8">Ready to automate trust? Point your agent's success webhook to our protocol endpoint.</p>
-            <div class="bg-black/50 p-4 rounded-lg border border-white/5 inline-block mb-8">
-                <code class="mono text-teal-400 text-lg">https://n8n.agenttrust.com/webhook/new-job</code>
+    <!-- ============================================================ -->
+    <!-- COMPARISON SECTION -->
+    <!-- ============================================================ -->
+    <div class="compare-section">
+        <div class="compare-side old">
+            <div class="compare-eyebrow">
+                The old way
+                <span class="compare-eyebrow-line"></span>
             </div>
-            <br>
-            <button class="px-10 py-4 bg-teal-500 text-black font-bold rounded-full hover:scale-105 transition duration-300">Request Beta Access</button>
+            <h2 class="compare-heading">The Middleman<br>Economy</h2>
+            <ul class="compare-items">
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="percent"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">Opaque commissions</div>
+                        <div class="compare-item-sub">Platforms take 10–20% off every transaction, often hidden in the pricing</div>
+                    </div>
+                </li>
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="clock"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">Multi-day settlement</div>
+                        <div class="compare-item-sub">Funds held for days or weeks while platforms process and verify payments</div>
+                    </div>
+                </li>
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="scale"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">Subjective disputes</div>
+                        <div class="compare-item-sub">Human arbiters with conflicts of interest decide who gets paid</div>
+                    </div>
+                </li>
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="file-x"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">No protection for either side</div>
+                        <div class="compare-item-sub">Buyers can refuse payment. Workers can disappear with deposits.</div>
+                    </div>
+                </li>
+            </ul>
+            <div class="compare-stat">
+                <div class="compare-stat-num">20%</div>
+                <div class="compare-stat-label">typical platform commission per transaction</div>
+            </div>
         </div>
-    </section>
 
-    <footer class="py-10 text-center text-gray-600 text-xs uppercase tracking-widest">
-        &copy; 2026 AgentTrust Protocol • Secured by XRPL • Audited by AI
-    </footer>
+        <div class="compare-side new">
+            <div class="compare-eyebrow">
+                The AgentTrust way
+                <span class="compare-eyebrow-line"></span>
+            </div>
+            <h2 class="compare-heading">Code is Law.<br>AI is the Jury.</h2>
+            <ul class="compare-items">
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="coins"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">Flat 0.1 XRP fee</div>
+                        <div class="compare-item-sub">One tiny fee covers escrow setup and the AI audit. The rest goes to the worker.</div>
+                    </div>
+                </li>
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="zap"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">4-second settlement</div>
+                        <div class="compare-item-sub">XRP Ledger finalises in seconds. Funds move the moment the audit passes.</div>
+                    </div>
+                </li>
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="cpu"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">Objective AI verdict</div>
+                        <div class="compare-item-sub">No human bias. Gemini audits work against the buyer's exact specification.</div>
+                    </div>
+                </li>
+                <li class="compare-item">
+                    <div class="compare-item-icon"><i data-lucide="shield-check"></i></div>
+                    <div class="compare-item-text">
+                        <div class="compare-item-title">Both parties protected</div>
+                        <div class="compare-item-sub">Buyer's funds are locked. Worker gets paid on approval. Auto-cancel if abandoned.</div>
+                    </div>
+                </li>
+            </ul>
+            <div class="compare-stat">
+                <div class="compare-stat-num">0.1</div>
+                <div class="compare-stat-label">XRP flat fee — covers setup and AI audit</div>
+            </div>
+        </div>
+    </div>
 
+    <!-- ============================================================ -->
+    <!-- USE CASES -->
+    <!-- ============================================================ -->
+    <h2 class="use-cases-title">Built for every kind of work</h2>
+    <div class="use-cases">
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="bot"></i></div>
+            <h4>AI Agent Marketplaces</h4>
+            <p>Agents post, bid, and settle jobs trustlessly. Fulfillment delivered via webhook the moment the audit passes.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="pen-tool"></i></div>
+            <h4>Freelance &amp; Creative</h4>
+            <p>Writers, designers, and developers get paid the second the AI verifies their deliverable meets spec.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="truck"></i></div>
+            <h4>Supply Chain</h4>
+            <p>Release manufacturer payments the moment AI verifies port-entry data and bill of lading authenticity.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="copyright"></i></div>
+            <h4>IP &amp; Royalties</h4>
+            <p>Lock funds for digital assets. AI verifies licensing terms and copyright uniqueness before release.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="shield"></i></div>
+            <h4>Bug Bounties</h4>
+            <p>Secure $1M+ bounties. AI verifies the exploit proof-of-concept before releasing capital to the researcher.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="landmark"></i></div>
+            <h4>Legal Settlements</h4>
+            <p>Unbiased AI arbiter for high-stakes corporate settlements where both parties require a neutral payout.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="home"></i></div>
+            <h4>Real Estate</h4>
+            <p>AI verifies land registry and structural reports to release deposits instantly, bypassing slow solicitors.</p>
+        </div>
+        <div class="use-case">
+            <div class="use-case-icon"><i data-lucide="trending-up"></i></div>
+            <h4>Corporate M&amp;A</h4>
+            <p>Hold funds during mergers. AI verifies financial audit benchmarks to trigger tranches of payout automatically.</p>
+        </div>
+    </div>
+
+</div><!-- /container -->
+
+<footer>
+    <div class="logo" style="font-size:1.9rem;margin-bottom:1rem;display:block;text-align:center;">AgentTrust<span>.</span></div>
+    <div class="disclaimer">
+        <strong>Legal Disclaimer:</strong> AgentTrust is a decentralized software protocol. We do not provide financial, legal, or investment advice. The protocol is provided "as is" without warranty of any kind. Users interact with the XRP Ledger and AI Referee at their own risk. AgentTrust does not hold, manage, or have custody of user funds at any time. All transactions are final and irreversible on the blockchain.
+    </div>
+    <p style="color:#b0b0be;font-size:.75rem;margin-top:1rem;">&copy; 2026 AgentTrust Protocol. All rights reserved.</p>
+</footer>
+
+<script>
+    // Init Lucide icons
+    lucide.createIcons();
+
+    function switchTab(tab) {
+        document.getElementById("panel-buyer").style.display  = tab === "buyer"  ? "block" : "none";
+        document.getElementById("panel-worker").style.display = tab === "worker" ? "block" : "none";
+        document.getElementById("tab-buyer").classList.toggle("active",  tab === "buyer");
+        document.getElementById("tab-worker").classList.toggle("active", tab === "worker");
+        lucide.createIcons();
+    }
+</script>
+<script src="js/app.js"></script>
 </body>
 </html>
