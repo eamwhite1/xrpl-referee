@@ -44,7 +44,7 @@ app = FastAPI(title="AgentTrust Protocol Core")
 # --- 2. CORS MIDDLEWARE ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,7 +59,6 @@ else:
 @app.get("/")
 @app.head("/")
 def serve_ui():
-    """Satisfies UptimeRobot (HEAD) and Users (GET)"""
     path = "static/index.html"
     if os.path.exists(path):
         return FileResponse(path)
@@ -67,7 +66,6 @@ def serve_ui():
 
 @app.get("/status")
 def health_check():
-    """Explicit secondary endpoint for health checks"""
     return {"status": "online", "timestamp": datetime.now(timezone.utc)}
 
 # --- 4. DATABASE CONFIGURATION ---
@@ -135,7 +133,6 @@ except Exception as e:
 xumm_api_key = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
 
-# This will tell us in the logs if the keys are actually being "seen"
 if xumm_api_key:
     logger.info(f"✅ XUMM_API_KEY found (Starts with: {xumm_api_key[:4]}...)")
 else:
@@ -150,7 +147,6 @@ xumm_sdk = None
 if xumm_api_key and xumm_api_secret and XummSdk:
     try:
         xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
-        # Check connection to Xumm
         pong = xumm_sdk.ping()
         logger.info(f"🔌 XUMM SDK Initialized: {pong.application.name}")
     except Exception as e:
@@ -159,7 +155,7 @@ if xumm_api_key and xumm_api_secret and XummSdk:
 class AuditRequest(BaseModel):
     task: str
     work: str
-    escrow_id: str 
+    escrow_id: str
 
 class EscrowSetupRequest(BaseModel):
     escrow_id: str
@@ -173,21 +169,22 @@ async def raw_smart_audit(task: str, work: str):
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing")
-        
-    candidates = ["gemini-3-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
-    
-    # We force the AI to follow a strict "Machine-First" format
+
+    # FIX: Removed non-existent "gemini-3-flash". Using valid model names only.
+    candidates = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
     refined_prompt = (
         f"You are a strict autonomous escrow auditor.\n"
         f"TASK: {task}\n"
         f"WORK SUBMITTED: {work}\n\n"
         f"INSTRUCTIONS:\n"
-        f"1. You must start your response with exactly 'VERDICT: PASS' or 'VERDICT: FAIL'.\n"
-        f"2. Follow this with a 1-2 sentence detailed explanation for the human worker."
+        f"1. You must start your response with EXACTLY 'VERDICT: PASS' or 'VERDICT: FAIL' with no other text before it.\n"
+        f"2. Do NOT use any markdown formatting like ** or ## in your response.\n"
+        f"3. Follow the verdict with a 1-2 sentence plain-text explanation for the human worker."
     )
-    
+
     payload = {"contents": [{"parts": [{"text": refined_prompt}]}]}
-    
+
     async with httpx.AsyncClient() as client:
         for model_id in candidates:
             try:
@@ -196,13 +193,15 @@ async def raw_smart_audit(task: str, work: str):
                 if res.status_code == 200:
                     data = res.json()
                     verdict_text = data['candidates'][0]['content']['parts'][0]['text'].strip()
-                    # We return the text as-is, the calling function will handle the 'PASS' check
+                    logger.info(f"✅ AI Model Used: {model_id} | Raw Verdict: {repr(verdict_text)}")
                     return verdict_text, model_id
+                else:
+                    logger.warning(f"Model {model_id} returned status {res.status_code}: {res.text}")
             except Exception as e:
-                print(f"Model {model_id} failed: {e}")
+                logger.warning(f"Model {model_id} failed: {e}")
                 continue
-                
-    raise Exception("AI Gateway Failure")
+
+    raise Exception("AI Gateway Failure: All models exhausted")
 
 # --- 7. PROTOCOL ENDPOINTS ---
 
@@ -215,59 +214,43 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
 
     # 2. Fee Verification
     if req.fee_hash:
-        # Check if hash has been used before
         already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
         if already_used:
             raise HTTPException(status_code=403, detail="Fee hash already used")
-        
+
         client = AsyncJsonRpcClient(XRPL_URL)
         try:
             tx_res = await client.request(Tx(transaction=req.fee_hash))
             if not tx_res.is_successful():
                 raise HTTPException(status_code=402, detail="Fee transaction not found on Ledger")
-            
-            # The Ledger response is using 'tx_json' based on your Render logs
+
             body = tx_res.result
-            
-            # This covers all bases: Top level, 'tx', or 'tx_json'
             tx_data = body.get("tx_json") or body.get("tx") or body
-            
             tx_type = tx_data.get("TransactionType")
             dest = tx_data.get("Destination")
-            
-            # DEBUG LOGGING: This will now show the actual Payment data in Render
+
             logger.info(f"🔍 LEDGER CHECK: Type={tx_type} | Dest={dest} | Target={TARGET_ADDRESS}")
 
-            # Validate Transaction Type
             if tx_type != "Payment":
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Hash provided is a {tx_type}, not a Payment."
-                )
-            
-            # Validate Destination (Case-Insensitive & Trimmed)
+                raise HTTPException(status_code=400, detail=f"Hash provided is a {tx_type}, not a Payment.")
+
             if not dest or str(dest).strip().lower() != TARGET_ADDRESS.strip().lower():
-                raise HTTPException(
-                    status_code=402, 
-                    detail=f"Target mismatch! Ledger says Dest is: {dest}"
-                )
-            
-            # If valid, log it so it can't be reused for another project
+                raise HTTPException(status_code=402, detail=f"Target mismatch! Ledger says Dest is: {dest}")
+
             db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
-            db.commit() 
-            
+            db.commit()
+
         except Exception as e:
             logger.error(f"Manual Hash Verify Error: {str(e)}")
             if isinstance(e, HTTPException):
                 raise e
             raise HTTPException(status_code=400, detail=f"Ledger verification failed: {str(e)}")
 
-    # 3. Generate Perfect XRPL Cryptography
+    # 3. Generate XRPL Cryptography
     preimage_bytes = secrets.token_bytes(32)
     preimage_hex = preimage_bytes.hex().upper()
     hash_hex = hashlib.sha256(preimage_bytes).hexdigest().upper()
-    
-    # Strict ASN.1 Condition and Fulfillment
+
     final_condition = f"A0258020{hash_hex}810120"
     final_fulfillment = f"A0228020{preimage_hex}"
 
@@ -275,13 +258,13 @@ async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(
     new_vault = EscrowVault(
         escrow_id=req.escrow_id,
         condition=final_condition,
-        fulfillment=final_fulfillment, 
+        fulfillment=final_fulfillment,
         status="LOCKED"
     )
     db.add(new_vault)
     db.commit()
 
-    # This return is what your app.js is waiting for to trigger Xaman
+    logger.info(f"🔒 VAULT CREATED: escrow_id='{req.escrow_id}' | Condition starts: {final_condition[:20]}...")
     return {"condition": final_condition, "status": "LOCKED"}
 
 @app.post("/xumm/create-payload")
@@ -299,7 +282,7 @@ async def create_xumm_payload(req: XummPayloadRequest):
 
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), db: Session = Depends(get_db)):
-    if not x_payment_hash: 
+    if not x_payment_hash:
         raise HTTPException(status_code=400, detail="Missing payment hash")
 
     # 1. Anti-Spam: Check if this hash was already used for a COMPLETED audit
@@ -307,55 +290,59 @@ async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), d
     if already_used and already_used.ai_verdict is not None:
         raise HTTPException(status_code=403, detail="Audit fee hash already used")
 
-    # 2. Ledger Check: Verify the 0.2 XRP fee exists on the XRPL
+    # 2. Ledger Check
     client = AsyncJsonRpcClient(XRPL_URL)
     tx_res = await client.request(Tx(transaction=x_payment_hash))
     if not tx_res.is_successful():
         raise HTTPException(status_code=402, detail="Transaction not found on Ledger")
 
-    # 3. AI Audit: Get the verdict from Gemini
+    # 3. AI Audit
     verdict, model_used = await raw_smart_audit(req.task, req.work)
-    
-    # --- THE NUCLEAR FIX ---
-    # We clean the text and check for BOTH 'PASS' (new) and 'APPROVED' (old/standalone)
+
+    # FIX: Strip markdown formatting before checking verdict.
+    # Gemini sometimes wraps output in **bold** even when told not to.
     clean_verdict = verdict.strip().upper()
-    is_approved = "PASS" in clean_verdict or "APPROVED" in clean_verdict
-    # -----------------------
+    # Remove common markdown artifacts before checking
+    clean_verdict = clean_verdict.replace("*", "").replace("#", "").replace("`", "")
+
+    is_approved = clean_verdict.startswith("VERDICT: PASS") or "VERDICT: PASS" in clean_verdict
+
+    logger.info(f"🧠 AUDIT RESULT: escrow_id='{req.escrow_id}' | Approved={is_approved} | Clean verdict start: {clean_verdict[:50]}")
 
     revealed_fulfillment = None
-    
+
     if is_approved:
-        # Search the Vault for the secret key using the Project ID
+        # FIX: Detailed vault lookup logging to diagnose mismatches
         vault_entry = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+
+        logger.info(f"🔍 VAULT LOOKUP: searching for escrow_id='{req.escrow_id}' | Found={vault_entry is not None}")
+
         if vault_entry:
             revealed_fulfillment = vault_entry.fulfillment
             vault_entry.status = "RELEASED"
+            db.commit()
             logger.info(f"✅ KEY RELEASED for Project: {req.escrow_id}")
         else:
-            logger.warning(f"⚠️ Audit PASSED but no Vault found for ID: {req.escrow_id}")
+            # FIX: Log ALL existing vault IDs so you can see exactly what's stored vs what was searched
+            all_vaults = db.query(EscrowVault).all()
+            stored_ids = [v.escrow_id for v in all_vaults]
+            logger.error(f"❌ VAULT MISS: No entry for '{req.escrow_id}'. All stored IDs: {stored_ids}")
 
-    # 4. Log the result to prevent double-spending the fee hash
+    # 4. Log the result
     log_entry = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
     if not log_entry:
         log_entry = PaymentLog(payment_hash=x_payment_hash)
         db.add(log_entry)
-        
+
     log_entry.ai_verdict = verdict
     log_entry.model_used = model_used
     db.commit()
 
+    # FIX: Return a clear vault_found flag so the frontend can give a specific error
     return {
-        "ai_verdict": verdict, 
-        "model_used": model_used, 
+        "ai_verdict": verdict,
+        "model_used": model_used,
         "status": "success" if is_approved else "rejected",
-        "fulfillment": revealed_fulfillment 
+        "fulfillment": revealed_fulfillment,
+        "vault_found": vault_entry is not None if is_approved else None
     }
-
-
-
-
-
-
-
-
-
