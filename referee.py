@@ -2,10 +2,9 @@ import os
 import httpx
 import logging
 import sys
-import asyncio
-import hmac
 import hashlib
 import secrets
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,10 +19,9 @@ from dotenv import load_dotenv
 from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
-from xrpl.utils import drops_to_xrp
 from xrpl.core.addresscodec import decode_seed
 
-# XUMM SDK Import (Graceful fallback if not installed)
+# XUMM SDK Import
 try:
     from xumm import XummSdk
 except ImportError:
@@ -34,14 +32,18 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# --- 1. INITIAL SETUP & LOGGING ---
+# ---------------------------------------------------------------------------
+# 1. INITIAL SETUP & LOGGING
+# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
 app = FastAPI(title="AgentTrust Protocol Core")
 
-# --- 2. CORS MIDDLEWARE ---
+# ---------------------------------------------------------------------------
+# 2. CORS
+# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,11 +52,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. UI & STATIC FILE ROUTING ---
+# ---------------------------------------------------------------------------
+# 3. STATIC FILES & HEALTH
+# ---------------------------------------------------------------------------
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 else:
-    logger.warning("⚠️ 'static' directory not found. UI will not be served.")
+    logger.warning("⚠️ 'static' directory not found.")
 
 @app.get("/")
 @app.head("/")
@@ -62,16 +66,18 @@ def serve_ui():
     path = "static/index.html"
     if os.path.exists(path):
         return FileResponse(path)
-    return {"status": "Referee Online", "message": "UI file not found in /static"}
+    return {"status": "Referee Online", "message": "UI not found in /static"}
 
 @app.get("/status")
 def health_check():
     return {"status": "online", "timestamp": datetime.now(timezone.utc)}
 
-# --- 4. DATABASE CONFIGURATION ---
+# ---------------------------------------------------------------------------
+# 4. DATABASE
+# ---------------------------------------------------------------------------
 db_url_raw = os.getenv("DATABASE_URL")
 if not db_url_raw:
-    logger.error("❌ DATABASE_URL missing!")
+    logger.error("❌ DATABASE_URL missing! Using SQLite fallback.")
     DATABASE_URL = "sqlite:///./fallback.db"
 else:
     DATABASE_URL = db_url_raw.replace("postgres://", "postgresql://", 1)
@@ -86,26 +92,47 @@ engine = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
 class PaymentLog(Base):
+    """
+    Every consumed fee hash lives here.
+    One hash = one use, forever. This is the anti-replay guard.
+    """
     __tablename__ = "payment_logs"
     id = Column(Integer, primary_key=True, index=True)
     payment_hash = Column(String, unique=True, index=True, nullable=False)
+    purpose = Column(String, nullable=True)       # "setup_fee"
     sender = Column(String, nullable=True)
-    amount = Column(Float, nullable=True)
-    currency = Column(String, nullable=True)
-    task_summary = Column(String, nullable=True)
-    ai_verdict = Column(Text, nullable=True)
-    model_used = Column(String, nullable=True)
+    amount_xrp = Column(Float, nullable=True)
+    escrow_id = Column(String, nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+
 class EscrowVault(Base):
+    """
+    Single source of truth for all escrow state.
+    Stores the fulfillment key, job details, and audit result.
+    The Banker service is no longer needed.
+    """
     __tablename__ = "escrow_vault"
-    escrow_id = Column(String, primary_key=True, index=True)
-    condition = Column(String, nullable=False)
-    fulfillment = Column(String, nullable=False)
-    status = Column(String, default="LOCKED")
+    escrow_id       = Column(String, primary_key=True, index=True)
+    condition       = Column(String, nullable=False)
+    fulfillment     = Column(String, nullable=False)
+    status          = Column(String, default="LOCKED")  # LOCKED | RELEASED | CANCELLED
+    # Job metadata stored at vault creation so the audit endpoint has full context
+    buyer_name       = Column(String, nullable=True)
+    task_description = Column(Text, nullable=True)
+    worker_address   = Column(String, nullable=True)
+    amount_xrp      = Column(Float, nullable=True)
+    cancel_after_ts = Column(DateTime, nullable=True)   # Human-readable deadline
+    # Audit result
+    ai_verdict      = Column(Text, nullable=True)       # JSON string
+    model_used      = Column(String, nullable=True)
+    created_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 
 Base.metadata.create_all(bind=engine)
+
 
 def get_db():
     db = SessionLocal()
@@ -114,9 +141,13 @@ def get_db():
     finally:
         db.close()
 
-# --- 5. CONFIGURATION ---
-XRPL_URL = os.getenv("XRPL_URL", "https://xrplcluster.com")
-TARGET_ADDRESS = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+
+# ---------------------------------------------------------------------------
+# 5. CONFIGURATION
+# ---------------------------------------------------------------------------
+XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
+PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+MIN_FEE_XRP     = 0.2   # Single upfront fee — covers setup + audit
 
 try:
     seed = os.getenv("XRPL_SEED")
@@ -124,225 +155,456 @@ try:
         raise ValueError("XRPL_SEED not found.")
     _, algo = decode_seed(seed)
     referee_wallet = Wallet.from_seed(seed, algorithm=algo)
-    logger.info(f"🚀 AGENT ACTIVE: Monitoring {referee_wallet.address}")
+    logger.info(f"🚀 AGENT ACTIVE: {referee_wallet.address}")
 except Exception as e:
-    logger.error(f"STARTUP ERROR: {e}")
+    logger.error(f"STARTUP ERROR (wallet): {e}")
     referee_wallet = None
 
-# XUMM SDK Setup
-xumm_api_key = os.getenv("XUMM_API_KEY")
+# XUMM SDK
+xumm_api_key    = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
+xumm_sdk        = None
 
 if xumm_api_key:
-    logger.info(f"✅ XUMM_API_KEY found (Starts with: {xumm_api_key[:4]}...)")
+    logger.info(f"✅ XUMM_API_KEY found (starts: {xumm_api_key[:4]}...)")
 else:
-    logger.error("❌ XUMM_API_KEY is EMPTY in Render environment variables!")
+    logger.error("❌ XUMM_API_KEY missing!")
 
-if xumm_api_secret:
-    logger.info("✅ XUMM_API_SECRET found.")
-else:
-    logger.error("❌ XUMM_API_SECRET is EMPTY in Render environment variables!")
-
-xumm_sdk = None
 if xumm_api_key and xumm_api_secret and XummSdk:
     try:
         xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
         pong = xumm_sdk.ping()
-        logger.info(f"🔌 XUMM SDK Initialized: {pong.application.name}")
+        logger.info(f"🔌 XUMM SDK connected: {pong.application.name}")
     except Exception as e:
-        logger.error(f"❌ XUMM SDK Failed to ping: {e}")
+        logger.error(f"❌ XUMM SDK ping failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 6. PYDANTIC MODELS
+# ---------------------------------------------------------------------------
+class EscrowSetupRequest(BaseModel):
+    escrow_id:        str
+    fee_hash:         str           # Required — buyer must pay before vault is created
+    buyer_name:       str           # Stored in vault for worker info lookup
+    task_description: str           # The job requirements the AI will audit against
+    worker_address:   str           # Worker's XRPL wallet (EscrowFinish destination)
+    amount_xrp:       float         # Amount being locked in escrow
+    cancel_after_hrs: int = 168     # Default: 7 days (168 hours)
 
 class AuditRequest(BaseModel):
-    task: str
-    work: str
     escrow_id: str
-
-class EscrowSetupRequest(BaseModel):
-    escrow_id: str
-    fee_hash: Optional[str] = None
+    work:      str                  # Worker's submitted proof of work
+    # Agent flow: optionally receive fulfillment via webhook instead of polling
+    callback_url: Optional[str] = None
 
 class XummPayloadRequest(BaseModel):
     txjson: dict
 
-# --- 6. AI AUDIT ENGINE ---
-async def raw_smart_audit(task: str, work: str):
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        raise Exception("GEMINI_API_KEY is missing")
 
-    # FIX: Removed non-existent "gemini-3-flash". Using valid model names only.
+# ---------------------------------------------------------------------------
+# 7. FEE VERIFICATION HELPER
+# ---------------------------------------------------------------------------
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict:
+    """
+    Verifies a tx hash on the XRPL and enforces:
+      - It is a Payment transaction
+      - Destination is the protocol wallet
+      - Amount is >= MIN_FEE_XRP
+      - Hash has never been used before (anti-replay attack prevention)
+
+    Logs the hash immediately on success so it can never be reused.
+    Returns {"sender": str, "amount_xrp": float} on success.
+    Raises HTTPException on any failure.
+    """
+    # Anti-replay: reject if hash already consumed
+    already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == fee_hash).first()
+    if already_used:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Payment hash already used for escrow '{already_used.escrow_id}' "
+                f"on {already_used.timestamp.strftime('%Y-%m-%d %H:%M UTC')}."
+            )
+        )
+
+    # Ledger lookup
+    client = AsyncJsonRpcClient(XRPL_URL)
+    try:
+        tx_res = await client.request(Tx(transaction=fee_hash))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ledger lookup failed: {str(e)}")
+
+    if not tx_res.is_successful():
+        raise HTTPException(status_code=402, detail="Transaction hash not found on the XRPL ledger.")
+
+    body    = tx_res.result
+    tx_data = body.get("tx_json") or body.get("tx") or body
+
+    tx_type    = tx_data.get("TransactionType", "")
+    dest       = str(tx_data.get("Destination", "")).strip()
+    raw_amount = tx_data.get("Amount", "0")
+    sender     = tx_data.get("Account", "unknown")
+
+    logger.info(f"🔍 LEDGER: type={tx_type} | dest={dest} | amount={raw_amount} | from={sender}")
+
+    # Must be a Payment
+    if tx_type != "Payment":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transaction is '{tx_type}', not a Payment."
+        )
+
+    # Destination must be the protocol wallet
+    if dest.lower() != PROTOCOL_WALLET.lower():
+        raise HTTPException(
+            status_code=402,
+            detail=f"Wrong destination. Expected {PROTOCOL_WALLET}, got {dest}."
+        )
+
+    # Issued currency not supported for fees
+    if isinstance(raw_amount, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Protocol fees must be paid in XRP, not issued currency."
+        )
+
+    # Amount must meet minimum
+    amount_xrp = int(raw_amount) / 1_000_000
+    if amount_xrp < MIN_FEE_XRP:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient fee. Required ≥{MIN_FEE_XRP} XRP, received {amount_xrp:.6f} XRP."
+        )
+
+    # Log the hash — consumed, can never be reused
+    db.add(PaymentLog(
+        payment_hash=fee_hash,
+        purpose="setup_fee",
+        sender=sender,
+        amount_xrp=amount_xrp,
+        escrow_id=escrow_id,
+    ))
+    db.commit()
+
+    logger.info(f"✅ FEE VERIFIED: {amount_xrp} XRP from {sender} for escrow '{escrow_id}'")
+    return {"sender": sender, "amount_xrp": amount_xrp}
+
+
+# ---------------------------------------------------------------------------
+# 8. AI AUDIT ENGINE
+# ---------------------------------------------------------------------------
+async def run_ai_audit(task: str, work: str) -> tuple[dict, str]:
+    """
+    Calls Gemini and returns a structured JSON verdict.
+    Response is always machine-parseable — no regex needed by agents.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise Exception("GEMINI_API_KEY is missing from environment.")
+
     candidates = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
-    refined_prompt = (
-        f"You are a strict autonomous escrow auditor.\n"
-        f"TASK: {task}\n"
-        f"WORK SUBMITTED: {work}\n\n"
-        f"INSTRUCTIONS:\n"
-        f"1. You must start your response with EXACTLY 'VERDICT: PASS' or 'VERDICT: FAIL' with no other text before it.\n"
-        f"2. Do NOT use any markdown formatting like ** or ## in your response.\n"
-        f"3. Follow the verdict with a 1-2 sentence plain-text explanation for the human worker."
+    prompt = (
+        "You are a strict autonomous escrow auditor. "
+        "Your response must be valid JSON and nothing else — no markdown, no backticks, no preamble.\n\n"
+        f"TASK REQUIREMENTS:\n{task}\n\n"
+        f"WORK SUBMITTED:\n{work}\n\n"
+        "Respond with ONLY this JSON object:\n"
+        "{\n"
+        '  "verdict": "PASS" or "FAIL",\n'
+        '  "score": <integer 0-100>,\n'
+        '  "summary": "<one sentence conclusion>",\n'
+        '  "details": "<2-3 sentences of specific feedback for the worker>",\n'
+        '  "criteria_met": ["<requirement 1>", "..."],\n'
+        '  "criteria_failed": ["<requirement 1>", "..."]\n'
+        "}"
     )
 
-    payload = {"contents": [{"parts": [{"text": refined_prompt}]}]}
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     async with httpx.AsyncClient() as client:
         for model_id in candidates:
             try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-                res = await client.post(url, json=payload, timeout=20.0)
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model_id}:generateContent?key={api_key}"
+                )
+                res = await client.post(url, json=payload, timeout=25.0)
+
                 if res.status_code == 200:
-                    data = res.json()
-                    verdict_text = data['candidates'][0]['content']['parts'][0]['text'].strip()
-                    logger.info(f"✅ AI Model Used: {model_id} | Raw Verdict: {repr(verdict_text)}")
-                    return verdict_text, model_id
+                    data     = res.json()
+                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+                    logger.info(f"🤖 AI raw ({model_id}): {repr(raw_text[:300])}")
+
+                    # Strip accidental markdown fences
+                    clean = raw_text.replace("```json", "").replace("```", "").strip()
+                    verdict_dict = json.loads(clean)
+                    verdict_dict["verdict"] = str(verdict_dict.get("verdict", "FAIL")).strip().upper()
+
+                    logger.info(
+                        f"✅ AI VERDICT: {verdict_dict['verdict']} | "
+                        f"score={verdict_dict.get('score')} | model={model_id}"
+                    )
+                    return verdict_dict, model_id
+
                 else:
-                    logger.warning(f"Model {model_id} returned status {res.status_code}: {res.text}")
+                    logger.warning(f"Model {model_id} HTTP {res.status_code}: {res.text[:200]}")
+
             except Exception as e:
                 logger.warning(f"Model {model_id} failed: {e}")
                 continue
 
-    raise Exception("AI Gateway Failure: All models exhausted")
+    raise Exception("AI Gateway Failure: all models exhausted.")
 
-# --- 7. PROTOCOL ENDPOINTS ---
 
-@app.post("/escrow/generate")
-async def generate_escrow_crypto(req: EscrowSetupRequest, db: Session = Depends(get_db)):
-    # 1. Existing ID check
-    existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Escrow ID already exists")
+# ---------------------------------------------------------------------------
+# 10. XUMM ENDPOINTS
+# ---------------------------------------------------------------------------
+@app.post("/xumm/fee-payload")
+async def create_fee_payload():
+    """
+    Step 1A — Creates a Xaman sign request for the 0.2 XRP protocol fee.
+    The buyer calls this first. After signing in Xaman, they get a tx hash
+    which they pass to /escrow/generate.
+    """
+    if not xumm_sdk:
+        raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
 
-    # 2. Fee Verification
-    if req.fee_hash:
-        already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == req.fee_hash).first()
-        if already_used:
-            raise HTTPException(status_code=403, detail="Fee hash already used")
+    tx = {
+        "TransactionType": "Payment",
+        "Destination": PROTOCOL_WALLET,
+        "Amount": str(int(MIN_FEE_XRP * 1_000_000)),  # drops
+    }
 
-        client = AsyncJsonRpcClient(XRPL_URL)
-        try:
-            tx_res = await client.request(Tx(transaction=req.fee_hash))
-            if not tx_res.is_successful():
-                raise HTTPException(status_code=402, detail="Fee transaction not found on Ledger")
+    try:
+        result = xumm_sdk.payload.create(tx)
+        return {
+            "nextUrl": result.next.always,
+            "uuid":    result.uuid,
+            "qr":      result.refs.qr_png,
+        }
+    except Exception as e:
+        logger.error(f"❌ XUMM fee payload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-            body = tx_res.result
-            tx_data = body.get("tx_json") or body.get("tx") or body
-            tx_type = tx_data.get("TransactionType")
-            dest = tx_data.get("Destination")
 
-            logger.info(f"🔍 LEDGER CHECK: Type={tx_type} | Dest={dest} | Target={TARGET_ADDRESS}")
+@app.get("/xumm/payload/{uuid}")
+async def get_xumm_payload_status(uuid: str):
+    """
+    Poll this after showing Xaman QR/deeplink.
+    Returns signed=true and the tx_hash once the user has signed.
+    The frontend polls this every 3 seconds until signed=true.
+    """
+    if not xumm_sdk:
+        raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
+    try:
+        result   = xumm_sdk.payload.get(uuid)
+        signed   = result.meta.signed
+        tx_hash  = result.response.txid if signed else None
+        return {"signed": signed, "tx_hash": tx_hash}
+    except Exception as e:
+        logger.error(f"❌ XUMM poll error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-            if tx_type != "Payment":
-                raise HTTPException(status_code=400, detail=f"Hash provided is a {tx_type}, not a Payment.")
-
-            if not dest or str(dest).strip().lower() != TARGET_ADDRESS.strip().lower():
-                raise HTTPException(status_code=402, detail=f"Target mismatch! Ledger says Dest is: {dest}")
-
-            db.add(PaymentLog(payment_hash=req.fee_hash, task_summary=f"Fee for {req.escrow_id}"))
-            db.commit()
-
-        except Exception as e:
-            logger.error(f"Manual Hash Verify Error: {str(e)}")
-            if isinstance(e, HTTPException):
-                raise e
-            raise HTTPException(status_code=400, detail=f"Ledger verification failed: {str(e)}")
-
-    # 3. Generate XRPL Cryptography
-    preimage_bytes = secrets.token_bytes(32)
-    preimage_hex = preimage_bytes.hex().upper()
-    hash_hex = hashlib.sha256(preimage_bytes).hexdigest().upper()
-
-    final_condition = f"A0258020{hash_hex}810120"
-    final_fulfillment = f"A0228020{preimage_hex}"
-
-    # 4. Save to Database
-    new_vault = EscrowVault(
-        escrow_id=req.escrow_id,
-        condition=final_condition,
-        fulfillment=final_fulfillment,
-        status="LOCKED"
-    )
-    db.add(new_vault)
-    db.commit()
-
-    logger.info(f"🔒 VAULT CREATED: escrow_id='{req.escrow_id}' | Condition starts: {final_condition[:20]}...")
-    return {"condition": final_condition, "status": "LOCKED"}
 
 @app.post("/xumm/create-payload")
 async def create_xumm_payload(req: XummPayloadRequest):
+    """Generic Xaman payload for EscrowCreate / EscrowFinish."""
     if not xumm_sdk:
-        logger.error("❌ XUMM SDK not initialized.")
         raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
     try:
-        logger.info(f"🚀 Sending to Xaman: {req.txjson}")
+        logger.info(f"🚀 Xaman payload: {req.txjson}")
         result = xumm_sdk.payload.create(req.txjson)
-        return {"nextUrl": result.next.always}
+        return {"nextUrl": result.next.always, "uuid": result.uuid}
     except Exception as e:
-        logger.error(f"❌ XUMM API ERROR: {str(e)}")
+        logger.error(f"❌ XUMM payload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---------------------------------------------------------------------------
+# 11. CORE PROTOCOL ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.post("/escrow/generate")
+async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)):
+    """
+    BUYER — Step 1B.
+    Called after the buyer has paid the 0.2 XRP fee and received their tx hash.
+
+    1. Verifies the fee payment on-chain (amount, destination, anti-replay)
+    2. Generates crypto-condition primitives (fulfillment + condition)
+    3. Stores the vault with all job metadata
+    4. Emails the worker their job details and portal link
+    5. Returns the Condition for the buyer to use in EscrowCreate via Xaman
+    """
+    # Guard: escrow_id must be unique
+    existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Project ID '{req.escrow_id}' already exists. Please choose a different ID."
+        )
+
+    # Gate: verify the fee was paid correctly
+    await verify_fee_payment(
+        fee_hash=req.fee_hash,
+        escrow_id=req.escrow_id,
+        db=db,
+    )
+
+    # Generate XRPL crypto-condition primitives
+    preimage_bytes   = secrets.token_bytes(32)
+    preimage_hex     = preimage_bytes.hex().upper()
+    hash_hex         = hashlib.sha256(preimage_bytes).hexdigest().upper()
+    final_condition  = f"A0258020{hash_hex}810120"
+    final_fulfillment = f"A0228020{preimage_hex}"
+
+    # Calculate human-readable deadline
+    cancel_after_ts = None
+    if req.cancel_after_hrs:
+        from datetime import timedelta
+        cancel_after_ts = datetime.now(timezone.utc) + timedelta(hours=req.cancel_after_hrs)
+
+    # Persist vault — single source of truth
+    vault = EscrowVault(
+        escrow_id        = req.escrow_id,
+        condition        = final_condition,
+        fulfillment      = final_fulfillment,
+        status           = "LOCKED",
+        buyer_name       = req.buyer_name,
+        task_description = req.task_description,
+        worker_address   = req.worker_address,
+        amount_xrp       = req.amount_xrp,
+        cancel_after_ts  = cancel_after_ts,
+    )
+    db.add(vault)
+    db.commit()
+
+    logger.info(f"🔒 VAULT CREATED: escrow_id='{req.escrow_id}'")
+
+    # CancelAfter in XRPL ripple epoch seconds for the EscrowCreate tx
+    RIPPLE_EPOCH = 946684800
+    cancel_after_ripple = (
+        int(cancel_after_ts.timestamp()) - RIPPLE_EPOCH
+        if cancel_after_ts else None
+    )
+
+    return {
+        "escrow_id":           req.escrow_id,
+        "condition":           final_condition,
+        "status":              "LOCKED",
+        "cancel_after_ripple": cancel_after_ripple,
+        "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
+    }
+
+
+@app.get("/escrow/{escrow_id}")
+async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
+    """
+    WORKER — Called when the worker lands on the portal with a Project ID.
+    Returns non-sensitive job info so the worker can see what they need to deliver.
+    The fulfillment key is never returned here.
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Project '{escrow_id}' not found.")
+
+    deadline_str = (
+        vault.cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC")
+        if vault.cancel_after_ts else "Not specified"
+    )
+
+    return {
+        "escrow_id":       vault.escrow_id,
+        "status":          vault.status,
+        "buyer_name":      vault.buyer_name,
+        "task_description":vault.task_description,
+        "amount_xrp":      vault.amount_xrp,
+        "deadline":        deadline_str,
+        "worker_address":  vault.worker_address,
+    }
+
+
 @app.post("/evaluate")
-async def evaluate_work(req: AuditRequest, x_payment_hash: str = Header(None), db: Session = Depends(get_db)):
-    if not x_payment_hash:
-        raise HTTPException(status_code=400, detail="Missing payment hash")
+async def evaluate_work(
+    req: AuditRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    WORKER — Step 2.
+    The worker submits their proof of work. No payment required here —
+    the buyer already covered the audit fee in Step 1.
 
-    # 1. Anti-Spam: Check if this hash was already used for a COMPLETED audit
-    already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
-    if already_used and already_used.ai_verdict is not None:
-        raise HTTPException(status_code=403, detail="Audit fee hash already used")
+    1. Looks up the vault by escrow_id
+    2. Verifies the vault is LOCKED (not already released or cancelled)
+    3. Runs the AI audit using the stored task description vs submitted work
+    4. If PASS: reveals the fulfillment key so the worker can do EscrowFinish
+    5. If callback_url provided (agents): posts the fulfillment there too
+    """
+    # Look up the vault
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
 
-    # 2. Ledger Check
-    client = AsyncJsonRpcClient(XRPL_URL)
-    tx_res = await client.request(Tx(transaction=x_payment_hash))
-    if not tx_res.is_successful():
-        raise HTTPException(status_code=402, detail="Transaction not found on Ledger")
+    if not vault:
+        all_ids = [v.escrow_id for v in db.query(EscrowVault).all()]
+        logger.error(f"❌ VAULT MISS: '{req.escrow_id}' not found. Stored: {all_ids}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Project ID '{req.escrow_id}' not found. Check the ID is exactly correct."
+        )
 
-    # 3. AI Audit
-    verdict, model_used = await raw_smart_audit(req.task, req.work)
+    if vault.status == "RELEASED":
+        raise HTTPException(
+            status_code=409,
+            detail="This escrow has already been released."
+        )
 
-    # FIX: Strip markdown formatting before checking verdict.
-    # Gemini sometimes wraps output in **bold** even when told not to.
-    clean_verdict = verdict.strip().upper()
-    # Remove common markdown artifacts before checking
-    clean_verdict = clean_verdict.replace("*", "").replace("#", "").replace("`", "")
+    if vault.status == "CANCELLED":
+        raise HTTPException(
+            status_code=409,
+            detail="This escrow has been cancelled by the buyer."
+        )
 
-    is_approved = clean_verdict.startswith("VERDICT: PASS") or "VERDICT: PASS" in clean_verdict
+    # Run the AI audit using the buyer's task description stored in the vault
+    verdict_dict, model_used = await run_ai_audit(vault.task_description, req.work)
 
-    logger.info(f"🧠 AUDIT RESULT: escrow_id='{req.escrow_id}' | Approved={is_approved} | Clean verdict start: {clean_verdict[:50]}")
-
+    is_approved       = verdict_dict.get("verdict") == "PASS"
     revealed_fulfillment = None
 
     if is_approved:
-        # FIX: Detailed vault lookup logging to diagnose mismatches
-        vault_entry = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+        revealed_fulfillment = vault.fulfillment
+        vault.status         = "RELEASED"
+        logger.info(f"✅ KEY RELEASED: escrow_id='{req.escrow_id}'")
+    else:
+        logger.info(f"❌ AUDIT FAILED: escrow_id='{req.escrow_id}' | score={verdict_dict.get('score')}")
 
-        logger.info(f"🔍 VAULT LOOKUP: searching for escrow_id='{req.escrow_id}' | Found={vault_entry is not None}")
-
-        if vault_entry:
-            revealed_fulfillment = vault_entry.fulfillment
-            vault_entry.status = "RELEASED"
-            db.commit()
-            logger.info(f"✅ KEY RELEASED for Project: {req.escrow_id}")
-        else:
-            # FIX: Log ALL existing vault IDs so you can see exactly what's stored vs what was searched
-            all_vaults = db.query(EscrowVault).all()
-            stored_ids = [v.escrow_id for v in all_vaults]
-            logger.error(f"❌ VAULT MISS: No entry for '{req.escrow_id}'. All stored IDs: {stored_ids}")
-
-    # 4. Log the result
-    log_entry = db.query(PaymentLog).filter(PaymentLog.payment_hash == x_payment_hash).first()
-    if not log_entry:
-        log_entry = PaymentLog(payment_hash=x_payment_hash)
-        db.add(log_entry)
-
-    log_entry.ai_verdict = verdict
-    log_entry.model_used = model_used
+    # Store audit result in vault for audit trail
+    vault.ai_verdict = json.dumps(verdict_dict)
+    vault.model_used = model_used
     db.commit()
 
-    # FIX: Return a clear vault_found flag so the frontend can give a specific error
+    # Webhook for agent flows
+    if is_approved and revealed_fulfillment and req.callback_url:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    req.callback_url,
+                    json={
+                        "escrow_id":   req.escrow_id,
+                        "fulfillment": revealed_fulfillment,
+                        "verdict":     verdict_dict,
+                    },
+                    timeout=10.0,
+                )
+            logger.info(f"📡 Webhook delivered to {req.callback_url}")
+        except Exception as e:
+            logger.warning(f"⚠️ Webhook delivery failed: {e}")
+
     return {
-        "ai_verdict": verdict,
-        "model_used": model_used,
-        "status": "success" if is_approved else "rejected",
-        "fulfillment": revealed_fulfillment,
-        "vault_found": vault_entry is not None if is_approved else None
+        "escrow_id":      req.escrow_id,
+        "status":         "approved" if is_approved else "rejected",
+        "verdict":        verdict_dict,
+        "model_used":     model_used,
+        "fulfillment":    revealed_fulfillment,   # null if rejected
+        "worker_address": vault.worker_address,   # frontend uses this for EscrowFinish
     }
