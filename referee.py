@@ -10,8 +10,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -53,26 +52,15 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# 3. STATIC FILES & HEALTH
+# 3. HEALTH CHECK
 # ---------------------------------------------------------------------------
-# Repo structure: index.html and js/ folder sit at the root level (no static/ subfolder)
-# Mount js/ so that <script src="js/app.js"> resolves correctly
-if os.path.isdir("js"):
-    app.mount("/js", StaticFiles(directory="js"), name="js")
-    logger.info("✅ Mounted /js static directory")
-else:
-    logger.warning("⚠️ 'js' directory not found — app.js will not load")
-
-for subdir in ["css", "images", "assets"]:
-    if os.path.isdir(subdir):
-        app.mount(f"/{subdir}", StaticFiles(directory=subdir), name=subdir)
+# The referee is a pure API server. The frontend is served from a separate
+# Render service (AgentTrust repo). No static files needed here.
 
 @app.get("/")
 @app.head("/")
 def serve_ui():
-    if os.path.exists("index.html"):
-        return FileResponse("index.html")
-    return {"status": "Referee Online", "message": "index.html not found at root"}
+    return {"status": "AgentTrust Referee Online", "version": "5.0"}
 
 @app.get("/status")
 def health_check():
@@ -822,7 +810,6 @@ async def get_dex_quote(req: QuoteRequest):
         "trust_line_ok":     trust_line_ok,
         "slippage_warning":  slippage_warning,
         "rlusd_issuer":      RLUSD_ISSUER,
-        # If no trust line, instruct the worker to add one in Xaman
         "trust_line_instructions": None if trust_line_ok else (
             f"Your wallet does not have a RLUSD trust line. "
             f"In Xaman: go to Assets → Add Asset → search RLUSD → "
@@ -830,3 +817,13 @@ async def get_dex_quote(req: QuoteRequest):
             f"Then return here and try again."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# STARTUP
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"🚀 Starting AgentTrust Referee on port {port}")
+    uvicorn.run("referee:app", host="0.0.0.0", port=port, reload=False)
