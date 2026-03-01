@@ -54,17 +54,20 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # 3. HEALTH CHECK
 # ---------------------------------------------------------------------------
-# The referee is a pure API server. The frontend is served from a separate
-# Render service (AgentTrust repo). No static files needed here.
+# The referee is a pure API server. Frontend lives at AgentTrust.
+# Bots/agents discover this service via agent.json and openapi.json.
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 @app.head("/")
 def serve_ui():
-    return {"status": "AgentTrust Referee Online", "version": "5.0"}
+    # Humans landing here get sent to the AgentTrust app
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="https://agenttrust.io", status_code=302)
 
 @app.get("/status")
 def health_check():
-    return {"status": "online", "timestamp": datetime.now(timezone.utc)}
+    return {"status": "online", "version": "5.0", "timestamp": datetime.now(timezone.utc)}
 
 # ---------------------------------------------------------------------------
 # 4. DATABASE
@@ -242,9 +245,20 @@ class EscrowSetupRequest(BaseModel):
 
 class AuditRequest(BaseModel):
     escrow_id:           str
-    work:                str                  # Worker's text submission
-    worker_attachments:  Optional[list[Attachment]] = None  # Proof of work files
+    work:                str
+    worker_attachments:  Optional[list[Attachment]] = None
     callback_url:        Optional[str] = None
+
+class StandaloneAuditRequest(BaseModel):
+    """
+    For the pure /audit endpoint — no escrow, no vault.
+    Any agent or human can POST a task + work, pay 0.1 XRP, get a verdict.
+    fee_hash can be passed in the body OR as x-payment-hash header.
+    """
+    task:                str                            # The original task/spec
+    work:                str                            # The completed work/output
+    fee_hash:            Optional[str] = None           # tx hash of 0.1 XRP payment
+    attachments:         Optional[list[Attachment]] = None  # Optional proof files
 
 class XummPayloadRequest(BaseModel):
     txjson: dict
@@ -475,7 +489,63 @@ async def run_ai_audit(
 
 
 # ---------------------------------------------------------------------------
-# 10. XUMM ENDPOINTS
+# 10. STANDALONE AUDIT ENDPOINT — Pure AI verdict, no escrow required
+# ---------------------------------------------------------------------------
+@app.post("/audit")
+async def standalone_audit(
+    req: StandaloneAuditRequest,
+    x_payment_hash: Optional[str] = Header(None),  # Accept fee hash in header (Smithery style)
+    db: Session = Depends(get_db),
+):
+    """
+    AGENTS & DEVELOPERS — Stateless AI verdict. No vault, no escrow, no receipt code.
+
+    Pay 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, pass the tx hash either:
+      - In the request body as fee_hash, OR
+      - In the x-payment-hash header (Smithery / OpenAPI convention)
+
+    Returns a structured verdict: PASS or FAIL with detailed criteria breakdown.
+    """
+    # Resolve fee hash — body takes priority, fall back to header
+    fee_hash = (req.fee_hash or x_payment_hash or "").strip()
+    if not fee_hash:
+        raise HTTPException(
+            status_code=402,
+            detail="Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and include the tx hash as fee_hash in the body or x-payment-hash header."
+        )
+
+    # Use a synthetic escrow_id for anti-replay (audit-specific prefix)
+    audit_id = f"audit-{fee_hash[:16].lower()}"
+    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db)
+
+    # Run the AI audit — same engine as the escrow flow
+    verdict_dict, model_used = await run_ai_audit(
+        task_description     = req.task,
+        work_submission      = req.work,
+        buyer_attachments    = [],
+        worker_attachments   = [
+            {"filename": a.filename, "mime_type": a.mime_type, "data": a.data}
+            for a in (req.attachments or [])
+        ],
+    )
+
+    is_approved = verdict_dict.get("verdict", "").upper() == "PASS"
+    logger.info(f"📋 STANDALONE AUDIT {audit_id}: {verdict_dict.get('verdict')} | model={model_used}")
+
+    return {
+        "status":     "approved" if is_approved else "rejected",
+        "verdict":    verdict_dict.get("verdict"),
+        "score":      verdict_dict.get("score"),
+        "summary":    verdict_dict.get("summary"),
+        "details":    verdict_dict.get("details"),
+        "criteria_met":    verdict_dict.get("criteria_met", []),
+        "criteria_failed": verdict_dict.get("criteria_failed", []),
+        "model_used": model_used,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 11. XUMM ENDPOINTS
 # ---------------------------------------------------------------------------
 @app.post("/xumm/fee-payload")
 async def create_fee_payload():
