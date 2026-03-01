@@ -277,12 +277,22 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
         raise HTTPException(status_code=402, detail="Transaction hash not found on the XRPL ledger.")
 
     body    = tx_res.result
+    logger.info(f"🔍 RAW TX KEYS: {list(body.keys())}")  # shows exactly what xrpl-py returns
     tx_data = body.get("tx_json") or body.get("tx") or body
+    meta    = body.get("meta") or body.get("metaData") or {}
 
     tx_type    = tx_data.get("TransactionType", "")
     dest       = str(tx_data.get("Destination", "")).strip()
-    raw_amount = tx_data.get("Amount", "0")
     sender     = tx_data.get("Account", "unknown")
+
+    # Amount: prefer meta.delivered_amount (actual delivered), fall back to tx_json.Amount
+    # delivered_amount is the authoritative field in newer xrpl-py versions
+    raw_amount = (
+        meta.get("delivered_amount")
+        or meta.get("DeliveredAmount")
+        or tx_data.get("Amount")
+        or "0"
+    )
 
     logger.info(f"🔍 LEDGER: type={tx_type} | dest={dest} | amount={raw_amount} | from={sender}")
 
@@ -307,9 +317,10 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
             detail="Protocol fees must be paid in XRP, not issued currency."
         )
 
-    # Amount must meet minimum
-    amount_xrp = int(raw_amount) / 1_000_000
-    if amount_xrp < MIN_FEE_XRP:
+    # Amount must meet minimum — round to 6 decimal places to avoid float precision issues
+    # e.g. 100000 drops / 1_000_000 can return 0.09999999999999999 in Python
+    amount_xrp = round(int(raw_amount) / 1_000_000, 6)
+    if amount_xrp < (MIN_FEE_XRP - 0.000001):  # 1 drop tolerance for float safety
         raise HTTPException(
             status_code=402,
             detail=f"Insufficient fee. Required ≥{MIN_FEE_XRP} XRP, received {amount_xrp:.6f} XRP."
