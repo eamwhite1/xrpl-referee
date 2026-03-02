@@ -1,9 +1,9 @@
 runtime: python
 target: remote
-url: https://xrpl-referee.onrender.com/audit
+url: https://xrpl-referee.onrender.com/mcp
 config:
-  x-payment-hash:
+  fee_hash:
     type: string
-    description: "XRPL tx hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
-    placeholder: "31735708FC234D19B527..."
-    required: true
+    description: "XRPL transaction hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+    placeholder: "56DC9FA1C9BC9B7A537FB4FBB69FD216280A2BA820EAA87F1E6E183CDC07847C"
+    required: false
