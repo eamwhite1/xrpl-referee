@@ -7,3 +7,4 @@ xrpl-py
 python-dotenv
 requests
 xumm-sdk-py
+fastmcp
