@@ -103,6 +103,7 @@ def serve_playground():
 </div></body></html>""", status_code=200)
 
 @app.get("/status")
+@app.head("/status")
 def health_check():
     return {"status": "online", "version": "5.0", "timestamp": datetime.now(timezone.utc)}
 
