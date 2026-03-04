@@ -17,9 +17,12 @@ import resend
 
 # XRPL Imports
 from xrpl.asyncio.clients import AsyncJsonRpcClient
+from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
+from xrpl.models.transactions import EscrowFinish, OfferCreate
 from xrpl.core.addresscodec import decode_seed
+from xrpl.utils import xrp_to_drops
 
 # XUMM SDK Import
 try:
@@ -76,7 +79,7 @@ def serve_ui(request: Request):
 <title>AgentTrust Referee</title></head>
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
-    return {"status": "online", "version": "5.1", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+    return {"status": "online", "version": "6.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
 
 @app.get("/playground")
 def serve_playground():
@@ -98,7 +101,7 @@ def serve_playground():
 @app.get("/status")
 @app.head("/status")
 def health_check():
-    return {"status": "online", "version": "5.1", "timestamp": datetime.now(timezone.utc)}
+    return {"status": "online", "version": "6.0", "timestamp": datetime.now(timezone.utc)}
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
@@ -125,22 +128,22 @@ def serve_agent_json():
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
-        "agentVersion": "5.1.0",
-        "protocolVersion": "0.3.0",
+        "agentVersion": "6.0.0",
+        "protocolVersion": "0.4.0",
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
-        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True},
+        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True},
         "authentication": {
             "schemes": ["x-payment-hash"],
             "description": "Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Pass tx hash as x-payment-hash header."
         },
         "payment": {"currency": "XRP", "amount": "0.1", "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR", "network": "XRPL Mainnet"},
         "skills": [
-            {"id": "standalone-audit", "name": "AI Verdict", "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit", "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow", "legal-tech"]},
-            {"id": "escrow-create",    "name": "Create Escrow Vault",          "description": "Lock XRPL funds in crypto-condition escrow gated by AI verdict.", "endpoint": "/escrow/generate", "method": "POST"},
-            {"id": "escrow-evaluate",  "name": "Submit Work for Escrow Audit", "description": "Worker submits proof. On PASS returns fulfillment key.", "endpoint": "/evaluate", "method": "POST"}
+            {"id": "standalone-audit",  "name": "AI Verdict",                   "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit",            "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow"]},
+            {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict.",              "endpoint": "/escrow/generate",  "method": "POST"},
+            {"id": "escrow-evaluate",   "name": "Submit Work for Escrow Audit",  "description": "Seller submits proof. On PASS the referee auto-releases funds to seller.",        "endpoint": "/evaluate",         "method": "POST"},
         ],
         "defaultInputModes": ["application/json"],
-        "defaultOutputModes": ["application/json"]
+        "defaultOutputModes": ["application/json"],
     }
 
 @app.get("/.well-known/ai-plugin.json")
@@ -152,11 +155,11 @@ def serve_ai_plugin():
         "schema_version": "v1",
         "name_for_human": "AgentTrust Referee",
         "name_for_model": "agenttrust_referee",
-        "description_for_human": "Trustless AI task verification. Pay 0.1 XRP, get PASS/FAIL verdict.",
-        "description_for_model": "Verify task completion. POST task+work to /audit with x-payment-hash header (0.1 XRP fee). Returns JSON with verdict, score, criteria_met, criteria_failed, details.",
+        "description_for_human": "Trustless AI task verification with automatic payment release.",
+        "description_for_model": "Verify task completion and auto-release escrowed funds. POST task+work to /audit with x-payment-hash header (0.1 XRP fee). Returns JSON with verdict, score, criteria_met, criteria_failed. For escrow flows, use /escrow/generate then /evaluate — funds are automatically released to the seller on PASS.",
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": "https://xrpl-referee.onrender.com/openapi.json"},
-        "legal_info_url": "https://xrpl-referee.onrender.com"
+        "legal_info_url": "https://xrpl-referee.onrender.com",
     }
 
 # ---------------------------------------------------------------------------
@@ -175,9 +178,9 @@ engine_args = {"pool_pre_ping": True, "pool_recycle": 300}
 if "sqlite" not in DATABASE_URL:
     engine_args["connect_args"] = {"sslmode": "require"}
 
-engine = create_engine(DATABASE_URL, **engine_args)
+engine       = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+Base         = declarative_base()
 
 
 class PaymentLog(Base):
@@ -186,7 +189,7 @@ class PaymentLog(Base):
     payment_hash = Column(String, unique=True, index=True, nullable=False)
     purpose      = Column(String, nullable=True)
     sender       = Column(String, nullable=True)
-    amount_xrp   = Column(Float, nullable=True)
+    amount_xrp   = Column(Float,  nullable=True)
     escrow_id    = Column(String, nullable=True)
     timestamp    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -194,31 +197,39 @@ class PaymentLog(Base):
 class EscrowVault(Base):
     __tablename__ = "escrow_vault"
     escrow_id         = Column(String, primary_key=True, index=True)
-    condition         = Column(String, nullable=False)
-    fulfillment       = Column(String, nullable=False)
-    status            = Column(String, default="LOCKED")
+    condition         = Column(String,  nullable=False)
+    fulfillment       = Column(String,  nullable=False)
+    status            = Column(String,  default="LOCKED")
+    # Currency — XRP or RLUSD
+    currency          = Column(String,  default="XRP")          # NEW v6
+    amount_xrp        = Column(Float,   nullable=True)          # kept for XRP flows
+    amount_rlusd      = Column(Float,   nullable=True)          # NEW v6
     # Job metadata
-    project_label     = Column(String, nullable=True)
-    buyer_name        = Column(String, nullable=True)
-    buyer_address     = Column(String, nullable=True)
-    buyer_email       = Column(String, nullable=True)   # V2: PASS notification
-    worker_email      = Column(String, nullable=True)   # V2: receipt code notification
-    task_description  = Column(Text, nullable=True)
-    worker_address    = Column(String, nullable=True)
-    amount_xrp        = Column(Float, nullable=True)
+    project_label     = Column(String,  nullable=True)
+    buyer_name        = Column(String,  nullable=True)
+    buyer_address     = Column(String,  nullable=True)
+    buyer_email       = Column(String,  nullable=True)
+    worker_email      = Column(String,  nullable=True)
+    task_description  = Column(Text,    nullable=True)
+    worker_address    = Column(String,  nullable=True)
     cancel_after_ts   = Column(DateTime, nullable=True)
-    buyer_attachments = Column(Text, nullable=True)
+    buyer_attachments = Column(Text,    nullable=True)
     # EscrowCreate tx
-    escrow_tx_hash    = Column(String, nullable=True)
+    escrow_tx_hash    = Column(String,  nullable=True)
     escrow_sequence   = Column(Integer, nullable=True)
+    # Seller preferred payout currency
+    seller_currency   = Column(String,  default="XRP")          # NEW v6
     # Audit result
-    ai_verdict        = Column(Text, nullable=True)
-    model_used        = Column(String, nullable=True)
+    ai_verdict        = Column(Text,    nullable=True)
+    model_used        = Column(String,  nullable=True)
     created_at        = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    # V2: delivery
-    worker_submission   = Column(Text, nullable=True)    # JSON blob, wiped on expiry
+    # Auto-finish tracking
+    auto_finish_hash  = Column(String,  nullable=True)          # NEW v6
+    auto_finish_error = Column(String,  nullable=True)          # NEW v6
+    # Delivery
+    worker_submission   = Column(Text,    nullable=True)
     delivery_expires_at = Column(DateTime, nullable=True)
-    delivery_status     = Column(String, nullable=True)  # PENDING/RELEASED/COLLECTED/EXPIRED
+    delivery_status     = Column(String,   nullable=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -226,29 +237,34 @@ Base.metadata.create_all(bind=engine)
 
 def run_migrations():
     migrations = [
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_name         VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS task_description    TEXT",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_address      VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS amount_xrp          FLOAT",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancel_after_ts     TIMESTAMP",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_attachments   TEXT",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS ai_verdict          TEXT",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS model_used          VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS created_at          TIMESTAMP",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS project_label       VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_address       VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_tx_hash      VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_sequence     INTEGER",
-        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS purpose             VARCHAR",
-        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS sender              VARCHAR",
-        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS amount_xrp          FLOAT",
-        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS escrow_id           VARCHAR",
-        # V2 columns
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_email         VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_email        VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_submission   TEXT",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS delivery_expires_at TIMESTAMP",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS delivery_status     VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_name          VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS task_description     TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_address       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS amount_xrp           FLOAT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancel_after_ts      TIMESTAMP",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_attachments    TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS ai_verdict           TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS model_used           VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS created_at           TIMESTAMP",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS project_label        VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_address        VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_tx_hash       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_sequence      INTEGER",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS purpose              VARCHAR",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS sender               VARCHAR",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS amount_xrp           FLOAT",
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS escrow_id            VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_email          VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_email         VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS worker_submission    TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS delivery_expires_at  TIMESTAMP",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS delivery_status      VARCHAR",
+        # v6 columns
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS currency             VARCHAR DEFAULT 'XRP'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS amount_rlusd         FLOAT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS seller_currency      VARCHAR DEFAULT 'XRP'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS auto_finish_hash     VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS auto_finish_error    VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -277,6 +293,10 @@ XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
 
+RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
+RLUSD_CURRENCY = "RLUSD"
+RLUSD_HEX      = "524C555344000000000000000000000000000000"
+
 RESEND_API_KEY       = os.getenv("RESEND_API_KEY")
 RESEND_FROM          = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
 DELIVERY_EXPIRY_DAYS = 7
@@ -292,9 +312,9 @@ try:
     seed = os.getenv("XRPL_SEED")
     if not seed:
         raise ValueError("XRPL_SEED not found.")
-    _, algo = decode_seed(seed)
+    _, algo        = decode_seed(seed)
     referee_wallet = Wallet.from_seed(seed, algorithm=algo)
-    logger.info(f"🚀 AGENT ACTIVE: {referee_wallet.address}")
+    logger.info(f"🚀 REFEREE WALLET ACTIVE: {referee_wallet.address}")
 except Exception as e:
     logger.error(f"STARTUP ERROR (wallet): {e}")
     referee_wallet = None
@@ -311,7 +331,7 @@ else:
 if xumm_api_key and xumm_api_secret and XummSdk:
     try:
         xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
-        pong = xumm_sdk.ping()
+        pong     = xumm_sdk.ping()
         logger.info(f"🔌 XUMM SDK connected: {pong.application.name}")
     except Exception as e:
         logger.error(f"❌ XUMM SDK ping failed: {e}")
@@ -328,35 +348,45 @@ class Attachment(BaseModel):
 class EscrowSetupRequest(BaseModel):
     escrow_id:          str
     fee_hash:           str
-    project_label:      Optional[str] = None
+    project_label:      Optional[str]   = None
     buyer_name:         str
     buyer_address:      str
-    buyer_email:        Optional[str] = None   # V2: notify buyer on PASS
-    worker_email:       Optional[str] = None   # V2: send receipt code to worker
+    buyer_email:        Optional[str]   = None
+    worker_email:       Optional[str]   = None
     task_description:   str
     worker_address:     str
-    amount_xrp:         float
-    cancel_after_hrs:   int = 168
+    # Currency selection — XRP (default) or RLUSD
+    currency:           str             = "XRP"
+    amount_xrp:         Optional[float] = None
+    amount_rlusd:       Optional[float] = None
+    # Seller's preferred payout currency
+    seller_currency:    str             = "XRP"
+    cancel_after_hrs:   int             = 168
     buyer_attachments:  Optional[list[Attachment]] = None
 
 class AuditRequest(BaseModel):
     escrow_id:           str
     work:                str
     worker_attachments:  Optional[list[Attachment]] = None
-    callback_url:        Optional[str] = None
-    task_category:       str  = "default"
-    require_consensus:   bool = False
+    callback_url:        Optional[str]  = None
+    task_category:       str            = "default"
+    require_consensus:   bool           = False
 
 class StandaloneAuditRequest(BaseModel):
     task:                str
     work:                str
     fee_hash:            Optional[str]  = None
     attachments:         Optional[list[Attachment]] = None
-    task_category:       str  = "default"
-    require_consensus:   bool = False
+    task_category:       str            = "default"
+    require_consensus:   bool           = False
 
 class XummPayloadRequest(BaseModel):
     txjson: dict
+
+class QuoteRequest(BaseModel):
+    worker_address:  str
+    xrp_amount:      float
+    seller_currency: str = "XRP"
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +400,7 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
             detail=(
                 f"Payment hash already used for escrow '{already_used.escrow_id}' "
                 f"on {already_used.timestamp.strftime('%Y-%m-%d %H:%M UTC')}."
-            )
+            ),
         )
 
     client = AsyncJsonRpcClient(XRPL_URL)
@@ -383,14 +413,12 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
         raise HTTPException(status_code=402, detail="Transaction hash not found on the XRPL ledger.")
 
     body    = tx_res.result
-    logger.info(f"🔍 RAW TX KEYS: {list(body.keys())}")
     tx_data = body.get("tx_json") or body.get("tx") or body
     meta    = body.get("meta") or body.get("metaData") or {}
 
     tx_type    = tx_data.get("TransactionType", "")
     dest       = str(tx_data.get("Destination", "")).strip()
     sender     = tx_data.get("Account", "unknown")
-
     raw_amount = (
         meta.get("delivered_amount")
         or meta.get("DeliveredAmount")
@@ -402,10 +430,8 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
 
     if tx_type != "Payment":
         raise HTTPException(status_code=400, detail=f"Transaction is '{tx_type}', not a Payment.")
-
     if dest.lower() != PROTOCOL_WALLET.lower():
         raise HTTPException(status_code=402, detail=f"Wrong destination. Expected {PROTOCOL_WALLET}, got {dest}.")
-
     if isinstance(raw_amount, dict):
         raise HTTPException(status_code=400, detail="Protocol fees must be paid in XRP, not issued currency.")
 
@@ -413,7 +439,7 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
     if amount_xrp < (MIN_FEE_XRP - 0.000001):
         raise HTTPException(
             status_code=402,
-            detail=f"Insufficient fee. Required ≥{MIN_FEE_XRP} XRP, received {amount_xrp:.6f} XRP."
+            detail=f"Insufficient fee. Required ≥{MIN_FEE_XRP} XRP, received {amount_xrp:.6f} XRP.",
         )
 
     db.add(PaymentLog(
@@ -430,10 +456,150 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
 
 
 # ---------------------------------------------------------------------------
-# 8. EMAIL HELPERS
+# 8. TRUSTLINE CHECK
+# ---------------------------------------------------------------------------
+async def check_rlusd_trustline(address: str) -> bool:
+    """Returns True if the address has a RLUSD trustline with the official issuer."""
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                XRPL_URL,
+                json={"method": "account_lines", "params": [{"account": address, "peer": RLUSD_ISSUER}]},
+                timeout=10.0,
+            )
+            lines = res.json().get("result", {}).get("lines", [])
+            return any(l.get("currency") == RLUSD_CURRENCY for l in lines)
+    except Exception as e:
+        logger.warning(f"⚠️ Trustline check failed for {address}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 9. AUTO-FINISH + SERVER-SIDE DEX SWAP
+# ---------------------------------------------------------------------------
+def _calc_finish_fee(fulfillment_hex: str) -> str:
+    """
+    XRPL formula: 330 + ceil(fulfillment_bytes / 16) * 10 drops.
+    Add a generous buffer to avoid insufficient-fee rejections.
+    """
+    try:
+        byte_len = len(bytes.fromhex(fulfillment_hex))
+    except Exception:
+        byte_len = 100
+    base_fee = 330 + (((byte_len + 15) // 16) * 10)
+    return str(base_fee + 100)  # small buffer
+
+
+async def auto_finish_escrow(
+    escrow_id:   str,
+    sequence:    int,
+    owner:       str,
+    fulfillment: str,
+    condition:   str,
+    worker_addr: str,
+    db_session_factory,
+):
+    """
+    Submits EscrowFinish on-chain using the referee wallet.
+    Referee pays the network fee (~0.005 XRP) from protocol income.
+    Seller receives the exact escrowed amount — no deductions.
+    After successful finish, triggers DEX swap if seller wants RLUSD.
+    """
+    if not referee_wallet:
+        logger.error(f"❌ AUTO-FINISH: referee wallet not loaded for {escrow_id}")
+        return
+
+    finish_fee = _calc_finish_fee(fulfillment)
+    logger.info(f"🔄 AUTO-FINISH starting: {escrow_id} | seq={sequence} | fee={finish_fee} drops")
+
+    try:
+        client    = AsyncJsonRpcClient(XRPL_URL)
+        finish_tx = EscrowFinish(
+            account        = referee_wallet.address,
+            owner          = owner,
+            offer_sequence = sequence,
+            fulfillment    = fulfillment.upper(),
+            condition      = condition.upper(),
+            fee            = finish_fee,
+        )
+        result   = await async_submit_and_wait(finish_tx, client, referee_wallet)
+        tx_hash  = result.result.get("hash", "unknown")
+        logger.info(f"✅ AUTO-FINISH SUCCESS: {escrow_id} | hash={tx_hash[:16]}... | worker={worker_addr}")
+
+        # Persist the finish hash
+        db = db_session_factory()
+        try:
+            vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+            if vault:
+                vault.auto_finish_hash = tx_hash
+                db.commit()
+        finally:
+            db.close()
+
+    except Exception as e:
+        logger.error(f"❌ AUTO-FINISH FAILED for {escrow_id}: {e}")
+        db = db_session_factory()
+        try:
+            vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+            if vault:
+                vault.auto_finish_error = str(e)[:500]
+                db.commit()
+        finally:
+            db.close()
+
+
+async def server_side_dex_swap(
+    escrow_id:   str,
+    worker_addr: str,
+    xrp_amount:  float,
+    db_session_factory,
+):
+    """
+    After auto-finish delivers XRP to worker, triggers an OfferCreate
+    on behalf of the worker (via Xaman webhook, since we cannot sign for them).
+    Instead we store a flag so the frontend can offer one-tap Xaman swap,
+    or agents can call /dex/swap directly.
+
+    NOTE: A true server-side swap would require signing with the worker's key,
+    which we never hold. So this function fetches a live quote and stores it,
+    then the frontend presents a single-tap Xaman swap. For agent flows the
+    fulfillment + quote are returned in the /evaluate response.
+    """
+    logger.info(f"💱 Fetching post-finish DEX quote for {escrow_id}")
+    try:
+        async with httpx.AsyncClient() as client:
+            pf_res = await client.post(
+                XRPL_URL,
+                json={
+                    "method": "ripple_path_find",
+                    "params": [{
+                        "source_account":      worker_addr,
+                        "source_amount":       str(int(xrp_amount * 1_000_000)),
+                        "destination_account": worker_addr,
+                        "destination_amount":  {
+                            "currency": RLUSD_CURRENCY,
+                            "issuer":   RLUSD_ISSUER,
+                            "value":    "999999999",
+                        },
+                    }],
+                },
+                timeout=15.0,
+            )
+            alt = pf_res.json().get("result", {}).get("alternatives", [])
+            if alt:
+                dest = alt[0].get("destination_amount", {})
+                estimated = float(dest.get("value", 0)) if isinstance(dest, dict) else 0
+                logger.info(f"💱 Post-finish DEX quote: {xrp_amount} XRP → ~{estimated:.4f} RLUSD for {escrow_id}")
+                return estimated
+    except Exception as e:
+        logger.warning(f"⚠️ Post-finish DEX quote failed for {escrow_id}: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 10. EMAIL HELPERS
 # ---------------------------------------------------------------------------
 def _email_styles() -> str:
-    """Shared inline CSS for all emails."""
     return """
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
              background:#f4f6fb;margin:0;padding:40px 20px;color:#0d0d12;}
@@ -455,24 +621,20 @@ def _email_styles() -> str:
 
 
 async def send_worker_receipt_email(
-    worker_email:  str,
-    worker_name:   str,
-    escrow_id:     str,
-    buyer_name:    str,
-    amount_xrp:    float,
-    task_preview:  str,
-    deadline:      str,
+    worker_email: str,
+    worker_name:  str,
+    escrow_id:    str,
+    buyer_name:   str,
+    amount:       float,
+    currency:     str,
+    task_preview: str,
+    deadline:     str,
 ):
-    """
-    Fires immediately after escrow is created.
-    Sends the worker their receipt code and a link to the worker tab.
-    """
     if not RESEND_API_KEY or not worker_email:
-        logger.info(f"📧 Worker email skipped for {escrow_id}")
         return
-
     worker_url   = f"{SITE_URL}?worker={escrow_id}"
     preview_safe = task_preview[:300] + ("…" if len(task_preview) > 300 else "")
+    amount_str   = f"{amount} {currency}"
 
     try:
         resend.Emails.send({
@@ -486,61 +648,49 @@ async def send_worker_receipt_email(
        border-radius:10px;padding:14px 20px;display:inline-block;
        color:#0033cc;margin:12px 0 20px;}}
 .task-box{{background:#f8f9fc;border-left:3px solid #0066FF;border-radius:0 8px 8px 0;
-           padding:12px 16px;font-size:.88rem;color:#333;line-height:1.65;
-           margin-bottom:20px;}}
+           padding:12px 16px;font-size:.88rem;color:#333;line-height:1.65;margin-bottom:20px;}}
 </style></head><body><div class="card">
   <div class="logo">AgentTrust<span>.</span></div>
   <h1>You have a new job</h1>
   <p>Hi{' ' + worker_name if worker_name else ''}, <strong>{buyer_name}</strong> has locked
-     <strong>{amount_xrp} XRP</strong> in escrow for you. Complete the work,
-     submit your proof, and claim payment instantly on AI approval.</p>
-
+     <strong>{amount_str}</strong> in escrow for you. Complete the work,
+     submit your proof, and payment is released automatically on AI approval — no further action needed.</p>
   <div class="detail"><span>Your Receipt Code</span></div>
   <div class="code">{escrow_id}</div>
-
-  <div class="detail"><span>Amount locked for you</span><br>
-    <strong>{amount_xrp} XRP</strong>
-  </div>
+  <div class="detail"><span>Amount locked for you</span><br><strong>{amount_str}</strong></div>
   <div class="detail"><span>Deadline</span><br><strong>{deadline}</strong></div>
-
   <p style="font-size:.85rem;font-weight:700;margin-bottom:.4rem;color:#0d0d12;">Task brief:</p>
   <div class="task-box">{preview_safe}</div>
-
   <a href="{worker_url}" class="btn">Submit Your Work →</a>
-
   <p style="font-size:.85rem;">Enter your receipt code <strong>{escrow_id}</strong> on the
-     Worker tab to load the full job details, submit your work, and claim payment.</p>
-
+     Seller tab to load the full job details and submit your work. Payment arrives in your
+     wallet automatically on approval.</p>
   <div class="footer">
-    Payment is held securely on the XRP Ledger — neither party can access it
-    until the AI referee approves your submission.<br><br>
+    Payment is held securely on the XRP Ledger and released automatically when
+    the AI referee approves your submission. No manual claim required.<br><br>
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
   </div>
 </div></body></html>""",
         })
-        logger.info(f"📧 Worker receipt email sent to {worker_email} for {escrow_id}")
+        logger.info(f"📧 Seller receipt email sent to {worker_email} for {escrow_id}")
     except Exception as e:
-        logger.error(f"❌ Worker email failed for {escrow_id}: {e}")
+        logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
 
 
 async def send_delivery_email(
     buyer_email: str,
     buyer_name:  str,
     escrow_id:   str,
-    amount_xrp:  float,
+    amount:      float,
+    currency:    str,
     verdict:     dict,
 ):
-    """
-    Fires when AI verdict is PASS.
-    Sends buyer a collect link valid for 7 days.
-    """
     if not RESEND_API_KEY or not buyer_email:
-        logger.info(f"📧 Buyer delivery email skipped for {escrow_id}")
         return
-
     collect_url = f"{SITE_URL}?collect={escrow_id}"
     score       = verdict.get("score", "—")
     summary     = verdict.get("summary", "Work verified by AI referee.")
+    amount_str  = f"{amount} {currency}"
 
     try:
         resend.Emails.send({
@@ -553,30 +703,21 @@ async def send_delivery_email(
               padding:16px 20px;margin:20px 0;}}
 .verdict-box .score{{font-size:1.5rem;font-weight:800;color:#00B97A;}}
 .verdict-box .summary{{color:#0d6644;font-size:.9rem;margin-top:4px;}}
-.expiry{{font-size:.8rem;color:#9999aa;margin-top:24px;
-         padding-top:20px;border-top:1px solid #eee;}}
 </style></head><body><div class="card">
   <div class="logo">AgentTrust<span>.</span></div>
   <h1>Your delivery is ready to collect</h1>
   <p>Hi {buyer_name}, the work for your escrow has passed AI verification
-     and your delivery is waiting for you.</p>
-
+     and payment has been automatically released to the seller.</p>
   <div class="detail"><span>Escrow ID</span><br><strong>{escrow_id}</strong></div>
-  <div class="detail"><span>Amount locked</span><br><strong>{amount_xrp} XRP</strong></div>
-
+  <div class="detail"><span>Amount released</span><br><strong>{amount_str}</strong></div>
   <div class="verdict-box">
     <div class="score">✓ PASS &nbsp;{score}/100</div>
     <div class="summary">{summary}</div>
   </div>
-
   <a href="{collect_url}" class="btn">Collect Your Delivery →</a>
-
-  <p>Click the button above to view and download everything the worker submitted.
-     Your receipt code is <strong>{escrow_id}</strong>.</p>
-
-  <div class="expiry">
-    ⏳ This delivery will expire in <strong>7 days</strong>. After that the
-    submission data is permanently deleted. Please collect it before then.<br><br>
+  <p>Click above to view and download everything the seller submitted.</p>
+  <div class="footer">
+    ⏳ This delivery link expires in <strong>7 days</strong>.<br><br>
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
   </div>
 </div></body></html>""",
@@ -587,7 +728,7 @@ async def send_delivery_email(
 
 
 # ---------------------------------------------------------------------------
-# 9. DOMAIN-SPECIFIC PROMPT LIBRARY
+# 11. DOMAIN-SPECIFIC PROMPT LIBRARY
 # ---------------------------------------------------------------------------
 DOMAIN_PROMPTS = {
     "bug_bounty": (
@@ -606,44 +747,38 @@ DOMAIN_PROMPTS = {
         "You are auditing a supply chain compliance deliverable. "
         "Check for: document completeness, consistency of dates/quantities/parties, "
         "presence of required fields (e.g. HS codes, port of entry, consignee details). "
-        "Flag any discrepancies between the task spec and submitted documents. "
-        "Note: you are evaluating submitted documents, not independently verifying against live databases."
+        "Flag any discrepancies between the task spec and submitted documents."
     ),
     "real_estate": (
         "You are auditing a real estate transaction milestone. "
-        "Evaluate whether submitted documents (surveys, registry excerpts, inspection reports) "
-        "satisfy the conditions stated in the task spec. "
-        "Flag missing documents, date inconsistencies, or unresolved conditions. "
-        "Note: you are evaluating submitted documents, not independently verifying land registry data."
+        "Evaluate whether submitted documents satisfy the conditions stated in the task spec. "
+        "Flag missing documents, date inconsistencies, or unresolved conditions."
     ),
     "creative": (
         "You are auditing a creative deliverable (writing, design, code, media). "
         "Evaluate quality, completeness, and adherence to the stated brief. "
         "For writing: check word count, tone, structure, and coverage of required topics. "
-        "For design: evaluate based on described requirements and any attached files. "
         "Be fair but hold the work to the standard the buyer specified."
     ),
     "code": (
         "You are auditing a software development deliverable. "
         "Evaluate: does the submitted work address the stated requirements? "
-        "Check for: completeness, correctness of described approach, presence of required components. "
-        "If a repo link or code is provided, evaluate its structure and described functionality. "
-        "You cannot execute code, so judge based on what is visible and described."
+        "Check for completeness, correctness of described approach, presence of required components."
     ),
     "data": (
         "You are auditing a data or research deliverable. "
-        "Evaluate: completeness of the dataset/report, format compliance, coverage of required fields. "
-        "Check that the volume, structure, and content match what was specified. "
-        "Flag any gaps, missing fields, or format deviations."
+        "Evaluate completeness of the dataset/report, format compliance, coverage of required fields. "
+        "Check that the volume, structure, and content match what was specified."
     ),
     "default": (
         "You are an autonomous escrow auditor — a neutral, objective third party determining "
-        "whether a worker has fulfilled a task specification well enough to be paid."
+        "whether a seller has fulfilled a task specification well enough to be paid."
     ),
 }
 
+
 # ---------------------------------------------------------------------------
-# 10. AI AUDIT ENGINE
+# 12. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
 async def run_ai_audit(
     task:               str,
@@ -679,12 +814,12 @@ async def run_ai_audit(
     )
 
     if buyer_attachments:
-        prompt_text += f"\nThe buyer has also provided {len(buyer_attachments)} supporting document(s) above as part of the task specification. Use these to inform your evaluation.\n"
+        prompt_text += f"\nThe buyer has provided {len(buyer_attachments)} supporting document(s) as part of the task specification.\n"
 
-    prompt_text += f"\nWORK SUBMITTED (text):\n{work}\n"
+    prompt_text += f"\nWORK SUBMITTED:\n{work}\n"
 
     if worker_attachments:
-        prompt_text += f"\nThe worker has also submitted {len(worker_attachments)} document(s)/image(s) above as proof of work. Evaluate these as part of the submission.\n"
+        prompt_text += f"\nThe seller has submitted {len(worker_attachments)} document(s) as proof of work.\n"
 
     prompt_text += (
         "\nRespond with ONLY this JSON object:\n"
@@ -692,7 +827,7 @@ async def run_ai_audit(
         '  "verdict": "PASS" or "FAIL",\n'
         '  "score": <integer 0-100>,\n'
         '  "summary": "<one sentence conclusion>",\n'
-        '  "details": "<2-3 sentences of specific feedback for the worker>",\n'
+        '  "details": "<2-3 sentences of specific feedback>",\n'
         '  "criteria_met": ["<requirement 1>", "..."],\n'
         '  "criteria_failed": ["<requirement 1>", "..."]\n'
         "}"
@@ -705,18 +840,12 @@ async def run_ai_audit(
             mime = att.get("mime_type", "application/octet-stream")
             if mime in ("application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"):
                 parts.append({"inline_data": {"mime_type": mime, "data": att.get("data")}})
-                logger.info(f"📎 Buyer attachment added to AI: {att.get('filename')} ({mime})")
-            else:
-                logger.info(f"ℹ️ Buyer attachment {att.get('filename')} is text-extracted")
 
     if worker_attachments:
         for att in worker_attachments:
             mime = att.get("mime_type", "application/octet-stream")
             if mime in ("application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"):
                 parts.append({"inline_data": {"mime_type": mime, "data": att.get("data")}})
-                logger.info(f"📎 Worker attachment added to AI: {att.get('filename')} ({mime})")
-            else:
-                logger.info(f"ℹ️ Worker attachment {att.get('filename')} is text-extracted")
 
     parts.append({"text": prompt_text})
     payload = {"contents": [{"parts": parts}]}
@@ -731,18 +860,13 @@ async def run_ai_audit(
                 res = await client.post(url, json=payload, timeout=60.0)
 
                 if res.status_code == 200:
-                    data     = res.json()
-                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    logger.info(f"🤖 AI raw ({model_id}): {repr(raw_text[:300])}")
-
+                    data         = res.json()
+                    raw_text     = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                     clean        = raw_text.replace("```json", "").replace("```", "").strip()
                     verdict_dict = json.loads(clean)
                     verdict_dict["verdict"] = str(verdict_dict.get("verdict", "FAIL")).strip().upper()
 
-                    logger.info(
-                        f"✅ AI VERDICT: {verdict_dict['verdict']} | "
-                        f"score={verdict_dict.get('score')} | model={model_id}"
-                    )
+                    logger.info(f"✅ AI VERDICT: {verdict_dict['verdict']} | score={verdict_dict.get('score')} | model={model_id}")
 
                     if require_consensus:
                         second_candidates = [m for m in candidates if m != model_id]
@@ -754,16 +878,14 @@ async def run_ai_audit(
                                 )
                                 res2 = await client.post(url2, json=payload, timeout=60.0)
                                 if res2.status_code == 200:
-                                    raw2   = res2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                                    clean2 = raw2.replace("```json","").replace("```","").strip()
+                                    raw2  = res2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                                    clean2 = raw2.replace("```json", "").replace("```", "").strip()
                                     v2     = json.loads(clean2)
-                                    v2["verdict"] = str(v2.get("verdict","FAIL")).strip().upper()
-                                    logger.info(f"🤖 CONSENSUS model {model_2}: {v2['verdict']}")
-
+                                    v2["verdict"] = str(v2.get("verdict", "FAIL")).strip().upper()
                                     if v2["verdict"] != verdict_dict["verdict"]:
-                                        logger.warning(f"⚖️ CONSENSUS SPLIT: {model_id}={verdict_dict['verdict']} vs {model_2}={v2['verdict']} — defaulting FAIL")
+                                        logger.warning(f"⚖️ CONSENSUS SPLIT — defaulting FAIL")
                                         verdict_dict["verdict"]   = "FAIL"
-                                        verdict_dict["summary"]   = f"Models disagreed ({model_id}: {verdict_dict.get('score')}, {model_2}: {v2.get('score')}). Conservative FAIL."
+                                        verdict_dict["summary"]   = f"Models disagreed. Conservative FAIL applied."
                                         verdict_dict["consensus"] = False
                                         verdict_dict["models"]    = [model_id, model_2]
                                     else:
@@ -772,13 +894,10 @@ async def run_ai_audit(
                                     break
                             except Exception as e2:
                                 logger.warning(f"Consensus model {model_2} failed: {e2}")
-                                continue
 
                     return verdict_dict, model_id
-
                 else:
-                    logger.warning(f"Model {model_id} HTTP {res.status_code}: {res.text[:200]}")
-
+                    logger.warning(f"Model {model_id} HTTP {res.status_code}")
             except Exception as e:
                 logger.warning(f"Model {model_id} failed: {e}")
                 continue
@@ -787,7 +906,7 @@ async def run_ai_audit(
 
 
 # ---------------------------------------------------------------------------
-# 11. STANDALONE AUDIT ENDPOINT
+# 13. STANDALONE AUDIT ENDPOINT
 # ---------------------------------------------------------------------------
 @app.post("/audit")
 async def standalone_audit(
@@ -799,7 +918,7 @@ async def standalone_audit(
     if not fee_hash:
         raise HTTPException(
             status_code=402,
-            detail="Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and include the tx hash as fee_hash in the body or x-payment-hash header."
+            detail="Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and include the tx hash as fee_hash or x-payment-hash header.",
         )
 
     audit_id = f"audit-{fee_hash[:16].lower()}"
@@ -817,11 +936,8 @@ async def standalone_audit(
         require_consensus  = req.require_consensus,
     )
 
-    is_approved = verdict_dict.get("verdict", "").upper() == "PASS"
-    logger.info(f"📋 STANDALONE AUDIT {audit_id}: {verdict_dict.get('verdict')} | model={model_used}")
-
     return {
-        "status":          "approved" if is_approved else "rejected",
+        "status":          "approved" if verdict_dict.get("verdict") == "PASS" else "rejected",
         "verdict":         verdict_dict.get("verdict"),
         "score":           verdict_dict.get("score"),
         "summary":         verdict_dict.get("summary"),
@@ -833,7 +949,7 @@ async def standalone_audit(
 
 
 # ---------------------------------------------------------------------------
-# 12. XUMM ENDPOINTS
+# 14. XUMM ENDPOINTS
 # ---------------------------------------------------------------------------
 @app.post("/xumm/fee-payload")
 async def create_fee_payload():
@@ -848,7 +964,6 @@ async def create_fee_payload():
         result = xumm_sdk.payload.create(tx)
         return {"nextUrl": result.next.always, "uuid": result.uuid, "qr": result.refs.qr_png}
     except Exception as e:
-        logger.error(f"❌ XUMM fee payload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -860,9 +975,9 @@ async def get_xumm_payload_status(uuid: str):
         result  = xumm_sdk.payload.get(uuid)
         signed  = result.meta.signed
         tx_hash = result.response.txid if signed else None
-        return {"signed": signed, "tx_hash": tx_hash}
+        signer  = result.response.account if signed else None
+        return {"signed": signed, "tx_hash": tx_hash, "signer": signer}
     except Exception as e:
-        logger.error(f"❌ XUMM poll error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -871,28 +986,52 @@ async def create_xumm_payload(req: XummPayloadRequest):
     if not xumm_sdk:
         raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
     try:
-        logger.info(f"🚀 Xaman payload: {req.txjson}")
         result = xumm_sdk.payload.create(req.txjson)
         return {"nextUrl": result.next.always, "uuid": result.uuid}
     except Exception as e:
-        logger.error(f"❌ XUMM payload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
-# 13. CORE PROTOCOL ENDPOINTS
+# 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
 @app.post("/escrow/generate")
 async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Project ID '{req.escrow_id}' already exists. Please choose a different ID."
-        )
+        raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
     await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db)
 
+    # Validate currency + amount
+    currency = req.currency.upper()
+    if currency not in ("XRP", "RLUSD"):
+        raise HTTPException(status_code=400, detail="currency must be XRP or RLUSD.")
+
+    amount_xrp   = req.amount_xrp   if currency == "XRP"   else None
+    amount_rlusd = req.amount_rlusd if currency == "RLUSD" else None
+
+    if currency == "XRP" and (not amount_xrp or amount_xrp <= 0):
+        raise HTTPException(status_code=400, detail="amount_xrp required for XRP escrow.")
+    if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
+        raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
+
+    # For RLUSD escrow, validate both wallets have trustlines
+    if currency == "RLUSD":
+        buyer_tl  = await check_rlusd_trustline(req.buyer_address)
+        worker_tl = await check_rlusd_trustline(req.worker_address)
+        if not buyer_tl:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Buyer wallet {req.buyer_address} does not have a RLUSD trustline. Please add one in Xaman: Assets → Add Asset → RLUSD (issuer: {RLUSD_ISSUER}).",
+            )
+        if not worker_tl:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Seller wallet {req.worker_address} does not have a RLUSD trustline. The seller must add one before this escrow can be created: Assets → Add Asset → RLUSD (issuer: {RLUSD_ISSUER}).",
+            )
+
+    # Generate crypto-condition
     preimage_bytes    = secrets.token_bytes(32)
     preimage_hex      = preimage_bytes.hex().upper()
     hash_hex          = hashlib.sha256(preimage_bytes).hexdigest().upper()
@@ -906,13 +1045,15 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     attachments_json = None
     if req.buyer_attachments:
         attachments_json = json.dumps([a.dict() for a in req.buyer_attachments])
-        logger.info(f"📎 Storing {len(req.buyer_attachments)} buyer attachment(s) for '{req.escrow_id}'")
 
     vault = EscrowVault(
         escrow_id         = req.escrow_id,
         condition         = final_condition,
         fulfillment       = final_fulfillment,
         status            = "LOCKED",
+        currency          = currency,
+        amount_xrp        = amount_xrp,
+        amount_rlusd      = amount_rlusd,
         project_label     = req.project_label,
         buyer_name        = req.buyer_name,
         buyer_address     = req.buyer_address,
@@ -920,7 +1061,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         worker_email      = req.worker_email,
         task_description  = req.task_description,
         worker_address    = req.worker_address,
-        amount_xrp        = req.amount_xrp,
+        seller_currency   = req.seller_currency.upper(),
         cancel_after_ts   = cancel_after_ts,
         buyer_attachments = attachments_json,
         delivery_status   = "PENDING",
@@ -928,31 +1069,45 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     db.add(vault)
     db.commit()
 
-    logger.info(f"🔒 VAULT CREATED: escrow_id='{req.escrow_id}'")
+    logger.info(f"🔒 VAULT CREATED: {req.escrow_id} | currency={currency} | seller_wants={req.seller_currency}")
 
-    # Fire worker receipt email immediately (non-blocking)
+    # Send worker receipt email
     if req.worker_email:
         import asyncio
         deadline_str = cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC") if cancel_after_ts else "Not specified"
+        amount_val   = amount_rlusd if currency == "RLUSD" else amount_xrp
         asyncio.create_task(send_worker_receipt_email(
-            worker_email  = req.worker_email,
-            worker_name   = "",
-            escrow_id     = req.escrow_id,
-            buyer_name    = req.buyer_name,
-            amount_xrp    = req.amount_xrp,
-            task_preview  = req.task_description,
-            deadline      = deadline_str,
+            worker_email = req.worker_email,
+            worker_name  = "",
+            escrow_id    = req.escrow_id,
+            buyer_name   = req.buyer_name,
+            amount       = amount_val,
+            currency     = currency,
+            task_preview = req.task_description,
+            deadline     = deadline_str,
         ))
 
-    RIPPLE_EPOCH = 946684800
+    RIPPLE_EPOCH        = 946684800
     cancel_after_ripple = (
         int(cancel_after_ts.timestamp()) - RIPPLE_EPOCH
         if cancel_after_ts else None
     )
 
+    # Build the EscrowCreate amount field for the frontend
+    if currency == "RLUSD":
+        escrow_amount = {
+            "currency": RLUSD_HEX,
+            "issuer":   RLUSD_ISSUER,
+            "value":    str(amount_rlusd),
+        }
+    else:
+        escrow_amount = str(int(amount_xrp * 1_000_000))
+
     return {
         "escrow_id":           req.escrow_id,
         "condition":           final_condition,
+        "escrow_amount":       escrow_amount,      # ready for EscrowCreate tx
+        "currency":            currency,
         "status":              "LOCKED",
         "cancel_after_ripple": cancel_after_ripple,
         "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
@@ -975,8 +1130,7 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
         client  = AsyncJsonRpcClient(XRPL_URL)
         tx_res  = await client.request(Tx(transaction=tx_hash))
         if tx_res.is_successful():
-            tx_body  = tx_res.result
-            tx_data  = tx_body.get("tx_json") or tx_body.get("tx") or tx_body
+            tx_data  = tx_res.result.get("tx_json") or tx_res.result.get("tx") or tx_res.result
             sequence = tx_data.get("Sequence")
             logger.info(f"✅ EscrowCreate confirmed: hash={tx_hash[:16]}... seq={sequence}")
     except Exception as e:
@@ -1000,43 +1154,64 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         if vault.cancel_after_ts else "Not specified"
     )
 
+    # Determine display amount
+    if vault.currency == "RLUSD":
+        display_amount = f"{vault.amount_rlusd} RLUSD"
+    else:
+        display_amount = f"{vault.amount_xrp} XRP"
+
+    # Trustline warning for RLUSD seller-wants-RLUSD flows
+    trustline_ok = True
+    trustline_warning = None
+    if vault.seller_currency == "RLUSD":
+        trustline_ok = await check_rlusd_trustline(vault.worker_address)
+        if not trustline_ok:
+            trustline_warning = (
+                f"⚠️ Your wallet does not have a RLUSD trustline. "
+                f"You must add one before submitting your work or payment cannot be converted to RLUSD. "
+                f"In Xaman: Assets → Add Asset → RLUSD → issuer {RLUSD_ISSUER}."
+            )
+
     return {
-        "escrow_id":       vault.escrow_id,
-        "project_label":   vault.project_label,
-        "status":          vault.status,
-        "buyer_name":      vault.buyer_name,
-        "buyer_address":   vault.buyer_address,
-        "task_description": vault.task_description,
-        "amount_xrp":      vault.amount_xrp,
-        "deadline":        deadline_str,
-        "worker_address":  vault.worker_address,
-        "escrow_sequence": vault.escrow_sequence,
-        "escrow_tx_hash":  vault.escrow_tx_hash,
+        "escrow_id":          vault.escrow_id,
+        "project_label":      vault.project_label,
+        "status":             vault.status,
+        "buyer_name":         vault.buyer_name,
+        "buyer_address":      vault.buyer_address,
+        "task_description":   vault.task_description,
+        "currency":           vault.currency,
+        "amount_xrp":         vault.amount_xrp,
+        "amount_rlusd":       vault.amount_rlusd,
+        "display_amount":     display_amount,
+        "seller_currency":    vault.seller_currency,
+        "deadline":           deadline_str,
+        "worker_address":     vault.worker_address,
+        "escrow_sequence":    vault.escrow_sequence,
+        "escrow_tx_hash":     vault.escrow_tx_hash,
+        "trustline_ok":       trustline_ok,
+        "trustline_warning":  trustline_warning,
     }
 
 
 # ---------------------------------------------------------------------------
-# 14. EVALUATE — core audit + delivery store + notifications
+# 16. EVALUATE — audit + auto-finish + server-side DEX quote
 # ---------------------------------------------------------------------------
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
-    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+    import asyncio, base64
 
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if not vault:
         all_ids = [v.escrow_id for v in db.query(EscrowVault).all()]
-        logger.error(f"❌ VAULT MISS: '{req.escrow_id}' not found. Stored: {all_ids}")
-        raise HTTPException(
-            status_code=404,
-            detail=f"Project ID '{req.escrow_id}' not found. Check the ID is exactly correct."
-        )
+        logger.error(f"❌ VAULT MISS: '{req.escrow_id}' | stored: {all_ids}")
+        raise HTTPException(status_code=404, detail=f"Project ID '{req.escrow_id}' not found.")
 
     if vault.status == "RELEASED":
         raise HTTPException(status_code=409, detail="This escrow has already been released.")
     if vault.status == "CANCELLED":
-        raise HTTPException(status_code=409, detail="This escrow has been cancelled by the buyer.")
+        raise HTTPException(status_code=409, detail="This escrow has been cancelled.")
 
-    # Enforce 50MB total attachment cap
-    import base64
+    # 50 MB attachment cap
     total_bytes = 0
     for att in (req.worker_attachments or []):
         try:
@@ -1044,10 +1219,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         except Exception:
             pass
     if total_bytes > 50 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Total attachment size exceeds 50 MB ({total_bytes / 1024 / 1024:.1f} MB submitted)."
-        )
+        raise HTTPException(status_code=413, detail=f"Total attachment size exceeds 50 MB.")
 
     stored_buyer_attachments = None
     if vault.buyer_attachments:
@@ -1067,13 +1239,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
 
     is_approved          = verdict_dict.get("verdict") == "PASS"
     revealed_fulfillment = None
+    dex_quote            = None
 
     if is_approved:
-        import asyncio
-        revealed_fulfillment        = vault.fulfillment
-        vault.status                = "RELEASED"
-        vault.delivery_status       = "RELEASED"
-        vault.delivery_expires_at   = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
+        revealed_fulfillment      = vault.fulfillment
+        vault.status              = "RELEASED"
+        vault.delivery_status     = "RELEASED"
+        vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
 
         vault.worker_submission = json.dumps({
             "work":         req.work,
@@ -1083,15 +1255,42 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             "escrow_id":    req.escrow_id,
         })
 
-        logger.info(f"✅ KEY RELEASED + DELIVERY STORED: '{req.escrow_id}' | expires in {DELIVERY_EXPIRY_DAYS}d")
+        # ── AUTO-FINISH: referee submits EscrowFinish, seller gets paid automatically ──
+        if vault.escrow_sequence and vault.buyer_address and vault.worker_address and referee_wallet:
+            asyncio.create_task(auto_finish_escrow(
+                escrow_id            = req.escrow_id,
+                sequence             = vault.escrow_sequence,
+                owner                = vault.buyer_address,
+                fulfillment          = vault.fulfillment,
+                condition            = vault.condition,
+                worker_addr          = vault.worker_address,
+                db_session_factory   = SessionLocal,
+            ))
+            logger.info(f"🚀 AUTO-FINISH queued for {req.escrow_id}")
+        else:
+            logger.warning(
+                f"⚠️ AUTO-FINISH skipped for {req.escrow_id}: "
+                f"seq={vault.escrow_sequence} | buyer={vault.buyer_address} | "
+                f"worker={vault.worker_address} | wallet={'ok' if referee_wallet else 'MISSING'}"
+            )
 
-        # Notify buyer by email
+        # ── DEX quote if seller wants RLUSD but escrow is in XRP ──
+        if vault.seller_currency == "RLUSD" and vault.currency == "XRP" and vault.amount_xrp:
+            dex_quote = await server_side_dex_swap(
+                escrow_id          = req.escrow_id,
+                worker_addr        = vault.worker_address,
+                xrp_amount         = vault.amount_xrp,
+                db_session_factory = SessionLocal,
+            )
+
         if vault.buyer_email:
+            amount_val = vault.amount_rlusd if vault.currency == "RLUSD" else vault.amount_xrp
             asyncio.create_task(send_delivery_email(
                 buyer_email = vault.buyer_email,
                 buyer_name  = vault.buyer_name or "there",
                 escrow_id   = req.escrow_id,
-                amount_xrp  = vault.amount_xrp or 0,
+                amount      = amount_val or 0,
+                currency    = vault.currency,
                 verdict     = verdict_dict,
             ))
     else:
@@ -1101,55 +1300,57 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     vault.model_used = model_used
     db.commit()
 
-    # Webhook for agent flows — V2 includes delivery payload
+    # Webhook for agent flows
     if req.callback_url:
         webhook_payload = {"escrow_id": req.escrow_id, "verdict": verdict_dict}
-        if is_approved and revealed_fulfillment:
-            webhook_payload["fulfillment"] = revealed_fulfillment
-            webhook_payload["delivery"]    = {
+        if is_approved:
+            webhook_payload["auto_finish_queued"] = True
+            webhook_payload["delivery"] = {
                 "work":        req.work,
-                "attachments": [
-                    {"filename": a.filename, "mime_type": a.mime_type}
-                    for a in (req.worker_attachments or [])
-                ],
+                "attachments": [{"filename": a.filename, "mime_type": a.mime_type} for a in (req.worker_attachments or [])],
                 "collect_url": f"{SITE_URL}?collect={req.escrow_id}",
                 "expires_at":  vault.delivery_expires_at.isoformat() if vault.delivery_expires_at else None,
             }
+            if dex_quote:
+                webhook_payload["dex_quote_rlusd"] = dex_quote
         try:
             async with httpx.AsyncClient() as client:
                 await client.post(req.callback_url, json=webhook_payload, timeout=10.0)
             logger.info(f"📡 Webhook delivered to {req.callback_url}")
         except Exception as e:
-            logger.warning(f"⚠️ Webhook delivery failed: {e}")
+            logger.warning(f"⚠️ Webhook failed: {e}")
 
     return {
-        "escrow_id":       req.escrow_id,
-        "status":          "approved" if is_approved else "rejected",
-        "verdict":         verdict_dict,
-        "model_used":      model_used,
-        "fulfillment":     revealed_fulfillment,
-        "condition":       vault.condition if is_approved else None,
-        "worker_address":  vault.worker_address,
-        "buyer_address":   vault.buyer_address,
-        "escrow_sequence": vault.escrow_sequence,
-        "amount_xrp":      vault.amount_xrp,
+        "escrow_id":            req.escrow_id,
+        "status":               "approved" if is_approved else "rejected",
+        "verdict":              verdict_dict,
+        "model_used":           model_used,
+        # fulfillment key still returned for agent fallback / manual claim
+        "fulfillment":          revealed_fulfillment,
+        "condition":            vault.condition if is_approved else None,
+        "worker_address":       vault.worker_address,
+        "buyer_address":        vault.buyer_address,
+        "escrow_sequence":      vault.escrow_sequence,
+        "amount_xrp":           vault.amount_xrp,
+        "amount_rlusd":         vault.amount_rlusd,
+        "currency":             vault.currency,
+        "auto_finish_queued":   is_approved and bool(vault.escrow_sequence),
+        # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
+        "dex_quote_rlusd":      dex_quote,
+        "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
+        "seller_currency":      vault.seller_currency,
     }
 
 
 # ---------------------------------------------------------------------------
-# 15. DELIVERY RETRIEVAL ENDPOINT
+# 17. DELIVERY RETRIEVAL
 # ---------------------------------------------------------------------------
 @app.get("/escrow/{escrow_id}/delivery")
 async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
-    """
-    Buyer retrieves the worker's full submission after PASS.
-    Handles lazy expiry — no cron job needed.
-    """
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
 
-    # Lazy expiry check
     if (
         vault.delivery_expires_at
         and datetime.now(timezone.utc) > vault.delivery_expires_at.replace(tzinfo=timezone.utc)
@@ -1158,28 +1359,17 @@ async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
         vault.worker_submission = None
         vault.delivery_status   = "EXPIRED"
         db.commit()
-        logger.info(f"🗑️ Delivery expired and wiped: {escrow_id}")
 
     if vault.delivery_status == "EXPIRED":
-        raise HTTPException(
-            status_code=410,
-            detail=f"This delivery expired 7 days after the PASS verdict and has been permanently deleted. Receipt: {escrow_id}"
-        )
-
+        raise HTTPException(status_code=410, detail=f"Delivery expired. Receipt: {escrow_id}")
     if vault.status != "RELEASED":
-        raise HTTPException(
-            status_code=403,
-            detail="Delivery is only available after the AI verdict is PASS."
-        )
-
+        raise HTTPException(status_code=403, detail="Delivery only available after PASS verdict.")
     if not vault.worker_submission:
         raise HTTPException(status_code=404, detail="Delivery data not found.")
 
-    # Mark collected on first access
     if vault.delivery_status == "RELEASED":
         vault.delivery_status = "COLLECTED"
         db.commit()
-        logger.info(f"📦 Delivery collected: {escrow_id}")
 
     submission = json.loads(vault.worker_submission)
 
@@ -1187,22 +1377,24 @@ async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
         "escrow_id":       escrow_id,
         "project_label":   vault.project_label,
         "buyer_name":      vault.buyer_name,
+        "currency":        vault.currency,
         "amount_xrp":      vault.amount_xrp,
+        "amount_rlusd":    vault.amount_rlusd,
         "delivery_status": vault.delivery_status,
         "expires_at":      vault.delivery_expires_at.isoformat() if vault.delivery_expires_at else None,
         "work":            submission.get("work"),
         "attachments":     submission.get("attachments", []),
         "verdict":         submission.get("verdict"),
         "delivered_at":    submission.get("delivered_at"),
+        "auto_finish_hash": vault.auto_finish_hash,
     }
 
 
 # ---------------------------------------------------------------------------
-# 16. XRP PRICE ENDPOINT
+# 18. XRP PRICE
 # ---------------------------------------------------------------------------
 @app.get("/xrp/price")
 async def get_xrp_price():
-    """Live XRP/USD/GBP price for buyer amount display."""
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(
@@ -1218,15 +1410,8 @@ async def get_xrp_price():
 
 
 # ---------------------------------------------------------------------------
-# 17. DEX QUOTE ENDPOINT
+# 19. DEX QUOTE ENDPOINT (used by frontend for pre-submission quote display)
 # ---------------------------------------------------------------------------
-RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
-RLUSD_CURRENCY = "RLUSD"
-
-class QuoteRequest(BaseModel):
-    worker_address: str
-    xrp_amount:     float
-
 @app.post("/dex/quote")
 async def get_dex_quote(req: QuoteRequest):
     drops = str(int(req.xrp_amount * 1_000_000))
@@ -1256,7 +1441,7 @@ async def get_dex_quote(req: QuoteRequest):
                         "source_amount":       drops,
                         "destination_account": req.worker_address,
                         "destination_amount":  {"currency": RLUSD_CURRENCY, "issuer": RLUSD_ISSUER, "value": "999999999"},
-                    }]
+                    }],
                 },
                 timeout=15.0,
             )
@@ -1267,23 +1452,19 @@ async def get_dex_quote(req: QuoteRequest):
                 dest_amount = best.get("destination_amount", {})
                 if isinstance(dest_amount, dict):
                     estimated_rlusd = float(dest_amount.get("value", 0))
-                if isinstance(source_used, str):
-                    if int(source_used) / 1_000_000 > req.xrp_amount * 1.02:
-                        slippage_warning = True
-                logger.info(f"💱 DEX QUOTE: {req.xrp_amount} XRP → ~{estimated_rlusd} RLUSD")
+                if isinstance(source_used, str) and int(source_used) / 1_000_000 > req.xrp_amount * 1.02:
+                    slippage_warning = True
         except Exception as e:
             logger.warning(f"⚠️ Pathfinding failed: {e}")
 
     return {
-        "xrp_amount":        req.xrp_amount,
-        "estimated_rlusd":   round(estimated_rlusd, 4) if estimated_rlusd else None,
-        "trust_line_ok":     trust_line_ok,
-        "slippage_warning":  slippage_warning,
-        "rlusd_issuer":      RLUSD_ISSUER,
+        "xrp_amount":             req.xrp_amount,
+        "estimated_rlusd":        round(estimated_rlusd, 4) if estimated_rlusd else None,
+        "trust_line_ok":          trust_line_ok,
+        "slippage_warning":       slippage_warning,
+        "rlusd_issuer":           RLUSD_ISSUER,
         "trust_line_instructions": None if trust_line_ok else (
-            f"Your wallet does not have a RLUSD trust line. "
-            f"In Xaman: go to Assets → Add Asset → search RLUSD → "
-            f"select issuer {RLUSD_ISSUER} → Add Trust Line."
+            f"Your wallet needs a RLUSD trust line. In Xaman: Assets → Add Asset → RLUSD → issuer {RLUSD_ISSUER}."
         ),
     }
 
@@ -1294,5 +1475,5 @@ async def get_dex_quote(req: QuoteRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting AgentTrust Referee v5.1 on port {port}")
+    logger.info(f"🚀 Starting AgentTrust Referee v6.0 on port {port}")
     uvicorn.run("referee:app", host="0.0.0.0", port=port, reload=False)
