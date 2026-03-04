@@ -8,4 +8,5 @@ python-dotenv
 requests
 xumm-sdk-py
 fastmcp
+resend
 
