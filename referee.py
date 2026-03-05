@@ -84,17 +84,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# GET /mcp — friendly info for browsers. Must be registered BEFORE the mount
-# so this route wins over the sub-app for GET requests.
-@app.get("/mcp")
-def mcp_info():
-    return {
-        "server": "AgentTrust Referee MCP",
-        "transport": "streamable-http (stateless)",
-        "hint": "POST to this URL using an MCP-compatible client (Smithery, Claude Desktop, Cursor, etc.)",
-        "docs": "https://smithery.ai",
-    }
-
 # Mount MCP at /mcp (Streamable HTTP — Smithery POSTs directly to this path)
 if _mcp_http_app is not None:
     app.mount("/mcp", _mcp_http_app)
