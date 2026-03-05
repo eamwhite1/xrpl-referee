@@ -7,6 +7,7 @@ xrpl-py
 python-dotenv
 requests
 xumm-sdk-py
-fastmcp
+fastmcp==0.4.1
 resend
+
 
