@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import json
 import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -28,7 +29,7 @@ from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
-from xrpl.models.transactions import EscrowFinish, OfferCreate
+from xrpl.models.transactions import EscrowFinish
 from xrpl.core.addresscodec import decode_seed
 from xrpl.utils import xrp_to_drops
 
@@ -46,10 +47,34 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
-app = FastAPI(title="AgentTrust Protocol Core")
+# ---------------------------------------------------------------------------
+# 2. MCP SERVER (imported before app so its lifespan can be wired in)
+# ---------------------------------------------------------------------------
+# FastMCP 2.x uses Streamable HTTP transport (path="/" = endpoint at mount root).
+# The lifespan MUST be passed to FastAPI or the session manager won't initialise,
+# causing Smithery / MCP clients to receive a 405 or a task-group error.
+_mcp_http_app = None
+try:
+    from mcp_server import mcp
+    _mcp_http_app = mcp.http_app(path="/")
+    logger.info("✅ MCP server loaded (streamable HTTP, path='/')")
+except Exception as e:
+    logger.debug(f"MCP server not available: {e}")
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    if _mcp_http_app is not None:
+        async with _mcp_http_app.lifespan(app):
+            yield
+    else:
+        yield
+
+
+app = FastAPI(title="AgentTrust Protocol Core", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
-# 2. CORS
+# 2b. CORS
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -59,15 +84,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# 2b. MCP SERVER (optional — requires fastmcp in requirements.txt)
-# ---------------------------------------------------------------------------
-try:
-    from mcp_server import mcp
-    app.mount("/mcp", mcp.http_app())
+# Mount MCP at /mcp (Streamable HTTP — Smithery POSTs directly to this path)
+if _mcp_http_app is not None:
+    app.mount("/mcp", _mcp_http_app)
     logger.info("✅ MCP server mounted at /mcp")
-except Exception as e:
-    logger.debug(f"MCP server not loaded: {e}")
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -83,7 +103,7 @@ def serve_ui(request: Request):
 <title>AgentTrust Referee</title></head>
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
-    return {"status": "online", "version": "6.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+    return {"status": "online", "version": "7.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
 
 @app.get("/playground")
 def serve_playground():
@@ -105,7 +125,7 @@ def serve_playground():
 @app.get("/status")
 @app.head("/status")
 def health_check():
-    return {"status": "online", "version": "6.0", "timestamp": datetime.now(timezone.utc)}
+    return {"status": "online", "version": "7.0", "timestamp": datetime.now(timezone.utc)}
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
@@ -132,7 +152,7 @@ def serve_agent_json():
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
-        "agentVersion": "6.0.0",
+        "agentVersion": "7.0.0",
         "protocolVersion": "0.4.0",
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True},
@@ -181,6 +201,7 @@ def serve_mcp_server_card():
     }
 
 
+@app.get("/.well-known/ai-plugin.json")
 def serve_ai_plugin():
     path = ".well-known/ai-plugin.json"
     if os.path.exists(path):
@@ -351,6 +372,7 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
+RIPPLE_EPOCH    = 946684800  # Unix timestamp of the XRP Ledger epoch (2000-01-01T00:00:00Z)
 
 RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
 RLUSD_CURRENCY = "RLUSD"
@@ -1508,7 +1530,6 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             deadline     = deadline_str,
         ))
 
-    RIPPLE_EPOCH        = 946684800
     cancel_after_ripple = (
         int(cancel_after_ts.timestamp()) - RIPPLE_EPOCH
         if cancel_after_ts else None
@@ -2175,7 +2196,7 @@ async def marketplace_jobs(
                 "poster":       v.buyer_address or "",
                 "poster_name":  v.buyer_name or "",
                 "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
-                "deadline_hrs": max(0, int((v.cancel_after_ts - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
+                "deadline_hrs": max(0, int((v.cancel_after_ts.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
                 "tags":         [],
                 "status":       "OPEN",
                 "is_demo":      False,
@@ -2208,5 +2229,5 @@ async def marketplace_jobs(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting AgentTrust Referee v6.0 on port {port}")
+    logger.info(f"🚀 Starting AgentTrust Referee v7.0 on port {port}")
     uvicorn.run("referee:app", host="0.0.0.0", port=port, reload=False)

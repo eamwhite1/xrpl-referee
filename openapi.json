@@ -3,7 +3,7 @@
   "info": {
     "title": "AgentTrust Referee",
     "description": "A trustless AI verdict engine for the agent economy. POST a task spec and proof of work, pay 0.1 XRP, receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
-    "version": "5.0.0",
+    "version": "7.0.0",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
       "currency": "XRP",
