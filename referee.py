@@ -32,11 +32,7 @@ from xrpl.models.transactions import EscrowFinish, OfferCreate
 from xrpl.core.addresscodec import decode_seed
 from xrpl.utils import xrp_to_drops
 
-# XUMM SDK Import
-try:
-    from xumm import XummSdk
-except ImportError:
-    XummSdk = None
+# XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
 
 # Database Imports
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text
@@ -458,20 +454,82 @@ except Exception as e:
 
 xumm_api_key    = os.getenv("XUMM_API_KEY")
 xumm_api_secret = os.getenv("XUMM_API_SECRET")
-xumm_sdk        = None
 
 if xumm_api_key:
     logger.info(f"✅ XUMM_API_KEY found (starts: {xumm_api_key[:4]}...)")
 else:
     logger.error("❌ XUMM_API_KEY missing!")
 
-if xumm_api_key and xumm_api_secret and XummSdk:
+async def xumm_create_payload(txjson: dict) -> dict:
+    """Create a XUMM payload via direct REST API call. Returns {nextUrl, uuid, qr}."""
+    if not xumm_api_key or not xumm_api_secret:
+        raise HTTPException(status_code=500, detail="XUMM API credentials not configured.")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            "https://xumm.app/api/v1/platform/payload",
+            json={"txjson": txjson},
+            headers={
+                "X-API-Key":    xumm_api_key,
+                "X-API-Secret": xumm_api_secret,
+                "Content-Type": "application/json",
+            },
+        )
+        if not res.is_success():
+            raise HTTPException(status_code=500, detail=f"XUMM API error: {res.text}")
+        data = res.json()
+        return {
+            "nextUrl": data["next"]["always"],
+            "uuid":    data["uuid"],
+            "qr":      data["refs"]["qr_png"],
+        }
+
+async def xumm_get_payload(uuid: str) -> dict:
+    """Get XUMM payload status via direct REST API call. Returns {signed, tx_hash, signer}."""
+    if not xumm_api_key or not xumm_api_secret:
+        raise HTTPException(status_code=500, detail="XUMM API credentials not configured.")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(
+            f"https://xumm.app/api/v1/platform/payload/{uuid}",
+            headers={
+                "X-API-Key":    xumm_api_key,
+                "X-API-Secret": xumm_api_secret,
+            },
+        )
+        if not res.is_success():
+            raise HTTPException(status_code=500, detail=f"XUMM API error: {res.text}")
+        data   = res.json()
+        signed  = data["meta"]["signed"]
+        tx_hash = data["response"].get("txid")  if signed else None
+        signer  = data["response"].get("account") if signed else None
+        return {"signed": signed, "tx_hash": tx_hash, "signer": signer}
+
+# Verify XUMM connectivity at startup
+async def _verify_xumm():
+    if not xumm_api_key or not xumm_api_secret:
+        return
     try:
-        xumm_sdk = XummSdk(xumm_api_key, xumm_api_secret)
-        pong     = xumm_sdk.ping()
-        logger.info(f"🔌 XUMM SDK connected: {pong.application.name}")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(
+                "https://xumm.app/api/v1/platform/ping",
+                headers={"X-API-Key": xumm_api_key, "X-API-Secret": xumm_api_secret},
+            )
+            if res.is_success():
+                name = res.json().get("application", {}).get("name", "unknown")
+                logger.info(f"🔌 XUMM SDK connected: {name}")
+            else:
+                logger.warning(f"⚠️ XUMM ping failed: {res.status_code}")
     except Exception as e:
-        logger.error(f"❌ XUMM SDK ping failed: {e}")
+        logger.warning(f"⚠️ XUMM ping error: {e}")
+
+import asyncio as _asyncio
+try:
+    loop = _asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(_verify_xumm())
+    else:
+        loop.run_until_complete(_verify_xumm())
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1327,43 +1385,23 @@ async def standalone_audit(
 # ---------------------------------------------------------------------------
 @app.post("/xumm/fee-payload")
 async def create_fee_payload():
-    if not xumm_sdk:
-        raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
     tx = {
         "TransactionType": "Payment",
-        "Destination": PROTOCOL_WALLET,
-        "Amount": str(int(MIN_FEE_XRP * 1_000_000)),
+        "Destination":     PROTOCOL_WALLET,
+        "Amount":          str(int(MIN_FEE_XRP * 1_000_000)),
     }
-    try:
-        result = xumm_sdk.payload.create(tx)
-        return {"nextUrl": result.next.always, "uuid": result.uuid, "qr": result.refs.qr_png}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await xumm_create_payload(tx)
 
 
 @app.get("/xumm/payload/{uuid}")
 async def get_xumm_payload_status(uuid: str):
-    if not xumm_sdk:
-        raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
-    try:
-        result  = xumm_sdk.payload.get(uuid)
-        signed  = result.meta.signed
-        tx_hash = result.response.txid if signed else None
-        signer  = result.response.account if signed else None
-        return {"signed": signed, "tx_hash": tx_hash, "signer": signer}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await xumm_get_payload(uuid)
 
 
 @app.post("/xumm/create-payload")
 async def create_xumm_payload(req: XummPayloadRequest):
-    if not xumm_sdk:
-        raise HTTPException(status_code=500, detail="Xumm SDK not configured.")
-    try:
-        result = xumm_sdk.payload.create(req.txjson)
-        return {"nextUrl": result.next.always, "uuid": result.uuid}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await xumm_create_payload(req.txjson)
+    return {"nextUrl": result["nextUrl"], "uuid": result["uuid"]}
 
 
 # ---------------------------------------------------------------------------
