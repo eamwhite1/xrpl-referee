@@ -1,18 +1,2 @@
 target: remote
 url: https://xrpl-referee.onrender.com/mcp
-
-configSchema:
-  type: object
-  properties:
-    fee_hash:
-      type: string
-      description: "XRPL transaction hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Required for audit_task and create_escrow_vault."
-      placeholder: "56DC9FA1C9BC9B7A537FB4FBB69FD216280A2BA820EAA87F1E6E183CDC07847C"
-    worker_address:
-      type: string
-      description: "Your XRPL wallet address. Used as the seller/worker when claiming escrow jobs."
-      placeholder: "rXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-    escrow_id:
-      type: string
-      description: "Receipt code for an existing escrow vault, e.g. AT-7X9K-2MQ4. Only needed if submitting work against a specific vault."
-      placeholder: "AT-7X9K-2MQ4"
