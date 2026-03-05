@@ -181,6 +181,7 @@ def serve_mcp_server_card():
     }
 
 
+@app.get("/.well-known/ai-plugin.json")
 def serve_ai_plugin():
     path = ".well-known/ai-plugin.json"
     if os.path.exists(path):
@@ -351,6 +352,7 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
+RIPPLE_EPOCH    = 946684800  # Unix timestamp of the XRP Ledger epoch (2000-01-01T00:00:00Z)
 
 RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
 RLUSD_CURRENCY = "RLUSD"
@@ -1508,7 +1510,6 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             deadline     = deadline_str,
         ))
 
-    RIPPLE_EPOCH        = 946684800
     cancel_after_ripple = (
         int(cancel_after_ts.timestamp()) - RIPPLE_EPOCH
         if cancel_after_ts else None
@@ -2175,7 +2176,7 @@ async def marketplace_jobs(
                 "poster":       v.buyer_address or "",
                 "poster_name":  v.buyer_name or "",
                 "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
-                "deadline_hrs": max(0, int((v.cancel_after_ts - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
+                "deadline_hrs": max(0, int((v.cancel_after_ts.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
                 "tags":         [],
                 "status":       "OPEN",
                 "is_demo":      False,
