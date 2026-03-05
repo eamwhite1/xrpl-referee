@@ -69,10 +69,11 @@ app.add_middleware(
 try:
     from mcp_server import mcp
     try:
+        app.mount("/mcp", mcp.streamable_http_app())
+        logger.info("✅ MCP server mounted at /mcp (streamable HTTP)")
+    except AttributeError:
         app.mount("/mcp", mcp.sse_app())
-        logger.info("✅ MCP server mounted at /mcp")
-    except Exception as mount_err:
-        logger.debug(f"MCP mount failed: {mount_err}")
+        logger.info("✅ MCP server mounted at /mcp (SSE fallback)")
 except ImportError:
     logger.debug("fastmcp not installed — MCP server disabled")
 
