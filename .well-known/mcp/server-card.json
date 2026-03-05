@@ -6,6 +6,9 @@
   "homepage": "https://www.cryptovault.co.uk",
   "contact": "hello@cryptovault.co.uk",
   "transport": ["http"],
+  "auth": {
+    "type": "none"
+  },
   "tools": [
     {"name": "audit_task",                "description": "Verify completed work against a task spec for 0.1 XRP. Returns PASS/FAIL with score and feedback."},
     {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
