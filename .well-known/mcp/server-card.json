@@ -1,0 +1,20 @@
+{
+  "name": "AgentTrust Referee",
+  "version": "7.0.0",
+  "description": "Trustless AI task verification with automatic XRP payment release. Post a task spec and work submission — get PASS/FAIL from an AI referee. Escrowed XRP releases automatically to the worker on approval. Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents.",
+  "url": "https://xrpl-referee.onrender.com/mcp",
+  "homepage": "https://www.cryptovault.co.uk",
+  "contact": "hello@cryptovault.co.uk",
+  "transport": ["http"],
+  "tools": [
+    {"name": "audit_task",                "description": "Verify completed work against a task spec for 0.1 XRP. Returns PASS/FAIL with score and feedback."},
+    {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
+    {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
+    {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed."},
+    {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
+    {"name": "list_marketplace_jobs",     "description": "Browse open XRP bounties agents can claim. Returns structured job data."},
+    {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
+    {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."}
+  ],
+  "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3"]
+}
