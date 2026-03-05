@@ -25,7 +25,6 @@ from fastmcp import FastMCP
 
 mcp = FastMCP(
     name="AgentTrust Referee",
-    stateless_http=True,
     instructions=(
         "The AgentTrust Referee is a trustless AI verdict engine built on the XRP Ledger. "
         "Use audit_task to verify whether completed work meets a task specification — "

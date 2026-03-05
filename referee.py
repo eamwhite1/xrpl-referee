@@ -59,7 +59,7 @@ try:
     _mcp_http_app = mcp.http_app(path="/")
     logger.info("✅ MCP server loaded (streamable HTTP, path='/')")
 except Exception as e:
-    logger.debug(f"MCP server not available: {e}")
+    logger.error(f"❌ MCP server failed to load: {e}", exc_info=True)
 
 
 @asynccontextmanager
