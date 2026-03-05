@@ -7,6 +7,6 @@ xrpl-py
 python-dotenv==0.21.1
 requests
 xumm-sdk-py
-fastmcp
 resend
 cryptography
+
