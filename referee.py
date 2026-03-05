@@ -5,6 +5,7 @@ import sys
 import hashlib
 import secrets
 import json
+import base64
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -14,6 +15,15 @@ from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, Red
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import resend
+
+# Encryption for fulfillment keys at rest
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    logger_tmp = logging.getLogger("RefereeBot")
+    logger_tmp.warning("⚠️ cryptography package not installed — fulfillment keys stored unencrypted. Run: pip install cryptography")
 
 # XRPL Imports
 from xrpl.asyncio.clients import AsyncJsonRpcClient
@@ -230,6 +240,12 @@ class EscrowVault(Base):
     worker_submission   = Column(Text,    nullable=True)
     delivery_expires_at = Column(DateTime, nullable=True)
     delivery_status     = Column(String,   nullable=True)
+    # URL snapshots — v7
+    spec_link_snapshots     = Column(Text, nullable=True)   # JSON: [{url, content, fetched_at}]
+    evidence_link_snapshots = Column(Text, nullable=True)   # JSON: [{url, content, fetched_at}]
+    # Submission limits — v7
+    submission_count  = Column(Integer, default=0)          # how many times seller has submitted
+    max_submissions   = Column(Integer, default=3)          # configurable per-vault
 
 
 Base.metadata.create_all(bind=engine)
@@ -265,6 +281,11 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS seller_currency      VARCHAR DEFAULT 'XRP'",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS auto_finish_hash     VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS auto_finish_error    VARCHAR",
+        # v7 columns
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS spec_link_snapshots     TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evidence_link_snapshots TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS submission_count        INTEGER DEFAULT 0",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS max_submissions         INTEGER DEFAULT 3",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -307,6 +328,76 @@ if RESEND_API_KEY:
     logger.info("✅ Resend email configured")
 else:
     logger.warning("⚠️ RESEND_API_KEY missing — email notifications disabled")
+
+# ---------------------------------------------------------------------------
+# FULFILLMENT KEY ENCRYPTION (AES-256-GCM)
+# ---------------------------------------------------------------------------
+# Set FULFILLMENT_ENCRYPTION_KEY in your Render env vars.
+# Generate one with: python3 -c "import secrets; print(secrets.token_hex(32))"
+# A 64-char hex string = 32 bytes = AES-256 key.
+# Without this env var, fulfillments are stored unencrypted (backwards-compatible).
+
+_RAW_ENC_KEY = os.getenv("FULFILLMENT_ENCRYPTION_KEY", "")
+
+def _get_aesgcm() -> "AESGCM | None":
+    """Return an AESGCM instance if key + library are available, else None."""
+    if not CRYPTO_AVAILABLE or not _RAW_ENC_KEY:
+        return None
+    try:
+        key_bytes = bytes.fromhex(_RAW_ENC_KEY)
+        if len(key_bytes) not in (16, 24, 32):
+            logger.error("❌ FULFILLMENT_ENCRYPTION_KEY must be 32, 48, or 64 hex chars (16/24/32 bytes)")
+            return None
+        return AESGCM(key_bytes)
+    except ValueError as e:
+        logger.error(f"❌ FULFILLMENT_ENCRYPTION_KEY is not valid hex: {e}")
+        return None
+
+def encrypt_fulfillment(plaintext: str) -> str:
+    """
+    Encrypt fulfillment hex string.
+    Returns: "enc:v1:<base64(nonce+ciphertext)>" or original string if no key configured.
+    """
+    aesgcm = _get_aesgcm()
+    if not aesgcm:
+        return plaintext  # fallback: store plaintext if no key configured
+    nonce      = secrets.token_bytes(12)   # 96-bit nonce for GCM
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
+    encoded    = base64.b64encode(nonce + ciphertext).decode()
+    return f"enc:v1:{encoded}"
+
+def decrypt_fulfillment(stored: str) -> str:
+    """
+    Decrypt a fulfillment string.
+    Handles both encrypted ("enc:v1:...") and legacy plaintext values.
+    """
+    if not stored.startswith("enc:v1:"):
+        return stored  # legacy plaintext — return as-is
+    aesgcm = _get_aesgcm()
+    if not aesgcm:
+        raise ValueError("Fulfillment is encrypted but FULFILLMENT_ENCRYPTION_KEY is not set.")
+    try:
+        raw        = base64.b64decode(stored[7:])  # strip "enc:v1:"
+        nonce      = raw[:12]
+        ciphertext = raw[12:]
+        return aesgcm.decrypt(nonce, ciphertext, None).decode()
+    except Exception as e:
+        raise ValueError(f"Failed to decrypt fulfillment: {e}")
+
+if _RAW_ENC_KEY and CRYPTO_AVAILABLE:
+    aesgcm_test = _get_aesgcm()
+    if aesgcm_test:
+        logger.info("🔐 Fulfillment key encryption: ACTIVE (AES-256-GCM)")
+    else:
+        logger.warning("⚠️ Fulfillment key encryption: MISCONFIGURED — check FULFILLMENT_ENCRYPTION_KEY")
+else:
+    logger.warning("⚠️ Fulfillment key encryption: DISABLED — set FULFILLMENT_ENCRYPTION_KEY in env vars")
+
+# ---------------------------------------------------------------------------
+# SUBMISSION LIMITS
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_SUBMISSIONS = int(os.getenv("DEFAULT_MAX_SUBMISSIONS", "3"))
+EXTRA_ATTEMPT_FEE_XRP   = 0.05  # charged per extra submission beyond the limit
 
 try:
     seed = os.getenv("XRPL_SEED")
@@ -363,6 +454,10 @@ class EscrowSetupRequest(BaseModel):
     seller_currency:    str             = "XRP"
     cancel_after_hrs:   int             = 168
     buyer_attachments:  Optional[list[Attachment]] = None
+    # Spec links — up to 3 URLs the buyer provides as reference material
+    spec_links:         Optional[list[str]] = None
+    # How many submission attempts the seller gets (default 3, buyer can raise for complex work)
+    max_submissions:    int             = 3
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -371,6 +466,8 @@ class AuditRequest(BaseModel):
     callback_url:        Optional[str]  = None
     task_category:       str            = "default"
     require_consensus:   bool           = False
+    # Evidence links — up to 3 URLs the seller provides as proof
+    evidence_links:      Optional[list[str]] = None
 
 class StandaloneAuditRequest(BaseModel):
     task:                str
@@ -392,7 +489,8 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None) -> dict:
+    required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == fee_hash).first()
     if already_used:
         raise HTTPException(
@@ -436,10 +534,10 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session) -> dict
         raise HTTPException(status_code=400, detail="Protocol fees must be paid in XRP, not issued currency.")
 
     amount_xrp = round(int(raw_amount) / 1_000_000, 6)
-    if amount_xrp < (MIN_FEE_XRP - 0.000001):
+    if amount_xrp < (required_xrp - 0.000001):
         raise HTTPException(
             status_code=402,
-            detail=f"Insufficient fee. Required ≥{MIN_FEE_XRP} XRP, received {amount_xrp:.6f} XRP.",
+            detail=f"Insufficient fee. Required ≥{required_xrp} XRP, received {amount_xrp:.6f} XRP.",
         )
 
     db.add(PaymentLog(
@@ -728,8 +826,123 @@ async def send_delivery_email(
 
 
 # ---------------------------------------------------------------------------
-# 11. DOMAIN-SPECIFIC PROMPT LIBRARY
+# 10b. URL SNAPSHOT FETCHER
 # ---------------------------------------------------------------------------
+# Blocked TLDs / patterns — private networks, localhost, cloud metadata
+_BLOCKED_URL_PATTERNS = [
+    r"^https?://localhost",
+    r"^https?://127\.",
+    r"^https?://10\.",
+    r"^https?://192\.168\.",
+    r"^https?://172\.(1[6-9]|2[0-9]|3[01])\.",
+    r"^https?://169\.254\.",           # link-local / AWS metadata
+    r"^https?://metadata\.google",
+    r"^https?://0\.",
+    r"file://",
+]
+
+# Max content we inject per URL (chars) — keeps token usage sane
+_URL_SNAPSHOT_MAX_CHARS = 8_000
+
+# Suspiciously long content that might be prompt injection
+_INJECTION_MARKERS = [
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard the above",
+    "you are now",
+    "new system prompt",
+    "override your instructions",
+    "forget everything",
+    "act as",
+]
+
+async def fetch_url_snapshot(url: str) -> dict:
+    """
+    Fetch a URL and return a snapshot dict:
+    {url, content, content_type, fetched_at, error}
+
+    Security:
+    - Blocks private/loopback/metadata IPs
+    - Caps content at _URL_SNAPSHOT_MAX_CHARS
+    - Strips HTML tags to plain text
+    - Detects and neutralises prompt injection attempts
+    - 10s timeout, follows up to 3 redirects
+    """
+    import re as _re
+    from datetime import datetime, timezone
+
+    result = {"url": url, "content": None, "content_type": None,
+              "fetched_at": datetime.now(timezone.utc).isoformat(), "error": None}
+
+    # Basic URL validation
+    if not url.startswith(("http://", "https://")):
+        result["error"] = "Only http/https URLs are supported."
+        return result
+
+    for pattern in _BLOCKED_URL_PATTERNS:
+        if _re.search(pattern, url, _re.IGNORECASE):
+            result["error"] = "URL resolves to a blocked network range."
+            return result
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            max_redirects=3,
+            headers={"User-Agent": "AgentTrust-Referee/1.0 (evidence-snapshot)"},
+        ) as client:
+            resp = await client.get(url)
+            content_type = resp.headers.get("content-type", "")
+            result["content_type"] = content_type
+
+            # Only process text content — no binary, no PDFs (those go via attachments)
+            if not any(t in content_type for t in ["text/", "application/json", "application/xml"]):
+                result["error"] = f"Non-text content type '{content_type[:60]}' — use file attachments for binary content."
+                return result
+
+            raw = resp.text
+
+            # Strip HTML tags to plain text
+            if "text/html" in content_type:
+                # Remove scripts and styles entirely
+                raw = _re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", raw,
+                              flags=_re.DOTALL | _re.IGNORECASE)
+                raw = _re.sub(r"<[^>]+>", " ", raw)
+                raw = _re.sub(r"\s{3,}", "\n", raw).strip()
+
+            # Truncate
+            if len(raw) > _URL_SNAPSHOT_MAX_CHARS:
+                raw = raw[:_URL_SNAPSHOT_MAX_CHARS] + f"\n[... truncated at {_URL_SNAPSHOT_MAX_CHARS} chars]"
+
+            # Prompt injection detection — neutralise rather than reject
+            lower = raw.lower()
+            injection_detected = any(marker in lower for marker in _INJECTION_MARKERS)
+            if injection_detected:
+                logger.warning(f"⚠️ Potential prompt injection in URL snapshot: {url}")
+                raw = "[CONTENT SANITISED: this page contained text that could interfere with AI evaluation. It has been removed. The AI will evaluate based on the seller's written submission only.]"
+
+            result["content"] = raw
+
+    except httpx.TimeoutException:
+        result["error"] = "Request timed out after 10 seconds."
+    except httpx.TooManyRedirects:
+        result["error"] = "Too many redirects."
+    except Exception as e:
+        result["error"] = f"Fetch failed: {str(e)[:120]}"
+
+    return result
+
+
+async def fetch_url_snapshots(urls: list[str]) -> list[dict]:
+    """Fetch up to 3 URLs concurrently."""
+    import asyncio
+    if not urls:
+        return []
+    urls = [u.strip() for u in urls[:3] if u and u.strip()]  # hard cap at 3
+    return await asyncio.gather(*[fetch_url_snapshot(u) for u in urls])
+
+
+
 DOMAIN_PROMPTS = {
     "bug_bounty": (
         "You are auditing a security bug bounty submission. Be extremely rigorous. "
@@ -781,12 +994,14 @@ DOMAIN_PROMPTS = {
 # 12. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
 async def run_ai_audit(
-    task:               str,
-    work:               str,
-    buyer_attachments:  list = None,
-    worker_attachments: list = None,
-    task_category:      str  = "default",
-    require_consensus:  bool = False,
+    task:                    str,
+    work:                    str,
+    buyer_attachments:       list = None,
+    worker_attachments:      list = None,
+    task_category:           str  = "default",
+    require_consensus:       bool = False,
+    spec_link_snapshots:     list = None,
+    evidence_link_snapshots: list = None,
 ) -> tuple[dict, str]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -816,7 +1031,30 @@ async def run_ai_audit(
     if buyer_attachments:
         prompt_text += f"\nThe buyer has provided {len(buyer_attachments)} supporting document(s) as part of the task specification.\n"
 
+    # Spec links — buyer-provided reference URLs, snapshotted at vault creation
+    if spec_link_snapshots:
+        ok = [s for s in spec_link_snapshots if s.get("content")]
+        if ok:
+            prompt_text += f"\nThe buyer provided {len(ok)} reference URL(s) as part of the specification:\n"
+            for snap in ok:
+                prompt_text += f"\n--- REFERENCE URL: {snap['url']} (fetched {snap['fetched_at'][:10]}) ---\n"
+                prompt_text += snap["content"] + "\n--- END REFERENCE URL ---\n"
+
     prompt_text += f"\nWORK SUBMITTED:\n{work}\n"
+
+    # Evidence links — seller-provided proof URLs, snapshotted at submission time
+    if evidence_link_snapshots:
+        ok = [s for s in evidence_link_snapshots if s.get("content")]
+        failed = [s for s in evidence_link_snapshots if s.get("error")]
+        if ok:
+            prompt_text += f"\nThe seller provided {len(ok)} evidence URL(s) as supporting proof:\n"
+            for snap in ok:
+                prompt_text += f"\n--- EVIDENCE URL: {snap['url']} (fetched {snap['fetched_at'][:10]}) ---\n"
+                prompt_text += snap["content"] + "\n--- END EVIDENCE URL ---\n"
+        if failed:
+            prompt_text += f"\nNote: {len(failed)} evidence URL(s) could not be fetched: "
+            prompt_text += ", ".join(f"{s['url']} ({s['error']})" for s in failed) + "\n"
+            prompt_text += "Evaluate based on what was successfully retrieved and the written submission.\n"
 
     if worker_attachments:
         prompt_text += f"\nThe seller has submitted {len(worker_attachments)} document(s) as proof of work.\n"
@@ -1046,25 +1284,38 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if req.buyer_attachments:
         attachments_json = json.dumps([a.dict() for a in req.buyer_attachments])
 
+    # Fetch and snapshot spec links provided by the buyer
+    spec_snapshots_json = None
+    if req.spec_links:
+        logger.info(f"🔗 Fetching {len(req.spec_links[:3])} spec link(s) for {req.escrow_id}")
+        snapshots = await fetch_url_snapshots(req.spec_links)
+        spec_snapshots_json = json.dumps(snapshots)
+        ok    = sum(1 for s in snapshots if s.get("content"))
+        failed = sum(1 for s in snapshots if s.get("error"))
+        logger.info(f"🔗 Spec links: {ok} fetched, {failed} failed for {req.escrow_id}")
+
     vault = EscrowVault(
-        escrow_id         = req.escrow_id,
-        condition         = final_condition,
-        fulfillment       = final_fulfillment,
-        status            = "LOCKED",
-        currency          = currency,
-        amount_xrp        = amount_xrp,
-        amount_rlusd      = amount_rlusd,
-        project_label     = req.project_label,
-        buyer_name        = req.buyer_name,
-        buyer_address     = req.buyer_address,
-        buyer_email       = req.buyer_email,
-        worker_email      = req.worker_email,
-        task_description  = req.task_description,
-        worker_address    = req.worker_address,
-        seller_currency   = req.seller_currency.upper(),
-        cancel_after_ts   = cancel_after_ts,
-        buyer_attachments = attachments_json,
-        delivery_status   = "PENDING",
+        escrow_id             = req.escrow_id,
+        condition             = final_condition,
+        fulfillment           = encrypt_fulfillment(final_fulfillment),
+        status                = "LOCKED",
+        currency              = currency,
+        amount_xrp            = amount_xrp,
+        amount_rlusd          = amount_rlusd,
+        project_label         = req.project_label,
+        buyer_name            = req.buyer_name,
+        buyer_address         = req.buyer_address,
+        buyer_email           = req.buyer_email,
+        worker_email          = req.worker_email,
+        task_description      = req.task_description,
+        worker_address        = req.worker_address,
+        seller_currency       = req.seller_currency.upper(),
+        cancel_after_ts       = cancel_after_ts,
+        buyer_attachments     = attachments_json,
+        spec_link_snapshots   = spec_snapshots_json,
+        delivery_status       = "PENDING",
+        submission_count      = 0,
+        max_submissions       = max(1, min(req.max_submissions, 10)),  # clamp 1–10
     )
     db.add(vault)
     db.commit()
@@ -1173,23 +1424,26 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
             )
 
     return {
-        "escrow_id":          vault.escrow_id,
-        "project_label":      vault.project_label,
-        "status":             vault.status,
-        "buyer_name":         vault.buyer_name,
-        "buyer_address":      vault.buyer_address,
-        "task_description":   vault.task_description,
-        "currency":           vault.currency,
-        "amount_xrp":         vault.amount_xrp,
-        "amount_rlusd":       vault.amount_rlusd,
-        "display_amount":     display_amount,
-        "seller_currency":    vault.seller_currency,
-        "deadline":           deadline_str,
-        "worker_address":     vault.worker_address,
-        "escrow_sequence":    vault.escrow_sequence,
-        "escrow_tx_hash":     vault.escrow_tx_hash,
-        "trustline_ok":       trustline_ok,
-        "trustline_warning":  trustline_warning,
+        "escrow_id":            vault.escrow_id,
+        "project_label":        vault.project_label,
+        "status":               vault.status,
+        "buyer_name":           vault.buyer_name,
+        "buyer_address":        vault.buyer_address,
+        "task_description":     vault.task_description,
+        "currency":             vault.currency,
+        "amount_xrp":           vault.amount_xrp,
+        "amount_rlusd":         vault.amount_rlusd,
+        "display_amount":       display_amount,
+        "seller_currency":      vault.seller_currency,
+        "deadline":             deadline_str,
+        "worker_address":       vault.worker_address,
+        "escrow_sequence":      vault.escrow_sequence,
+        "escrow_tx_hash":       vault.escrow_tx_hash,
+        "trustline_ok":         trustline_ok,
+        "trustline_warning":    trustline_warning,
+        "submission_count":     vault.submission_count or 0,
+        "max_submissions":      vault.max_submissions  or DEFAULT_MAX_SUBMISSIONS,
+        "attempts_remaining":   max(0, (vault.max_submissions or DEFAULT_MAX_SUBMISSIONS) - (vault.submission_count or 0)),
     }
 
 
@@ -1211,6 +1465,24 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     if vault.status == "CANCELLED":
         raise HTTPException(status_code=409, detail="This escrow has been cancelled.")
 
+    # ── SUBMISSION LIMIT CHECK ──
+    current_count = vault.submission_count or 0
+    max_allowed   = vault.max_submissions   or DEFAULT_MAX_SUBMISSIONS
+    if current_count >= max_allowed:
+        attempts_left = 0
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Submission limit reached ({max_allowed} attempt{'s' if max_allowed != 1 else ''} allowed). "
+                f"Contact the buyer to request additional attempts, or purchase an extra attempt for "
+                f"{EXTRA_ATTEMPT_FEE_XRP} XRP via POST /evaluate/purchase-attempt."
+            ),
+        )
+
+    # Increment submission count immediately (before audit — counts even failed attempts)
+    vault.submission_count = current_count + 1
+    db.commit()
+
     # 50 MB attachment cap
     total_bytes = 0
     for att in (req.worker_attachments or []):
@@ -1228,13 +1500,34 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         except Exception:
             logger.warning("⚠️ Could not parse stored buyer attachments")
 
+    # Load stored spec link snapshots (fetched at vault creation)
+    stored_spec_snapshots = None
+    if vault.spec_link_snapshots:
+        try:
+            stored_spec_snapshots = json.loads(vault.spec_link_snapshots)
+        except Exception:
+            logger.warning("⚠️ Could not parse stored spec link snapshots")
+
+    # Fetch evidence link snapshots now (at submission time = tamper-proof snapshot)
+    evidence_snapshots = None
+    if req.evidence_links:
+        logger.info(f"🔗 Fetching {len(req.evidence_links[:3])} evidence link(s) for {req.escrow_id}")
+        evidence_snapshots = await fetch_url_snapshots(req.evidence_links)
+        # Store the snapshots on the vault so the collect page can show them
+        vault.evidence_link_snapshots = json.dumps(evidence_snapshots)
+        ok     = sum(1 for s in evidence_snapshots if s.get("content"))
+        failed = sum(1 for s in evidence_snapshots if s.get("error"))
+        logger.info(f"🔗 Evidence links: {ok} fetched, {failed} failed for {req.escrow_id}")
+
     verdict_dict, model_used = await run_ai_audit(
-        task               = vault.task_description,
-        work               = req.work,
-        buyer_attachments  = stored_buyer_attachments,
-        worker_attachments = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
-        task_category      = req.task_category,
-        require_consensus  = req.require_consensus,
+        task                    = vault.task_description,
+        work                    = req.work,
+        buyer_attachments       = stored_buyer_attachments,
+        worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
+        task_category           = req.task_category,
+        require_consensus       = req.require_consensus,
+        spec_link_snapshots     = stored_spec_snapshots,
+        evidence_link_snapshots = evidence_snapshots,
     )
 
     is_approved          = verdict_dict.get("verdict") == "PASS"
@@ -1242,17 +1535,25 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     dex_quote            = None
 
     if is_approved:
-        revealed_fulfillment      = vault.fulfillment
+        try:
+            plaintext_fulfillment = decrypt_fulfillment(vault.fulfillment)
+        except ValueError as e:
+            logger.error(f"❌ Could not decrypt fulfillment for {req.escrow_id}: {e}")
+            raise HTTPException(status_code=500, detail="Internal error: could not decrypt fulfillment key. Contact support.")
+
+        revealed_fulfillment      = plaintext_fulfillment
         vault.status              = "RELEASED"
         vault.delivery_status     = "RELEASED"
         vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
 
         vault.worker_submission = json.dumps({
-            "work":         req.work,
-            "attachments":  [a.dict() for a in (req.worker_attachments or [])],
-            "verdict":      verdict_dict,
-            "delivered_at": datetime.now(timezone.utc).isoformat(),
-            "escrow_id":    req.escrow_id,
+            "work":               req.work,
+            "attachments":        [a.dict() for a in (req.worker_attachments or [])],
+            "evidence_links":     req.evidence_links or [],
+            "evidence_snapshots": evidence_snapshots or [],
+            "verdict":            verdict_dict,
+            "delivered_at":       datetime.now(timezone.utc).isoformat(),
+            "escrow_id":          req.escrow_id,
         })
 
         # ── AUTO-FINISH: referee submits EscrowFinish, seller gets paid automatically ──
@@ -1261,7 +1562,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 escrow_id            = req.escrow_id,
                 sequence             = vault.escrow_sequence,
                 owner                = vault.buyer_address,
-                fulfillment          = vault.fulfillment,
+                fulfillment          = plaintext_fulfillment,
                 condition            = vault.condition,
                 worker_addr          = vault.worker_address,
                 db_session_factory   = SessionLocal,
@@ -1339,6 +1640,51 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "dex_quote_rlusd":      dex_quote,
         "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
         "seller_currency":      vault.seller_currency,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# 16b. PURCHASE EXTRA SUBMISSION ATTEMPT
+# ---------------------------------------------------------------------------
+class PurchaseAttemptRequest(BaseModel):
+    escrow_id: str
+    fee_hash:  str   # 0.05 XRP payment hash
+
+@app.post("/evaluate/purchase-attempt")
+async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db)):
+    """
+    Seller pays EXTRA_ATTEMPT_FEE_XRP (0.05 XRP) to unlock one more submission.
+    Returns updated attempts_remaining.
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{req.escrow_id}' not found.")
+    if vault.status == "RELEASED":
+        raise HTTPException(status_code=409, detail="Escrow already released — no more submissions needed.")
+    if vault.status == "CANCELLED":
+        raise HTTPException(status_code=409, detail="Escrow is cancelled.")
+
+    # Verify the 0.05 XRP payment
+    await verify_fee_payment(
+        fee_hash  = req.fee_hash,
+        escrow_id = f"{req.escrow_id}-attempt",
+        db        = db,
+        min_xrp   = EXTRA_ATTEMPT_FEE_XRP,
+    )
+
+    # Grant one extra submission
+    vault.max_submissions = (vault.max_submissions or DEFAULT_MAX_SUBMISSIONS) + 1
+    db.commit()
+
+    attempts_remaining = vault.max_submissions - (vault.submission_count or 0)
+    logger.info(f"🎟️ Extra attempt purchased for {req.escrow_id} — now {vault.max_submissions} max, {attempts_remaining} remaining")
+
+    return {
+        "escrow_id":         req.escrow_id,
+        "max_submissions":   vault.max_submissions,
+        "submission_count":  vault.submission_count or 0,
+        "attempts_remaining": attempts_remaining,
     }
 
 
