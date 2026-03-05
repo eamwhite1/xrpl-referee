@@ -64,14 +64,10 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 try:
     from mcp_server import mcp
-    try:
-        app.mount("/mcp", mcp.streamable_http_app())
-        logger.info("✅ MCP server mounted at /mcp (streamable HTTP)")
-    except AttributeError:
-        app.mount("/mcp", mcp.sse_app())
-        logger.info("✅ MCP server mounted at /mcp (SSE fallback)")
-except ImportError:
-    logger.debug("fastmcp not installed — MCP server disabled")
+    app.mount("/mcp", mcp.http_app())
+    logger.info("✅ MCP server mounted at /mcp")
+except Exception as e:
+    logger.debug(f"MCP server not loaded: {e}")
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
