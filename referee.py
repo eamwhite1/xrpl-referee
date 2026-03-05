@@ -22,8 +22,6 @@ try:
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
-    logger_tmp = logging.getLogger("RefereeBot")
-    logger_tmp.warning("⚠️ cryptography package not installed — fulfillment keys stored unencrypted. Run: pip install cryptography")
 
 # XRPL Imports
 from xrpl.asyncio.clients import AsyncJsonRpcClient
@@ -66,14 +64,17 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# 2b. MCP SERVER
+# 2b. MCP SERVER (optional — requires fastmcp in requirements.txt)
 # ---------------------------------------------------------------------------
 try:
     from mcp_server import mcp
-    app.mount("/mcp", mcp.sse_app())
-    logger.info("✅ MCP server mounted at /mcp")
-except Exception as e:
-    logger.debug(f"MCP server not loaded: {e}")
+    try:
+        app.mount("/mcp", mcp.sse_app())
+        logger.info("✅ MCP server mounted at /mcp")
+    except Exception as mount_err:
+        logger.debug(f"MCP mount failed: {mount_err}")
+except ImportError:
+    logger.debug("fastmcp not installed — MCP server disabled")
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -2174,4 +2175,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     logger.info(f"🚀 Starting AgentTrust Referee v6.0 on port {port}")
     uvicorn.run("referee:app", host="0.0.0.0", port=port, reload=False)
-
