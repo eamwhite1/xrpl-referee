@@ -4,9 +4,9 @@ sqlalchemy
 psycopg2-binary
 httpx
 xrpl-py
-python-dotenv==0.21.1
+python-dotenv>=0.19.2
 requests
 xumm-sdk-py
 resend
 cryptography
-
+fastmcp
