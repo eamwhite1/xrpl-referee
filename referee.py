@@ -70,10 +70,21 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 try:
     from mcp_server import mcp
-    app.mount("/mcp", mcp.http_app())
-    logger.info("✅ MCP server mounted at /mcp")
+    # FastMCP 2.x uses streamable HTTP transport
+    try:
+        app.mount("/mcp", mcp.streamable_http_app())
+        logger.info("✅ MCP server mounted at /mcp (streamable HTTP)")
+    except AttributeError:
+        try:
+            app.mount("/mcp", mcp.http_app())
+            logger.info("✅ MCP server mounted at /mcp (HTTP)")
+        except AttributeError:
+            # FastMCP 0.x — SSE transport
+            from starlette.routing import Mount
+            app.mount("/mcp", mcp.sse_app())
+            logger.info("✅ MCP server mounted at /mcp (SSE)")
 except Exception as e:
-    logger.warning(f"⚠️ MCP server not loaded: {e} — continuing without it")
+    logger.debug(f"MCP server not loaded: {e} — continuing without it")
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -156,7 +167,37 @@ def serve_agent_json():
         "defaultOutputModes": ["application/json"],
     }
 
-@app.get("/.well-known/ai-plugin.json")
+@app.get("/.well-known/mcp/server-card.json")
+def serve_mcp_server_card():
+    """Smithery server card — lets Smithery skip scanning and use this metadata directly."""
+    return {
+        "name":        "AgentTrust Referee",
+        "version":     "7.0.0",
+        "description": (
+            "Trustless AI task verification with automatic XRP payment release. "
+            "Post a task spec and work submission — get PASS/FAIL from an AI referee. "
+            "Escrowed XRP releases automatically to the worker on approval. "
+            "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents."
+        ),
+        "url":         "https://xrpl-referee.onrender.com/mcp",
+        "homepage":    "https://www.cryptovault.co.uk",
+        "contact":     "hello@cryptovault.co.uk",
+        "license":     "MIT",
+        "transport":   ["http"],
+        "tools": [
+            {"name": "audit_task",               "description": "Verify completed work against a task spec for 0.1 XRP. Returns PASS/FAIL with score and feedback."},
+            {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
+            {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
+            {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed."},
+            {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
+            {"name": "list_marketplace_jobs",     "description": "Browse open XRP bounties agents can claim. Returns structured job data."},
+            {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
+            {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
+        ],
+        "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3"],
+    }
+
+
 def serve_ai_plugin():
     path = ".well-known/ai-plugin.json"
     if os.path.exists(path):
@@ -165,11 +206,25 @@ def serve_ai_plugin():
         "schema_version": "v1",
         "name_for_human": "AgentTrust Referee",
         "name_for_model": "agenttrust_referee",
-        "description_for_human": "Trustless AI task verification with automatic payment release.",
-        "description_for_model": "Verify task completion and auto-release escrowed funds. POST task+work to /audit with x-payment-hash header (0.1 XRP fee). Returns JSON with verdict, score, criteria_met, criteria_failed. For escrow flows, use /escrow/generate then /evaluate — funds are automatically released to the seller on PASS.",
+        "description_for_human": (
+            "Trustless AI task verification with automatic XRPL payment release. "
+            "Post a task spec and a work submission — get a structured PASS/FAIL verdict. "
+            "Optional escrow: lock XRP or RLUSD on-chain, funds release automatically on approval."
+        ),
+        "description_for_model": (
+            "Use this tool to verify whether a seller has completed a task to specification and auto-release escrowed funds. "
+            "POST the task requirements and the completed work to /audit with a 0.1 XRP fee hash (x-payment-hash header). "
+            "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
+            "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
+            "Set require_consensus=true for high-stakes decisions requiring two-model agreement. "
+            "For full escrow-gated payments: POST to /escrow/generate to lock funds, then POST to /evaluate to audit and auto-release. "
+            "Supports XRP and RLUSD. Sellers may include XRPL transaction hashes as proof of on-chain delivery — the referee will verify them on the ledger."
+        ),
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": "https://xrpl-referee.onrender.com/openapi.json"},
-        "legal_info_url": "https://xrpl-referee.onrender.com",
+        "logo_url": "https://www.cryptovault.co.uk/logo.png",
+        "contact_email": "hello@cryptovault.co.uk",
+        "legal_info_url": "https://www.cryptovault.co.uk",
     }
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1046,91 @@ DOMAIN_PROMPTS = {
 
 
 # ---------------------------------------------------------------------------
+# 11b. XRPL TRANSACTION HASH AUTO-VERIFICATION
+# ---------------------------------------------------------------------------
+import re as _re
+
+_XRPL_HASH_RE = _re.compile(r'\b([0-9A-Fa-f]{64})\b')
+
+async def extract_and_verify_xrpl_hashes(text: str) -> str | None:
+    """
+    Scan submission text for 64-char hex strings (XRPL tx hashes).
+    Look up each one on the ledger and return a formatted context block
+    to inject into the AI prompt, or None if no hashes found.
+    """
+    hashes = list(dict.fromkeys(_XRPL_HASH_RE.findall(text)))[:3]  # deduplicate, cap at 3
+    if not hashes:
+        return None
+
+    results = []
+    client  = AsyncJsonRpcClient(XRPL_URL)
+
+    for h in hashes:
+        try:
+            tx_res = await client.request(Tx(transaction=h.upper()))
+            if not tx_res.is_successful():
+                results.append(f"Hash {h}: not found on ledger.")
+                continue
+
+            body    = tx_res.result
+            tx_data = body.get("tx_json") or body.get("tx") or body
+            meta    = body.get("meta") or body.get("metaData") or {}
+
+            tx_type  = tx_data.get("TransactionType", "unknown")
+            account  = tx_data.get("Account", "—")
+            dest     = tx_data.get("Destination", "—")
+            amount   = tx_data.get("Amount", "—")
+            ledger   = body.get("ledger_index", "—")
+            result   = meta.get("TransactionResult", "—")
+
+            # Human-readable amount
+            if isinstance(amount, dict):
+                amt_str = f"{amount.get('value')} {amount.get('currency')} (issuer: {amount.get('issuer','')})"
+            elif isinstance(amount, str) and amount.isdigit():
+                amt_str = f"{int(amount)/1_000_000:.6f} XRP"
+            else:
+                amt_str = str(amount)
+
+            # NFT-specific fields
+            nft_fields = ""
+            if tx_type in ("NFTokenMint", "NFTokenBurn", "NFTokenCreateOffer",
+                           "NFTokenAcceptOffer", "NFTokenCancelOffer"):
+                nft_id = tx_data.get("NFTokenID") or meta.get("nftoken_id", "")
+                if nft_id:
+                    nft_fields = f"\n  NFTokenID: {nft_id}"
+                uri = tx_data.get("URI", "")
+                if uri:
+                    try:
+                        import binascii
+                        nft_fields += f"\n  URI: {binascii.unhexlify(uri).decode(errors='replace')}"
+                    except Exception:
+                        pass
+
+            results.append(
+                f"Hash {h}:\n"
+                f"  Type: {tx_type}\n"
+                f"  From: {account}\n"
+                f"  To: {dest}\n"
+                f"  Amount: {amt_str}\n"
+                f"  Ledger: {ledger}\n"
+                f"  Result: {result}{nft_fields}"
+            )
+        except Exception as e:
+            results.append(f"Hash {h}: ledger lookup failed ({str(e)[:80]}).")
+
+    if not results:
+        return None
+
+    return (
+        "\nON-CHAIN EVIDENCE (auto-verified from XRPL ledger):\n"
+        + "\n\n".join(results)
+        + "\n\nNote: use this verified on-chain data as authoritative proof. "
+          "If the task required an on-chain transfer, NFT mint, or payment, "
+          "verify the above matches the task requirements.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 12. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
 async def run_ai_audit(
@@ -1041,6 +1181,11 @@ async def run_ai_audit(
                 prompt_text += snap["content"] + "\n--- END REFERENCE URL ---\n"
 
     prompt_text += f"\nWORK SUBMITTED:\n{work}\n"
+
+    # Auto-detect and verify any XRPL transaction hashes in the submission
+    xrpl_evidence = await extract_and_verify_xrpl_hashes(work)
+    if xrpl_evidence:
+        prompt_text += xrpl_evidence
 
     # Evidence links — seller-provided proof URLs, snapshotted at submission time
     if evidence_link_snapshots:
@@ -1741,18 +1886,43 @@ async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @app.get("/xrp/price")
 async def get_xrp_price():
+    """
+    Fetch live XRP price. Primary: CoinGecko. Fallback: Binance.
+    Returns last cached value if both fail — never logs a warning for expected transient failures.
+    """
+    global _xrp_price_cache
     try:
-        async with httpx.AsyncClient() as client:
-            res = await client.get(
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res  = await client.get(
                 "https://api.coingecko.com/api/v3/simple/price",
                 params={"ids": "ripple", "vs_currencies": "usd,gbp"},
-                timeout=5.0,
             )
             data = res.json()
-            return {"usd": data["ripple"]["usd"], "gbp": data["ripple"]["gbp"]}
-    except Exception as e:
-        logger.warning(f"⚠️ XRP price fetch failed: {e}")
-        return {"usd": None, "gbp": None}
+            usd  = data["ripple"]["usd"]
+            gbp  = data["ripple"]["gbp"]
+            _xrp_price_cache = {"usd": usd, "gbp": gbp}
+            return _xrp_price_cache
+    except Exception:
+        pass  # try fallback silently
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res  = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
+            usd  = float(res.json()["price"])
+            # Approximate GBP via fixed ~0.79 ratio if no better source
+            gbp  = round(usd * 0.79, 4)
+            _xrp_price_cache = {"usd": usd, "gbp": gbp}
+            return _xrp_price_cache
+    except Exception:
+        pass
+
+    # Return last cached value if available, else null
+    if _xrp_price_cache:
+        return {**_xrp_price_cache, "cached": True}
+    return {"usd": None, "gbp": None}
+
+# Module-level price cache — survives across requests within a process
+_xrp_price_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1812,6 +1982,198 @@ async def get_dex_quote(req: QuoteRequest):
         "trust_line_instructions": None if trust_line_ok else (
             f"Your wallet needs a RLUSD trust line. In Xaman: Assets → Add Asset → RLUSD → issuer {RLUSD_ISSUER}."
         ),
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# 20. MARKETPLACE JOBS API — machine-readable bounty board for agents
+# ---------------------------------------------------------------------------
+# Seed jobs mirror the frontend demo listings in marketplace.html.
+# Real jobs posted via the marketplace UI are stored in localStorage (frontend only).
+# This endpoint serves the seed data plus any jobs stored in the DB
+# (future: marketplace jobs backed by on-chain escrow use the vault table).
+
+_MARKETPLACE_SEED_JOBS = [
+    {
+        "id": "AT-MKT-001",
+        "title": "Scrape and summarise 100 arXiv AI papers from last 30 days",
+        "description": "Fetch the 100 most-cited arXiv papers tagged cs.AI or cs.LG published in the last 30 days. For each paper output: title, authors, abstract summary (≤80 words), key contributions (3 bullet points), and citation count. Deliver as a valid JSON array.",
+        "category": "data",
+        "bounty": 200,
+        "currency": "XRP",
+        "poster": "rAgentLabsXXXXXXXXXXXXXXXXXXXXXXX",
+        "poster_name": "AgentLabs",
+        "deadline": "6 days",
+        "deadline_hrs": 144,
+        "tags": ["python", "nlp", "json", "research"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+    {
+        "id": "AT-MKT-002",
+        "title": "Find and document 5 critical XSS vulnerabilities in open-source CMS",
+        "description": "Identify and document at least 5 stored or reflected XSS vulnerabilities in a widely-used open-source CMS (WordPress, Joomla, or Drupal) plugin with >10k installs. Each finding must include: CVE-style description, reproduction steps, affected versions, proof-of-concept payload, and recommended fix.",
+        "category": "bug_bounty",
+        "bounty": 2500,
+        "currency": "XRP",
+        "poster": "rSecurityDAOXXXXXXXXXXXXXXXXXXXX",
+        "poster_name": "SecurityDAO",
+        "deadline": "13 days",
+        "deadline_hrs": 312,
+        "tags": ["security", "xss", "vulnerability", "cms"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+    {
+        "id": "AT-MKT-003",
+        "title": "Generate 500 synthetic customer support dialogues for LLM fine-tuning",
+        "description": "Create 500 realistic customer support conversation pairs for a SaaS product. Cover: billing issues, technical bugs, feature requests, account access, cancellations. Each dialogue must be unique, natural-sounding, 2–6 turns, and delivered as JSONL.",
+        "category": "data",
+        "bounty": 350,
+        "currency": "XRP",
+        "poster": "rMLOpsAgentXXXXXXXXXXXXXXXXXXXXX",
+        "poster_name": "MLOps.ai",
+        "deadline": "4 days",
+        "deadline_hrs": 96,
+        "tags": ["synthetic-data", "jsonl", "llm", "fine-tuning"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+    {
+        "id": "AT-MKT-004",
+        "title": "Build a Python script that monitors XRPL escrow events via WebSocket",
+        "description": "Write a Python script using xrpl-py that subscribes to the XRPL public WebSocket, filters for EscrowCreate and EscrowFinish events, and logs them to a SQLite database with fields: tx_hash, type, account, destination, amount, condition, sequence, timestamp. Must include README, requirements.txt, and pass provided unit tests.",
+        "category": "code",
+        "bounty": 180,
+        "currency": "XRP",
+        "poster": "rXRPLDevAgentXXXXXXXXXXXXXXXXXXX",
+        "poster_name": "XRPLDev",
+        "deadline": "5 days",
+        "deadline_hrs": 120,
+        "tags": ["python", "xrpl", "websocket", "sqlite"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+    {
+        "id": "AT-MKT-005",
+        "title": "Legal memo: analyse enforceability of smart contract arbitration clause",
+        "description": "Write a 1,500–2,000 word legal memo analysing the enforceability of AI-arbitrated smart contract dispute resolution clauses under English law and New York law. Address: contract formation, arbitrability, recognition of algorithmic verdicts, and recommendations for drafting enforceable clauses.",
+        "category": "legal",
+        "bounty": 800,
+        "currency": "XRP",
+        "poster": "rLexDAOXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "poster_name": "LexDAO",
+        "deadline": "10 days",
+        "deadline_hrs": 240,
+        "tags": ["legal", "smart-contracts", "arbitration", "memo"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+    {
+        "id": "AT-MKT-006",
+        "title": "Write 10 product description variations for an AI SaaS landing page",
+        "description": "Write 10 distinct product description variations for an AI-powered escrow SaaS product targeting: enterprise procurement teams, freelance developers, and AI agent builders. Each variation: 60–90 words, value-focused, no jargon. Deliver as markdown.",
+        "category": "creative",
+        "bounty": 120,
+        "currency": "XRP",
+        "poster": "rCopyAgentXXXXXXXXXXXXXXXXXXXXXX",
+        "poster_name": "CopyAgent",
+        "deadline": "2 days",
+        "deadline_hrs": 48,
+        "tags": ["copywriting", "saas", "marketing", "markdown"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+    {
+        "id": "AT-MKT-007",
+        "title": "Analyse DeFi protocol TVL trends Q1 2025 — structured report",
+        "description": "Compile and analyse Total Value Locked data for the top 20 DeFi protocols by TVL for Q1 2025. Identify top 5 gainers, top 5 losers, correlations with BTC price movement, and 3 key macro factors. Deliver as structured markdown with a data table and chart descriptions.",
+        "category": "data_analysis",
+        "bounty": 420,
+        "currency": "XRP",
+        "poster": "rDeFiAnalyticsXXXXXXXXXXXXXXXXXX",
+        "poster_name": "DeFiAnalytics",
+        "deadline": "7 days",
+        "deadline_hrs": 168,
+        "tags": ["defi", "tvl", "analysis", "report"],
+        "status": "OPEN",
+        "is_demo": True,
+    },
+]
+
+@app.get("/marketplace/jobs")
+async def marketplace_jobs(
+    category:       str   = "all",
+    min_bounty_xrp: float = 0,
+    limit:          int   = 20,
+    db: Session = Depends(get_db),
+):
+    """
+    Machine-readable marketplace job listing for agents and API consumers.
+    Returns open bounties in structured JSON.
+
+    Real on-chain jobs (vaults with status=OPEN and a marketplace flag) are
+    returned first, followed by demo seed jobs. Agents should check is_demo —
+    demo jobs have no live escrow to claim against.
+    """
+    limit = min(limit, 100)
+
+    # Real jobs: vaults that are OPEN and have a project_label (posted via marketplace)
+    # For now this returns all LOCKED vaults as potential claimable jobs.
+    # Future: add a marketplace_visible column to filter precisely.
+    real_jobs = []
+    try:
+        vaults = (
+            db.query(EscrowVault)
+            .filter(EscrowVault.status == "LOCKED")
+            .order_by(EscrowVault.created_at.desc())
+            .limit(200)
+            .all()
+        )
+        for v in vaults:
+            if not v.task_description:
+                continue
+            bounty = v.amount_xrp or 0
+            if bounty < min_bounty_xrp:
+                continue
+            if category != "all":
+                # We don't store category on vault yet — skip category filter for real jobs
+                pass
+            real_jobs.append({
+                "id":           v.escrow_id,
+                "title":        v.project_label or f"Job {v.escrow_id}",
+                "description":  v.task_description,
+                "category":     "default",
+                "bounty":       bounty,
+                "currency":     v.currency or "XRP",
+                "poster":       v.buyer_address or "",
+                "poster_name":  v.buyer_name or "",
+                "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
+                "deadline_hrs": max(0, int((v.cancel_after_ts - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
+                "tags":         [],
+                "status":       "OPEN",
+                "is_demo":      False,
+            })
+    except Exception as e:
+        logger.warning(f"⚠️ marketplace_jobs DB query failed: {e}")
+
+    # Seed demo jobs — filter by category and bounty
+    seed = _MARKETPLACE_SEED_JOBS
+    if category != "all":
+        seed = [j for j in seed if j["category"] == category]
+    if min_bounty_xrp > 0:
+        seed = [j for j in seed if j["bounty"] >= min_bounty_xrp]
+
+    combined = (real_jobs + seed)[:limit]
+
+    return {
+        "jobs":            combined,
+        "total":           len(combined),
+        "real_jobs":       len(real_jobs),
+        "demo_jobs":       len([j for j in combined if j.get("is_demo")]),
+        "marketplace_url": f"{SITE_URL}/marketplace",
+        "note":            "Demo jobs (is_demo=true) are illustrative examples — no live escrow exists to claim against.",
     }
 
 
