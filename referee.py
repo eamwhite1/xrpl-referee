@@ -70,21 +70,10 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 try:
     from mcp_server import mcp
-    # FastMCP 2.x uses streamable HTTP transport
-    try:
-        app.mount("/mcp", mcp.streamable_http_app())
-        logger.info("✅ MCP server mounted at /mcp (streamable HTTP)")
-    except AttributeError:
-        try:
-            app.mount("/mcp", mcp.http_app())
-            logger.info("✅ MCP server mounted at /mcp (HTTP)")
-        except AttributeError:
-            # FastMCP 0.x — SSE transport
-            from starlette.routing import Mount
-            app.mount("/mcp", mcp.sse_app())
-            logger.info("✅ MCP server mounted at /mcp (SSE)")
+    app.mount("/mcp", mcp.sse_app())
+    logger.info("✅ MCP server mounted at /mcp")
 except Exception as e:
-    logger.debug(f"MCP server not loaded: {e} — continuing without it")
+    logger.debug(f"MCP server not loaded: {e}")
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -2185,3 +2174,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     logger.info(f"🚀 Starting AgentTrust Referee v6.0 on port {port}")
     uvicorn.run("referee:app", host="0.0.0.0", port=port, reload=False)
+
