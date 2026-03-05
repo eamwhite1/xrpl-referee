@@ -3,7 +3,7 @@
   "name": "AgentTrust Referee",
   "description": "A trustless AI verdict engine. Pay 0.1 XRP, POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
   "url": "https://xrpl-referee.onrender.com",
-  "agentVersion": "5.0.0",
+  "agentVersion": "7.0.0",
   "protocolVersion": "0.3.0",
   "provider": {
     "organization": "AgentTrust Protocol",

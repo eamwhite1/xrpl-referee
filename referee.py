@@ -29,7 +29,7 @@ from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
-from xrpl.models.transactions import EscrowFinish, OfferCreate
+from xrpl.models.transactions import EscrowFinish
 from xrpl.core.addresscodec import decode_seed
 from xrpl.utils import xrp_to_drops
 
@@ -103,7 +103,7 @@ def serve_ui(request: Request):
 <title>AgentTrust Referee</title></head>
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
-    return {"status": "online", "version": "6.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+    return {"status": "online", "version": "7.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
 
 @app.get("/playground")
 def serve_playground():
@@ -125,7 +125,7 @@ def serve_playground():
 @app.get("/status")
 @app.head("/status")
 def health_check():
-    return {"status": "online", "version": "6.0", "timestamp": datetime.now(timezone.utc)}
+    return {"status": "online", "version": "7.0", "timestamp": datetime.now(timezone.utc)}
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
@@ -152,7 +152,7 @@ def serve_agent_json():
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
-        "agentVersion": "6.0.0",
+        "agentVersion": "7.0.0",
         "protocolVersion": "0.4.0",
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True},
@@ -2229,5 +2229,5 @@ async def marketplace_jobs(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting AgentTrust Referee v6.0 on port {port}")
+    logger.info(f"🚀 Starting AgentTrust Referee v7.0 on port {port}")
     uvicorn.run("referee:app", host="0.0.0.0", port=port, reload=False)
