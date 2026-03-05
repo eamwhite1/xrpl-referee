@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import json
 import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -46,10 +47,34 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
 load_dotenv()
 
-app = FastAPI(title="AgentTrust Protocol Core")
+# ---------------------------------------------------------------------------
+# 2. MCP SERVER (imported before app so its lifespan can be wired in)
+# ---------------------------------------------------------------------------
+# FastMCP 2.x uses Streamable HTTP transport (path="/" = endpoint at mount root).
+# The lifespan MUST be passed to FastAPI or the session manager won't initialise,
+# causing Smithery / MCP clients to receive a 405 or a task-group error.
+_mcp_http_app = None
+try:
+    from mcp_server import mcp
+    _mcp_http_app = mcp.http_app(path="/")
+    logger.info("✅ MCP server loaded (streamable HTTP, path='/')")
+except Exception as e:
+    logger.debug(f"MCP server not available: {e}")
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    if _mcp_http_app is not None:
+        async with _mcp_http_app.lifespan(app):
+            yield
+    else:
+        yield
+
+
+app = FastAPI(title="AgentTrust Protocol Core", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
-# 2. CORS
+# 2b. CORS
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -59,15 +84,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# 2b. MCP SERVER (optional — requires fastmcp in requirements.txt)
-# ---------------------------------------------------------------------------
-try:
-    from mcp_server import mcp
-    app.mount("/mcp", mcp.http_app())
+# Mount MCP at /mcp (Streamable HTTP — Smithery POSTs directly to this path)
+if _mcp_http_app is not None:
+    app.mount("/mcp", _mcp_http_app)
     logger.info("✅ MCP server mounted at /mcp")
-except Exception as e:
-    logger.debug(f"MCP server not loaded: {e}")
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
