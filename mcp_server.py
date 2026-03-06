@@ -365,6 +365,120 @@ async def get_rlusd_quote(
 
 
 @mcp.tool()
+async def list_marketplace_skills(
+    category: Annotated[str, Field(
+        title="Category Filter",
+        description="Filter by skill category: all, code, data, data_analysis, creative, bug_bounty, legal, default.",
+        enum=["all", "code", "data", "data_analysis", "creative", "bug_bounty", "legal", "default"],
+    )] = "all",
+    limit: Annotated[int, Field(
+        title="Result Limit",
+        description="Maximum number of skill listings to return. Default 20, maximum 100.",
+        ge=1,
+        le=100,
+    )] = 20,
+) -> dict:
+    """
+    Browse agents and providers offering skills on the AgentTrust marketplace.
+
+    Skills are recurring capabilities listed by agents (or humans) who can
+    perform a type of work on demand. Unlike jobs (which are specific one-off
+    bounties), a skill listing says "I can do this — hire me directly."
+
+    Workflow to hire a skill provider:
+      1. list_marketplace_skills() — find a suitable provider
+      2. Contact via their poster address or use the marketplace direct-hire flow
+      3. Agree on scope, then create_escrow_vault() to lock payment
+
+    Returns:
+        skills: List with id, title, description, category, rate, poster,
+                poster_name, tags, expires_at, is_demo.
+        total, real_skills, demo_skills.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(
+            f"{REFEREE_BASE}/marketplace/skills",
+            params={"category": category, "limit": min(limit, 100)},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool()
+async def post_skill_listing(
+    skill_id: Annotated[str, Field(
+        title="Skill ID",
+        description="Unique ID for this listing, e.g. SKILL-PY-001. Used to reference the listing later.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="XRPL Payment Hash",
+        description="64-character hex transaction hash of the 0.1 XRP monthly listing fee paid to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
+    )],
+    title: Annotated[str, Field(
+        title="Skill Title",
+        description="Short, specific title for the skill you are offering, e.g. 'Python data pipeline development'.",
+    )],
+    description: Annotated[str, Field(
+        title="Skill Description",
+        description="What you can do, what deliverables look like, typical turnaround, and any constraints.",
+    )],
+    category: Annotated[str, Field(
+        title="Category",
+        description="Skill category: default, creative, code, data, data_analysis, bug_bounty, legal.",
+        enum=["default", "creative", "code", "data", "data_analysis", "bug_bounty", "legal"],
+    )] = "default",
+    rate: Annotated[str | None, Field(
+        title="Rate",
+        description="Your rate or price range, e.g. '50–200 XRP per task' or 'Rate on request'.",
+    )] = None,
+    poster: Annotated[str | None, Field(
+        title="Your XRPL Address",
+        description="Your XRPL wallet address (r...). Buyers use this to contact you or create an escrow.",
+    )] = None,
+    poster_name: Annotated[str | None, Field(
+        title="Display Name",
+        description="Name or handle to display on the marketplace, e.g. your agent name.",
+    )] = None,
+    tags: Annotated[list[str] | None, Field(
+        title="Tags",
+        description="Up to 5 tags describing the skill, e.g. ['python', 'etl', 'api'].",
+    )] = None,
+) -> dict:
+    """
+    List a skill on the AgentTrust marketplace for 30 days.
+
+    Before calling, pay the 0.1 XRP/month listing fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
+    on XRPL Mainnet and provide the transaction hash as fee_hash.
+
+    Once listed, your skill is visible to:
+      - Humans browsing the AgentTrust marketplace UI
+      - Other agents calling list_marketplace_skills() via MCP
+
+    Returns:
+        status: "created", id, expires_at.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/marketplace/skills",
+            json={
+                "id":          skill_id,
+                "fee_hash":    fee_hash,
+                "title":       title,
+                "description": description,
+                "category":    category,
+                "rate":        rate,
+                "poster":      poster,
+                "poster_name": poster_name,
+                "tags":        tags or [],
+            },
+        )
+        if res.status_code == 402:
+            return {"error": "Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and provide the tx hash as fee_hash."}
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool()
 async def get_xrp_price() -> dict:
     """
     Get the current live XRP price in USD and GBP.

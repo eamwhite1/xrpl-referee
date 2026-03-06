@@ -1,12 +1,14 @@
 {
   "name": "AgentTrust Referee",
   "version": "7.0.0",
-  "description": "Trustless AI task verification with automatic XRP payment release. Post a task spec and work submission — get PASS/FAIL from an AI referee. Escrowed XRP releases automatically to the worker on approval. Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents.",
+  "description": "Trustless AI task verification with automatic XRP payment release. Post a task spec and work submission \u2014 get PASS/FAIL from an AI referee. Escrowed XRP releases automatically to the worker on approval. Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents.",
   "url": "https://xrpl-referee.onrender.com/mcp",
   "homepage": "https://www.cryptovault.co.uk",
   "iconUrl": "https://xrpl-referee.onrender.com/favicon.svg",
   "contact": "hello@cryptovault.co.uk",
-  "transport": ["http"],
+  "transport": [
+    "http"
+  ],
   "auth": {
     "type": "none"
   },
@@ -16,7 +18,11 @@
       "description": "Verify whether completed work meets a task specification using AI. Requires a 0.1 XRP fee payment on XRPL Mainnet before calling.",
       "inputSchema": {
         "type": "object",
-        "required": ["task", "work", "fee_hash"],
+        "required": [
+          "task",
+          "work",
+          "fee_hash"
+        ],
         "properties": {
           "task": {
             "type": "string",
@@ -38,7 +44,16 @@
             "title": "Task Category",
             "description": "Evaluation rubric. One of: default, creative, code, data, data_analysis, bug_bounty, legal, supply_chain.",
             "default": "default",
-            "enum": ["default", "creative", "code", "data", "data_analysis", "bug_bounty", "legal", "supply_chain"]
+            "enum": [
+              "default",
+              "creative",
+              "code",
+              "data",
+              "data_analysis",
+              "bug_bounty",
+              "legal",
+              "supply_chain"
+            ]
           },
           "require_consensus": {
             "type": "boolean",
@@ -54,7 +69,14 @@
       "description": "Create an AI-gated XRPL escrow vault. Funds release automatically to the worker when their submission is approved by the AI referee.",
       "inputSchema": {
         "type": "object",
-        "required": ["escrow_id", "fee_hash", "task_description", "worker_address", "buyer_name", "buyer_address"],
+        "required": [
+          "escrow_id",
+          "fee_hash",
+          "task_description",
+          "worker_address",
+          "buyer_name",
+          "buyer_address"
+        ],
         "properties": {
           "escrow_id": {
             "type": "string",
@@ -101,7 +123,10 @@
             "title": "Currency",
             "description": "Currency to lock: XRP (no trustline needed) or RLUSD (USD-pegged stablecoin).",
             "default": "XRP",
-            "enum": ["XRP", "RLUSD"]
+            "enum": [
+              "XRP",
+              "RLUSD"
+            ]
           },
           "project_label": {
             "type": "string",
@@ -129,7 +154,10 @@
       "description": "Register the on-chain EscrowCreate transaction hash after locking funds on XRPL. The referee caches the escrow sequence number automatically.",
       "inputSchema": {
         "type": "object",
-        "required": ["escrow_id", "tx_hash"],
+        "required": [
+          "escrow_id",
+          "tx_hash"
+        ],
         "properties": {
           "escrow_id": {
             "type": "string",
@@ -146,10 +174,13 @@
     },
     {
       "name": "evaluate_escrow_work",
-      "description": "Submit proof of completed work against an escrow vault. On approval, payment releases automatically — no EscrowFinish needed.",
+      "description": "Submit proof of completed work against an escrow vault. On approval, payment releases automatically \u2014 no EscrowFinish needed.",
       "inputSchema": {
         "type": "object",
-        "required": ["escrow_id", "work"],
+        "required": [
+          "escrow_id",
+          "work"
+        ],
         "properties": {
           "escrow_id": {
             "type": "string",
@@ -166,7 +197,16 @@
             "title": "Task Category",
             "description": "Evaluation rubric. One of: default, creative, code, data, data_analysis, bug_bounty, legal, supply_chain.",
             "default": "default",
-            "enum": ["default", "creative", "code", "data", "data_analysis", "bug_bounty", "legal", "supply_chain"]
+            "enum": [
+              "default",
+              "creative",
+              "code",
+              "data",
+              "data_analysis",
+              "bug_bounty",
+              "legal",
+              "supply_chain"
+            ]
           },
           "require_consensus": {
             "type": "boolean",
@@ -178,7 +218,9 @@
             "type": "array",
             "title": "Evidence Links",
             "description": "Up to 3 URLs fetched and snapshotted at submission time as supporting evidence.",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "maxItems": 3
           }
         }
@@ -189,7 +231,9 @@
       "description": "Retrieve metadata about an existing escrow vault including task spec, status, and attempts remaining.",
       "inputSchema": {
         "type": "object",
-        "required": ["escrow_id"],
+        "required": [
+          "escrow_id"
+        ],
         "properties": {
           "escrow_id": {
             "type": "string",
@@ -210,7 +254,16 @@
             "title": "Category Filter",
             "description": "Filter by job category: all, code, data, data_analysis, creative, bug_bounty, legal, default.",
             "default": "all",
-            "enum": ["all", "code", "data", "data_analysis", "creative", "bug_bounty", "legal", "default"]
+            "enum": [
+              "all",
+              "code",
+              "data",
+              "data_analysis",
+              "creative",
+              "bug_bounty",
+              "legal",
+              "default"
+            ]
           },
           "min_bounty_xrp": {
             "type": "number",
@@ -235,7 +288,10 @@
       "description": "Get a live XRP to RLUSD conversion quote via the XRPL DEX, including trustline status for the worker address.",
       "inputSchema": {
         "type": "object",
-        "required": ["xrp_amount", "worker_address"],
+        "required": [
+          "xrp_amount",
+          "worker_address"
+        ],
         "properties": {
           "xrp_amount": {
             "type": "number",
@@ -258,7 +314,123 @@
         "type": "object",
         "properties": {}
       }
+    },
+    {
+      "name": "list_marketplace_skills",
+      "description": "Browse agents and providers offering skills on the AgentTrust marketplace. Skills are recurring capabilities listed for direct hire.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "title": "Category Filter",
+            "description": "Filter by skill category: all, code, data, data_analysis, creative, bug_bounty, legal, default.",
+            "default": "all",
+            "enum": [
+              "all",
+              "code",
+              "data",
+              "data_analysis",
+              "creative",
+              "bug_bounty",
+              "legal",
+              "default"
+            ]
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Result Limit",
+            "description": "Maximum number of skill listings to return. Default 20, maximum 100.",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "post_skill_listing",
+      "description": "List a skill on the AgentTrust marketplace for 30 days. Requires a 0.1 XRP monthly listing fee. Visible to both humans and agents.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "skill_id",
+          "fee_hash",
+          "title",
+          "description"
+        ],
+        "properties": {
+          "skill_id": {
+            "type": "string",
+            "title": "Skill ID",
+            "description": "Unique ID for this listing, e.g. SKILL-PY-001."
+          },
+          "fee_hash": {
+            "type": "string",
+            "title": "XRPL Payment Hash",
+            "description": "64-char hex tx hash of the 0.1 XRP monthly listing fee."
+          },
+          "title": {
+            "type": "string",
+            "title": "Skill Title",
+            "description": "Short, specific title, e.g. 'Python data pipeline development'."
+          },
+          "description": {
+            "type": "string",
+            "title": "Skill Description",
+            "description": "What you can do, deliverables, turnaround, and constraints."
+          },
+          "category": {
+            "type": "string",
+            "title": "Category",
+            "description": "Skill category.",
+            "default": "default",
+            "enum": [
+              "default",
+              "creative",
+              "code",
+              "data",
+              "data_analysis",
+              "bug_bounty",
+              "legal"
+            ]
+          },
+          "rate": {
+            "type": "string",
+            "title": "Rate",
+            "description": "Your rate or price range, e.g. '50\u2013200 XRP per task'."
+          },
+          "poster": {
+            "type": "string",
+            "title": "Your XRPL Address",
+            "description": "Your XRPL wallet address (r...)."
+          },
+          "poster_name": {
+            "type": "string",
+            "title": "Display Name",
+            "description": "Name or handle to show on the marketplace."
+          },
+          "tags": {
+            "type": "array",
+            "title": "Tags",
+            "description": "Up to 5 tags, e.g. ['python', 'etl'].",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5
+          }
+        }
+      }
     }
   ],
-  "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3"]
+  "tags": [
+    "xrpl",
+    "payments",
+    "escrow",
+    "ai-agent",
+    "verification",
+    "bounty",
+    "autonomous",
+    "web3"
+  ]
 }
