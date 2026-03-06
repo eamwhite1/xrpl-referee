@@ -36,7 +36,7 @@ from xrpl.utils import xrp_to_drops
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -2208,12 +2208,14 @@ async def marketplace_jobs(
     """
     limit = min(limit, 100)
 
-    # Real jobs: vaults that are OPEN and have a project_label (posted via marketplace)
-    # For now this returns all LOCKED vaults as potential claimable jobs.
-    # Future: add a marketplace_visible column to filter precisely.
     real_jobs = []
+    now = datetime.now(timezone.utc)
     try:
-        q = db.query(EscrowVault).filter(EscrowVault.status == "LOCKED")
+        q = db.query(EscrowVault).filter(
+            EscrowVault.status == "LOCKED",
+            # Exclude vaults past their deadline (on-chain expired but not yet cancelled)
+            or_(EscrowVault.cancel_after_ts == None, EscrowVault.cancel_after_ts > now),
+        )
         if category != "all":
             q = q.filter(EscrowVault.category == category)
         vaults = q.order_by(EscrowVault.created_at.desc()).limit(200).all()
