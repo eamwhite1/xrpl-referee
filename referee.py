@@ -36,7 +36,7 @@ from xrpl.utils import xrp_to_drops
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -307,6 +307,25 @@ class EscrowVault(Base):
     # Submission limits — v7
     submission_count  = Column(Integer, default=0)          # how many times seller has submitted
     max_submissions   = Column(Integer, default=3)          # configurable per-vault
+    # Marketplace — v8
+    category          = Column(String,  default="default")  # task category for filtering
+    marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
+
+
+class SkillListing(Base):
+    __tablename__ = "skill_listing"
+    id           = Column(String,   primary_key=True, index=True)
+    title        = Column(String,   nullable=False)
+    description  = Column(Text,     nullable=False)
+    category     = Column(String,   default="default")
+    rate         = Column(String,   nullable=True)
+    poster       = Column(String,   nullable=True)   # XRPL address
+    poster_name  = Column(String,   nullable=True)
+    tags         = Column(Text,     nullable=True)   # JSON array
+    fee_hash     = Column(String,   unique=True, nullable=False)
+    created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at   = Column(DateTime, nullable=True)
+    status       = Column(String,   default="ACTIVE")
 
 
 Base.metadata.create_all(bind=engine)
@@ -347,6 +366,23 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evidence_link_snapshots TEXT",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS submission_count        INTEGER DEFAULT 0",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS max_submissions         INTEGER DEFAULT 3",
+        # v8 columns
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS category               VARCHAR DEFAULT 'default'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS marketplace_tags        TEXT",
+        """CREATE TABLE IF NOT EXISTS skill_listing (
+            id          VARCHAR PRIMARY KEY,
+            title       VARCHAR NOT NULL,
+            description TEXT    NOT NULL,
+            category    VARCHAR DEFAULT 'default',
+            rate        VARCHAR,
+            poster      VARCHAR,
+            poster_name VARCHAR,
+            tags        TEXT,
+            fee_hash    VARCHAR UNIQUE NOT NULL,
+            created_at  TIMESTAMP,
+            expires_at  TIMESTAMP,
+            status      VARCHAR DEFAULT 'ACTIVE'
+        )""",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -582,6 +618,9 @@ class EscrowSetupRequest(BaseModel):
     spec_links:         Optional[list[str]] = None
     # How many submission attempts the seller gets (default 3, buyer can raise for complex work)
     max_submissions:    int             = 3
+    # Marketplace metadata
+    category:           str             = "default"
+    tags:               Optional[list[str]] = None
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -1507,6 +1546,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         cancel_after_ts       = cancel_after_ts,
         buyer_attachments     = attachments_json,
         spec_link_snapshots   = spec_snapshots_json,
+        category              = req.category,
+        marketplace_tags      = json.dumps(req.tags) if req.tags else None,
         delivery_status       = "PENDING",
         submission_count      = 0,
         max_submissions       = max(1, min(req.max_submissions, 10)),  # clamp 1–10
@@ -2167,39 +2208,40 @@ async def marketplace_jobs(
     """
     limit = min(limit, 100)
 
-    # Real jobs: vaults that are OPEN and have a project_label (posted via marketplace)
-    # For now this returns all LOCKED vaults as potential claimable jobs.
-    # Future: add a marketplace_visible column to filter precisely.
     real_jobs = []
+    now = datetime.now(timezone.utc)
     try:
-        vaults = (
-            db.query(EscrowVault)
-            .filter(EscrowVault.status == "LOCKED")
-            .order_by(EscrowVault.created_at.desc())
-            .limit(200)
-            .all()
+        q = db.query(EscrowVault).filter(
+            EscrowVault.status == "LOCKED",
+            # Exclude vaults past their deadline (on-chain expired but not yet cancelled)
+            or_(EscrowVault.cancel_after_ts == None, EscrowVault.cancel_after_ts > now),
         )
+        if category != "all":
+            q = q.filter(EscrowVault.category == category)
+        vaults = q.order_by(EscrowVault.created_at.desc()).limit(200).all()
         for v in vaults:
             if not v.task_description:
                 continue
             bounty = v.amount_xrp or 0
             if bounty < min_bounty_xrp:
                 continue
-            if category != "all":
-                # We don't store category on vault yet — skip category filter for real jobs
+            tags = []
+            try:
+                tags = json.loads(v.marketplace_tags) if v.marketplace_tags else []
+            except Exception:
                 pass
             real_jobs.append({
                 "id":           v.escrow_id,
                 "title":        v.project_label or f"Job {v.escrow_id}",
                 "description":  v.task_description,
-                "category":     "default",
+                "category":     v.category or "default",
                 "bounty":       bounty,
                 "currency":     v.currency or "XRP",
                 "poster":       v.buyer_address or "",
                 "poster_name":  v.buyer_name or "",
                 "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
                 "deadline_hrs": max(0, int((v.cancel_after_ts.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
-                "tags":         [],
+                "tags":         tags,
                 "status":       "OPEN",
                 "is_demo":      False,
             })
@@ -2222,6 +2264,141 @@ async def marketplace_jobs(
         "demo_jobs":       len([j for j in combined if j.get("is_demo")]),
         "marketplace_url": f"{SITE_URL}/marketplace",
         "note":            "Demo jobs (is_demo=true) are illustrative examples — no live escrow exists to claim against.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# SKILL LISTINGS
+# ---------------------------------------------------------------------------
+
+_SEED_SKILLS = [
+    {
+        "id": "SVC-001", "title": "Production-ready Python data pipelines",
+        "description": "ETL pipelines, data cleaning scripts, and API integrations with full test coverage and documentation. Typical turnaround 24–72hrs.",
+        "category": "code", "rate": "80–300 XRP per task",
+        "poster": "rDevAgentXXXXXXXXXXXXXXXXXXXXXXX", "poster_name": "PipelineBot",
+        "tags": ["python", "etl", "api", "data"], "is_demo": True,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=25)).isoformat(),
+    },
+    {
+        "id": "SVC-002", "title": "Legal document drafting — contracts & NDAs",
+        "description": "AI-assisted drafting of contracts, NDAs, and terms of service. First draft for human review; not a substitute for qualified legal advice.",
+        "category": "legal", "rate": "200–800 XRP per document",
+        "poster": "rLegalAgentXXXXXXXXXXXXXXXXXXXXX", "poster_name": "LexDraft",
+        "tags": ["legal", "contracts", "nda", "drafting"], "is_demo": True,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=28)).isoformat(),
+    },
+    {
+        "id": "SVC-003", "title": "SEO-optimised blog posts & technical writing",
+        "description": "Long-form content (1,000–3,000 words) for SaaS, fintech, and crypto brands. Research, write, and deliver publication-ready markdown.",
+        "category": "creative", "rate": "50–150 XRP per article",
+        "poster": "rWriterAgentXXXXXXXXXXXXXXXXXXXX", "poster_name": "ContentAgent",
+        "tags": ["writing", "seo", "blog", "markdown"], "is_demo": True,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=20)).isoformat(),
+    },
+]
+
+
+class SkillListingRequest(BaseModel):
+    id:          str
+    fee_hash:    str
+    title:       str
+    description: str
+    category:    str  = "default"
+    rate:        Optional[str]       = None
+    poster:      Optional[str]       = None   # XRPL address
+    poster_name: Optional[str]       = None
+    tags:        Optional[list[str]] = None
+
+
+@app.get("/marketplace/skills")
+async def marketplace_skills(
+    category: str = "all",
+    limit:    int = 20,
+    db: Session = Depends(get_db),
+):
+    """
+    Return active skill listings: real listings from DB first, then demo seeds.
+    Callable by both agents (via MCP list_marketplace_skills) and the human UI.
+    """
+    limit = min(limit, 100)
+    real = []
+    try:
+        now = datetime.now(timezone.utc)
+        q = db.query(SkillListing).filter(
+            SkillListing.status == "ACTIVE",
+            (SkillListing.expires_at == None) | (SkillListing.expires_at > now),
+        )
+        if category != "all":
+            q = q.filter(SkillListing.category == category)
+        listings = q.order_by(SkillListing.created_at.desc()).limit(200).all()
+        for s in listings:
+            tags = []
+            try:
+                tags = json.loads(s.tags) if s.tags else []
+            except Exception:
+                pass
+            real.append({
+                "id":          s.id,
+                "title":       s.title,
+                "description": s.description,
+                "category":    s.category or "default",
+                "rate":        s.rate or "Rate on request",
+                "poster":      s.poster or "",
+                "poster_name": s.poster_name or "",
+                "tags":        tags,
+                "expires_at":  s.expires_at.isoformat() if s.expires_at else None,
+                "is_demo":     False,
+            })
+    except Exception as e:
+        logger.warning(f"⚠️ marketplace_skills DB query failed: {e}")
+
+    seeds = _SEED_SKILLS
+    if category != "all":
+        seeds = [s for s in seeds if s["category"] == category]
+
+    combined = (real + seeds)[:limit]
+    return {
+        "skills":     combined,
+        "total":      len(combined),
+        "real_skills": len(real),
+        "demo_skills": len([s for s in combined if s.get("is_demo")]),
+    }
+
+
+@app.post("/marketplace/skills")
+async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db)):
+    """
+    Create a new skill listing. Requires a valid 0.1 XRP fee payment.
+    Both humans (via the marketplace UI) and agents (via MCP) can post skills.
+    """
+    existing = db.query(SkillListing).filter(SkillListing.id == req.id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Skill ID '{req.id}' already exists.")
+
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db)
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    listing = SkillListing(
+        id          = req.id,
+        title       = req.title,
+        description = req.description,
+        category    = req.category,
+        rate        = req.rate,
+        poster      = req.poster,
+        poster_name = req.poster_name,
+        tags        = json.dumps(req.tags) if req.tags else None,
+        fee_hash    = req.fee_hash,
+        expires_at  = expires_at,
+    )
+    db.add(listing)
+    db.commit()
+    logger.info(f"✅ Skill listing created: {req.id} by {req.poster_name or req.poster}")
+    return {
+        "status":     "created",
+        "id":         req.id,
+        "expires_at": expires_at.isoformat(),
+        "message":    "Your skill listing is now live for 30 days.",
     }
 
 
