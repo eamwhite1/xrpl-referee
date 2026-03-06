@@ -5,6 +5,7 @@ configSchema:
   properties:
     network:
       type: string
+      title: XRPL Network
       enum:
         - mainnet
         - testnet
@@ -14,8 +15,12 @@ configSchema:
       default: mainnet
     base_url:
       type: string
+      title: Service URL
       description: >
         Override the referee service URL for self-hosted deployments.
         Defaults to the hosted service at https://xrpl-referee.onrender.com.
       default: "https://xrpl-referee.onrender.com"
   additionalProperties: false
+exampleConfig:
+  network: testnet
+  base_url: "https://xrpl-referee.onrender.com"
