@@ -494,7 +494,7 @@ async def xumm_create_payload(txjson: dict) -> dict:
                 "Content-Type": "application/json",
             },
         )
-        if not res.is_success():
+        if not res.is_success:
             raise HTTPException(status_code=500, detail=f"XUMM API error: {res.text}")
         data = res.json()
         return {
@@ -515,7 +515,7 @@ async def xumm_get_payload(uuid: str) -> dict:
                 "X-API-Secret": xumm_api_secret,
             },
         )
-        if not res.is_success():
+        if not res.is_success:
             raise HTTPException(status_code=500, detail=f"XUMM API error: {res.text}")
         data   = res.json()
         signed  = data["meta"]["signed"]
@@ -533,7 +533,7 @@ async def _verify_xumm():
                 "https://xumm.app/api/v1/platform/ping",
                 headers={"X-API-Key": xumm_api_key, "X-API-Secret": xumm_api_secret},
             )
-            if res.is_success():
+            if res.is_success:
                 name = res.json().get("application", {}).get("name", "unknown")
                 logger.info(f"🔌 XUMM SDK connected: {name}")
             else:
