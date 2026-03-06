@@ -15,13 +15,12 @@ Usage in Claude Desktop / Cursor / any MCP client:
       }
     }
   }
-
-Note: annotations= kwarg removed — not supported in FastMCP < 2.0.
-Tool descriptions are conveyed through docstrings, which all MCP clients read.
 """
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import Field
+from typing import Annotated
 
 mcp = FastMCP(
     name="AgentTrust Referee",
@@ -42,25 +41,32 @@ REFEREE_BASE = "https://xrpl-referee.onrender.com"
 
 @mcp.tool()
 async def audit_task(
-    task: str,
-    work: str,
-    fee_hash: str,
-    task_category: str = "default",
-    require_consensus: bool = False,
+    task: Annotated[str, Field(
+        title="Task Specification",
+        description="The task requirements or specification the worker must meet.",
+    )],
+    work: Annotated[str, Field(
+        title="Completed Work",
+        description="The work, output, or proof of completion to evaluate against the specification.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="XRPL Payment Hash",
+        description="64-character hex transaction hash of the 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Each hash is single-use.",
+    )],
+    task_category: Annotated[str, Field(
+        title="Task Category",
+        description="Evaluation rubric. One of: default, creative, code, data, data_analysis, bug_bounty, legal, supply_chain.",
+    )] = "default",
+    require_consensus: Annotated[bool, Field(
+        title="Require Consensus",
+        description="When True, two AI models must independently agree before returning PASS. Recommended for high-stakes tasks.",
+    )] = False,
 ) -> dict:
     """
     Verify whether completed work meets a task specification using AI.
 
     Before calling, send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet.
     Each fee_hash is single-use (anti-replay protection).
-
-    Args:
-        task: The task specification or requirements given to the worker.
-        work: The completed work, output, or proof of completion.
-        fee_hash: XRPL transaction hash of the 0.1 XRP payment to the protocol wallet.
-        task_category: One of: default, creative, code, data, data_analysis,
-                       bug_bounty, legal, supply_chain.
-        require_consensus: If True, two models must agree. For high-stakes tasks.
 
     Returns:
         status (approved/rejected), verdict (PASS/FAIL), score (0-100),
@@ -87,18 +93,54 @@ async def audit_task(
 
 @mcp.tool()
 async def create_escrow_vault(
-    escrow_id: str,
-    fee_hash: str,
-    task_description: str,
-    worker_address: str,
-    buyer_name: str,
-    buyer_address: str,
-    amount_xrp: float = None,
-    amount_rlusd: float = None,
-    currency: str = "XRP",
-    project_label: str = "",
-    cancel_after_hrs: int = 168,
-    max_submissions: int = 3,
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="Unique receipt code for this vault, e.g. AT-7X9K-2MQ4. Used to reference the vault in subsequent calls.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="XRPL Payment Hash",
+        description="64-character hex transaction hash of the 0.1 XRP protocol fee payment.",
+    )],
+    task_description: Annotated[str, Field(
+        title="Task Description",
+        description="Detailed specification the worker must fulfil to be paid. Be precise — the AI referee evaluates against this.",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="XRPL wallet address (r...) of the worker who will receive payment on approval.",
+    )],
+    buyer_name: Annotated[str, Field(
+        title="Buyer Name",
+        description="Name or identifier of the buyer posting the job.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Buyer XRPL Address",
+        description="XRPL wallet address (r...) of the buyer. Used to look up the escrow sequence on approval.",
+    )],
+    amount_xrp: Annotated[float | None, Field(
+        title="XRP Amount",
+        description="Amount of XRP to lock in escrow. Required when currency is XRP.",
+    )] = None,
+    amount_rlusd: Annotated[float | None, Field(
+        title="RLUSD Amount",
+        description="Amount of RLUSD to lock in escrow. Required when currency is RLUSD.",
+    )] = None,
+    currency: Annotated[str, Field(
+        title="Currency",
+        description='Currency to lock. Use "XRP" (no trustline needed) or "RLUSD" (USD-pegged stablecoin).',
+    )] = "XRP",
+    project_label: Annotated[str, Field(
+        title="Project Label",
+        description="Optional human-readable label for the job, shown in the marketplace.",
+    )] = "",
+    cancel_after_hrs: Annotated[int, Field(
+        title="Cancel After (hours)",
+        description="Hours until the buyer can reclaim funds if the worker does not deliver. Default 168 = 7 days.",
+    )] = 168,
+    max_submissions: Annotated[int, Field(
+        title="Max Submissions",
+        description="Number of work submission attempts the worker is allowed before the vault is locked. Default 3.",
+    )] = 3,
 ) -> dict:
     """
     Create an AI-gated XRPL escrow vault. Funds release automatically to the
@@ -106,20 +148,6 @@ async def create_escrow_vault(
 
     Before calling: pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.
     After calling: use the returned condition in an XRPL EscrowCreate transaction.
-
-    Args:
-        escrow_id: Unique receipt code, e.g. AT-7X9K-2MQ4
-        fee_hash: XRPL tx hash of the 0.1 XRP protocol fee payment
-        task_description: Detailed spec the worker must fulfil to be paid
-        worker_address: XRPL wallet address of the worker
-        buyer_name: Name or identifier of the buyer
-        buyer_address: Buyer's XRPL wallet address
-        amount_xrp: Amount of XRP to lock (when currency=XRP)
-        amount_rlusd: Amount of RLUSD to lock (when currency=RLUSD)
-        currency: "XRP" (default, no trustline needed) or "RLUSD" (USD-pegged stable)
-        project_label: Optional human-readable label
-        cancel_after_hrs: Hours until buyer can reclaim (default 168 = 7 days)
-        max_submissions: How many attempts the worker gets (default 3)
 
     Returns:
         escrow_id, condition (for EscrowCreate tx), cancel_after_human.
@@ -148,17 +176,25 @@ async def create_escrow_vault(
 
 
 @mcp.tool()
-async def confirm_escrow_transaction(escrow_id: str, tx_hash: str) -> dict:
+async def confirm_escrow_transaction(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code returned by create_escrow_vault.",
+    )],
+    tx_hash: Annotated[str, Field(
+        title="EscrowCreate Transaction Hash",
+        description="64-character hex XRPL transaction hash of the EscrowCreate transaction that locked the funds.",
+    )],
+) -> dict:
     """
-    After submitting the EscrowCreate transaction on XRPL, call this to register
-    the tx hash. The referee caches the escrow sequence number automatically.
+    Register the on-chain EscrowCreate transaction hash with the referee.
 
-    Args:
-        escrow_id: The receipt code from create_escrow_vault
-        tx_hash: XRPL transaction hash of the EscrowCreate transaction
+    Call this after submitting the EscrowCreate transaction on XRPL.
+    The referee caches the escrow sequence number automatically so the
+    worker does not need to provide it when claiming payment.
 
     Returns:
-        status: "confirmed", sequence: escrow sequence number
+        status: "confirmed", sequence: escrow sequence number.
     """
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(
@@ -171,37 +207,40 @@ async def confirm_escrow_transaction(escrow_id: str, tx_hash: str) -> dict:
 
 @mcp.tool()
 async def evaluate_escrow_work(
-    escrow_id: str,
-    work: str,
-    task_category: str = "default",
-    require_consensus: bool = False,
-    evidence_links: list = None,
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code provided by the buyer when creating the vault.",
+    )],
+    work: Annotated[str, Field(
+        title="Completed Work",
+        description="Work submission or proof of completion. XRPL tx hashes (64-char hex) are auto-verified on the ledger.",
+    )],
+    task_category: Annotated[str, Field(
+        title="Task Category",
+        description="Evaluation rubric. One of: default, creative, code, data, data_analysis, bug_bounty, legal, supply_chain.",
+    )] = "default",
+    require_consensus: Annotated[bool, Field(
+        title="Require Consensus",
+        description="Require two AI models to agree before returning PASS. Recommended for high-stakes jobs.",
+    )] = False,
+    evidence_links: Annotated[list[str] | None, Field(
+        title="Evidence Links",
+        description="Up to 3 URLs that are fetched and snapshotted at submission time as supporting evidence.",
+    )] = None,
 ) -> dict:
     """
     Submit proof of completed work against an existing escrow vault.
-    On approval, payment releases automatically — no EscrowFinish needed.
 
+    On approval, payment releases automatically — no EscrowFinish needed.
     XRPL transaction hashes (64-char hex) in the work field are automatically
     verified on the ledger. Useful as proof of NFT transfers, token payments,
-    or any on-chain delivery — just paste the tx hash.
-
-    Args:
-        escrow_id: The receipt code provided by the buyer
-        work: Completed work or proof of completion. Include XRPL tx hashes
-              directly — they are auto-verified on the ledger.
-        task_category: default, creative, code, data, data_analysis,
-                       bug_bounty, legal, supply_chain
-        require_consensus: Require two models to agree (high-stakes jobs)
-        evidence_links: Up to 3 URLs fetched and snapshotted at submission time.
+    or any on-chain delivery.
 
     Returns on PASS:
-        status: "approved", auto_finish_queued: True
+        status: "approved", auto_finish_queued: True.
 
     Returns on FAIL:
         status: "rejected", score, summary, criteria_failed, attempts_remaining.
-
-    Returns HTTP 429 if submission limit reached — purchase extra attempt for
-    0.05 XRP via POST /evaluate/purchase-attempt.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
         res = await client.post(
@@ -226,12 +265,16 @@ async def evaluate_escrow_work(
 
 
 @mcp.tool()
-async def get_escrow_info(escrow_id: str) -> dict:
+async def get_escrow_info(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code for the vault to look up, e.g. AT-7X9K-2MQ4.",
+    )],
+) -> dict:
     """
-    Retrieve metadata about an existing escrow vault. Never returns the fulfillment key.
+    Retrieve metadata about an existing escrow vault.
 
-    Args:
-        escrow_id: The receipt code (e.g. AT-7X9K-2MQ4)
+    Never returns the fulfillment key — that is only returned on approval.
 
     Returns:
         task_description, buyer_name, worker_address, amount, deadline,
@@ -245,31 +288,38 @@ async def get_escrow_info(escrow_id: str) -> dict:
 
 @mcp.tool()
 async def list_marketplace_jobs(
-    category: str = "all",
-    min_bounty_xrp: float = 0,
-    limit: int = 20,
+    category: Annotated[str, Field(
+        title="Category Filter",
+        description="Filter by job category. One of: all, code, data, data_analysis, creative, bug_bounty, legal, default.",
+    )] = "all",
+    min_bounty_xrp: Annotated[float, Field(
+        title="Minimum Bounty (XRP)",
+        description="Only return jobs with a bounty of at least this many XRP. Use 0 for no minimum.",
+        ge=0,
+    )] = 0,
+    limit: Annotated[int, Field(
+        title="Result Limit",
+        description="Maximum number of jobs to return. Default 20, maximum 100.",
+        ge=1,
+        le=100,
+    )] = 20,
 ) -> dict:
     """
-    Browse open bounties on the AgentTrust marketplace. The primary way
-    autonomous agents discover work available on the protocol. All bounties
-    are locked in XRPL escrow and pay in XRP automatically on AI approval.
+    Browse open bounties on the AgentTrust marketplace.
+
+    The primary way autonomous agents discover work available on the protocol.
+    All bounties are locked in XRPL escrow and pay automatically on AI approval.
 
     Workflow to claim a job:
       1. list_marketplace_jobs() — find a suitable job
       2. get_escrow_info(job.escrow_id) — verify escrow is live and check spec
       3. evaluate_escrow_work(job.escrow_id, your_work) — submit and get paid
 
-    Args:
-        category: all, code, data, data_analysis, creative, bug_bounty, legal, default
-        min_bounty_xrp: Minimum bounty in XRP (e.g. 100 to see jobs worth >= 100 XRP)
-        limit: Max jobs to return (default 20, max 100)
-
     Returns:
         jobs: List with id (use as escrow_id), title, description, bounty,
               deadline_hrs, poster, tags, status, is_demo.
         total: Total matching jobs.
         marketplace_url: Human-facing visual marketplace.
-        note: Demo jobs (is_demo=true) are illustrative — no live escrow to claim.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(
@@ -285,14 +335,22 @@ async def list_marketplace_jobs(
 
 
 @mcp.tool()
-async def get_rlusd_quote(xrp_amount: float, worker_address: str) -> dict:
+async def get_rlusd_quote(
+    xrp_amount: Annotated[float, Field(
+        title="XRP Amount",
+        description="Amount of XRP to get a conversion quote for.",
+        gt=0,
+    )],
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="Your XRPL wallet address (r...). Also used to check whether your trustline for RLUSD is active.",
+    )],
+) -> dict:
     """
     Get a live XRP to RLUSD conversion quote via the XRPL DEX.
-    Use before claiming an escrow if you want RLUSD instead of XRP.
 
-    Args:
-        xrp_amount: Amount of XRP to convert
-        worker_address: Your XRPL wallet address (also checks trustline status)
+    Use before creating an RLUSD-denominated escrow or before claiming an
+    escrow if you want to understand the current USD value.
 
     Returns:
         estimated_rlusd, trust_line_ok, slippage_warning, trust_line_instructions.
@@ -309,8 +367,10 @@ async def get_rlusd_quote(xrp_amount: float, worker_address: str) -> dict:
 @mcp.tool()
 async def get_xrp_price() -> dict:
     """
-    Get the current live XRP price in USD and GBP. Use this to convert XRP
-    bounty amounts to fiat before deciding whether a job is worth taking.
+    Get the current live XRP price in USD and GBP.
+
+    Use this to convert XRP bounty amounts to fiat before deciding whether
+    a job is worth taking.
 
     Returns:
         usd, gbp, cached (True if recently cached due to source being briefly unavailable).
