@@ -2,6 +2,7 @@ target: remote
 url: https://xrpl-referee.onrender.com/mcp/
 configSchema:
   type: object
+  required: []
   properties:
     network:
       type: string
