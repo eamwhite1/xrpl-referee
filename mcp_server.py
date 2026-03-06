@@ -19,6 +19,7 @@ Usage in Claude Desktop / Cursor / any MCP client:
 
 import httpx
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import Field
 from typing import Annotated
 
@@ -39,7 +40,12 @@ mcp = FastMCP(
 REFEREE_BASE = "https://xrpl-referee.onrender.com"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 async def audit_task(
     task: Annotated[str, Field(
         title="Task Specification",
@@ -91,7 +97,12 @@ async def audit_task(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 async def create_escrow_vault(
     escrow_id: Annotated[str, Field(
         title="Escrow ID",
@@ -137,6 +148,11 @@ async def create_escrow_vault(
         title="Cancel After (hours)",
         description="Hours until the buyer can reclaim funds if the worker does not deliver. Default 168 = 7 days.",
     )] = 168,
+    category: Annotated[str, Field(
+        title="Job Category",
+        description="Marketplace category for this job. One of: default, creative, code, data, data_analysis, bug_bounty, legal, supply_chain.",
+        enum=["default", "creative", "code", "data", "data_analysis", "bug_bounty", "legal", "supply_chain"],
+    )] = "default",
     max_submissions: Annotated[int, Field(
         title="Max Submissions",
         description="Number of work submission attempts the worker is allowed before the vault is locked. Default 3.",
@@ -161,6 +177,7 @@ async def create_escrow_vault(
         "task_description": task_description,
         "worker_address":   worker_address,
         "currency":         currency.upper(),
+        "category":         category,
         "cancel_after_hrs": cancel_after_hrs,
         "max_submissions":  max_submissions,
     }
@@ -175,7 +192,12 @@ async def create_escrow_vault(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 async def confirm_escrow_transaction(
     escrow_id: Annotated[str, Field(
         title="Escrow ID",
@@ -205,7 +227,12 @@ async def confirm_escrow_transaction(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 async def evaluate_escrow_work(
     escrow_id: Annotated[str, Field(
         title="Escrow ID",
@@ -264,7 +291,12 @@ async def evaluate_escrow_work(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 async def get_escrow_info(
     escrow_id: Annotated[str, Field(
         title="Escrow ID",
@@ -286,7 +318,12 @@ async def get_escrow_info(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 async def list_marketplace_jobs(
     category: Annotated[str, Field(
         title="Category Filter",
@@ -334,7 +371,12 @@ async def list_marketplace_jobs(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 async def get_rlusd_quote(
     xrp_amount: Annotated[float, Field(
         title="XRP Amount",
@@ -364,7 +406,12 @@ async def get_rlusd_quote(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 async def list_marketplace_skills(
     category: Annotated[str, Field(
         title="Category Filter",
@@ -404,8 +451,13 @@ async def list_marketplace_skills(
         return res.json()
 
 
-@mcp.tool()
-async def post_skill_listing(
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def create_skill_listing(
     skill_id: Annotated[str, Field(
         title="Skill ID",
         description="Unique ID for this listing, e.g. SKILL-PY-001. Used to reference the listing later.",
@@ -478,7 +530,12 @@ async def post_skill_listing(
         return res.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 async def get_xrp_price() -> dict:
     """
     Get the current live XRP price in USD and GBP.
@@ -493,3 +550,71 @@ async def get_xrp_price() -> dict:
         res = await client.get(f"{REFEREE_BASE}/xrp/price")
         res.raise_for_status()
         return res.json()
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompt Templates
+# ---------------------------------------------------------------------------
+
+@mcp.prompt()
+def claim_bounty(
+    escrow_id: Annotated[str, Field(description="Escrow ID of the job to claim, from list_marketplace_jobs.")] = "",
+    your_wallet: Annotated[str, Field(description="Your XRPL wallet address (r...) to receive payment.")] = "",
+) -> str:
+    """
+    Step-by-step guide for finding and claiming a bounty on the AgentTrust marketplace.
+
+    Walks through browsing jobs, verifying the escrow is live, submitting work,
+    and receiving automatic payment on approval.
+    """
+    job_ref = f" for job {escrow_id}" if escrow_id else ""
+    wallet_note = f" Your receiving wallet: {your_wallet}." if your_wallet else ""
+    return (
+        f"You want to claim a bounty{job_ref} on the AgentTrust marketplace.{wallet_note}\n\n"
+        "Follow these steps:\n\n"
+        "1. **Browse open jobs** — call `list_marketplace_jobs()` to see available bounties. "
+        "Filter by category or minimum bounty as needed.\n\n"
+        "2. **Check the escrow** — call `get_escrow_info(escrow_id)` to verify the vault is live, "
+        "review the exact task specification, and note the deadline.\n\n"
+        "3. **Check the XRP price** — call `get_xrp_price()` to understand the fiat value of the bounty "
+        "before committing to the work.\n\n"
+        "4. **Do the work** — complete the task according to the specification.\n\n"
+        "5. **Submit for payment** — call `evaluate_escrow_work(escrow_id, your_work)`. "
+        "On PASS the bounty releases automatically to your wallet. "
+        "On FAIL you will receive a score, feedback, and remaining attempt count.\n\n"
+        "Important: each vault has a limited number of submission attempts (usually 3). "
+        "Only submit when your work is complete and polished."
+    )
+
+
+@mcp.prompt()
+def post_bounty(
+    task: Annotated[str, Field(description="Description of the work you need done.")] = "",
+    bounty_xrp: Annotated[float, Field(description="Bounty amount in XRP.")] = 0.0,
+) -> str:
+    """
+    Step-by-step guide for posting a new bounty job on the AgentTrust marketplace.
+
+    Walks through paying the protocol fee, creating the escrow vault, signing
+    the XRPL EscrowCreate transaction, and confirming the job is live.
+    """
+    task_note = f"\n\nYour task: {task}" if task else ""
+    bounty_note = f" ({bounty_xrp} XRP bounty)" if bounty_xrp else ""
+    return (
+        f"You want to post a bounty job{bounty_note} on the AgentTrust marketplace.{task_note}\n\n"
+        "Follow these steps:\n\n"
+        "1. **Pay the protocol fee** — send exactly 0.1 XRP to "
+        "`rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. "
+        "Save the 64-character transaction hash — this is your `fee_hash`.\n\n"
+        "2. **Create the vault** — call `create_escrow_vault()` with your `fee_hash`, "
+        "task description, worker address, bounty amount, and a unique `escrow_id` (e.g. AT-XXXX-YYYY). "
+        "The response includes a `condition` string needed for the next step.\n\n"
+        "3. **Lock the funds on-chain** — submit an XRPL EscrowCreate transaction using the "
+        "`condition` from step 2. Sign with your XRPL wallet (e.g. via Xaman / XUMM).\n\n"
+        "4. **Confirm the transaction** — call `confirm_escrow_transaction(escrow_id, tx_hash)` "
+        "with the EscrowCreate transaction hash. This registers the escrow sequence so payment "
+        "can release automatically on approval.\n\n"
+        "5. **Share the job** — your job is now live on the AgentTrust marketplace. "
+        "Workers can find it via `list_marketplace_jobs()` and claim payment by submitting work.\n\n"
+        "Total cost: 0.1 XRP protocol fee + bounty amount locked in escrow."
+    )

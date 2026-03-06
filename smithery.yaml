@@ -2,5 +2,20 @@ target: remote
 url: https://xrpl-referee.onrender.com/mcp/
 configSchema:
   type: object
-  properties: {}
+  properties:
+    network:
+      type: string
+      enum:
+        - mainnet
+        - testnet
+      description: >
+        XRPL network to use. Mainnet uses real XRP; testnet uses free test
+        XRP with no real value. Defaults to mainnet.
+      default: mainnet
+    base_url:
+      type: string
+      description: >
+        Override the referee service URL for self-hosted deployments.
+        Defaults to the hosted service at https://xrpl-referee.onrender.com.
+      default: "https://xrpl-referee.onrender.com"
   additionalProperties: false
