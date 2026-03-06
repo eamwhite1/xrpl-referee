@@ -65,7 +65,9 @@ except Exception as e:
 @asynccontextmanager
 async def _lifespan(app):
     if _mcp_http_app is not None:
-        async with _mcp_http_app.lifespan(app):
+        # Pass the MCP http app itself (not the parent FastAPI app) so the
+        # session manager stores its state in the correct app scope.
+        async with _mcp_http_app.lifespan(_mcp_http_app):
             yield
     else:
         yield
@@ -79,7 +81,7 @@ app = FastAPI(title="AgentTrust Protocol Core", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # Cannot combine allow_credentials=True with allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
