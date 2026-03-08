@@ -29,7 +29,7 @@ from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
-from xrpl.models.transactions import EscrowFinish, EscrowCreate
+from xrpl.models.transactions import EscrowFinish
 from xrpl.core.addresscodec import decode_seed
 from xrpl.utils import xrp_to_drops
 
@@ -154,10 +154,10 @@ def serve_agent_json():
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
-        "agentVersion": "8.0.0",
-        "protocolVersion": "0.5.0",
+        "agentVersion": "9.0.0",
+        "protocolVersion": "0.6.0",
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
-        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "openBounty": True},
+        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
             "description": (
@@ -202,9 +202,13 @@ def serve_mcp_server_card():
             {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
             {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed."},
-            {"name": "claim_job",                 "description": "Claim an open bounty job. Referee creates the on-chain escrow automatically for the claiming agent."},
             {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
-            {"name": "list_marketplace_jobs",     "description": "Browse open XRP bounties agents can claim. Returns structured job data with claimable flag."},
+            {"name": "list_marketplace_jobs",     "description": "Browse live XRPL escrow bounties. Returns structured job data."},
+            {"name": "post_job",                  "description": "Post a job to the job board. No fee or funds — workers bid, you negotiate and award."},
+            {"name": "list_open_jobs",            "description": "Browse jobs posted by buyers that are open for bidding."},
+            {"name": "submit_bid",                "description": "Submit a bid (price + proposal) on an open job."},
+            {"name": "view_job",                  "description": "View job details and all current bids."},
+            {"name": "award_job",                 "description": "Accept a bid. Returns worker address and agreed price to use in create_escrow_vault()."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
         ],
@@ -341,6 +345,40 @@ class EscrowVault(Base):
     escrow_owner      = Column(String,  nullable=True)      # Account field of EscrowCreate tx
 
 
+class JobPosting(Base):
+    """
+    A buyer agent's request for work — no funds held.
+    Workers bid; buyer awards the job; then buyer creates the bilateral escrow.
+    """
+    __tablename__ = "job_posting"
+    id             = Column(String,   primary_key=True, index=True)  # e.g. JOB-XXXX-YYYY
+    title          = Column(String,   nullable=False)
+    description    = Column(Text,     nullable=False)
+    budget_xrp     = Column(Float,    nullable=True)    # indicative max budget
+    buyer_address  = Column(String,   nullable=False)
+    buyer_name     = Column(String,   nullable=True)
+    category       = Column(String,   default="default")
+    tags           = Column(Text,     nullable=True)    # JSON array
+    status         = Column(String,   default="open")   # open, awarded, cancelled, expired
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at     = Column(DateTime, nullable=True)
+    awarded_bid_id = Column(String,   nullable=True)    # winning bid id
+    escrow_id      = Column(String,   nullable=True)    # set by buyer after escrow created
+
+
+class Bid(Base):
+    """A worker agent's bid on an open job posting."""
+    __tablename__ = "bid"
+    id             = Column(String,   primary_key=True, index=True)   # BID-XXXX-YYYY
+    job_id         = Column(String,   nullable=False, index=True)
+    worker_address = Column(String,   nullable=False)
+    worker_name    = Column(String,   nullable=True)
+    proposed_xrp   = Column(Float,    nullable=False)
+    proposal       = Column(Text,     nullable=False)   # pitch / approach
+    status         = Column(String,   default="pending")  # pending, accepted, rejected
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class SkillListing(Base):
     __tablename__ = "skill_listing"
     id           = Column(String,   primary_key=True, index=True)
@@ -398,8 +436,34 @@ def run_migrations():
         # v8 columns
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS category               VARCHAR DEFAULT 'default'",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS marketplace_tags        TEXT",
-        # v9 columns — open bounty support
+        # v9 columns — escrow_owner tracks who signed EscrowCreate (buyer or referee)
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_owner           VARCHAR",
+        # v10 tables — job board + bidding (no funds held by referee)
+        """CREATE TABLE IF NOT EXISTS job_posting (
+            id              VARCHAR PRIMARY KEY,
+            title           VARCHAR NOT NULL,
+            description     TEXT    NOT NULL,
+            budget_xrp      FLOAT,
+            buyer_address   VARCHAR NOT NULL,
+            buyer_name      VARCHAR,
+            category        VARCHAR DEFAULT 'default',
+            tags            TEXT,
+            status          VARCHAR DEFAULT 'open',
+            created_at      TIMESTAMP,
+            expires_at      TIMESTAMP,
+            awarded_bid_id  VARCHAR,
+            escrow_id       VARCHAR
+        )""",
+        """CREATE TABLE IF NOT EXISTS bid (
+            id              VARCHAR PRIMARY KEY,
+            job_id          VARCHAR NOT NULL,
+            worker_address  VARCHAR NOT NULL,
+            worker_name     VARCHAR,
+            proposed_xrp    FLOAT   NOT NULL,
+            proposal        TEXT    NOT NULL,
+            status          VARCHAR DEFAULT 'pending',
+            created_at      TIMESTAMP
+        )""",
         """CREATE TABLE IF NOT EXISTS skill_listing (
             id          VARCHAR PRIMARY KEY,
             title       VARCHAR NOT NULL,
@@ -678,9 +742,7 @@ class EscrowSetupRequest(BaseModel):
     buyer_email:        Optional[str]   = None
     worker_email:       Optional[str]   = None
     task_description:   str
-    worker_address:     Optional[str]   = None   # Optional for open bounties
-    # Open bounty mode — referee creates EscrowCreate after worker claims
-    open_bounty:        bool            = False
+    worker_address:     str
     # Currency selection — XRP (default) or RLUSD
     currency:           str             = "XRP"
     amount_xrp:         Optional[float] = None
@@ -883,49 +945,6 @@ async def auto_finish_escrow(
                 db.commit()
         finally:
             db.close()
-
-
-async def referee_create_escrow(vault) -> tuple:
-    """
-    Creates an EscrowCreate on-chain signed by the referee wallet.
-
-    Used for open bounties where the buyer pre-paid the referee and a worker
-    has just claimed the job.  Returns (tx_hash, sequence).
-    """
-    if not referee_wallet:
-        raise RuntimeError("Referee wallet not loaded — cannot create on-chain escrow.")
-
-    if vault.currency != "XRP":
-        raise RuntimeError("Referee-funded open bounties only support XRP at this time.")
-
-    amount_drops = str(int(vault.amount_xrp * 1_000_000))
-
-    cancel_after_ripple = None
-    if vault.cancel_after_ts:
-        ts = vault.cancel_after_ts
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        cancel_after_ripple = int(ts.timestamp()) - RIPPLE_EPOCH
-
-    create_kwargs = dict(
-        account     = referee_wallet.address,
-        destination = vault.worker_address,
-        amount      = amount_drops,
-        condition   = vault.condition.upper(),
-    )
-    if cancel_after_ripple:
-        create_kwargs["cancel_after"] = cancel_after_ripple
-
-    client    = AsyncJsonRpcClient(XRPL_URL)
-    create_tx = EscrowCreate(**create_kwargs)
-    result    = await async_submit_and_wait(create_tx, client, referee_wallet)
-
-    tx_hash = result.result.get("hash", "unknown")
-    tx_data = result.result.get("tx_json") or result.result
-    sequence = tx_data.get("Sequence")
-
-    logger.info(f"✅ REFEREE ESCROW CREATED: {vault.escrow_id} | hash={tx_hash[:16]}... | seq={sequence} | worker={vault.worker_address}")
-    return tx_hash, sequence
 
 
 async def server_side_dex_swap(
@@ -1593,6 +1612,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate")
+
     # Validate currency + amount
     currency = req.currency.upper()
     if currency not in ("XRP", "RLUSD"):
@@ -1606,28 +1627,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
         raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
 
-    # Open bounty: referee creates EscrowCreate when a worker claims.
-    # Buyer must pre-pay bounty + protocol fee in one payment to PROTOCOL_WALLET.
-    is_open_bounty = req.open_bounty or not req.worker_address
-
-    if is_open_bounty:
-        if currency != "XRP":
-            raise HTTPException(status_code=400, detail="Open bounties (no worker_address) only support XRP at this time.")
-        if not referee_wallet:
-            raise HTTPException(status_code=503, detail="Referee wallet not configured. Cannot offer open bounties.")
-        # Payment must cover bounty + protocol fee
-        required_total = round(amount_xrp + MIN_FEE_XRP, 6)
-        await verify_fee_payment(
-            fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db,
-            min_xrp=required_total, resource="/escrow/generate",
-        )
-    else:
-        if not req.worker_address:
-            raise HTTPException(status_code=400, detail="worker_address is required for bilateral escrows.")
-        await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate")
-
-    # For RLUSD bilateral escrow, validate both wallets have trustlines
-    if currency == "RLUSD" and not is_open_bounty:
+    # For RLUSD escrow, validate both wallets have trustlines
+    if currency == "RLUSD":
         buyer_tl  = await check_rlusd_trustline(req.buyer_address)
         worker_tl = await check_rlusd_trustline(req.worker_address)
         if not buyer_tl:
@@ -1670,7 +1671,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         escrow_id             = req.escrow_id,
         condition             = final_condition,
         fulfillment           = encrypt_fulfillment(final_fulfillment),
-        status                = "OPEN" if is_open_bounty else "LOCKED",
+        status                = "LOCKED",
         currency              = currency,
         amount_xrp            = amount_xrp,
         amount_rlusd          = amount_rlusd,
@@ -1727,27 +1728,16 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     else:
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
-    vault_status = "OPEN" if is_open_bounty else "LOCKED"
-    result = {
+    return {
         "escrow_id":           req.escrow_id,
+        "condition":           final_condition,
+        "escrow_amount":       escrow_amount,      # ready for EscrowCreate tx
         "currency":            currency,
-        "status":              vault_status,
+        "status":              "LOCKED",
         "cancel_after_ripple": cancel_after_ripple,
         "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
         "worker_email_sent":   bool(req.worker_email),
     }
-    if is_open_bounty:
-        result["open_bounty"]   = True
-        result["bounty_xrp"]    = amount_xrp
-        result["next_step"]     = (
-            "Job is live on the marketplace. Workers can find and claim it via "
-            "POST /escrow/{escrow_id}/claim. On claim, the referee creates the "
-            "on-chain EscrowCreate automatically."
-        )
-    else:
-        result["condition"]     = final_condition
-        result["escrow_amount"] = escrow_amount   # ready for EscrowCreate tx
-    return result
 
 
 @app.post("/escrow/{escrow_id}/confirm")
@@ -1773,65 +1763,12 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
 
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
+    # Record who created the EscrowCreate (buyer in the bilateral flow)
+    if not vault.escrow_owner:
+        vault.escrow_owner = vault.buyer_address
     db.commit()
 
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
-
-
-@app.post("/escrow/{escrow_id}/claim")
-async def claim_escrow_job(escrow_id: str, body: dict, db: Session = Depends(get_db)):
-    """
-    Worker claims an open bounty job and triggers referee to create the on-chain escrow.
-
-    The buyer must have already created the vault with open_bounty=True and pre-paid
-    (bounty + 0.1 XRP) to the protocol wallet.  On success, the referee signs and
-    submits the EscrowCreate transaction so funds are locked on-chain for this worker.
-    """
-    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-    if not vault:
-        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found.")
-    if vault.status != "OPEN":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Job '{escrow_id}' is not open for claiming (status: {vault.status}).",
-        )
-    if vault.worker_address:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Job '{escrow_id}' has already been claimed by {vault.worker_address}.",
-        )
-    if not referee_wallet:
-        raise HTTPException(status_code=503, detail="Referee wallet not configured — cannot create on-chain escrow.")
-
-    worker_address = (body.get("worker_address") or "").strip()
-    if not worker_address or not worker_address.startswith("r"):
-        raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
-
-    # Assign worker then create escrow atomically (vault updated only on success)
-    vault.worker_address = worker_address
-    try:
-        tx_hash, sequence = await referee_create_escrow(vault)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"❌ CLAIM FAILED for {escrow_id}: {e}")
-        raise HTTPException(status_code=502, detail=f"Failed to create on-chain escrow: {str(e)}")
-
-    vault.escrow_tx_hash  = tx_hash
-    vault.escrow_sequence = sequence
-    vault.escrow_owner    = referee_wallet.address
-    vault.status          = "LOCKED"
-    db.commit()
-
-    logger.info(f"✅ JOB CLAIMED: {escrow_id} | worker={worker_address} | seq={sequence}")
-    return {
-        "status":           "claimed",
-        "escrow_id":        escrow_id,
-        "worker_address":   worker_address,
-        "escrow_owner":     referee_wallet.address,
-        "escrow_tx_hash":   tx_hash,
-        "escrow_sequence":  sequence,
-        "next_step":        "Do the work, then call evaluate_escrow_work() to submit. Payment releases automatically on approval.",
-    }
 
 
 @app.get("/escrow/{escrow_id}")
@@ -2421,8 +2358,7 @@ async def marketplace_jobs(
     now = datetime.now(timezone.utc)
     try:
         q = db.query(EscrowVault).filter(
-            # OPEN = unclaimed open bounty; LOCKED = claimed/bilateral (escrow on-chain)
-            EscrowVault.status.in_(["OPEN", "LOCKED"]),
+            EscrowVault.status == "LOCKED",
             # Exclude vaults past their deadline (on-chain expired but not yet cancelled)
             or_(EscrowVault.cancel_after_ts == None, EscrowVault.cancel_after_ts > now),
         )
@@ -2452,10 +2388,7 @@ async def marketplace_jobs(
                 "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
                 "deadline_hrs": max(0, int((v.cancel_after_ts.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
                 "tags":         tags,
-                # OPEN = any agent can claim via POST /escrow/{id}/claim
-                # LOCKED = already claimed; worker_address is set; do not attempt to claim
-                "status":       v.status,
-                "claimable":    v.status == "OPEN",
+                "status":       "OPEN",
                 "is_demo":      False,
             })
     except Exception as e:
@@ -2477,6 +2410,256 @@ async def marketplace_jobs(
         "demo_jobs":       len([j for j in combined if j.get("is_demo")]),
         "marketplace_url": f"{SITE_URL}/marketplace",
         "note":            "Demo jobs (is_demo=true) are illustrative examples — no live escrow exists to claim against.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# JOB BOARD — post jobs, bid, negotiate, award (no funds held by referee)
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs")
+async def post_job(body: dict, db: Session = Depends(get_db)):
+    """
+    Post a job to the marketplace. No fee, no escrow — purely a request for bids.
+    Once a bid is accepted via /jobs/{id}/award, the buyer creates a bilateral
+    escrow via POST /escrow/generate using the worker's address.
+    """
+    job_id        = (body.get("id") or "").strip()
+    title         = (body.get("title") or "").strip()
+    description   = (body.get("description") or "").strip()
+    buyer_address = (body.get("buyer_address") or "").strip()
+
+    if not job_id:
+        raise HTTPException(status_code=400, detail="id is required (e.g. JOB-XXXX-YYYY).")
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required.")
+    if not description:
+        raise HTTPException(status_code=400, detail="description is required.")
+    if not buyer_address:
+        raise HTTPException(status_code=400, detail="buyer_address is required.")
+
+    existing = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Job ID '{job_id}' already exists.")
+
+    expires_hrs = int(body.get("expires_hrs") or 168)
+    expires_at  = datetime.now(timezone.utc) + timedelta(hours=expires_hrs)
+
+    job = JobPosting(
+        id            = job_id,
+        title         = title,
+        description   = description,
+        budget_xrp    = body.get("budget_xrp"),
+        buyer_address = buyer_address,
+        buyer_name    = body.get("buyer_name") or "",
+        category      = body.get("category") or "default",
+        tags          = json.dumps(body.get("tags") or []),
+        expires_at    = expires_at,
+    )
+    db.add(job)
+    db.commit()
+
+    logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={body.get('budget_xrp')} XRP")
+    return {
+        "status":     "posted",
+        "job_id":     job_id,
+        "expires_at": expires_at.strftime("%Y-%m-%d %H:%M UTC"),
+        "next_step":  "Worker agents can find this job via GET /jobs and bid via POST /jobs/{id}/bid.",
+    }
+
+
+@app.get("/jobs")
+async def list_jobs(
+    category:    str   = "all",
+    min_budget:  float = 0,
+    max_budget:  float = 0,
+    limit:       int   = 20,
+    db: Session = Depends(get_db),
+):
+    """List open job postings available for bidding."""
+    limit = min(limit, 100)
+    now   = datetime.now(timezone.utc)
+
+    q = db.query(JobPosting).filter(
+        JobPosting.status == "open",
+        or_(JobPosting.expires_at == None, JobPosting.expires_at > now),
+    )
+    if category != "all":
+        q = q.filter(JobPosting.category == category)
+
+    jobs = q.order_by(JobPosting.created_at.desc()).limit(200).all()
+
+    result = []
+    for j in jobs:
+        budget = j.budget_xrp or 0
+        if min_budget > 0 and budget < min_budget:
+            continue
+        if max_budget > 0 and budget > max_budget:
+            continue
+        try:
+            tags = json.loads(j.tags) if j.tags else []
+        except Exception:
+            tags = []
+        bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
+        result.append({
+            "id":           j.id,
+            "title":        j.title,
+            "description":  j.description,
+            "budget_xrp":   j.budget_xrp,
+            "buyer_address": j.buyer_address,
+            "buyer_name":   j.buyer_name or "",
+            "category":     j.category or "default",
+            "tags":         tags,
+            "status":       j.status,
+            "bid_count":    bid_count,
+            "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
+            "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
+        })
+        if len(result) >= limit:
+            break
+
+    return {"jobs": result, "total": len(result)}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, db: Session = Depends(get_db)):
+    """Get job details and all current bids."""
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    bids = db.query(Bid).filter(Bid.job_id == job_id).order_by(Bid.created_at.asc()).all()
+    bids_out = [
+        {
+            "bid_id":        b.id,
+            "worker_address": b.worker_address,
+            "worker_name":   b.worker_name or "",
+            "proposed_xrp":  b.proposed_xrp,
+            "proposal":      b.proposal,
+            "status":        b.status,
+            "created_at":    b.created_at.strftime("%Y-%m-%d %H:%M UTC") if b.created_at else None,
+        }
+        for b in bids
+    ]
+
+    try:
+        tags = json.loads(job.tags) if job.tags else []
+    except Exception:
+        tags = []
+
+    return {
+        "id":            job.id,
+        "title":         job.title,
+        "description":   job.description,
+        "budget_xrp":    job.budget_xrp,
+        "buyer_address": job.buyer_address,
+        "buyer_name":    job.buyer_name or "",
+        "category":      job.category,
+        "tags":          tags,
+        "status":        job.status,
+        "awarded_bid_id": job.awarded_bid_id,
+        "escrow_id":     job.escrow_id,
+        "expires_at":    job.expires_at.strftime("%Y-%m-%d %H:%M UTC") if job.expires_at else None,
+        "bids":          bids_out,
+    }
+
+
+@app.post("/jobs/{job_id}/bid")
+async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """Worker agent submits a bid on an open job."""
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    if job.status != "open":
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open for bids (status: {job.status}).")
+
+    worker_address = (body.get("worker_address") or "").strip()
+    proposed_xrp   = body.get("proposed_xrp")
+    proposal       = (body.get("proposal") or "").strip()
+
+    if not worker_address or not worker_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
+    if not proposed_xrp or float(proposed_xrp) <= 0:
+        raise HTTPException(status_code=400, detail="proposed_xrp must be > 0.")
+    if not proposal:
+        raise HTTPException(status_code=400, detail="proposal is required — describe your approach.")
+
+    import uuid
+    bid_id = f"BID-{uuid.uuid4().hex[:8].upper()}"
+
+    bid = Bid(
+        id             = bid_id,
+        job_id         = job_id,
+        worker_address = worker_address,
+        worker_name    = body.get("worker_name") or "",
+        proposed_xrp   = float(proposed_xrp),
+        proposal       = proposal,
+    )
+    db.add(bid)
+    db.commit()
+
+    logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP")
+    return {
+        "status":         "submitted",
+        "bid_id":         bid_id,
+        "job_id":         job_id,
+        "proposed_xrp":   float(proposed_xrp),
+        "next_step":      "The buyer will review bids and award the job. Check back via GET /jobs/{job_id}.",
+    }
+
+
+@app.post("/jobs/{job_id}/award")
+async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Buyer accepts a bid and awards the job.
+
+    Returns the worker's address and agreed price so the buyer can immediately
+    call POST /escrow/generate to create the bilateral XRPL escrow.
+    No funds are held by the referee at any point.
+    """
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    buyer_address = (body.get("buyer_address") or "").strip()
+    if not buyer_address or buyer_address.lower() != job.buyer_address.lower():
+        raise HTTPException(status_code=403, detail="Only the job poster can award this job.")
+    if job.status != "open":
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open (status: {job.status}).")
+
+    bid_id = (body.get("bid_id") or "").strip()
+    bid    = db.query(Bid).filter(Bid.id == bid_id, Bid.job_id == job_id).first()
+    if not bid:
+        raise HTTPException(status_code=404, detail=f"Bid '{bid_id}' not found on job '{job_id}'.")
+    if bid.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Bid '{bid_id}' is not pending (status: {bid.status}).")
+
+    # Award
+    job.status          = "awarded"
+    job.awarded_bid_id  = bid_id
+    bid.status          = "accepted"
+
+    # Reject all other bids on this job
+    other_bids = db.query(Bid).filter(Bid.job_id == job_id, Bid.id != bid_id).all()
+    for b in other_bids:
+        b.status = "rejected"
+
+    db.commit()
+
+    logger.info(f"🏆 JOB AWARDED: {job_id} → bid={bid_id} | worker={bid.worker_address} | price={bid.proposed_xrp} XRP")
+    return {
+        "status":          "awarded",
+        "job_id":          job_id,
+        "bid_id":          bid_id,
+        "worker_address":  bid.worker_address,
+        "worker_name":     bid.worker_name or "",
+        "agreed_xrp":      bid.proposed_xrp,
+        "next_step": (
+            f"Create the escrow: call create_escrow_vault() with "
+            f"worker_address='{bid.worker_address}' and amount_xrp={bid.proposed_xrp}. "
+            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
+            f"Then sign the EscrowCreate on XRPL and confirm via confirm_escrow_transaction()."
+        ),
     }
 
 

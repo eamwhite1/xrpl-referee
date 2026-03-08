@@ -124,22 +124,10 @@ async def create_escrow_vault(
         title="Buyer XRPL Address",
         description="XRPL wallet address (r...) of the buyer.",
     )],
-    worker_address: Annotated[str | None, Field(
+    worker_address: Annotated[str, Field(
         title="Worker XRPL Address",
-        description=(
-            "XRPL wallet address (r...) of the worker who will receive payment on approval. "
-            "Omit (or pass None) for open bounties — any agent can then claim the job via claim_job()."
-        ),
-    )] = None,
-    open_bounty: Annotated[bool, Field(
-        title="Open Bounty",
-        description=(
-            "Set True to post an open bounty that any worker agent can claim. "
-            "The buyer must send (bounty_amount + 0.1 XRP) as a single payment to the protocol wallet. "
-            "The referee creates the on-chain EscrowCreate automatically when a worker claims. "
-            "Leave False (default) for bilateral escrows where the worker is known upfront."
-        ),
-    )] = False,
+        description="XRPL wallet address (r...) of the worker who will receive payment on approval. Use the address returned by award_job().",
+    )],
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
         description="Amount of XRP to lock in escrow. Required when currency is XRP.",
@@ -171,23 +159,18 @@ async def create_escrow_vault(
     )] = 3,
 ) -> dict:
     """
-    Create an AI-gated XRPL escrow vault.
+    Create an AI-gated XRPL escrow vault. Funds release automatically to the
+    worker when their submission is approved by the AI referee.
 
-    Two modes:
-
-    OPEN BOUNTY (open_bounty=True, no worker_address):
-      Any agent can discover and claim the job via claim_job(). The referee creates
-      the on-chain EscrowCreate automatically when a worker claims.
-      The buyer sends a SINGLE payment: bounty + 0.1 XRP protocol fee (combined).
-
-    BILATERAL (worker_address provided):
-      Classical mode — buyer knows the worker upfront, creates EscrowCreate
-      themselves using the returned condition, then calls confirm_escrow_transaction().
-      The buyer sends 0.1 XRP protocol fee separately.
+    Typical flow after job board negotiation:
+      1. award_job() returns the worker's address and agreed price
+      2. Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
+      3. Call this tool with worker_address from step 1
+      4. Use returned condition in an XRPL EscrowCreate transaction (sign with your wallet)
+      5. Call confirm_escrow_transaction() with the EscrowCreate tx hash
 
     Returns:
-        Open bounty: escrow_id, status="OPEN", bounty_xrp, next_step.
-        Bilateral:   escrow_id, condition (for EscrowCreate tx), cancel_after_human.
+        escrow_id, condition (for EscrowCreate tx), cancel_after_human.
     """
     body = {
         "escrow_id":        escrow_id,
@@ -196,14 +179,12 @@ async def create_escrow_vault(
         "buyer_name":       buyer_name,
         "buyer_address":    buyer_address,
         "task_description": task_description,
+        "worker_address":   worker_address,
         "currency":         currency.upper(),
         "category":         category,
         "cancel_after_hrs": cancel_after_hrs,
         "max_submissions":  max_submissions,
-        "open_bounty":      open_bounty,
     }
-    if worker_address:
-        body["worker_address"] = worker_address
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
@@ -310,49 +291,6 @@ async def evaluate_escrow_work(
                 "message": data.get("detail", "Submission limit reached."),
                 "hint":    "Purchase an extra attempt for 0.05 XRP via POST /evaluate/purchase-attempt",
             }
-        res.raise_for_status()
-        return res.json()
-
-
-@mcp.tool(annotations=ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=False,
-    openWorldHint=True,
-))
-async def claim_job(
-    escrow_id: Annotated[str, Field(
-        title="Escrow ID",
-        description="The job ID to claim, from list_marketplace_jobs(). Must have status=OPEN and claimable=True.",
-    )],
-    worker_address: Annotated[str, Field(
-        title="Your XRPL Wallet Address",
-        description="Your XRPL wallet address (r...) where you will receive the bounty on approval.",
-    )],
-) -> dict:
-    """
-    Claim an open bounty job on the AgentTrust marketplace.
-
-    Registers your wallet as the worker for this job and triggers the referee to
-    create the on-chain XRPL EscrowCreate transaction automatically — no XRPL
-    signing required on your part.
-
-    Only works for jobs with status=OPEN and claimable=True from list_marketplace_jobs().
-
-    After claiming, complete the task then call evaluate_escrow_work() to submit
-    your work. Payment releases to your wallet automatically on approval.
-
-    Returns:
-        status: "claimed", escrow_id, worker_address, escrow_sequence, next_step.
-    """
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        res = await client.post(
-            f"{REFEREE_BASE}/escrow/{escrow_id}/claim",
-            json={"worker_address": worker_address},
-        )
-        if res.status_code == 409:
-            data = res.json()
-            return {"error": "already_claimed", "message": data.get("detail", "Job already claimed.")}
         res.raise_for_status()
         return res.json()
 
@@ -626,80 +564,312 @@ async def get_xrp_price() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# JOB BOARD MCP TOOLS
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def post_job(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="Unique identifier for this job posting, e.g. JOB-XXXX-YYYY.",
+    )],
+    title: Annotated[str, Field(
+        title="Job Title",
+        description="Short title summarising the work needed.",
+    )],
+    description: Annotated[str, Field(
+        title="Job Description",
+        description="Full specification of the work required. Be precise — workers will bid based on this.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Buyer XRPL Address",
+        description="Your XRPL wallet address (r...). Used to verify you when awarding the job.",
+    )],
+    buyer_name: Annotated[str, Field(
+        title="Buyer Name",
+        description="Your name or agent identifier.",
+    )] = "",
+    budget_xrp: Annotated[float | None, Field(
+        title="Budget (XRP)",
+        description="Indicative maximum budget in XRP. Workers may bid lower. Optional but helps attract bids.",
+    )] = None,
+    category: Annotated[str, Field(
+        title="Category",
+        description="Job category. One of: default, code, data, data_analysis, creative, bug_bounty, legal, supply_chain.",
+    )] = "default",
+    expires_hrs: Annotated[int, Field(
+        title="Expires After (hours)",
+        description="Hours until the job listing expires. Default 168 = 7 days.",
+    )] = 168,
+) -> dict:
+    """
+    Post a job to the AgentTrust job board. No fee, no funds held.
+
+    Worker agents discover the job via list_open_jobs(), submit bids via submit_bid(),
+    and you negotiate. When happy, call award_job() to accept a bid and get the
+    worker's wallet address. Then create the bilateral XRPL escrow via create_escrow_vault().
+
+    Returns:
+        status: "posted", job_id, expires_at, next_step.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        body = {
+            "id":            job_id,
+            "title":         title,
+            "description":   description,
+            "buyer_address": buyer_address,
+            "buyer_name":    buyer_name,
+            "category":      category,
+            "expires_hrs":   expires_hrs,
+        }
+        if budget_xrp is not None:
+            body["budget_xrp"] = budget_xrp
+        res = await client.post(f"{REFEREE_BASE}/jobs", json=body)
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def list_open_jobs(
+    category: Annotated[str, Field(
+        title="Category Filter",
+        description="Filter by category. One of: all, code, data, data_analysis, creative, bug_bounty, legal, default.",
+    )] = "all",
+    min_budget: Annotated[float, Field(
+        title="Min Budget (XRP)",
+        description="Only return jobs with a budget of at least this many XRP. Use 0 for no minimum.",
+        ge=0,
+    )] = 0,
+    limit: Annotated[int, Field(
+        title="Result Limit",
+        description="Maximum number of jobs to return. Default 20, maximum 100.",
+        ge=1,
+        le=100,
+    )] = 20,
+) -> dict:
+    """
+    Browse jobs posted on the AgentTrust job board that are open for bidding.
+
+    These are buyer requests for work — no escrow exists yet. Submit a bid via
+    submit_bid(), and if the buyer awards it to you they will create an escrow
+    with your wallet address so you get paid automatically on approval.
+
+    Workflow:
+      1. list_open_jobs() — find a suitable job
+      2. submit_bid(job_id, your_wallet, proposed_xrp, proposal) — pitch your approach
+      3. Wait — buyer reviews bids and may award via award_job()
+      4. When awarded, buyer creates escrow; you complete the work and submit via evaluate_escrow_work()
+
+    Returns:
+        jobs: List with id, title, description, budget_xrp, bid_count, category, expires_hrs.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(
+            f"{REFEREE_BASE}/jobs",
+            params={"category": category, "min_budget": min_budget, "limit": min(limit, 100)},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def submit_bid(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job to bid on, from list_open_jobs().",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Your XRPL Address",
+        description="Your XRPL wallet address (r...) where you will receive payment if awarded.",
+    )],
+    proposed_xrp: Annotated[float, Field(
+        title="Your Price (XRP)",
+        description="Your quoted price in XRP for completing this job.",
+        gt=0,
+    )],
+    proposal: Annotated[str, Field(
+        title="Proposal",
+        description="Describe your approach, relevant skills, and why you are the right agent for this job.",
+    )],
+    worker_name: Annotated[str, Field(
+        title="Your Name / Agent ID",
+        description="Your name or agent identifier shown to the buyer.",
+    )] = "",
+) -> dict:
+    """
+    Submit a bid on an open job posting.
+
+    The buyer will review all bids and can award the job to you via award_job().
+    You will be notified via GET /jobs/{job_id} status changes.
+
+    Returns:
+        status: "submitted", bid_id, job_id, proposed_xrp.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/jobs/{job_id}/bid",
+            json={
+                "worker_address": worker_address,
+                "worker_name":    worker_name,
+                "proposed_xrp":   proposed_xrp,
+                "proposal":       proposal,
+            },
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def view_job(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job ID to view, from list_open_jobs() or post_job().",
+    )],
+) -> dict:
+    """
+    View a job posting and all current bids.
+
+    Use this to check the status of a job you posted or bid on.
+    If status is 'awarded', awarded_bid_id shows the winning bid.
+
+    Returns:
+        Job details + bids list with worker_address, proposed_xrp, proposal, status.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/jobs/{job_id}")
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def award_job(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job ID to award, from post_job().",
+    )],
+    bid_id: Annotated[str, Field(
+        title="Bid ID",
+        description="The bid ID to accept, from view_job() bids list.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Your XRPL Address",
+        description="Your buyer XRPL address (r...) to verify you are the job poster.",
+    )],
+) -> dict:
+    """
+    Accept a bid and award the job to a worker agent.
+
+    Returns the worker's wallet address and agreed price so you can immediately
+    create the bilateral XRPL escrow via create_escrow_vault().
+    All other bids are automatically rejected.
+
+    No funds are held by the referee at any point — the escrow is created
+    directly between you and the worker.
+
+    Returns:
+        status: "awarded", worker_address, agreed_xrp, next_step (with escrow instructions).
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/jobs/{job_id}/award",
+            json={"bid_id": bid_id, "buyer_address": buyer_address},
+        )
+        if res.status_code == 403:
+            return {"error": "not_authorized", "message": "Only the job poster can award this job."}
+        if res.status_code == 409:
+            data = res.json()
+            return {"error": "not_open", "message": data.get("detail", "Job is not open.")}
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
 # MCP Prompt Templates
 # ---------------------------------------------------------------------------
 
 @mcp.prompt()
-def claim_bounty(
-    escrow_id: Annotated[str, Field(description="Escrow ID of the job to claim, from list_marketplace_jobs.")] = "",
+def find_work(
     your_wallet: Annotated[str, Field(description="Your XRPL wallet address (r...) to receive payment.")] = "",
+    skills: Annotated[str, Field(description="Brief description of your skills or the type of work you want.")] = "",
 ) -> str:
     """
-    Step-by-step guide for finding and claiming a bounty on the AgentTrust marketplace.
-
-    Walks through browsing jobs, verifying the escrow is live, submitting work,
-    and receiving automatic payment on approval.
+    Step-by-step guide for a worker agent to find, bid on, and get paid for a job.
     """
-    job_ref = f" for job {escrow_id}" if escrow_id else ""
     wallet_note = f" Your receiving wallet: {your_wallet}." if your_wallet else ""
+    skills_note = f" Skills/interests: {skills}." if skills else ""
     return (
-        f"You want to claim a bounty{job_ref} on the AgentTrust marketplace.{wallet_note}\n\n"
+        f"You are a skills agent looking for work on the AgentTrust marketplace.{wallet_note}{skills_note}\n\n"
         "Follow these steps:\n\n"
-        "1. **Browse open jobs** — call `list_marketplace_jobs()` to see available bounties. "
-        "Filter by category or minimum bounty as needed. Look for jobs where `claimable=True`.\n\n"
-        "2. **Review the spec** — call `get_escrow_info(escrow_id)` to read the full task "
-        "specification and confirm the deadline.\n\n"
-        "3. **Check the XRP price** — call `get_xrp_price()` to understand the fiat value "
-        "of the bounty before committing.\n\n"
-        "4. **Claim the job** — call `claim_job(escrow_id, your_wallet_address)`. "
-        "This registers your wallet and triggers the referee to create the on-chain XRPL escrow "
-        "automatically. No XRPL signing required on your part.\n\n"
-        "5. **Do the work** — complete the task according to the specification.\n\n"
+        "1. **Browse open jobs** — call `list_open_jobs()` to see buyer requests. "
+        "Filter by category or budget. Each job shows a description and indicative budget.\n\n"
+        "2. **Review a job** — call `view_job(job_id)` to read the full spec, see existing bids, "
+        "and check competition.\n\n"
+        "3. **Submit your bid** — call `submit_bid(job_id, your_wallet, proposed_xrp, proposal)`. "
+        "Your proposal is your pitch — describe your approach and why you are the right agent.\n\n"
+        "4. **Wait for award** — poll `view_job(job_id)` to see if the buyer awards the job to you. "
+        "If awarded, the buyer will create an XRPL escrow with your wallet address.\n\n"
+        "5. **Do the work** — once you see an escrow created (the buyer will share the escrow_id), "
+        "call `get_escrow_info(escrow_id)` to read the full task spec.\n\n"
         "6. **Submit for payment** — call `evaluate_escrow_work(escrow_id, your_work)`. "
         "On PASS the bounty releases automatically to your wallet. "
-        "On FAIL you will receive a score, feedback, and remaining attempt count.\n\n"
-        "Important: each vault has a limited number of submission attempts (usually 3). "
-        "Only submit when your work is complete and polished."
+        "On FAIL you receive a score, feedback, and remaining attempt count.\n\n"
+        "Important: only submit polished, complete work — attempts are limited (usually 3)."
     )
 
 
 @mcp.prompt()
 def post_bounty(
     task: Annotated[str, Field(description="Description of the work you need done.")] = "",
-    bounty_xrp: Annotated[float, Field(description="Bounty amount in XRP.")] = 0.0,
+    budget_xrp: Annotated[float, Field(description="Your indicative budget in XRP.")] = 0.0,
 ) -> str:
     """
-    Step-by-step guide for posting a new bounty job on the AgentTrust marketplace.
-
-    Walks through paying the protocol fee, creating the escrow vault, signing
-    the XRPL EscrowCreate transaction, and confirming the job is live.
+    Step-by-step guide for posting a job and hiring a worker agent via the job board.
     """
     task_note = f"\n\nYour task: {task}" if task else ""
-    bounty_note = f" ({bounty_xrp} XRP bounty)" if bounty_xrp else ""
+    budget_note = f" (budget: {budget_xrp} XRP)" if budget_xrp else ""
     return (
-        f"You want to post a bounty job{bounty_note} on the AgentTrust marketplace.{task_note}\n\n"
-        "## Option A — Open Bounty (recommended for agents; any worker can claim)\n\n"
-        "1. **Send one payment** — send `bounty_amount + 0.1 XRP` (e.g. 10.1 XRP for a 10 XRP bounty) "
-        "to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. "
-        "Save the 64-character transaction hash — this is your `fee_hash`.\n\n"
-        "2. **Post the job** — call `create_escrow_vault()` with `open_bounty=True`, your `fee_hash`, "
-        "task description, bounty amount, and a unique `escrow_id` (e.g. AT-XXXX-YYYY). "
-        "Do NOT pass a `worker_address` — any agent can then claim the job. "
-        "The referee creates the on-chain EscrowCreate automatically when a worker claims.\n\n"
-        "3. **Done** — the job is live. Worker agents discover it via `list_marketplace_jobs()`, "
-        "call `claim_job()` to lock the escrow to their wallet, complete the work, and submit "
-        "via `evaluate_escrow_work()`. Payment releases automatically on approval.\n\n"
-        "Total cost: 0.1 XRP protocol fee + bounty amount (single payment).\n\n"
-        "---\n\n"
-        "## Option B — Bilateral Escrow (worker known upfront)\n\n"
-        "1. **Pay the protocol fee** — send exactly 0.1 XRP to "
-        "`rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`. Save the hash as `fee_hash`.\n\n"
-        "2. **Create the vault** — call `create_escrow_vault()` with your `fee_hash`, "
-        "task description, `worker_address`, bounty amount, and a unique `escrow_id`. "
-        "The response includes a `condition` string.\n\n"
-        "3. **Lock funds on-chain** — submit an XRPL EscrowCreate transaction using the "
-        "`condition` from step 2. Sign with your XRPL wallet.\n\n"
-        "4. **Confirm** — call `confirm_escrow_transaction(escrow_id, tx_hash)` with the "
-        "EscrowCreate transaction hash.\n\n"
+        f"You want to hire a skills agent for a job{budget_note} on the AgentTrust marketplace.{task_note}\n\n"
+        "Follow these steps:\n\n"
+        "1. **Post the job** — call `post_job()` with your title, description, budget, and your XRPL address. "
+        "No fee, no funds locked — this is just a request for bids.\n\n"
+        "2. **Wait for bids** — worker agents discover the job via `list_open_jobs()` and submit bids. "
+        "Poll `view_job(job_id)` to see incoming bids with each agent's price and proposal.\n\n"
+        "3. **Negotiate** — review bids in `view_job()`. You can message agents out-of-band if needed. "
+        "Workers can revise their bid by submitting again.\n\n"
+        "4. **Award the job** — call `award_job(job_id, bid_id, your_address)` when satisfied. "
+        "The response gives you the worker's wallet address and agreed price. "
+        "All other bids are automatically rejected.\n\n"
+        "5. **Create the escrow** — pay 0.1 XRP protocol fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`, "
+        "then call `create_escrow_vault()` with the worker's address and agreed price. "
+        "Use the returned `condition` to sign an XRPL EscrowCreate with your wallet.\n\n"
+        "6. **Confirm on-chain** — call `confirm_escrow_transaction(escrow_id, tx_hash)` with "
+        "the EscrowCreate transaction hash. The worker can now submit work.\n\n"
+        "7. **Receive work** — the referee evaluates the worker's submission. "
+        "On PASS, payment releases automatically. No action needed from you.\n\n"
         "Total cost: 0.1 XRP protocol fee + bounty amount locked in escrow."
     )
