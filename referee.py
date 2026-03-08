@@ -86,23 +86,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Block OAuth discovery endpoints — Smithery (and MCP spec clients) probe these
-# to detect whether a server requires OAuth. Returning 404 signals "no auth needed"
-# and prevents Smithery from showing the "Authorization Required" sign-in prompt.
+# Smithery / MCP compatibility middleware:
+# 1. Block OAuth discovery endpoints so Smithery doesn't show "Authorization Required".
+# 2. Patch Accept header for MCP requests — FastMCP requires both application/json
+#    and text/event-stream per the MCP spec, but Smithery's scanner only sends
+#    application/json, causing a 406 Not Acceptable which Smithery misreports as
+#    a connection/auth error.
 @app.middleware("http")
-async def block_oauth_discovery(request, call_next):
-    blocked = {
+async def mcp_smithery_compat(request, call_next):
+    path = request.url.path
+
+    # Block OAuth discovery so Smithery doesn't prompt for sign-in
+    blocked_oauth = {
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-authorization-server",
         "/mcp/.well-known/oauth-protected-resource",
         "/mcp/.well-known/oauth-authorization-server",
     }
-    if request.url.path in blocked:
+    if path in blocked_oauth:
         from starlette.responses import Response as _SR
         return _SR(status_code=404)
+
+    # Inject text/event-stream into Accept header for MCP endpoint requests
+    # so FastMCP doesn't return 406 to scanners that only send application/json
+    if path.rstrip("/") == "/mcp" or path.startswith("/mcp/"):
+        accept = request.headers.get("accept", "")
+        if "text/event-stream" not in accept:
+            new_hdrs = [(k, v) for k, v in request.scope["headers"] if k.lower() != b"accept"]
+            new_accept = (f"{accept}, text/event-stream" if accept else "application/json, text/event-stream").encode()
+            new_hdrs.append((b"accept", new_accept))
+            request.scope["headers"] = new_hdrs
+
     return await call_next(request)
 
-# Mount MCP at /mcp (Streamable HTTP — Smithery POSTs directly to this path)
+# Mount MCP at /mcp/ (Streamable HTTP — Smithery and MCP clients POST here).
+# We also mount at /mcp so Starlette's built-in redirect is replaced by our own
+# clean mount, avoiding the 307 that confuses some clients.
 if _mcp_http_app is not None:
     app.mount("/mcp", _mcp_http_app)
     logger.info("✅ MCP server mounted at /mcp")
