@@ -211,6 +211,21 @@ def serve_mcp_server_card():
     }
 
 
+@app.get("/.well-known/mcp-config")
+def serve_mcp_config():
+    """Smithery External MCP config schema — declares no authentication required."""
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": "https://xrpl-referee.onrender.com/.well-known/mcp-config",
+        "type": "object",
+        "title": "AgentTrust Referee",
+        "description": "No authentication required. Connect directly to the MCP endpoint at /mcp.",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
 @app.get("/.well-known/ai-plugin.json")
 def serve_ai_plugin():
     path = ".well-known/ai-plugin.json"

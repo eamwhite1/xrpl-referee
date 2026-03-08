@@ -1,5 +1,5 @@
 target: remote
-url: https://xrpl-referee.onrender.com/mcp/
+url: https://xrpl-referee.onrender.com/mcp
 configSchema:
   type: object
   required: []
