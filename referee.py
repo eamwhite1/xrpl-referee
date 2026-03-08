@@ -159,8 +159,13 @@ def serve_agent_json():
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True},
         "authentication": {
-            "schemes": ["x-payment-hash"],
-            "description": "Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Pass tx hash as x-payment-hash header."
+            "schemes": ["x402", "x-payment-hash"],
+            "description": (
+                "x402 protocol supported. Send a request with no payment to receive a 402 with an "
+                "X-Payment-Required header containing full payment details. Send 0.1 XRP to "
+                "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on the XRPL, then retry with the transaction "
+                "hash as the X-PAYMENT header (x402 standard) or x-payment-hash header (legacy)."
+            )
         },
         "payment": {"currency": "XRP", "amount": "0.1", "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR", "network": "XRPL Mainnet"},
         "skills": [
@@ -219,7 +224,10 @@ def serve_ai_plugin():
         ),
         "description_for_model": (
             "Use this tool to verify whether a seller has completed a task to specification and auto-release escrowed funds. "
-            "POST the task requirements and the completed work to /audit with a 0.1 XRP fee hash (x-payment-hash header). "
+            "This API implements the x402 payment protocol: if you call any paid endpoint without a payment, you will receive "
+            "a 402 response with an X-Payment-Required header containing base64-encoded JSON that tells you exactly how much "
+            "XRP to send, where to send it, and which header to use. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on "
+            "the XRPL, then retry with the transaction hash as the X-PAYMENT header (or legacy x-payment-hash header). "
             "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
             "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
             "Set require_consensus=true for high-stakes decisions requiring two-model agreement. "
