@@ -187,13 +187,24 @@ def serve_mcp_server_card():
             "Trustless AI task verification with automatic XRP payment release. "
             "Post a task spec and work submission — get PASS/FAIL from an AI referee. "
             "Escrowed XRP releases automatically to the worker on approval. "
-            "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents."
+            "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents. "
+            "Implements the x402 payment protocol: call any paid endpoint without payment to receive "
+            "a 402 with an X-Payment-Required header describing exactly how to pay in XRP."
         ),
         "url":         "https://xrpl-referee.onrender.com/mcp",
         "homepage":    "https://www.cryptovault.co.uk",
         "contact":     "hello@cryptovault.co.uk",
         "license":     "MIT",
         "transport":   ["http"],
+        "authentication": {
+            "schemes": ["x402", "x-payment-hash"],
+            "description": (
+                "x402 protocol supported. Call any paid endpoint without payment to receive a 402 "
+                "with an X-Payment-Required header. Send the specified XRP amount to "
+                "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on the XRPL, then retry with the transaction "
+                "hash as the X-PAYMENT header."
+            ),
+        },
         "tools": [
             {"name": "audit_task",               "description": "Verify completed work against a task spec for 0.1 XRP. Returns PASS/FAIL with score and feedback."},
             {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
