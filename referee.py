@@ -497,6 +497,48 @@ else:
 DEFAULT_MAX_SUBMISSIONS = int(os.getenv("DEFAULT_MAX_SUBMISSIONS", "3"))
 EXTRA_ATTEMPT_FEE_XRP   = 0.05  # charged per extra submission beyond the limit
 
+
+# ---------------------------------------------------------------------------
+# x402 PAYMENT REQUIRED HELPER
+# ---------------------------------------------------------------------------
+def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
+    """Raise an x402-compliant 402 Payment Required exception.
+
+    Includes a base64-encoded X-Payment-Required header so that any HTTP
+    client or AI agent implementing the x402 standard can auto-discover
+    payment requirements without reading documentation.
+
+    Spec: https://x402.org
+    """
+    required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
+    body = {
+        "x402Version": 1,
+        "accepts": [{
+            "scheme": "exact",
+            "network": "xrpl-mainnet",
+            "maxAmountRequired": str(int(required_xrp * 1_000_000)),
+            "resource": resource,
+            "payTo": PROTOCOL_WALLET,
+            "asset": "XRP",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "instruction": (
+                    f"Send {required_xrp} XRP to {PROTOCOL_WALLET} on the XRPL, "
+                    "then include the transaction hash as the X-PAYMENT header."
+                ),
+                "headerName": "X-PAYMENT",
+            },
+        }],
+        "error": error,
+    }
+    encoded = base64.b64encode(json.dumps(body).encode()).decode()
+    raise HTTPException(
+        status_code=402,
+        detail=body,
+        headers={"X-Payment-Required": encoded},
+    )
+
+
 try:
     seed = os.getenv("XRPL_SEED")
     if not seed:
@@ -652,7 +694,7 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None) -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/") -> dict:
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == fee_hash).first()
     if already_used:
@@ -671,7 +713,7 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
         raise HTTPException(status_code=400, detail=f"Ledger lookup failed: {str(e)}")
 
     if not tx_res.is_successful():
-        raise HTTPException(status_code=402, detail="Transaction hash not found on the XRPL ledger.")
+        _raise_402(resource, "Transaction hash not found on the XRPL ledger.", min_xrp=required_xrp)
 
     body    = tx_res.result
     tx_data = body.get("tx_json") or body.get("tx") or body
@@ -692,15 +734,16 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
     if tx_type != "Payment":
         raise HTTPException(status_code=400, detail=f"Transaction is '{tx_type}', not a Payment.")
     if dest.lower() != PROTOCOL_WALLET.lower():
-        raise HTTPException(status_code=402, detail=f"Wrong destination. Expected {PROTOCOL_WALLET}, got {dest}.")
+        _raise_402(resource, f"Wrong destination. Expected {PROTOCOL_WALLET}, got {dest}.", min_xrp=required_xrp)
     if isinstance(raw_amount, dict):
         raise HTTPException(status_code=400, detail="Protocol fees must be paid in XRP, not issued currency.")
 
     amount_xrp = round(int(raw_amount) / 1_000_000, 6)
     if amount_xrp < (required_xrp - 0.000001):
-        raise HTTPException(
-            status_code=402,
-            detail=f"Insufficient fee. Required ≥{required_xrp} XRP, received {amount_xrp:.6f} XRP.",
+        _raise_402(
+            resource,
+            f"Insufficient fee. Required ≥{required_xrp} XRP, received {amount_xrp:.6f} XRP.",
+            min_xrp=required_xrp,
         )
 
     db.add(PaymentLog(
@@ -1403,17 +1446,19 @@ async def run_ai_audit(
 async def standalone_audit(
     req: StandaloneAuditRequest,
     x_payment_hash: Optional[str] = Header(None),
+    x_payment: Optional[str] = Header(None),  # x402 standard header
     db: Session = Depends(get_db),
 ):
-    fee_hash = (req.fee_hash or x_payment_hash or "").strip()
+    fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
     if not fee_hash:
-        raise HTTPException(
-            status_code=402,
-            detail="Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and include the tx hash as fee_hash or x-payment-hash header.",
+        _raise_402(
+            "/audit",
+            f"Payment required. Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL, "
+            "then include the transaction hash as the X-PAYMENT header (or fee_hash body field).",
         )
 
     audit_id = f"audit-{fee_hash[:16].lower()}"
-    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db)
+    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit")
 
     verdict_dict, model_used = await run_ai_audit(
         task               = req.task,
@@ -1472,7 +1517,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db)
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate")
 
     # Validate currency + amount
     currency = req.currency.upper()
@@ -1905,6 +1950,7 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         escrow_id = f"{req.escrow_id}-attempt",
         db        = db,
         min_xrp   = EXTRA_ATTEMPT_FEE_XRP,
+        resource  = "/evaluate/purchase-attempt",
     )
 
     # Grant one extra submission
@@ -2376,7 +2422,7 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
     if existing:
         raise HTTPException(status_code=400, detail=f"Skill ID '{req.id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db)
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills")
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     listing = SkillListing(
