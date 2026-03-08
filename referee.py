@@ -86,6 +86,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Block OAuth discovery endpoints — Smithery (and MCP spec clients) probe these
+# to detect whether a server requires OAuth. Returning 404 signals "no auth needed"
+# and prevents Smithery from showing the "Authorization Required" sign-in prompt.
+@app.middleware("http")
+async def block_oauth_discovery(request, call_next):
+    blocked = {
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+        "/mcp/.well-known/oauth-protected-resource",
+        "/mcp/.well-known/oauth-authorization-server",
+    }
+    if request.url.path in blocked:
+        from starlette.responses import Response as _SR
+        return _SR(status_code=404)
+    return await call_next(request)
+
 # Mount MCP at /mcp (Streamable HTTP — Smithery POSTs directly to this path)
 if _mcp_http_app is not None:
     app.mount("/mcp", _mcp_http_app)
