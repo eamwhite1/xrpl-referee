@@ -511,6 +511,7 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
+MIN_ESCROW_XRP  = 0.000001   # 1 drop — XRPL EscrowCreate minimum
 RIPPLE_EPOCH    = 946684800  # Unix timestamp of the XRP Ledger epoch (2000-01-01T00:00:00Z)
 
 RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
@@ -1628,8 +1629,12 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     amount_xrp   = req.amount_xrp   if currency == "XRP"   else None
     amount_rlusd = req.amount_rlusd if currency == "RLUSD" else None
 
-    if currency == "XRP" and (not amount_xrp or amount_xrp <= 0):
-        raise HTTPException(status_code=400, detail="amount_xrp required for XRP escrow.")
+    if currency == "XRP":
+        if not amount_xrp or amount_xrp < MIN_ESCROW_XRP:
+            raise HTTPException(
+                status_code=400,
+                detail=f"amount_xrp must be ≥ {MIN_ESCROW_XRP} XRP (1 drop — XRPL minimum)."
+            )
     if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
         raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
 

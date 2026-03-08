@@ -130,7 +130,7 @@ async def create_escrow_vault(
     )],
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
-        description="Amount of XRP to lock in escrow. Required when currency is XRP.",
+        description="Amount of XRP to lock in escrow. Required when currency is XRP. Minimum: 0.000001 XRP (1 drop — XRPL EscrowCreate minimum). Practically, ensure the bounty exceeds the 0.1 XRP protocol fee.",
     )] = None,
     amount_rlusd: Annotated[float | None, Field(
         title="RLUSD Amount",
