@@ -29,7 +29,7 @@ from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
-from xrpl.models.transactions import EscrowFinish
+from xrpl.models.transactions import EscrowFinish, EscrowCreate
 from xrpl.core.addresscodec import decode_seed
 from xrpl.utils import xrp_to_drops
 
@@ -154,10 +154,10 @@ def serve_agent_json():
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
-        "agentVersion": "7.0.0",
-        "protocolVersion": "0.4.0",
+        "agentVersion": "8.0.0",
+        "protocolVersion": "0.5.0",
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
-        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True},
+        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "openBounty": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
             "description": (
@@ -202,8 +202,9 @@ def serve_mcp_server_card():
             {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
             {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed."},
+            {"name": "claim_job",                 "description": "Claim an open bounty job. Referee creates the on-chain escrow automatically for the claiming agent."},
             {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
-            {"name": "list_marketplace_jobs",     "description": "Browse open XRP bounties agents can claim. Returns structured job data."},
+            {"name": "list_marketplace_jobs",     "description": "Browse open XRP bounties agents can claim. Returns structured job data with claimable flag."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
         ],
@@ -336,6 +337,8 @@ class EscrowVault(Base):
     # Marketplace — v8
     category          = Column(String,  default="default")  # task category for filtering
     marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
+    # Open bounty — v9: tracks who created the on-chain EscrowCreate (buyer or referee)
+    escrow_owner      = Column(String,  nullable=True)      # Account field of EscrowCreate tx
 
 
 class SkillListing(Base):
@@ -395,6 +398,8 @@ def run_migrations():
         # v8 columns
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS category               VARCHAR DEFAULT 'default'",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS marketplace_tags        TEXT",
+        # v9 columns — open bounty support
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_owner           VARCHAR",
         """CREATE TABLE IF NOT EXISTS skill_listing (
             id          VARCHAR PRIMARY KEY,
             title       VARCHAR NOT NULL,
@@ -673,7 +678,9 @@ class EscrowSetupRequest(BaseModel):
     buyer_email:        Optional[str]   = None
     worker_email:       Optional[str]   = None
     task_description:   str
-    worker_address:     str
+    worker_address:     Optional[str]   = None   # Optional for open bounties
+    # Open bounty mode — referee creates EscrowCreate after worker claims
+    open_bounty:        bool            = False
     # Currency selection — XRP (default) or RLUSD
     currency:           str             = "XRP"
     amount_xrp:         Optional[float] = None
@@ -876,6 +883,49 @@ async def auto_finish_escrow(
                 db.commit()
         finally:
             db.close()
+
+
+async def referee_create_escrow(vault) -> tuple:
+    """
+    Creates an EscrowCreate on-chain signed by the referee wallet.
+
+    Used for open bounties where the buyer pre-paid the referee and a worker
+    has just claimed the job.  Returns (tx_hash, sequence).
+    """
+    if not referee_wallet:
+        raise RuntimeError("Referee wallet not loaded — cannot create on-chain escrow.")
+
+    if vault.currency != "XRP":
+        raise RuntimeError("Referee-funded open bounties only support XRP at this time.")
+
+    amount_drops = str(int(vault.amount_xrp * 1_000_000))
+
+    cancel_after_ripple = None
+    if vault.cancel_after_ts:
+        ts = vault.cancel_after_ts
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        cancel_after_ripple = int(ts.timestamp()) - RIPPLE_EPOCH
+
+    create_kwargs = dict(
+        account     = referee_wallet.address,
+        destination = vault.worker_address,
+        amount      = amount_drops,
+        condition   = vault.condition.upper(),
+    )
+    if cancel_after_ripple:
+        create_kwargs["cancel_after"] = cancel_after_ripple
+
+    client    = AsyncJsonRpcClient(XRPL_URL)
+    create_tx = EscrowCreate(**create_kwargs)
+    result    = await async_submit_and_wait(create_tx, client, referee_wallet)
+
+    tx_hash = result.result.get("hash", "unknown")
+    tx_data = result.result.get("tx_json") or result.result
+    sequence = tx_data.get("Sequence")
+
+    logger.info(f"✅ REFEREE ESCROW CREATED: {vault.escrow_id} | hash={tx_hash[:16]}... | seq={sequence} | worker={vault.worker_address}")
+    return tx_hash, sequence
 
 
 async def server_side_dex_swap(
@@ -1543,8 +1593,6 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate")
-
     # Validate currency + amount
     currency = req.currency.upper()
     if currency not in ("XRP", "RLUSD"):
@@ -1558,8 +1606,28 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
         raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
 
-    # For RLUSD escrow, validate both wallets have trustlines
-    if currency == "RLUSD":
+    # Open bounty: referee creates EscrowCreate when a worker claims.
+    # Buyer must pre-pay bounty + protocol fee in one payment to PROTOCOL_WALLET.
+    is_open_bounty = req.open_bounty or not req.worker_address
+
+    if is_open_bounty:
+        if currency != "XRP":
+            raise HTTPException(status_code=400, detail="Open bounties (no worker_address) only support XRP at this time.")
+        if not referee_wallet:
+            raise HTTPException(status_code=503, detail="Referee wallet not configured. Cannot offer open bounties.")
+        # Payment must cover bounty + protocol fee
+        required_total = round(amount_xrp + MIN_FEE_XRP, 6)
+        await verify_fee_payment(
+            fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db,
+            min_xrp=required_total, resource="/escrow/generate",
+        )
+    else:
+        if not req.worker_address:
+            raise HTTPException(status_code=400, detail="worker_address is required for bilateral escrows.")
+        await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate")
+
+    # For RLUSD bilateral escrow, validate both wallets have trustlines
+    if currency == "RLUSD" and not is_open_bounty:
         buyer_tl  = await check_rlusd_trustline(req.buyer_address)
         worker_tl = await check_rlusd_trustline(req.worker_address)
         if not buyer_tl:
@@ -1602,7 +1670,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         escrow_id             = req.escrow_id,
         condition             = final_condition,
         fulfillment           = encrypt_fulfillment(final_fulfillment),
-        status                = "LOCKED",
+        status                = "OPEN" if is_open_bounty else "LOCKED",
         currency              = currency,
         amount_xrp            = amount_xrp,
         amount_rlusd          = amount_rlusd,
@@ -1659,16 +1727,27 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     else:
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
-    return {
+    vault_status = "OPEN" if is_open_bounty else "LOCKED"
+    result = {
         "escrow_id":           req.escrow_id,
-        "condition":           final_condition,
-        "escrow_amount":       escrow_amount,      # ready for EscrowCreate tx
         "currency":            currency,
-        "status":              "LOCKED",
+        "status":              vault_status,
         "cancel_after_ripple": cancel_after_ripple,
         "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
         "worker_email_sent":   bool(req.worker_email),
     }
+    if is_open_bounty:
+        result["open_bounty"]   = True
+        result["bounty_xrp"]    = amount_xrp
+        result["next_step"]     = (
+            "Job is live on the marketplace. Workers can find and claim it via "
+            "POST /escrow/{escrow_id}/claim. On claim, the referee creates the "
+            "on-chain EscrowCreate automatically."
+        )
+    else:
+        result["condition"]     = final_condition
+        result["escrow_amount"] = escrow_amount   # ready for EscrowCreate tx
+    return result
 
 
 @app.post("/escrow/{escrow_id}/confirm")
@@ -1697,6 +1776,62 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     db.commit()
 
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
+
+
+@app.post("/escrow/{escrow_id}/claim")
+async def claim_escrow_job(escrow_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Worker claims an open bounty job and triggers referee to create the on-chain escrow.
+
+    The buyer must have already created the vault with open_bounty=True and pre-paid
+    (bounty + 0.1 XRP) to the protocol wallet.  On success, the referee signs and
+    submits the EscrowCreate transaction so funds are locked on-chain for this worker.
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found.")
+    if vault.status != "OPEN":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job '{escrow_id}' is not open for claiming (status: {vault.status}).",
+        )
+    if vault.worker_address:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job '{escrow_id}' has already been claimed by {vault.worker_address}.",
+        )
+    if not referee_wallet:
+        raise HTTPException(status_code=503, detail="Referee wallet not configured — cannot create on-chain escrow.")
+
+    worker_address = (body.get("worker_address") or "").strip()
+    if not worker_address or not worker_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
+
+    # Assign worker then create escrow atomically (vault updated only on success)
+    vault.worker_address = worker_address
+    try:
+        tx_hash, sequence = await referee_create_escrow(vault)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ CLAIM FAILED for {escrow_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to create on-chain escrow: {str(e)}")
+
+    vault.escrow_tx_hash  = tx_hash
+    vault.escrow_sequence = sequence
+    vault.escrow_owner    = referee_wallet.address
+    vault.status          = "LOCKED"
+    db.commit()
+
+    logger.info(f"✅ JOB CLAIMED: {escrow_id} | worker={worker_address} | seq={sequence}")
+    return {
+        "status":           "claimed",
+        "escrow_id":        escrow_id,
+        "worker_address":   worker_address,
+        "escrow_owner":     referee_wallet.address,
+        "escrow_tx_hash":   tx_hash,
+        "escrow_sequence":  sequence,
+        "next_step":        "Do the work, then call evaluate_escrow_work() to submit. Payment releases automatically on approval.",
+    }
 
 
 @app.get("/escrow/{escrow_id}")
@@ -1862,11 +1997,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         })
 
         # ── AUTO-FINISH: referee submits EscrowFinish, seller gets paid automatically ──
-        if vault.escrow_sequence and vault.buyer_address and vault.worker_address and referee_wallet:
+        # escrow_owner is who signed the EscrowCreate (buyer for bilateral, referee for open bounty)
+        escrow_owner = vault.escrow_owner or vault.buyer_address
+        if vault.escrow_sequence and escrow_owner and vault.worker_address and referee_wallet:
             asyncio.create_task(auto_finish_escrow(
                 escrow_id            = req.escrow_id,
                 sequence             = vault.escrow_sequence,
-                owner                = vault.buyer_address,
+                owner                = escrow_owner,
                 fulfillment          = plaintext_fulfillment,
                 condition            = vault.condition,
                 worker_addr          = vault.worker_address,
@@ -1876,7 +2013,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         else:
             logger.warning(
                 f"⚠️ AUTO-FINISH skipped for {req.escrow_id}: "
-                f"seq={vault.escrow_sequence} | buyer={vault.buyer_address} | "
+                f"seq={vault.escrow_sequence} | owner={escrow_owner} | "
                 f"worker={vault.worker_address} | wallet={'ok' if referee_wallet else 'MISSING'}"
             )
 
@@ -2284,7 +2421,8 @@ async def marketplace_jobs(
     now = datetime.now(timezone.utc)
     try:
         q = db.query(EscrowVault).filter(
-            EscrowVault.status == "LOCKED",
+            # OPEN = unclaimed open bounty; LOCKED = claimed/bilateral (escrow on-chain)
+            EscrowVault.status.in_(["OPEN", "LOCKED"]),
             # Exclude vaults past their deadline (on-chain expired but not yet cancelled)
             or_(EscrowVault.cancel_after_ts == None, EscrowVault.cancel_after_ts > now),
         )
@@ -2314,7 +2452,10 @@ async def marketplace_jobs(
                 "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
                 "deadline_hrs": max(0, int((v.cancel_after_ts.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
                 "tags":         tags,
-                "status":       "OPEN",
+                # OPEN = any agent can claim via POST /escrow/{id}/claim
+                # LOCKED = already claimed; worker_address is set; do not attempt to claim
+                "status":       v.status,
+                "claimable":    v.status == "OPEN",
                 "is_demo":      False,
             })
     except Exception as e:

@@ -110,15 +110,11 @@ async def create_escrow_vault(
     )],
     fee_hash: Annotated[str, Field(
         title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the 0.1 XRP protocol fee payment.",
+        description="64-character hex transaction hash of the payment to the protocol wallet.",
     )],
     task_description: Annotated[str, Field(
         title="Task Description",
         description="Detailed specification the worker must fulfil to be paid. Be precise — the AI referee evaluates against this.",
-    )],
-    worker_address: Annotated[str, Field(
-        title="Worker XRPL Address",
-        description="XRPL wallet address (r...) of the worker who will receive payment on approval.",
     )],
     buyer_name: Annotated[str, Field(
         title="Buyer Name",
@@ -126,8 +122,24 @@ async def create_escrow_vault(
     )],
     buyer_address: Annotated[str, Field(
         title="Buyer XRPL Address",
-        description="XRPL wallet address (r...) of the buyer. Used to look up the escrow sequence on approval.",
+        description="XRPL wallet address (r...) of the buyer.",
     )],
+    worker_address: Annotated[str | None, Field(
+        title="Worker XRPL Address",
+        description=(
+            "XRPL wallet address (r...) of the worker who will receive payment on approval. "
+            "Omit (or pass None) for open bounties — any agent can then claim the job via claim_job()."
+        ),
+    )] = None,
+    open_bounty: Annotated[bool, Field(
+        title="Open Bounty",
+        description=(
+            "Set True to post an open bounty that any worker agent can claim. "
+            "The buyer must send (bounty_amount + 0.1 XRP) as a single payment to the protocol wallet. "
+            "The referee creates the on-chain EscrowCreate automatically when a worker claims. "
+            "Leave False (default) for bilateral escrows where the worker is known upfront."
+        ),
+    )] = False,
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
         description="Amount of XRP to lock in escrow. Required when currency is XRP.",
@@ -159,14 +171,23 @@ async def create_escrow_vault(
     )] = 3,
 ) -> dict:
     """
-    Create an AI-gated XRPL escrow vault. Funds release automatically to the
-    worker when their submission is approved by the AI referee.
+    Create an AI-gated XRPL escrow vault.
 
-    Before calling: pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.
-    After calling: use the returned condition in an XRPL EscrowCreate transaction.
+    Two modes:
+
+    OPEN BOUNTY (open_bounty=True, no worker_address):
+      Any agent can discover and claim the job via claim_job(). The referee creates
+      the on-chain EscrowCreate automatically when a worker claims.
+      The buyer sends a SINGLE payment: bounty + 0.1 XRP protocol fee (combined).
+
+    BILATERAL (worker_address provided):
+      Classical mode — buyer knows the worker upfront, creates EscrowCreate
+      themselves using the returned condition, then calls confirm_escrow_transaction().
+      The buyer sends 0.1 XRP protocol fee separately.
 
     Returns:
-        escrow_id, condition (for EscrowCreate tx), cancel_after_human.
+        Open bounty: escrow_id, status="OPEN", bounty_xrp, next_step.
+        Bilateral:   escrow_id, condition (for EscrowCreate tx), cancel_after_human.
     """
     body = {
         "escrow_id":        escrow_id,
@@ -175,12 +196,14 @@ async def create_escrow_vault(
         "buyer_name":       buyer_name,
         "buyer_address":    buyer_address,
         "task_description": task_description,
-        "worker_address":   worker_address,
         "currency":         currency.upper(),
         "category":         category,
         "cancel_after_hrs": cancel_after_hrs,
         "max_submissions":  max_submissions,
+        "open_bounty":      open_bounty,
     }
+    if worker_address:
+        body["worker_address"] = worker_address
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
@@ -292,6 +315,49 @@ async def evaluate_escrow_work(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def claim_job(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The job ID to claim, from list_marketplace_jobs(). Must have status=OPEN and claimable=True.",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Your XRPL Wallet Address",
+        description="Your XRPL wallet address (r...) where you will receive the bounty on approval.",
+    )],
+) -> dict:
+    """
+    Claim an open bounty job on the AgentTrust marketplace.
+
+    Registers your wallet as the worker for this job and triggers the referee to
+    create the on-chain XRPL EscrowCreate transaction automatically — no XRPL
+    signing required on your part.
+
+    Only works for jobs with status=OPEN and claimable=True from list_marketplace_jobs().
+
+    After claiming, complete the task then call evaluate_escrow_work() to submit
+    your work. Payment releases to your wallet automatically on approval.
+
+    Returns:
+        status: "claimed", escrow_id, worker_address, escrow_sequence, next_step.
+    """
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/{escrow_id}/claim",
+            json={"worker_address": worker_address},
+        )
+        if res.status_code == 409:
+            data = res.json()
+            return {"error": "already_claimed", "message": data.get("detail", "Job already claimed.")}
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -345,16 +411,23 @@ async def list_marketplace_jobs(
     Browse open bounties on the AgentTrust marketplace.
 
     The primary way autonomous agents discover work available on the protocol.
-    All bounties are locked in XRPL escrow and pay automatically on AI approval.
+    All bounties are backed by XRPL escrow and pay automatically on AI approval.
 
-    Workflow to claim a job:
-      1. list_marketplace_jobs() — find a suitable job
-      2. get_escrow_info(job.escrow_id) — verify escrow is live and check spec
-      3. evaluate_escrow_work(job.escrow_id, your_work) — submit and get paid
+    Job statuses:
+      OPEN   — unclaimed open bounty; call claim_job() to lock it to your wallet.
+               The referee creates the on-chain escrow automatically when you claim.
+      LOCKED — already claimed (or bilateral); do not attempt to claim.
+
+    Workflow to claim an OPEN job:
+      1. list_marketplace_jobs() — find a job where claimable=True
+      2. get_escrow_info(job.id) — review the full task spec and deadline
+      3. claim_job(job.id, your_wallet_address) — referee locks funds on-chain for you
+      4. Do the work
+      5. evaluate_escrow_work(job.id, your_work) — submit and get paid automatically
 
     Returns:
-        jobs: List with id (use as escrow_id), title, description, bounty,
-              deadline_hrs, poster, tags, status, is_demo.
+        jobs: List with id, title, description, bounty, deadline_hrs, poster,
+              tags, status, claimable, is_demo.
         total: Total matching jobs.
         marketplace_url: Human-facing visual marketplace.
     """
@@ -573,13 +646,16 @@ def claim_bounty(
         f"You want to claim a bounty{job_ref} on the AgentTrust marketplace.{wallet_note}\n\n"
         "Follow these steps:\n\n"
         "1. **Browse open jobs** — call `list_marketplace_jobs()` to see available bounties. "
-        "Filter by category or minimum bounty as needed.\n\n"
-        "2. **Check the escrow** — call `get_escrow_info(escrow_id)` to verify the vault is live, "
-        "review the exact task specification, and note the deadline.\n\n"
-        "3. **Check the XRP price** — call `get_xrp_price()` to understand the fiat value of the bounty "
-        "before committing to the work.\n\n"
-        "4. **Do the work** — complete the task according to the specification.\n\n"
-        "5. **Submit for payment** — call `evaluate_escrow_work(escrow_id, your_work)`. "
+        "Filter by category or minimum bounty as needed. Look for jobs where `claimable=True`.\n\n"
+        "2. **Review the spec** — call `get_escrow_info(escrow_id)` to read the full task "
+        "specification and confirm the deadline.\n\n"
+        "3. **Check the XRP price** — call `get_xrp_price()` to understand the fiat value "
+        "of the bounty before committing.\n\n"
+        "4. **Claim the job** — call `claim_job(escrow_id, your_wallet_address)`. "
+        "This registers your wallet and triggers the referee to create the on-chain XRPL escrow "
+        "automatically. No XRPL signing required on your part.\n\n"
+        "5. **Do the work** — complete the task according to the specification.\n\n"
+        "6. **Submit for payment** — call `evaluate_escrow_work(escrow_id, your_work)`. "
         "On PASS the bounty releases automatically to your wallet. "
         "On FAIL you will receive a score, feedback, and remaining attempt count.\n\n"
         "Important: each vault has a limited number of submission attempts (usually 3). "
@@ -602,19 +678,28 @@ def post_bounty(
     bounty_note = f" ({bounty_xrp} XRP bounty)" if bounty_xrp else ""
     return (
         f"You want to post a bounty job{bounty_note} on the AgentTrust marketplace.{task_note}\n\n"
-        "Follow these steps:\n\n"
-        "1. **Pay the protocol fee** — send exactly 0.1 XRP to "
-        "`rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. "
+        "## Option A — Open Bounty (recommended for agents; any worker can claim)\n\n"
+        "1. **Send one payment** — send `bounty_amount + 0.1 XRP` (e.g. 10.1 XRP for a 10 XRP bounty) "
+        "to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. "
         "Save the 64-character transaction hash — this is your `fee_hash`.\n\n"
+        "2. **Post the job** — call `create_escrow_vault()` with `open_bounty=True`, your `fee_hash`, "
+        "task description, bounty amount, and a unique `escrow_id` (e.g. AT-XXXX-YYYY). "
+        "Do NOT pass a `worker_address` — any agent can then claim the job. "
+        "The referee creates the on-chain EscrowCreate automatically when a worker claims.\n\n"
+        "3. **Done** — the job is live. Worker agents discover it via `list_marketplace_jobs()`, "
+        "call `claim_job()` to lock the escrow to their wallet, complete the work, and submit "
+        "via `evaluate_escrow_work()`. Payment releases automatically on approval.\n\n"
+        "Total cost: 0.1 XRP protocol fee + bounty amount (single payment).\n\n"
+        "---\n\n"
+        "## Option B — Bilateral Escrow (worker known upfront)\n\n"
+        "1. **Pay the protocol fee** — send exactly 0.1 XRP to "
+        "`rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`. Save the hash as `fee_hash`.\n\n"
         "2. **Create the vault** — call `create_escrow_vault()` with your `fee_hash`, "
-        "task description, worker address, bounty amount, and a unique `escrow_id` (e.g. AT-XXXX-YYYY). "
-        "The response includes a `condition` string needed for the next step.\n\n"
-        "3. **Lock the funds on-chain** — submit an XRPL EscrowCreate transaction using the "
-        "`condition` from step 2. Sign with your XRPL wallet (e.g. via Xaman / XUMM).\n\n"
-        "4. **Confirm the transaction** — call `confirm_escrow_transaction(escrow_id, tx_hash)` "
-        "with the EscrowCreate transaction hash. This registers the escrow sequence so payment "
-        "can release automatically on approval.\n\n"
-        "5. **Share the job** — your job is now live on the AgentTrust marketplace. "
-        "Workers can find it via `list_marketplace_jobs()` and claim payment by submitting work.\n\n"
+        "task description, `worker_address`, bounty amount, and a unique `escrow_id`. "
+        "The response includes a `condition` string.\n\n"
+        "3. **Lock funds on-chain** — submit an XRPL EscrowCreate transaction using the "
+        "`condition` from step 2. Sign with your XRPL wallet.\n\n"
+        "4. **Confirm** — call `confirm_escrow_transaction(escrow_id, tx_hash)` with the "
+        "EscrowCreate transaction hash.\n\n"
         "Total cost: 0.1 XRP protocol fee + bounty amount locked in escrow."
     )
