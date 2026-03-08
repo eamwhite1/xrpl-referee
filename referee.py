@@ -154,10 +154,10 @@ def serve_agent_json():
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
-        "agentVersion": "7.0.0",
-        "protocolVersion": "0.4.0",
+        "agentVersion": "9.0.0",
+        "protocolVersion": "0.6.0",
         "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
-        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True},
+        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
             "description": (
@@ -203,7 +203,15 @@ def serve_mcp_server_card():
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
             {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed."},
             {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
-            {"name": "list_marketplace_jobs",     "description": "Browse open XRP bounties agents can claim. Returns structured job data."},
+            {"name": "list_marketplace_jobs",     "description": "Browse live XRPL escrow bounties. Returns structured job data."},
+            {"name": "post_job",                  "description": "Post a job to the job board. No fee or funds — workers bid, you negotiate and award."},
+            {"name": "list_open_jobs",            "description": "Browse jobs posted by buyers that are open for bidding."},
+            {"name": "submit_bid",                "description": "Submit a bid (price + proposal) on an open job."},
+            {"name": "view_job",                  "description": "View job details and all current bids."},
+            {"name": "award_job",                 "description": "Accept a bid. Returns worker address and agreed price to use in create_escrow_vault()."},
+            {"name": "list_marketplace_skills",   "description": "Browse skill agents/humans offering services. Filter by category and rate. Supports direct hire."},
+            {"name": "create_skill_listing",      "description": "List your skills publicly for 30 days (0.1 XRP/month). Buyers can direct-hire you from the listing."},
+            {"name": "direct_hire",               "description": "Get a skill provider's wallet address for immediate escrow creation — no bidding needed."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
         ],
@@ -336,6 +344,43 @@ class EscrowVault(Base):
     # Marketplace — v8
     category          = Column(String,  default="default")  # task category for filtering
     marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
+    # Open bounty — v9: tracks who created the on-chain EscrowCreate (buyer or referee)
+    escrow_owner      = Column(String,  nullable=True)      # Account field of EscrowCreate tx
+
+
+class JobPosting(Base):
+    """
+    A buyer agent's request for work — no funds held.
+    Workers bid; buyer awards the job; then buyer creates the bilateral escrow.
+    """
+    __tablename__ = "job_posting"
+    id             = Column(String,   primary_key=True, index=True)  # e.g. JOB-XXXX-YYYY
+    title          = Column(String,   nullable=False)
+    description    = Column(Text,     nullable=False)
+    budget_xrp     = Column(Float,    nullable=True)    # indicative max budget
+    buyer_address  = Column(String,   nullable=False)
+    buyer_name     = Column(String,   nullable=True)
+    category       = Column(String,   default="default")
+    tags           = Column(Text,     nullable=True)    # JSON array
+    status         = Column(String,   default="open")   # open, awarded, cancelled, expired
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at     = Column(DateTime, nullable=True)
+    awarded_bid_id = Column(String,   nullable=True)    # winning bid id
+    escrow_id      = Column(String,   nullable=True)    # set by buyer after escrow created
+
+
+class Bid(Base):
+    """A worker agent's bid on an open job posting."""
+    __tablename__ = "bid"
+    id             = Column(String,   primary_key=True, index=True)   # BID-XXXX-YYYY
+    job_id         = Column(String,   nullable=False, index=True)
+    worker_address = Column(String,   nullable=False)
+    worker_name    = Column(String,   nullable=True)
+    worker_email   = Column(String,   nullable=True)   # optional — triggers award + escrow emails
+    proposed_xrp   = Column(Float,    nullable=False)
+    proposal       = Column(Text,     nullable=False)   # pitch / approach
+    status         = Column(String,   default="pending")  # pending, accepted, rejected
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class SkillListing(Base):
@@ -344,10 +389,11 @@ class SkillListing(Base):
     title        = Column(String,   nullable=False)
     description  = Column(Text,     nullable=False)
     category     = Column(String,   default="default")
-    rate         = Column(String,   nullable=True)
-    poster       = Column(String,   nullable=True)   # XRPL address
+    rate         = Column(String,   nullable=True)    # human-readable rate string
+    rate_xrp     = Column(Float,    nullable=True)    # numeric rate in XRP for filtering
+    poster       = Column(String,   nullable=True)    # XRPL address — used for direct hire
     poster_name  = Column(String,   nullable=True)
-    tags         = Column(Text,     nullable=True)   # JSON array
+    tags         = Column(Text,     nullable=True)    # JSON array
     fee_hash     = Column(String,   unique=True, nullable=False)
     created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at   = Column(DateTime, nullable=True)
@@ -395,12 +441,43 @@ def run_migrations():
         # v8 columns
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS category               VARCHAR DEFAULT 'default'",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS marketplace_tags        TEXT",
+        # v9 columns — escrow_owner tracks who signed EscrowCreate (buyer or referee)
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS escrow_owner           VARCHAR",
+        # v10 tables — job board + bidding (no funds held by referee)
+        """CREATE TABLE IF NOT EXISTS job_posting (
+            id              VARCHAR PRIMARY KEY,
+            title           VARCHAR NOT NULL,
+            description     TEXT    NOT NULL,
+            budget_xrp      FLOAT,
+            buyer_address   VARCHAR NOT NULL,
+            buyer_name      VARCHAR,
+            category        VARCHAR DEFAULT 'default',
+            tags            TEXT,
+            status          VARCHAR DEFAULT 'open',
+            created_at      TIMESTAMP,
+            expires_at      TIMESTAMP,
+            awarded_bid_id  VARCHAR,
+            escrow_id       VARCHAR
+        )""",
+        """CREATE TABLE IF NOT EXISTS bid (
+            id              VARCHAR PRIMARY KEY,
+            job_id          VARCHAR NOT NULL,
+            worker_address  VARCHAR NOT NULL,
+            worker_name     VARCHAR,
+            worker_email    VARCHAR,
+            proposed_xrp    FLOAT   NOT NULL,
+            proposal        TEXT    NOT NULL,
+            status          VARCHAR DEFAULT 'pending',
+            created_at      TIMESTAMP
+        )""",
+        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS worker_email VARCHAR",
         """CREATE TABLE IF NOT EXISTS skill_listing (
             id          VARCHAR PRIMARY KEY,
             title       VARCHAR NOT NULL,
             description TEXT    NOT NULL,
             category    VARCHAR DEFAULT 'default',
             rate        VARCHAR,
+            rate_xrp    FLOAT,
             poster      VARCHAR,
             poster_name VARCHAR,
             tags        TEXT,
@@ -409,6 +486,7 @@ def run_migrations():
             expires_at  TIMESTAMP,
             status      VARCHAR DEFAULT 'ACTIVE'
         )""",
+        "ALTER TABLE skill_listing ADD COLUMN IF NOT EXISTS rate_xrp FLOAT",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -436,6 +514,7 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
+MIN_ESCROW_XRP  = 0.000001   # 1 drop — XRPL EscrowCreate minimum
 RIPPLE_EPOCH    = 946684800  # Unix timestamp of the XRP Ledger epoch (2000-01-01T00:00:00Z)
 
 RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
@@ -1007,6 +1086,51 @@ async def send_worker_receipt_email(
         logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
 
 
+async def send_bid_awarded_email(
+    worker_email:  str,
+    worker_name:   str,
+    job_id:        str,
+    job_title:     str,
+    buyer_name:    str,
+    agreed_xrp:    float,
+):
+    """
+    Notify a human worker that their bid was accepted.
+    Sent at award time — before the escrow is created — so they know to watch for
+    a second email (the escrow receipt) once the buyer locks the funds.
+    """
+    if not RESEND_API_KEY or not worker_email:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      worker_email,
+            "subject": f"🏆 Your bid was accepted — {job_title}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Your bid was accepted!</h1>
+  <p>Hi{' ' + worker_name if worker_name else ''}, <strong>{buyer_name}</strong> has accepted
+     your bid of <strong>{agreed_xrp} XRP</strong> for:</p>
+  <div class="detail"><span>Job</span><br><strong>{job_title}</strong></div>
+  <div class="detail"><span>Agreed amount</span><br><strong>{agreed_xrp} XRP</strong></div>
+  <p>The buyer is now creating the escrow to lock your payment on the XRP Ledger.
+     You will receive another email shortly with your receipt code and a link to
+     submit your work on the AgentTrust website.</p>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+     Payment is held securely on-chain and released automatically when the AI
+     referee approves your submission — no manual claim required.
+  </p>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Bid award email sent to {worker_email} for job {job_id}")
+    except Exception as e:
+        logger.error(f"❌ Bid award email failed for job {job_id}: {e}")
+
+
 async def send_delivery_email(
     buyer_email: str,
     buyer_name:  str,
@@ -1553,8 +1677,12 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     amount_xrp   = req.amount_xrp   if currency == "XRP"   else None
     amount_rlusd = req.amount_rlusd if currency == "RLUSD" else None
 
-    if currency == "XRP" and (not amount_xrp or amount_xrp <= 0):
-        raise HTTPException(status_code=400, detail="amount_xrp required for XRP escrow.")
+    if currency == "XRP":
+        if not amount_xrp or amount_xrp < MIN_ESCROW_XRP:
+            raise HTTPException(
+                status_code=400,
+                detail=f"amount_xrp must be ≥ {MIN_ESCROW_XRP} XRP (1 drop — XRPL minimum)."
+            )
     if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
         raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
 
@@ -1694,6 +1822,9 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
 
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
+    # Record who created the EscrowCreate (buyer in the bilateral flow)
+    if not vault.escrow_owner:
+        vault.escrow_owner = vault.buyer_address
     db.commit()
 
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
@@ -1862,11 +1993,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         })
 
         # ── AUTO-FINISH: referee submits EscrowFinish, seller gets paid automatically ──
-        if vault.escrow_sequence and vault.buyer_address and vault.worker_address and referee_wallet:
+        # escrow_owner is who signed the EscrowCreate (buyer for bilateral, referee for open bounty)
+        escrow_owner = vault.escrow_owner or vault.buyer_address
+        if vault.escrow_sequence and escrow_owner and vault.worker_address and referee_wallet:
             asyncio.create_task(auto_finish_escrow(
                 escrow_id            = req.escrow_id,
                 sequence             = vault.escrow_sequence,
-                owner                = vault.buyer_address,
+                owner                = escrow_owner,
                 fulfillment          = plaintext_fulfillment,
                 condition            = vault.condition,
                 worker_addr          = vault.worker_address,
@@ -1876,7 +2009,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         else:
             logger.warning(
                 f"⚠️ AUTO-FINISH skipped for {req.escrow_id}: "
-                f"seq={vault.escrow_sequence} | buyer={vault.buyer_address} | "
+                f"seq={vault.escrow_sequence} | owner={escrow_owner} | "
                 f"worker={vault.worker_address} | wallet={'ok' if referee_wallet else 'MISSING'}"
             )
 
@@ -2340,6 +2473,279 @@ async def marketplace_jobs(
 
 
 # ---------------------------------------------------------------------------
+# JOB BOARD — post jobs, bid, negotiate, award (no funds held by referee)
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs")
+async def post_job(body: dict, db: Session = Depends(get_db)):
+    """
+    Post a job to the marketplace. No fee, no escrow — purely a request for bids.
+    Once a bid is accepted via /jobs/{id}/award, the buyer creates a bilateral
+    escrow via POST /escrow/generate using the worker's address.
+    """
+    job_id        = (body.get("id") or "").strip()
+    title         = (body.get("title") or "").strip()
+    description   = (body.get("description") or "").strip()
+    buyer_address = (body.get("buyer_address") or "").strip()
+
+    if not job_id:
+        raise HTTPException(status_code=400, detail="id is required (e.g. JOB-XXXX-YYYY).")
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required.")
+    if not description:
+        raise HTTPException(status_code=400, detail="description is required.")
+    if not buyer_address:
+        raise HTTPException(status_code=400, detail="buyer_address is required.")
+
+    existing = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Job ID '{job_id}' already exists.")
+
+    expires_hrs = int(body.get("expires_hrs") or 168)
+    expires_at  = datetime.now(timezone.utc) + timedelta(hours=expires_hrs)
+
+    job = JobPosting(
+        id            = job_id,
+        title         = title,
+        description   = description,
+        budget_xrp    = body.get("budget_xrp"),
+        buyer_address = buyer_address,
+        buyer_name    = body.get("buyer_name") or "",
+        category      = body.get("category") or "default",
+        tags          = json.dumps(body.get("tags") or []),
+        expires_at    = expires_at,
+    )
+    db.add(job)
+    db.commit()
+
+    logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={body.get('budget_xrp')} XRP")
+    return {
+        "status":     "posted",
+        "job_id":     job_id,
+        "expires_at": expires_at.strftime("%Y-%m-%d %H:%M UTC"),
+        "next_step":  "Worker agents can find this job via GET /jobs and bid via POST /jobs/{id}/bid.",
+    }
+
+
+@app.get("/jobs")
+async def list_jobs(
+    category:    str   = "all",
+    min_budget:  float = 0,
+    max_budget:  float = 0,
+    limit:       int   = 20,
+    db: Session = Depends(get_db),
+):
+    """List open job postings available for bidding."""
+    limit = min(limit, 100)
+    now   = datetime.now(timezone.utc)
+
+    q = db.query(JobPosting).filter(
+        JobPosting.status == "open",
+        or_(JobPosting.expires_at == None, JobPosting.expires_at > now),
+    )
+    if category != "all":
+        q = q.filter(JobPosting.category == category)
+
+    jobs = q.order_by(JobPosting.created_at.desc()).limit(200).all()
+
+    result = []
+    for j in jobs:
+        budget = j.budget_xrp or 0
+        if min_budget > 0 and budget < min_budget:
+            continue
+        if max_budget > 0 and budget > max_budget:
+            continue
+        try:
+            tags = json.loads(j.tags) if j.tags else []
+        except Exception:
+            tags = []
+        bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
+        result.append({
+            "id":           j.id,
+            "title":        j.title,
+            "description":  j.description,
+            "budget_xrp":   j.budget_xrp,
+            "buyer_address": j.buyer_address,
+            "buyer_name":   j.buyer_name or "",
+            "category":     j.category or "default",
+            "tags":         tags,
+            "status":       j.status,
+            "bid_count":    bid_count,
+            "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
+            "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
+        })
+        if len(result) >= limit:
+            break
+
+    return {"jobs": result, "total": len(result)}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, db: Session = Depends(get_db)):
+    """Get job details and all current bids."""
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    bids = db.query(Bid).filter(Bid.job_id == job_id).order_by(Bid.created_at.asc()).all()
+    bids_out = [
+        {
+            "bid_id":        b.id,
+            "worker_address": b.worker_address,
+            "worker_name":   b.worker_name or "",
+            "proposed_xrp":  b.proposed_xrp,
+            "proposal":      b.proposal,
+            "status":        b.status,
+            "created_at":    b.created_at.strftime("%Y-%m-%d %H:%M UTC") if b.created_at else None,
+        }
+        for b in bids
+    ]
+
+    try:
+        tags = json.loads(job.tags) if job.tags else []
+    except Exception:
+        tags = []
+
+    return {
+        "id":            job.id,
+        "title":         job.title,
+        "description":   job.description,
+        "budget_xrp":    job.budget_xrp,
+        "buyer_address": job.buyer_address,
+        "buyer_name":    job.buyer_name or "",
+        "category":      job.category,
+        "tags":          tags,
+        "status":        job.status,
+        "awarded_bid_id": job.awarded_bid_id,
+        "escrow_id":     job.escrow_id,
+        "expires_at":    job.expires_at.strftime("%Y-%m-%d %H:%M UTC") if job.expires_at else None,
+        "bids":          bids_out,
+    }
+
+
+@app.post("/jobs/{job_id}/bid")
+async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """Worker agent submits a bid on an open job."""
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    if job.status != "open":
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open for bids (status: {job.status}).")
+
+    worker_address = (body.get("worker_address") or "").strip()
+    proposed_xrp   = body.get("proposed_xrp")
+    proposal       = (body.get("proposal") or "").strip()
+
+    if not worker_address or not worker_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
+    if not proposed_xrp or float(proposed_xrp) <= 0:
+        raise HTTPException(status_code=400, detail="proposed_xrp must be > 0.")
+    if not proposal:
+        raise HTTPException(status_code=400, detail="proposal is required — describe your approach.")
+
+    import uuid
+    bid_id = f"BID-{uuid.uuid4().hex[:8].upper()}"
+
+    bid = Bid(
+        id             = bid_id,
+        job_id         = job_id,
+        worker_address = worker_address,
+        worker_name    = body.get("worker_name") or "",
+        worker_email   = body.get("worker_email") or None,
+        proposed_xrp   = float(proposed_xrp),
+        proposal       = proposal,
+    )
+    db.add(bid)
+    db.commit()
+
+    has_email = bool(bid.worker_email)
+    logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP | email={'yes' if has_email else 'no'}")
+    return {
+        "status":         "submitted",
+        "bid_id":         bid_id,
+        "job_id":         job_id,
+        "proposed_xrp":   float(proposed_xrp),
+        "email_on_award": has_email,
+        "next_step":      "The buyer will review bids and award the job. Check back via GET /jobs/{job_id}.",
+    }
+
+
+@app.post("/jobs/{job_id}/award")
+async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Buyer accepts a bid and awards the job.
+
+    Returns the worker's address and agreed price so the buyer can immediately
+    call POST /escrow/generate to create the bilateral XRPL escrow.
+    No funds are held by the referee at any point.
+    """
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    buyer_address = (body.get("buyer_address") or "").strip()
+    if not buyer_address or buyer_address.lower() != job.buyer_address.lower():
+        raise HTTPException(status_code=403, detail="Only the job poster can award this job.")
+    if job.status != "open":
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open (status: {job.status}).")
+
+    bid_id = (body.get("bid_id") or "").strip()
+    bid    = db.query(Bid).filter(Bid.id == bid_id, Bid.job_id == job_id).first()
+    if not bid:
+        raise HTTPException(status_code=404, detail=f"Bid '{bid_id}' not found on job '{job_id}'.")
+    if bid.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Bid '{bid_id}' is not pending (status: {bid.status}).")
+
+    # Award
+    job.status          = "awarded"
+    job.awarded_bid_id  = bid_id
+    bid.status          = "accepted"
+
+    # Reject all other bids on this job
+    other_bids = db.query(Bid).filter(Bid.job_id == job_id, Bid.id != bid_id).all()
+    for b in other_bids:
+        b.status = "rejected"
+
+    db.commit()
+
+    logger.info(f"🏆 JOB AWARDED: {job_id} → bid={bid_id} | worker={bid.worker_address} | price={bid.proposed_xrp} XRP")
+
+    # Notify human worker (fire-and-forget; agents don't need this)
+    if bid.worker_email:
+        import asyncio
+        asyncio.create_task(send_bid_awarded_email(
+            worker_email = bid.worker_email,
+            worker_name  = bid.worker_name or "",
+            job_id       = job_id,
+            job_title    = job.title,
+            buyer_name   = job.buyer_name or "the buyer",
+            agreed_xrp   = bid.proposed_xrp,
+        ))
+
+    worker_email_hint = (
+        f"Pass worker_email='{bid.worker_email}' to create_escrow_vault() so the worker "
+        f"receives an escrow receipt email with their submission link."
+    ) if bid.worker_email else None
+
+    return {
+        "status":          "awarded",
+        "job_id":          job_id,
+        "bid_id":          bid_id,
+        "worker_address":  bid.worker_address,
+        "worker_name":     bid.worker_name or "",
+        "worker_email":    bid.worker_email or None,
+        "agreed_xrp":      bid.proposed_xrp,
+        "next_step": (
+            f"Create the escrow: call create_escrow_vault() with "
+            f"worker_address='{bid.worker_address}' and amount_xrp={bid.proposed_xrp}. "
+            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
+            f"Then sign the EscrowCreate on XRPL and confirm via confirm_escrow_transaction()."
+            + (f" {worker_email_hint}" if worker_email_hint else "")
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # SKILL LISTINGS
 # ---------------------------------------------------------------------------
 
@@ -2376,22 +2782,26 @@ class SkillListingRequest(BaseModel):
     fee_hash:    str
     title:       str
     description: str
-    category:    str  = "default"
-    rate:        Optional[str]       = None
-    poster:      Optional[str]       = None   # XRPL address
-    poster_name: Optional[str]       = None
+    category:    str            = "default"
+    rate:        Optional[str]  = None    # human-readable, e.g. "50–200 XRP per task"
+    rate_xrp:    Optional[float] = None  # numeric starting rate for filtering
+    poster:      Optional[str]  = None   # XRPL address
+    poster_name: Optional[str]  = None
     tags:        Optional[list[str]] = None
 
 
 @app.get("/marketplace/skills")
 async def marketplace_skills(
-    category: str = "all",
-    limit:    int = 20,
+    category:  str   = "all",
+    min_rate:  float = 0,
+    max_rate:  float = 0,
+    limit:     int   = 20,
     db: Session = Depends(get_db),
 ):
     """
     Return active skill listings: real listings from DB first, then demo seeds.
     Callable by both agents (via MCP list_marketplace_skills) and the human UI.
+    Use GET /marketplace/skills/{id} to get a single listing for direct hire.
     """
     limit = min(limit, 100)
     real = []
@@ -2405,6 +2815,10 @@ async def marketplace_skills(
             q = q.filter(SkillListing.category == category)
         listings = q.order_by(SkillListing.created_at.desc()).limit(200).all()
         for s in listings:
+            if min_rate > 0 and (s.rate_xrp or 0) < min_rate:
+                continue
+            if max_rate > 0 and (s.rate_xrp or 0) > max_rate:
+                continue
             tags = []
             try:
                 tags = json.loads(s.tags) if s.tags else []
@@ -2416,6 +2830,7 @@ async def marketplace_skills(
                 "description": s.description,
                 "category":    s.category or "default",
                 "rate":        s.rate or "Rate on request",
+                "rate_xrp":    s.rate_xrp,
                 "poster":      s.poster or "",
                 "poster_name": s.poster_name or "",
                 "tags":        tags,
@@ -2431,10 +2846,53 @@ async def marketplace_skills(
 
     combined = (real + seeds)[:limit]
     return {
-        "skills":     combined,
-        "total":      len(combined),
+        "skills":      combined,
+        "total":       len(combined),
         "real_skills": len(real),
         "demo_skills": len([s for s in combined if s.get("is_demo")]),
+    }
+
+
+@app.get("/marketplace/skills/{skill_id}")
+async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
+    """
+    Get a single skill listing by ID.
+
+    Returns full details including the poster's XRPL wallet address for direct hire.
+    Use the returned poster address as worker_address in create_escrow_vault().
+    """
+    listing = db.query(SkillListing).filter(SkillListing.id == skill_id).first()
+    if not listing:
+        raise HTTPException(status_code=404, detail=f"Skill listing '{skill_id}' not found.")
+
+    now = datetime.now(timezone.utc)
+    is_expired = listing.expires_at and listing.expires_at.replace(tzinfo=timezone.utc) < now
+
+    tags = []
+    try:
+        tags = json.loads(listing.tags) if listing.tags else []
+    except Exception:
+        pass
+
+    return {
+        "id":            listing.id,
+        "title":         listing.title,
+        "description":   listing.description,
+        "category":      listing.category or "default",
+        "rate":          listing.rate or "Rate on request",
+        "rate_xrp":      listing.rate_xrp,
+        "worker_address": listing.poster or "",   # the address to use in create_escrow_vault()
+        "poster_name":   listing.poster_name or "",
+        "tags":          tags,
+        "status":        listing.status,
+        "expires_at":    listing.expires_at.isoformat() if listing.expires_at else None,
+        "is_expired":    is_expired,
+        "is_demo":       False,
+        "direct_hire_hint": (
+            f"To hire directly: call create_escrow_vault() with "
+            f"worker_address='{listing.poster}' and your agreed amount_xrp. "
+            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first."
+        ) if listing.poster else None,
     }
 
 
@@ -2457,6 +2915,7 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
         description = req.description,
         category    = req.category,
         rate        = req.rate,
+        rate_xrp    = req.rate_xrp,
         poster      = req.poster,
         poster_name = req.poster_name,
         tags        = json.dumps(req.tags) if req.tags else None,
