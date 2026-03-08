@@ -209,6 +209,9 @@ def serve_mcp_server_card():
             {"name": "submit_bid",                "description": "Submit a bid (price + proposal) on an open job."},
             {"name": "view_job",                  "description": "View job details and all current bids."},
             {"name": "award_job",                 "description": "Accept a bid. Returns worker address and agreed price to use in create_escrow_vault()."},
+            {"name": "list_marketplace_skills",   "description": "Browse skill agents/humans offering services. Filter by category and rate. Supports direct hire."},
+            {"name": "create_skill_listing",      "description": "List your skills publicly for 30 days (0.1 XRP/month). Buyers can direct-hire you from the listing."},
+            {"name": "direct_hire",               "description": "Get a skill provider's wallet address for immediate escrow creation — no bidding needed."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
         ],
@@ -385,10 +388,11 @@ class SkillListing(Base):
     title        = Column(String,   nullable=False)
     description  = Column(Text,     nullable=False)
     category     = Column(String,   default="default")
-    rate         = Column(String,   nullable=True)
-    poster       = Column(String,   nullable=True)   # XRPL address
+    rate         = Column(String,   nullable=True)    # human-readable rate string
+    rate_xrp     = Column(Float,    nullable=True)    # numeric rate in XRP for filtering
+    poster       = Column(String,   nullable=True)    # XRPL address — used for direct hire
     poster_name  = Column(String,   nullable=True)
-    tags         = Column(Text,     nullable=True)   # JSON array
+    tags         = Column(Text,     nullable=True)    # JSON array
     fee_hash     = Column(String,   unique=True, nullable=False)
     created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at   = Column(DateTime, nullable=True)
@@ -470,6 +474,7 @@ def run_migrations():
             description TEXT    NOT NULL,
             category    VARCHAR DEFAULT 'default',
             rate        VARCHAR,
+            rate_xrp    FLOAT,
             poster      VARCHAR,
             poster_name VARCHAR,
             tags        TEXT,
@@ -478,6 +483,7 @@ def run_migrations():
             expires_at  TIMESTAMP,
             status      VARCHAR DEFAULT 'ACTIVE'
         )""",
+        "ALTER TABLE skill_listing ADD COLUMN IF NOT EXISTS rate_xrp FLOAT",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2700,22 +2706,26 @@ class SkillListingRequest(BaseModel):
     fee_hash:    str
     title:       str
     description: str
-    category:    str  = "default"
-    rate:        Optional[str]       = None
-    poster:      Optional[str]       = None   # XRPL address
-    poster_name: Optional[str]       = None
+    category:    str            = "default"
+    rate:        Optional[str]  = None    # human-readable, e.g. "50–200 XRP per task"
+    rate_xrp:    Optional[float] = None  # numeric starting rate for filtering
+    poster:      Optional[str]  = None   # XRPL address
+    poster_name: Optional[str]  = None
     tags:        Optional[list[str]] = None
 
 
 @app.get("/marketplace/skills")
 async def marketplace_skills(
-    category: str = "all",
-    limit:    int = 20,
+    category:  str   = "all",
+    min_rate:  float = 0,
+    max_rate:  float = 0,
+    limit:     int   = 20,
     db: Session = Depends(get_db),
 ):
     """
     Return active skill listings: real listings from DB first, then demo seeds.
     Callable by both agents (via MCP list_marketplace_skills) and the human UI.
+    Use GET /marketplace/skills/{id} to get a single listing for direct hire.
     """
     limit = min(limit, 100)
     real = []
@@ -2729,6 +2739,10 @@ async def marketplace_skills(
             q = q.filter(SkillListing.category == category)
         listings = q.order_by(SkillListing.created_at.desc()).limit(200).all()
         for s in listings:
+            if min_rate > 0 and (s.rate_xrp or 0) < min_rate:
+                continue
+            if max_rate > 0 and (s.rate_xrp or 0) > max_rate:
+                continue
             tags = []
             try:
                 tags = json.loads(s.tags) if s.tags else []
@@ -2740,6 +2754,7 @@ async def marketplace_skills(
                 "description": s.description,
                 "category":    s.category or "default",
                 "rate":        s.rate or "Rate on request",
+                "rate_xrp":    s.rate_xrp,
                 "poster":      s.poster or "",
                 "poster_name": s.poster_name or "",
                 "tags":        tags,
@@ -2755,10 +2770,53 @@ async def marketplace_skills(
 
     combined = (real + seeds)[:limit]
     return {
-        "skills":     combined,
-        "total":      len(combined),
+        "skills":      combined,
+        "total":       len(combined),
         "real_skills": len(real),
         "demo_skills": len([s for s in combined if s.get("is_demo")]),
+    }
+
+
+@app.get("/marketplace/skills/{skill_id}")
+async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
+    """
+    Get a single skill listing by ID.
+
+    Returns full details including the poster's XRPL wallet address for direct hire.
+    Use the returned poster address as worker_address in create_escrow_vault().
+    """
+    listing = db.query(SkillListing).filter(SkillListing.id == skill_id).first()
+    if not listing:
+        raise HTTPException(status_code=404, detail=f"Skill listing '{skill_id}' not found.")
+
+    now = datetime.now(timezone.utc)
+    is_expired = listing.expires_at and listing.expires_at.replace(tzinfo=timezone.utc) < now
+
+    tags = []
+    try:
+        tags = json.loads(listing.tags) if listing.tags else []
+    except Exception:
+        pass
+
+    return {
+        "id":            listing.id,
+        "title":         listing.title,
+        "description":   listing.description,
+        "category":      listing.category or "default",
+        "rate":          listing.rate or "Rate on request",
+        "rate_xrp":      listing.rate_xrp,
+        "worker_address": listing.poster or "",   # the address to use in create_escrow_vault()
+        "poster_name":   listing.poster_name or "",
+        "tags":          tags,
+        "status":        listing.status,
+        "expires_at":    listing.expires_at.isoformat() if listing.expires_at else None,
+        "is_expired":    is_expired,
+        "is_demo":       False,
+        "direct_hire_hint": (
+            f"To hire directly: call create_escrow_vault() with "
+            f"worker_address='{listing.poster}' and your agreed amount_xrp. "
+            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first."
+        ) if listing.poster else None,
     }
 
 
@@ -2781,6 +2839,7 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
         description = req.description,
         category    = req.category,
         rate        = req.rate,
+        rate_xrp    = req.rate_xrp,
         poster      = req.poster,
         poster_name = req.poster_name,
         tags        = json.dumps(req.tags) if req.tags else None,

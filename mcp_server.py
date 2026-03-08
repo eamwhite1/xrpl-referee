@@ -429,6 +429,16 @@ async def list_marketplace_skills(
         description="Filter by skill category: all, code, data, data_analysis, creative, bug_bounty, legal, default.",
         enum=["all", "code", "data", "data_analysis", "creative", "bug_bounty", "legal", "default"],
     )] = "all",
+    min_rate: Annotated[float, Field(
+        title="Min Rate (XRP)",
+        description="Only return listings with a rate_xrp at or above this value. Use 0 for no minimum.",
+        ge=0,
+    )] = 0,
+    max_rate: Annotated[float, Field(
+        title="Max Rate (XRP)",
+        description="Only return listings with a rate_xrp at or below this value. Use 0 for no maximum.",
+        ge=0,
+    )] = 0,
     limit: Annotated[int, Field(
         title="Result Limit",
         description="Maximum number of skill listings to return. Default 20, maximum 100.",
@@ -437,26 +447,27 @@ async def list_marketplace_skills(
     )] = 20,
 ) -> dict:
     """
-    Browse agents and providers offering skills on the AgentTrust marketplace.
+    Browse agents and humans offering skills on the AgentTrust marketplace.
 
-    Skills are recurring capabilities listed by agents (or humans) who can
-    perform a type of work on demand. Unlike jobs (which are specific one-off
-    bounties), a skill listing says "I can do this — hire me directly."
+    Skill listings are published by workers (agents or humans) who want to be
+    found and hired directly — no bidding required. Each listing shows the
+    poster's XRPL wallet address so a buyer can skip the job board entirely
+    and go straight to creating an escrow.
 
-    Workflow to hire a skill provider:
-      1. list_marketplace_skills() — find a suitable provider
-      2. Contact via their poster address or use the marketplace direct-hire flow
-      3. Agree on scope, then create_escrow_vault() to lock payment
+    Workflow to direct-hire a skill provider:
+      1. list_marketplace_skills() — find a suitable provider (filter by category/rate)
+      2. direct_hire(skill_id) — get the worker's wallet address + escrow instructions
+      3. create_escrow_vault(worker_address=..., amount_xrp=...) — lock payment
 
     Returns:
-        skills: List with id, title, description, category, rate, poster,
-                poster_name, tags, expires_at, is_demo.
+        skills: List with id, title, description, category, rate, rate_xrp,
+                poster (wallet address), poster_name, tags, expires_at, is_demo.
         total, real_skills, demo_skills.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(
             f"{REFEREE_BASE}/marketplace/skills",
-            params={"category": category, "limit": min(limit, 100)},
+            params={"category": category, "min_rate": min_rate, "max_rate": max_rate, "limit": min(limit, 100)},
         )
         res.raise_for_status()
         return res.json()
@@ -491,8 +502,13 @@ async def create_skill_listing(
         enum=["default", "creative", "code", "data", "data_analysis", "bug_bounty", "legal"],
     )] = "default",
     rate: Annotated[str | None, Field(
-        title="Rate",
-        description="Your rate or price range, e.g. '50–200 XRP per task' or 'Rate on request'.",
+        title="Rate (display)",
+        description="Human-readable rate string, e.g. '50–200 XRP per task' or '10 XRP/hr'. Shown on the listing.",
+    )] = None,
+    rate_xrp: Annotated[float | None, Field(
+        title="Starting Rate (XRP)",
+        description="Your minimum / starting rate in XRP as a number. Used so buyers can filter by budget. E.g. 50.0 for '50 XRP and up'.",
+        ge=0,
     )] = None,
     poster: Annotated[str | None, Field(
         title="Your XRPL Address",
@@ -530,6 +546,7 @@ async def create_skill_listing(
                 "description": description,
                 "category":    category,
                 "rate":        rate,
+                "rate_xrp":    rate_xrp,
                 "poster":      poster,
                 "poster_name": poster_name,
                 "tags":        tags or [],
@@ -539,6 +556,63 @@ async def create_skill_listing(
             return {"error": "Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and provide the tx hash as fee_hash."}
         res.raise_for_status()
         return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def direct_hire(
+    skill_id: Annotated[str, Field(
+        title="Skill Listing ID",
+        description="The skill listing ID from list_marketplace_skills(). e.g. SKILL-PY-001.",
+    )],
+) -> dict:
+    """
+    Get the wallet address and hiring details for a skill listing — skipping the job board entirely.
+
+    Use this when you've found a skill provider via list_marketplace_skills() and want
+    to hire them directly without going through the bid/award process.
+
+    Returns the worker's XRPL wallet address and ready-to-use escrow instructions.
+    No funds move — you still create the escrow yourself via create_escrow_vault().
+
+    Typical flow:
+      1. list_marketplace_skills() — browse and find a provider
+      2. direct_hire(skill_id) — get their wallet address + escrow instructions
+      3. create_escrow_vault(worker_address=..., amount_xrp=...) — lock payment on XRPL
+
+    Returns:
+        worker_address, rate, title, direct_hire_hint (escrow creation instructions).
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/marketplace/skills/{skill_id}")
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"Skill listing '{skill_id}' not found."}
+        res.raise_for_status()
+        data = res.json()
+        if data.get("is_expired"):
+            return {
+                "error":   "listing_expired",
+                "message": f"Skill listing '{skill_id}' has expired. The provider may renew it.",
+            }
+        if not data.get("worker_address"):
+            return {
+                "error":   "no_wallet",
+                "message": "This listing has no XRPL wallet address on file. Contact the poster via another channel.",
+            }
+        return {
+            "skill_id":       data["id"],
+            "title":          data["title"],
+            "worker_address": data["worker_address"],
+            "poster_name":    data["poster_name"],
+            "rate":           data["rate"],
+            "rate_xrp":       data.get("rate_xrp"),
+            "description":    data["description"],
+            "direct_hire_hint": data.get("direct_hire_hint"),
+        }
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -824,17 +898,24 @@ def find_work(
     skills_note = f" Skills/interests: {skills}." if skills else ""
     return (
         f"You are a skills agent looking for work on the AgentTrust marketplace.{wallet_note}{skills_note}\n\n"
-        "Follow these steps:\n\n"
+        "## Option A — Bid on a posted job\n\n"
         "1. **Browse open jobs** — call `list_open_jobs()` to see buyer requests. "
-        "Filter by category or budget. Each job shows a description and indicative budget.\n\n"
-        "2. **Review a job** — call `view_job(job_id)` to read the full spec, see existing bids, "
-        "and check competition.\n\n"
+        "Filter by category or budget.\n\n"
+        "2. **Review a job** — call `view_job(job_id)` to read the full spec and see existing bids.\n\n"
         "3. **Submit your bid** — call `submit_bid(job_id, your_wallet, proposed_xrp, proposal)`. "
         "Your proposal is your pitch — describe your approach and why you are the right agent.\n\n"
-        "4. **Wait for award** — poll `view_job(job_id)` to see if the buyer awards the job to you. "
-        "If awarded, the buyer will create an XRPL escrow with your wallet address.\n\n"
-        "5. **Do the work** — once you see an escrow created (the buyer will share the escrow_id), "
-        "call `get_escrow_info(escrow_id)` to read the full task spec.\n\n"
+        "4. **Wait for award** — poll `view_job(job_id)`. If awarded, the buyer creates an "
+        "XRPL escrow with your wallet address and shares the escrow_id with you.\n\n"
+        "---\n\n"
+        "## Option B — List your skills so buyers find you\n\n"
+        "1. **Pay 0.1 XRP** monthly fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`. Save the tx hash.\n\n"
+        "2. **Post your listing** — call `create_skill_listing()` with your wallet address, "
+        "skills description, rate, and the fee tx hash. Your listing is live for 30 days.\n\n"
+        "3. **Get hired** — buyers find you via `list_marketplace_skills()` and call "
+        "`direct_hire(skill_id)` to get your wallet address. They create an escrow directly with you.\n\n"
+        "---\n\n"
+        "## Once an escrow exists (either route)\n\n"
+        "5. **Do the work** — call `get_escrow_info(escrow_id)` to read the exact task spec.\n\n"
         "6. **Submit for payment** — call `evaluate_escrow_work(escrow_id, your_work)`. "
         "On PASS the bounty releases automatically to your wallet. "
         "On FAIL you receive a score, feedback, and remaining attempt count.\n\n"
@@ -854,22 +935,25 @@ def post_bounty(
     budget_note = f" (budget: {budget_xrp} XRP)" if budget_xrp else ""
     return (
         f"You want to hire a skills agent for a job{budget_note} on the AgentTrust marketplace.{task_note}\n\n"
-        "Follow these steps:\n\n"
-        "1. **Post the job** — call `post_job()` with your title, description, budget, and your XRPL address. "
-        "No fee, no funds locked — this is just a request for bids.\n\n"
-        "2. **Wait for bids** — worker agents discover the job via `list_open_jobs()` and submit bids. "
-        "Poll `view_job(job_id)` to see incoming bids with each agent's price and proposal.\n\n"
-        "3. **Negotiate** — review bids in `view_job()`. You can message agents out-of-band if needed. "
-        "Workers can revise their bid by submitting again.\n\n"
-        "4. **Award the job** — call `award_job(job_id, bid_id, your_address)` when satisfied. "
-        "The response gives you the worker's wallet address and agreed price. "
-        "All other bids are automatically rejected.\n\n"
-        "5. **Create the escrow** — pay 0.1 XRP protocol fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`, "
-        "then call `create_escrow_vault()` with the worker's address and agreed price. "
-        "Use the returned `condition` to sign an XRPL EscrowCreate with your wallet.\n\n"
-        "6. **Confirm on-chain** — call `confirm_escrow_transaction(escrow_id, tx_hash)` with "
-        "the EscrowCreate transaction hash. The worker can now submit work.\n\n"
-        "7. **Receive work** — the referee evaluates the worker's submission. "
-        "On PASS, payment releases automatically. No action needed from you.\n\n"
-        "Total cost: 0.1 XRP protocol fee + bounty amount locked in escrow."
+        "## Option A — Direct hire (fastest — worker is already listed)\n\n"
+        "1. **Browse skill agents** — call `list_marketplace_skills()`. Filter by category and rate.\n\n"
+        "2. **Direct hire** — call `direct_hire(skill_id)` to get the worker's XRPL wallet address "
+        "and their rate. No bidding, no waiting.\n\n"
+        "3. **Create the escrow** — pay 0.1 XRP protocol fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`, "
+        "then call `create_escrow_vault(worker_address=..., amount_xrp=...)`. "
+        "Sign the EscrowCreate with your wallet using the returned `condition`.\n\n"
+        "4. **Confirm** — call `confirm_escrow_transaction(escrow_id, tx_hash)`. "
+        "The worker submits work and gets paid automatically on approval.\n\n"
+        "---\n\n"
+        "## Option B — Post a job and collect bids\n\n"
+        "1. **Post the job** — call `post_job()` with title, description, budget, and your XRPL address. "
+        "Free — no fee, no funds locked. Expires in 7 days.\n\n"
+        "2. **Review bids** — poll `view_job(job_id)` to see incoming bids from worker agents "
+        "(price + proposal). Workers bid via `submit_bid()`.\n\n"
+        "3. **Award** — call `award_job(job_id, bid_id, your_address)` when satisfied. "
+        "Returns the worker's wallet address and agreed price.\n\n"
+        "4. **Create the escrow & confirm** — same as Option A steps 3–4.\n\n"
+        "---\n\n"
+        "Total cost (both options): 0.1 XRP protocol fee + agreed bounty locked in escrow.\n"
+        "The referee evaluates work and auto-pays on PASS — no further action needed from you."
     )
