@@ -376,6 +376,7 @@ class Bid(Base):
     job_id         = Column(String,   nullable=False, index=True)
     worker_address = Column(String,   nullable=False)
     worker_name    = Column(String,   nullable=True)
+    worker_email   = Column(String,   nullable=True)   # optional — triggers award + escrow emails
     proposed_xrp   = Column(Float,    nullable=False)
     proposal       = Column(Text,     nullable=False)   # pitch / approach
     status         = Column(String,   default="pending")  # pending, accepted, rejected
@@ -463,11 +464,13 @@ def run_migrations():
             job_id          VARCHAR NOT NULL,
             worker_address  VARCHAR NOT NULL,
             worker_name     VARCHAR,
+            worker_email    VARCHAR,
             proposed_xrp    FLOAT   NOT NULL,
             proposal        TEXT    NOT NULL,
             status          VARCHAR DEFAULT 'pending',
             created_at      TIMESTAMP
         )""",
+        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS worker_email VARCHAR",
         """CREATE TABLE IF NOT EXISTS skill_listing (
             id          VARCHAR PRIMARY KEY,
             title       VARCHAR NOT NULL,
@@ -1081,6 +1084,51 @@ async def send_worker_receipt_email(
         logger.info(f"📧 Seller receipt email sent to {worker_email} for {escrow_id}")
     except Exception as e:
         logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
+
+
+async def send_bid_awarded_email(
+    worker_email:  str,
+    worker_name:   str,
+    job_id:        str,
+    job_title:     str,
+    buyer_name:    str,
+    agreed_xrp:    float,
+):
+    """
+    Notify a human worker that their bid was accepted.
+    Sent at award time — before the escrow is created — so they know to watch for
+    a second email (the escrow receipt) once the buyer locks the funds.
+    """
+    if not RESEND_API_KEY or not worker_email:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      worker_email,
+            "subject": f"🏆 Your bid was accepted — {job_title}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Your bid was accepted!</h1>
+  <p>Hi{' ' + worker_name if worker_name else ''}, <strong>{buyer_name}</strong> has accepted
+     your bid of <strong>{agreed_xrp} XRP</strong> for:</p>
+  <div class="detail"><span>Job</span><br><strong>{job_title}</strong></div>
+  <div class="detail"><span>Agreed amount</span><br><strong>{agreed_xrp} XRP</strong></div>
+  <p>The buyer is now creating the escrow to lock your payment on the XRP Ledger.
+     You will receive another email shortly with your receipt code and a link to
+     submit your work on the AgentTrust website.</p>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+     Payment is held securely on-chain and released automatically when the AI
+     referee approves your submission — no manual claim required.
+  </p>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Bid award email sent to {worker_email} for job {job_id}")
+    except Exception as e:
+        logger.error(f"❌ Bid award email failed for job {job_id}: {e}")
 
 
 async def send_delivery_email(
@@ -2603,18 +2651,21 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         job_id         = job_id,
         worker_address = worker_address,
         worker_name    = body.get("worker_name") or "",
+        worker_email   = body.get("worker_email") or None,
         proposed_xrp   = float(proposed_xrp),
         proposal       = proposal,
     )
     db.add(bid)
     db.commit()
 
-    logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP")
+    has_email = bool(bid.worker_email)
+    logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP | email={'yes' if has_email else 'no'}")
     return {
         "status":         "submitted",
         "bid_id":         bid_id,
         "job_id":         job_id,
         "proposed_xrp":   float(proposed_xrp),
+        "email_on_award": has_email,
         "next_step":      "The buyer will review bids and award the job. Check back via GET /jobs/{job_id}.",
     }
 
@@ -2658,18 +2709,38 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
     db.commit()
 
     logger.info(f"🏆 JOB AWARDED: {job_id} → bid={bid_id} | worker={bid.worker_address} | price={bid.proposed_xrp} XRP")
+
+    # Notify human worker (fire-and-forget; agents don't need this)
+    if bid.worker_email:
+        import asyncio
+        asyncio.create_task(send_bid_awarded_email(
+            worker_email = bid.worker_email,
+            worker_name  = bid.worker_name or "",
+            job_id       = job_id,
+            job_title    = job.title,
+            buyer_name   = job.buyer_name or "the buyer",
+            agreed_xrp   = bid.proposed_xrp,
+        ))
+
+    worker_email_hint = (
+        f"Pass worker_email='{bid.worker_email}' to create_escrow_vault() so the worker "
+        f"receives an escrow receipt email with their submission link."
+    ) if bid.worker_email else None
+
     return {
         "status":          "awarded",
         "job_id":          job_id,
         "bid_id":          bid_id,
         "worker_address":  bid.worker_address,
         "worker_name":     bid.worker_name or "",
+        "worker_email":    bid.worker_email or None,
         "agreed_xrp":      bid.proposed_xrp,
         "next_step": (
             f"Create the escrow: call create_escrow_vault() with "
             f"worker_address='{bid.worker_address}' and amount_xrp={bid.proposed_xrp}. "
             f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
             f"Then sign the EscrowCreate on XRPL and confirm via confirm_escrow_transaction()."
+            + (f" {worker_email_hint}" if worker_email_hint else "")
         ),
     }
 

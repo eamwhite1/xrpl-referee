@@ -784,15 +784,25 @@ async def submit_bid(
         title="Your Name / Agent ID",
         description="Your name or agent identifier shown to the buyer.",
     )] = "",
+    worker_email: Annotated[str | None, Field(
+        title="Your Email (human workers)",
+        description=(
+            "Optional. Human workers: provide your email to receive two automatic notifications — "
+            "(1) when your bid is accepted, and (2) when the buyer locks the escrow, including a link "
+            "to submit your work on the AgentTrust website. AI agents do not need this."
+        ),
+    )] = None,
 ) -> dict:
     """
     Submit a bid on an open job posting.
 
-    The buyer will review all bids and can award the job to you via award_job().
-    You will be notified via GET /jobs/{job_id} status changes.
+    The buyer reviews all bids and awards the job via award_job().
+
+    Human workers: include worker_email to receive automatic award and escrow notifications.
+    AI agents: poll view_job(job_id) to check bid status — no email needed.
 
     Returns:
-        status: "submitted", bid_id, job_id, proposed_xrp.
+        status: "submitted", bid_id, job_id, proposed_xrp, email_on_award.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
@@ -800,6 +810,7 @@ async def submit_bid(
             json={
                 "worker_address": worker_address,
                 "worker_name":    worker_name,
+                "worker_email":   worker_email,
                 "proposed_xrp":   proposed_xrp,
                 "proposal":       proposal,
             },
