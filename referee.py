@@ -583,6 +583,28 @@ if RESEND_API_KEY:
 else:
     logger.warning("⚠️ RESEND_API_KEY missing — email notifications disabled")
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_API_KEY")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    logger.info("✅ Telegram notifications configured")
+else:
+    logger.warning("⚠️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing — Telegram notifications disabled")
+
+
+async def _telegram_notify(text: str) -> None:
+    """Fire-and-forget Telegram message to the owner chat."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            )
+    except Exception as e:
+        logger.warning(f"⚠️ Telegram notify failed: {e}")
+
 # ---------------------------------------------------------------------------
 # FULFILLMENT KEY ENCRYPTION (AES-256-GCM)
 # ---------------------------------------------------------------------------
@@ -912,6 +934,17 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
     db.commit()
 
     logger.info(f"✅ FEE VERIFIED: {amount_xrp} XRP from {sender} for escrow '{escrow_id}'")
+
+    import asyncio
+    asyncio.create_task(_telegram_notify(
+        f"💰 *Protocol fee received*\n"
+        f"Amount: `{amount_xrp} XRP`\n"
+        f"From: `{sender}`\n"
+        f"Escrow: `{escrow_id}`\n"
+        f"Resource: `{resource}`\n"
+        f"Hash: `{fee_hash[:16]}…`"
+    ))
+
     return {"sender": sender, "amount_xrp": amount_xrp}
 
 
