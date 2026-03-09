@@ -8,4 +8,4 @@ python-dotenv
 requests
 resend
 cryptography
-fastmcp>=2.2.0,<2.3.0
+fastmcp>=2.2.0
