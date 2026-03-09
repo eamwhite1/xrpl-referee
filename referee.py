@@ -2381,12 +2381,12 @@ async def get_dex_quote(req: QuoteRequest):
 
 
 # ---------------------------------------------------------------------------
-# 20. MARKETPLACE JOBS API — machine-readable bounty board for agents
+# 20. MARKETPLACE JOBS API — proxies the job board for agents and the marketplace UI
 # ---------------------------------------------------------------------------
-# Seed jobs mirror the frontend demo listings in marketplace.html.
-# Real jobs posted via the marketplace UI are stored in localStorage (frontend only).
-# This endpoint serves the seed data plus any jobs stored in the DB
-# (future: marketplace jobs backed by on-chain escrow use the vault table).
+# /marketplace/jobs now returns job board posts (from the Job model) in a
+# normalised format. Any "bounty"-style job must go through the job board:
+# post → bid → award → escrow, because XRPL EscrowCreate requires the worker's
+# address to be known at creation time. There is no open-claim model.
 
 _MARKETPLACE_SEED_JOBS = [
     {
@@ -2504,56 +2504,59 @@ async def marketplace_jobs(
     db: Session = Depends(get_db),
 ):
     """
-    Machine-readable marketplace job listing for agents and API consumers.
-    Returns open bounties in structured JSON.
+    Machine-readable job listing for agents and API consumers.
+    Returns open job board posts — workers bid, buyer awards, then escrow is created.
 
-    Real on-chain jobs (vaults with status=OPEN and a marketplace flag) are
-    returned first, followed by demo seed jobs. Agents should check is_demo —
-    demo jobs have no live escrow to claim against.
+    XRPL escrow requires the worker's address at creation time, so there is no
+    open-claim model. All jobs (including 'bug bounty'-style) go through:
+    bid → award → create_escrow_vault → confirm_escrow_transaction → evaluate_escrow_work.
+
+    Use POST /jobs to post a job, POST /jobs/{id}/bid to bid, POST /jobs/{id}/award to award.
     """
     limit = min(limit, 100)
+    now   = datetime.now(timezone.utc)
 
     real_jobs = []
-    now = datetime.now(timezone.utc)
     try:
-        q = db.query(EscrowVault).filter(
-            EscrowVault.status == "LOCKED",
-            # Exclude vaults past their deadline (on-chain expired but not yet cancelled)
-            or_(EscrowVault.cancel_after_ts == None, EscrowVault.cancel_after_ts > now),
+        q = db.query(JobPosting).filter(
+            JobPosting.status == "open",
+            or_(JobPosting.expires_at == None, JobPosting.expires_at > now),
         )
         if category != "all":
-            q = q.filter(EscrowVault.category == category)
-        vaults = q.order_by(EscrowVault.created_at.desc()).limit(200).all()
-        for v in vaults:
-            if not v.task_description:
+            q = q.filter(JobPosting.category == category)
+        posts = q.order_by(JobPosting.created_at.desc()).limit(200).all()
+        for j in posts:
+            budget = j.budget_xrp or 0
+            if min_bounty_xrp > 0 and budget < min_bounty_xrp:
                 continue
-            bounty = v.amount_xrp or 0
-            if bounty < min_bounty_xrp:
-                continue
-            tags = []
             try:
-                tags = json.loads(v.marketplace_tags) if v.marketplace_tags else []
+                tags = json.loads(j.tags) if j.tags else []
             except Exception:
-                pass
+                tags = []
+            bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
+            expires_hrs = max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None
             real_jobs.append({
-                "id":           v.escrow_id,
-                "title":        v.project_label or f"Job {v.escrow_id}",
-                "description":  v.task_description,
-                "category":     v.category or "default",
-                "bounty":       bounty,
-                "currency":     v.currency or "XRP",
-                "poster":       v.buyer_address or "",
-                "poster_name":  v.buyer_name or "",
-                "deadline":     f"{v.cancel_after_ts.strftime('%d %b %Y %H:%M UTC')}" if v.cancel_after_ts else "—",
-                "deadline_hrs": max(0, int((v.cancel_after_ts.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600)) if v.cancel_after_ts else None,
+                "id":           j.id,
+                "title":        j.title,
+                "description":  j.description,
+                "category":     j.category or "default",
+                "bounty":       budget,
+                "currency":     "XRP",
+                "poster":       j.buyer_address or "",
+                "poster_name":  j.buyer_name or "",
+                "deadline":     j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
+                "deadline_hrs": expires_hrs,
                 "tags":         tags,
                 "status":       "OPEN",
+                "bid_count":    bid_count,
                 "is_demo":      False,
             })
+            if len(real_jobs) >= limit:
+                break
     except Exception as e:
         logger.warning(f"⚠️ marketplace_jobs DB query failed: {e}")
 
-    # Seed demo jobs — filter by category and bounty
+    # Seed demo jobs — shown when the job board is empty, illustrate the bid flow
     seed = _MARKETPLACE_SEED_JOBS
     if category != "all":
         seed = [j for j in seed if j["category"] == category]
@@ -2568,7 +2571,11 @@ async def marketplace_jobs(
         "real_jobs":       len(real_jobs),
         "demo_jobs":       len([j for j in combined if j.get("is_demo")]),
         "marketplace_url": f"{SITE_URL}/marketplace",
-        "note":            "Demo jobs (is_demo=true) are illustrative examples — no live escrow exists to claim against.",
+        "note":            (
+            "To claim a job: submit a bid via POST /jobs/{id}/bid. "
+            "The buyer awards your bid, then creates an escrow with your wallet address. "
+            "Demo jobs (is_demo=true) are illustrative — submit a real bid via the job board."
+        ),
     }
 
 
