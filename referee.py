@@ -51,13 +51,20 @@ load_dotenv()
 # 2. MCP SERVER (imported before app so its lifespan can be wired in)
 # ---------------------------------------------------------------------------
 # FastMCP 2.x uses Streamable HTTP transport (path="/" = endpoint at mount root).
-# The lifespan MUST be passed to FastAPI or the session manager won't initialise,
-# causing Smithery / MCP clients to receive a 405 or a task-group error.
+# stateless_http=True makes FastMCP handle each POST independently — no session
+# ID required. This is essential for Smithery's scanner, which does not send the
+# Mcp-Session-Id header on the second request (tools/list), causing a 400 that
+# Smithery misreads as "Authorization Required".
 _mcp_http_app = None
 try:
     from mcp_server import mcp
-    _mcp_http_app = mcp.http_app(path="/")
-    logger.info("✅ MCP server loaded (streamable HTTP, path='/')")
+    try:
+        _mcp_http_app = mcp.http_app(path="/", stateless_http=True)
+        logger.info("✅ MCP server loaded (stateless streamable HTTP)")
+    except TypeError:
+        # Older FastMCP versions don't have stateless_http — fall back
+        _mcp_http_app = mcp.http_app(path="/")
+        logger.info("✅ MCP server loaded (streamable HTTP, path='/')")
 except Exception as e:
     logger.error(f"❌ MCP server failed to load: {e}", exc_info=True)
 
