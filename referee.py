@@ -2229,45 +2229,61 @@ async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # 18. XRP PRICE
 # ---------------------------------------------------------------------------
+import time as _time
+
+# Module-level price cache — survives across requests within a process
+_xrp_price_cache: dict = {}
+_xrp_price_cache_ts: float = 0.0
+_XRP_PRICE_TTL: float = 60.0  # seconds
+
+
 @app.get("/xrp/price")
 async def get_xrp_price():
     """
-    Fetch live XRP price. Primary: CoinGecko. Fallback: Binance.
-    Returns last cached value if both fail — never logs a warning for expected transient failures.
+    Fetch live XRP price. Primary: Binance. Fallback: CoinGecko (rate-limited).
+    Cached for 60 s to avoid hitting external APIs on every request.
+    Returns last cached value if both sources fail.
     """
-    global _xrp_price_cache
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            res  = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": "ripple", "vs_currencies": "usd,gbp"},
-            )
-            data = res.json()
-            usd  = data["ripple"]["usd"]
-            gbp  = data["ripple"]["gbp"]
-            _xrp_price_cache = {"usd": usd, "gbp": gbp}
-            return _xrp_price_cache
-    except Exception:
-        pass  # try fallback silently
+    global _xrp_price_cache, _xrp_price_cache_ts
 
+    # Return cache if still fresh
+    if _xrp_price_cache and (_time.monotonic() - _xrp_price_cache_ts) < _XRP_PRICE_TTL:
+        return {**_xrp_price_cache, "cached": True}
+
+    # Primary: Binance (no rate limit on public ticker)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            res  = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
-            usd  = float(res.json()["price"])
-            # Approximate GBP via fixed ~0.79 ratio if no better source
-            gbp  = round(usd * 0.79, 4)
+            res = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
+            res.raise_for_status()
+            usd = float(res.json()["price"])
+            gbp = round(usd * 0.79, 4)
             _xrp_price_cache = {"usd": usd, "gbp": gbp}
+            _xrp_price_cache_ts = _time.monotonic()
             return _xrp_price_cache
     except Exception:
         pass
 
-    # Return last cached value if available, else null
+    # Fallback: CoinGecko (may be rate-limited; only reached if Binance fails)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "ripple", "vs_currencies": "usd,gbp"},
+            )
+            res.raise_for_status()
+            data = res.json()
+            usd  = data["ripple"]["usd"]
+            gbp  = data["ripple"]["gbp"]
+            _xrp_price_cache = {"usd": usd, "gbp": gbp}
+            _xrp_price_cache_ts = _time.monotonic()
+            return _xrp_price_cache
+    except Exception:
+        pass
+
+    # Return stale cache or null
     if _xrp_price_cache:
         return {**_xrp_price_cache, "cached": True}
     return {"usd": None, "gbp": None}
-
-# Module-level price cache — survives across requests within a process
-_xrp_price_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
