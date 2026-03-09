@@ -1,27 +1,20 @@
+runtime: python
 target: remote
 url: https://xrpl-referee.onrender.com/mcp/
+
 configSchema:
   type: object
+  # We leave properties empty because the server is configured via 
+  # environment variables on the host (Render).
+  properties: {}
   required: []
-  properties:
-    network:
-      type: string
-      title: XRPL Network
-      enum:
-        - mainnet
-        - testnet
-      description: >
-        XRPL network to use. Mainnet uses real XRP; testnet uses free test
-        XRP with no real value. Defaults to mainnet.
-      default: mainnet
-    base_url:
-      type: string
-      title: Service URL
-      description: >
-        Override the referee service URL for self-hosted deployments.
-        Defaults to the hosted service at https://xrpl-referee.onrender.com.
-      default: "https://xrpl-referee.onrender.com"
   additionalProperties: false
-exampleConfig:
-  network: testnet
-  base_url: "https://xrpl-referee.onrender.com"
+
+exampleConfig: {}
+
+# Metadata to help Smithery categorize and rank the server
+categories:
+  - blockchain
+  - crypto
+  - ai
+  - finance
