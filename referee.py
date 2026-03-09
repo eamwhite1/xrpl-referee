@@ -86,29 +86,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Smithery / MCP compatibility middleware:
-# 1. Block OAuth discovery endpoints so Smithery doesn't show "Authorization Required".
-# 2. Patch Accept header for MCP requests — FastMCP requires both application/json
-#    and text/event-stream per the MCP spec, but Smithery's scanner only sends
-#    application/json, causing a 406 Not Acceptable which Smithery misreports as
-#    a connection/auth error.
+# Smithery / MCP compatibility middleware — prevents "Authorization Required" prompt:
+# 1. Block all OAuth discovery endpoints (404) so Smithery never detects auth.
+# 2. Inject text/event-stream into Accept for MCP requests (FastMCP requires it
+#    per spec; Smithery's scanner only sends application/json → 406 without this).
+# 3. Strip WWW-Authenticate and OAuth Link headers from responses — newer FastMCP
+#    versions add these headers automatically, which Smithery reads as "needs auth".
 @app.middleware("http")
 async def mcp_smithery_compat(request, call_next):
     path = request.url.path
 
-    # Block OAuth discovery so Smithery doesn't prompt for sign-in
+    # Block every known OAuth/OIDC discovery path at both root and /mcp prefix
     blocked_oauth = {
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
         "/mcp/.well-known/oauth-protected-resource",
         "/mcp/.well-known/oauth-authorization-server",
+        "/mcp/.well-known/openid-configuration",
     }
     if path in blocked_oauth:
         from starlette.responses import Response as _SR
         return _SR(status_code=404)
 
-    # Inject text/event-stream into Accept header for MCP endpoint requests
-    # so FastMCP doesn't return 406 to scanners that only send application/json
+    # Inject text/event-stream into Accept for MCP endpoint requests
     if path.rstrip("/") == "/mcp" or path.startswith("/mcp/"):
         accept = request.headers.get("accept", "")
         if "text/event-stream" not in accept:
@@ -117,7 +118,15 @@ async def mcp_smithery_compat(request, call_next):
             new_hdrs.append((b"accept", new_accept))
             request.scope["headers"] = new_hdrs
 
-    return await call_next(request)
+    response = await call_next(request)
+
+    # Strip any auth-advertising headers that would trigger Smithery's auth prompt.
+    # FastMCP 2.3+ adds these even when no auth is configured.
+    for hdr in ("www-authenticate", "link"):
+        if hdr in response.headers:
+            del response.headers[hdr]
+
+    return response
 
 # Mount MCP at /mcp/ (Streamable HTTP — Smithery and MCP clients POST here).
 # We also mount at /mcp so Starlette's built-in redirect is replaced by our own
