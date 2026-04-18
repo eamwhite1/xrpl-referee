@@ -69,8 +69,16 @@ except Exception as e:
     logger.error(f"❌ MCP server failed to load: {e}", exc_info=True)
 
 
+class PaymentRequired(Exception):
+    """Carries an x402-compliant JSONResponse. Registered with FastAPI below."""
+    def __init__(self, response: JSONResponse):
+        self.response = response
+
+
 @asynccontextmanager
 async def _lifespan(app):
+    # XUMM connectivity check
+    await _verify_xumm()
     if _mcp_http_app is not None:
         # Pass the MCP http app itself (not the parent FastAPI app) so the
         # session manager stores its state in the correct app scope.
@@ -81,6 +89,12 @@ async def _lifespan(app):
 
 
 app = FastAPI(title="AgentTrust Protocol Core", lifespan=_lifespan)
+
+
+@app.exception_handler(PaymentRequired)
+async def _payment_required_handler(request: Request, exc: PaymentRequired):
+    return exc.response
+
 
 # ---------------------------------------------------------------------------
 # 2b. CORS
@@ -710,11 +724,7 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
         "error": error,
     }
     encoded = base64.b64encode(json.dumps(body).encode()).decode()
-    raise HTTPException(
-        status_code=402,
-        detail=body,
-        headers={"X-Payment-Required": encoded},
-    )
+    raise PaymentRequired(JSONResponse(status_code=402, content=body, headers={"X-Payment-Required": encoded}))
 
 
 try:
@@ -797,15 +807,6 @@ async def _verify_xumm():
     except Exception as e:
         logger.warning(f"⚠️ XUMM ping error: {e}")
 
-import asyncio as _asyncio
-try:
-    loop = _asyncio.get_event_loop()
-    if loop.is_running():
-        loop.create_task(_verify_xumm())
-    else:
-        loop.run_until_complete(_verify_xumm())
-except Exception:
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1999,10 +2000,6 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             ),
         )
 
-    # Increment submission count immediately (before audit — counts even failed attempts)
-    vault.submission_count = current_count + 1
-    db.commit()
-
     # 50 MB attachment cap
     total_bytes = 0
     for att in (req.worker_attachments or []):
@@ -2012,6 +2009,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             pass
     if total_bytes > 50 * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Total attachment size exceeds 50 MB.")
+
+    # Increment submission count immediately (before audit — counts even failed attempts)
+    vault.submission_count = current_count + 1
+    db.commit()
 
     stored_buyer_attachments = None
     if vault.buyer_attachments:
@@ -2079,7 +2080,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         # ── AUTO-FINISH: referee submits EscrowFinish, seller gets paid automatically ──
         # escrow_owner is who signed the EscrowCreate (buyer for bilateral, referee for open bounty)
         escrow_owner = vault.escrow_owner or vault.buyer_address
-        if vault.escrow_sequence and escrow_owner and vault.worker_address and referee_wallet:
+        if not escrow_owner:
+            logger.error(f"❌ AUTO-FINISH skipped for {req.escrow_id}: no owner address")
+        elif vault.escrow_sequence and vault.worker_address and referee_wallet:
             asyncio.create_task(auto_finish_escrow(
                 escrow_id            = req.escrow_id,
                 sequence             = vault.escrow_sequence,
