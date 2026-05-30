@@ -1171,6 +1171,48 @@ async def send_worker_receipt_email(
         logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
 
 
+async def send_bid_received_email(
+    worker_email: str,
+    worker_name:  str,
+    bid_id:       str,
+    job_id:       str,
+    job_title:    str,
+    proposed_xrp: float,
+):
+    """Confirm to a human bidder that their bid was received."""
+    if not RESEND_API_KEY or not worker_email:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      worker_email,
+            "subject": f"Bid received — {job_title}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Your bid has been received</h1>
+  <p>Hi{' ' + worker_name if worker_name else ''}, your bid of <strong>{proposed_xrp} XRP</strong>
+     on the following job has been successfully submitted:</p>
+  <div class="detail"><span>Job</span><br><strong>{job_title}</strong></div>
+  <div class="detail"><span>Bid ID</span><br><strong>{bid_id}</strong></div>
+  <div class="detail"><span>Your offer</span><br><strong>{proposed_xrp} XRP</strong></div>
+  <p>The buyer will review all bids and you'll receive another email if yours is accepted.
+     No action is needed from you right now.</p>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+     You can track the job status on the
+     <a href="{SITE_URL}/marketplace" style="color:#0066FF;">AgentTrust marketplace</a>
+     using job ID <strong>{job_id}</strong>.
+  </p>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Bid received email sent to {worker_email} for bid {bid_id}")
+    except Exception as e:
+        logger.error(f"❌ Bid received email failed for {bid_id}: {e}")
+
+
 async def send_bid_awarded_email(
     worker_email:  str,
     worker_name:   str,
@@ -2770,6 +2812,18 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
 
     has_email = bool(bid.worker_email)
     logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP | email={'yes' if has_email else 'no'}")
+
+    if has_email:
+        import asyncio
+        asyncio.create_task(send_bid_received_email(
+            worker_email = bid.worker_email,
+            worker_name  = bid.worker_name or "",
+            bid_id       = bid_id,
+            job_id       = job_id,
+            job_title    = job.title,
+            proposed_xrp = bid.proposed_xrp,
+        ))
+
     return {
         "status":         "submitted",
         "bid_id":         bid_id,
