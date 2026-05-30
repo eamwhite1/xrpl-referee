@@ -2782,7 +2782,6 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
     expires_hrs = int(body.get("expires_hrs") or 168)
     expires_at  = datetime.now(timezone.utc) + timedelta(hours=expires_hrs)
 
-    job = JobPosting(
     award_token      = secrets.token_urlsafe(32)
     award_token_hash = hashlib.sha256(award_token.encode()).hexdigest()
 
