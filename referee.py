@@ -434,6 +434,8 @@ class JobPosting(Base):
     escrow_id          = Column(String,   nullable=True)    # set by buyer after escrow created
     buyer_email        = Column(String,   nullable=True)    # optional — notified on new bids
     buyer_callback_url = Column(String,   nullable=True)    # optional — agent webhook on new bids
+    award_token_hash   = Column(String,   nullable=True)    # SHA-256 of the one-time award token
+    award_token        = Column(String,   nullable=True)    # plaintext — needed to embed in bid emails
 
 
 class Bid(Base):
@@ -544,6 +546,8 @@ def run_migrations():
         "ALTER TABLE bid ADD COLUMN IF NOT EXISTS callback_url        VARCHAR",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS buyer_email         VARCHAR",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS buyer_callback_url  VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS award_token_hash    VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS award_token         VARCHAR",
         """CREATE TABLE IF NOT EXISTS skill_listing (
             id          VARCHAR PRIMARY KEY,
             title       VARCHAR NOT NULL,
@@ -1190,12 +1194,18 @@ async def send_new_bid_buyer_email(
     proposed_xrp:   float,
     proposal:       str,
     total_bids:     int,
+    award_token:    str,
 ):
-    """Notify the job poster that a new bid has been received."""
+    """Notify the job poster that a new bid has been received, with a direct award link."""
     if not RESEND_API_KEY or not buyer_email:
         return
     try:
         short = worker_name or (worker_address[:6] + "…" + worker_address[-4:])
+        award_url = (
+            f"{SITE_URL}/marketplace"
+            f"?award_job={job_id}&award_bid={bid_id}&token={award_token}"
+        )
+        view_url = f"{SITE_URL}/marketplace?track_job={job_id}&token={award_token}"
         resend.Emails.send({
             "from":    RESEND_FROM,
             "to":      buyer_email,
@@ -1209,9 +1219,17 @@ async def send_new_bid_buyer_email(
   <div class="detail"><span>Their offer</span><br><strong>{proposed_xrp} XRP</strong></div>
   <div class="detail"><span>Proposal</span><br><span style="font-size:.85rem;">{proposal[:400]}{'…' if len(proposal) > 400 else ''}</span></div>
   <div class="detail"><span>Total bids so far</span><br><strong>{total_bids}</strong></div>
-  <p>To review all bids and select a winner, visit the
-     <a href="{SITE_URL}/marketplace" style="color:#0066FF;">AgentTrust marketplace</a>
-     and paste <strong>{job_id}</strong> into the "Track job ID" box in the top navigation.
+  <div style="margin:1.5rem 0;display:flex;gap:10px;flex-wrap:wrap;">
+    <a href="{award_url}" style="display:inline-block;padding:10px 20px;background:#10b981;color:#000;font-weight:700;font-family:'IBM Plex Sans',sans-serif;font-size:.9rem;border-radius:8px;text-decoration:none;">
+      ✓ Award this bid
+    </a>
+    <a href="{view_url}" style="display:inline-block;padding:10px 20px;background:#1a2230;color:#e2e8f0;font-weight:600;font-family:'IBM Plex Sans',sans-serif;font-size:.9rem;border-radius:8px;text-decoration:none;border:1px solid rgba(255,255,255,.12);">
+      View all bids
+    </a>
+  </div>
+  <p style="font-size:.8rem;color:#5c5c6e;">
+    These links are unique to you and authorise awarding this job.
+    Do not forward this email to the bidder.
   </p>
   <div class="footer">
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
@@ -2765,6 +2783,10 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
     expires_at  = datetime.now(timezone.utc) + timedelta(hours=expires_hrs)
 
     job = JobPosting(
+    award_token      = secrets.token_urlsafe(32)
+    award_token_hash = hashlib.sha256(award_token.encode()).hexdigest()
+
+    job = JobPosting(
         id                 = job_id,
         title              = title,
         description        = description,
@@ -2776,16 +2798,23 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         expires_at         = expires_at,
         buyer_email        = body.get("buyer_email") or None,
         buyer_callback_url = body.get("buyer_callback_url") or None,
+        award_token_hash   = award_token_hash,
+        award_token        = award_token,
     )
     db.add(job)
     db.commit()
 
     logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={body.get('budget_xrp')} XRP")
     return {
-        "status":     "posted",
-        "job_id":     job_id,
-        "expires_at": expires_at.strftime("%Y-%m-%d %H:%M UTC"),
-        "next_step":  "Worker agents can find this job via GET /jobs and bid via POST /jobs/{id}/bid.",
+        "status":      "posted",
+        "job_id":      job_id,
+        "expires_at":  expires_at.strftime("%Y-%m-%d %H:%M UTC"),
+        "award_token": award_token,
+        "next_step":   (
+            "Worker agents can find this job via GET /jobs and bid via POST /jobs/{id}/bid. "
+            "Store award_token securely — it is required to award a bid via POST /jobs/{id}/award "
+            "and is never shown again."
+        ),
     }
 
 
@@ -2951,6 +2980,7 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
             proposed_xrp   = bid.proposed_xrp,
             proposal       = bid.proposal,
             total_bids     = total_bids,
+            award_token    = job.award_token or "",
         ))
     if job.buyer_callback_url:
         asyncio.create_task(fire_new_bid_buyer_webhook(
@@ -2989,9 +3019,12 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
-    buyer_address = (body.get("buyer_address") or "").strip()
-    if not buyer_address or buyer_address.lower() != job.buyer_address.lower():
-        raise HTTPException(status_code=403, detail="Only the job poster can award this job.")
+    award_token = (body.get("award_token") or "").strip()
+    if not award_token:
+        raise HTTPException(status_code=403, detail="award_token is required to award a job.")
+    token_hash = hashlib.sha256(award_token.encode()).hexdigest()
+    if not job.award_token_hash or not secrets.compare_digest(token_hash, job.award_token_hash):
+        raise HTTPException(status_code=403, detail="Invalid award_token.")
     if job.status != "open":
         raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open (status: {job.status}).")
 
