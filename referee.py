@@ -430,8 +430,10 @@ class JobPosting(Base):
     status         = Column(String,   default="open")   # open, awarded, cancelled, expired
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at     = Column(DateTime, nullable=True)
-    awarded_bid_id = Column(String,   nullable=True)    # winning bid id
-    escrow_id      = Column(String,   nullable=True)    # set by buyer after escrow created
+    awarded_bid_id     = Column(String,   nullable=True)    # winning bid id
+    escrow_id          = Column(String,   nullable=True)    # set by buyer after escrow created
+    buyer_email        = Column(String,   nullable=True)    # optional — notified on new bids
+    buyer_callback_url = Column(String,   nullable=True)    # optional — agent webhook on new bids
 
 
 class Bid(Base):
@@ -442,6 +444,7 @@ class Bid(Base):
     worker_address = Column(String,   nullable=False)
     worker_name    = Column(String,   nullable=True)
     worker_email   = Column(String,   nullable=True)   # optional — triggers award + escrow emails
+    callback_url   = Column(String,   nullable=True)   # optional — agent webhook on award
     proposed_xrp   = Column(Float,    nullable=False)
     proposal       = Column(Text,     nullable=False)   # pitch / approach
     status         = Column(String,   default="pending")  # pending, accepted, rejected
@@ -522,7 +525,9 @@ def run_migrations():
             created_at      TIMESTAMP,
             expires_at      TIMESTAMP,
             awarded_bid_id  VARCHAR,
-            escrow_id       VARCHAR
+            escrow_id       VARCHAR,
+            buyer_email     VARCHAR,
+            buyer_callback_url VARCHAR
         )""",
         """CREATE TABLE IF NOT EXISTS bid (
             id              VARCHAR PRIMARY KEY,
@@ -535,7 +540,10 @@ def run_migrations():
             status          VARCHAR DEFAULT 'pending',
             created_at      TIMESTAMP
         )""",
-        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS worker_email VARCHAR",
+        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS worker_email        VARCHAR",
+        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS callback_url        VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS buyer_email         VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS buyer_callback_url  VARCHAR",
         """CREATE TABLE IF NOT EXISTS skill_listing (
             id          VARCHAR PRIMARY KEY,
             title       VARCHAR NOT NULL,
@@ -1171,6 +1179,81 @@ async def send_worker_receipt_email(
         logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
 
 
+async def send_new_bid_buyer_email(
+    buyer_email:    str,
+    buyer_name:     str,
+    job_id:         str,
+    job_title:      str,
+    bid_id:         str,
+    worker_name:    str,
+    worker_address: str,
+    proposed_xrp:   float,
+    proposal:       str,
+    total_bids:     int,
+):
+    """Notify the job poster that a new bid has been received."""
+    if not RESEND_API_KEY or not buyer_email:
+        return
+    try:
+        short = worker_name or (worker_address[:6] + "…" + worker_address[-4:])
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      buyer_email,
+            "subject": f"New bid on your job — {job_title}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>New bid received</h1>
+  <p>Hi{' ' + buyer_name if buyer_name else ''}, <strong>{short}</strong> has placed a bid on your job:</p>
+  <div class="detail"><span>Job</span><br><strong>{job_title}</strong></div>
+  <div class="detail"><span>Their offer</span><br><strong>{proposed_xrp} XRP</strong></div>
+  <div class="detail"><span>Proposal</span><br><span style="font-size:.85rem;">{proposal[:400]}{'…' if len(proposal) > 400 else ''}</span></div>
+  <div class="detail"><span>Total bids so far</span><br><strong>{total_bids}</strong></div>
+  <p>To review all bids and select a winner, visit the
+     <a href="{SITE_URL}/marketplace" style="color:#0066FF;">AgentTrust marketplace</a>
+     and paste <strong>{job_id}</strong> into the "Track job ID" box in the top navigation.
+  </p>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 New-bid buyer email sent to {buyer_email} for job {job_id} (bid {bid_id})")
+    except Exception as e:
+        logger.error(f"❌ New-bid buyer email failed for job {job_id}: {e}")
+
+
+async def fire_new_bid_buyer_webhook(
+    callback_url:   str,
+    job_id:         str,
+    job_title:      str,
+    bid_id:         str,
+    worker_address: str,
+    worker_name:    str,
+    proposed_xrp:   float,
+    proposal:       str,
+    total_bids:     int,
+):
+    """POST new-bid notification to the job poster's callback URL (fire-and-forget)."""
+    payload = {
+        "event":          "job.new_bid",
+        "job_id":         job_id,
+        "job_title":      job_title,
+        "bid_id":         bid_id,
+        "worker_address": worker_address,
+        "worker_name":    worker_name,
+        "proposed_xrp":   proposed_xrp,
+        "proposal":       proposal,
+        "total_bids":     total_bids,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(callback_url, json=payload)
+            logger.info(f"📡 New-bid webhook delivered to {callback_url} (HTTP {r.status_code}) for job {job_id}")
+    except Exception as e:
+        logger.error(f"❌ New-bid webhook failed for job {job_id} → {callback_url}: {e}")
+
+
 async def send_bid_received_email(
     worker_email: str,
     worker_name:  str,
@@ -1199,9 +1282,9 @@ async def send_bid_received_email(
   <p>The buyer will review all bids and you'll receive another email if yours is accepted.
      No action is needed from you right now.</p>
   <p style="font-size:.85rem;color:#5c5c6e;">
-     You can track the job status on the
+     Track your bid on the
      <a href="{SITE_URL}/marketplace" style="color:#0066FF;">AgentTrust marketplace</a>
-     using job ID <strong>{job_id}</strong>.
+     — paste <strong>{job_id}</strong> into the "Track job ID" box in the top navigation.
   </p>
   <div class="footer">
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
@@ -1211,6 +1294,31 @@ async def send_bid_received_email(
         logger.info(f"📧 Bid received email sent to {worker_email} for bid {bid_id}")
     except Exception as e:
         logger.error(f"❌ Bid received email failed for {bid_id}: {e}")
+
+
+async def fire_bid_awarded_webhook(
+    callback_url: str,
+    bid_id:       str,
+    job_id:       str,
+    job_title:    str,
+    agreed_xrp:   float,
+    worker_address: str,
+):
+    """POST award notification to an agent's callback URL (fire-and-forget)."""
+    payload = {
+        "event":          "bid.awarded",
+        "bid_id":         bid_id,
+        "job_id":         job_id,
+        "job_title":      job_title,
+        "agreed_xrp":     agreed_xrp,
+        "worker_address": worker_address,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(callback_url, json=payload)
+            logger.info(f"📡 Award webhook delivered to {callback_url} (HTTP {r.status_code}) for bid {bid_id}")
+    except Exception as e:
+        logger.error(f"❌ Award webhook failed for bid {bid_id} → {callback_url}: {e}")
 
 
 async def send_bid_awarded_email(
@@ -2657,15 +2765,17 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
     expires_at  = datetime.now(timezone.utc) + timedelta(hours=expires_hrs)
 
     job = JobPosting(
-        id            = job_id,
-        title         = title,
-        description   = description,
-        budget_xrp    = body.get("budget_xrp"),
-        buyer_address = buyer_address,
-        buyer_name    = body.get("buyer_name") or "",
-        category      = body.get("category") or "default",
-        tags          = json.dumps(body.get("tags") or []),
-        expires_at    = expires_at,
+        id                 = job_id,
+        title              = title,
+        description        = description,
+        budget_xrp         = body.get("budget_xrp"),
+        buyer_address      = buyer_address,
+        buyer_name         = body.get("buyer_name") or "",
+        category           = body.get("category") or "default",
+        tags               = json.dumps(body.get("tags") or []),
+        expires_at         = expires_at,
+        buyer_email        = body.get("buyer_email") or None,
+        buyer_callback_url = body.get("buyer_callback_url") or None,
     )
     db.add(job)
     db.commit()
@@ -2804,17 +2914,22 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         worker_address = worker_address,
         worker_name    = body.get("worker_name") or "",
         worker_email   = body.get("worker_email") or None,
+        callback_url   = body.get("callback_url") or None,
         proposed_xrp   = float(proposed_xrp),
         proposal       = proposal,
     )
     db.add(bid)
     db.commit()
 
-    has_email = bool(bid.worker_email)
-    logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP | email={'yes' if has_email else 'no'}")
+    has_email    = bool(bid.worker_email)
+    has_callback = bool(bid.callback_url)
+    logger.info(f"💼 BID SUBMITTED: {bid_id} | job={job_id} | worker={worker_address} | price={proposed_xrp} XRP | email={'yes' if has_email else 'no'} | webhook={'yes' if has_callback else 'no'}")
 
+    total_bids = db.query(Bid).filter(Bid.job_id == job_id).count()
+
+    import asyncio
+    # Notify the bidder (worker)
     if has_email:
-        import asyncio
         asyncio.create_task(send_bid_received_email(
             worker_email = bid.worker_email,
             worker_name  = bid.worker_name or "",
@@ -2823,13 +2938,40 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
             job_title    = job.title,
             proposed_xrp = bid.proposed_xrp,
         ))
+    # Notify the job poster (buyer) — works for both humans (email) and agents (webhook)
+    if job.buyer_email:
+        asyncio.create_task(send_new_bid_buyer_email(
+            buyer_email    = job.buyer_email,
+            buyer_name     = job.buyer_name or "",
+            job_id         = job_id,
+            job_title      = job.title,
+            bid_id         = bid_id,
+            worker_name    = bid.worker_name or "",
+            worker_address = bid.worker_address,
+            proposed_xrp   = bid.proposed_xrp,
+            proposal       = bid.proposal,
+            total_bids     = total_bids,
+        ))
+    if job.buyer_callback_url:
+        asyncio.create_task(fire_new_bid_buyer_webhook(
+            callback_url   = job.buyer_callback_url,
+            job_id         = job_id,
+            job_title      = job.title,
+            bid_id         = bid_id,
+            worker_address = bid.worker_address,
+            worker_name    = bid.worker_name or "",
+            proposed_xrp   = bid.proposed_xrp,
+            proposal       = bid.proposal,
+            total_bids     = total_bids,
+        ))
 
     return {
         "status":         "submitted",
         "bid_id":         bid_id,
         "job_id":         job_id,
         "proposed_xrp":   float(proposed_xrp),
-        "email_on_award": has_email,
+        "email_on_award":    has_email,
+        "webhook_on_award":  has_callback,
         "next_step":      "The buyer will review bids and award the job. Check back via GET /jobs/{job_id}.",
     }
 
@@ -2874,9 +3016,8 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
 
     logger.info(f"🏆 JOB AWARDED: {job_id} → bid={bid_id} | worker={bid.worker_address} | price={bid.proposed_xrp} XRP")
 
-    # Notify human worker (fire-and-forget; agents don't need this)
+    import asyncio
     if bid.worker_email:
-        import asyncio
         asyncio.create_task(send_bid_awarded_email(
             worker_email = bid.worker_email,
             worker_name  = bid.worker_name or "",
@@ -2884,6 +3025,15 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
             job_title    = job.title,
             buyer_name   = job.buyer_name or "the buyer",
             agreed_xrp   = bid.proposed_xrp,
+        ))
+    if bid.callback_url:
+        asyncio.create_task(fire_bid_awarded_webhook(
+            callback_url   = bid.callback_url,
+            bid_id         = bid_id,
+            job_id         = job_id,
+            job_title      = job.title,
+            agreed_xrp     = bid.proposed_xrp,
+            worker_address = bid.worker_address,
         ))
 
     worker_email_hint = (
