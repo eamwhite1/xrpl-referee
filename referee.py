@@ -2942,6 +2942,7 @@ async def list_jobs(
             "tags":         tags,
             "status":       j.status,
             "bid_count":    bid_count,
+            "created_at":   j.created_at.isoformat() if j.created_at else None,
             "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
             "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
         })
