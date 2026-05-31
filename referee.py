@@ -598,6 +598,13 @@ RLUSD_ISSUER   = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
 RLUSD_CURRENCY = "RLUSD"
 RLUSD_HEX      = "524C555344000000000000000000000000000000"
 
+# lsfAllowTrustLineLocking (0x20000000) — issuer must set this for XLS-85 token escrow to work.
+# Ripple has not yet enabled it on the RLUSD issuer account (as of May 2026).
+# We cache the result for 1 hour so we're not polling the ledger on every escrow request.
+LSF_ALLOW_TRUSTLINE_LOCKING = 0x20000000
+_rlusd_escrow_supported_cache: dict = {"value": None, "checked_at": 0}
+RLUSD_ESCROW_CACHE_TTL = 3600  # seconds
+
 RESEND_API_KEY       = os.getenv("RESEND_API_KEY")
 RESEND_FROM          = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
 DELIVERY_EXPIRY_DAYS = 7
@@ -977,6 +984,33 @@ async def check_rlusd_trustline(address: str) -> bool:
             return any(l.get("currency") == RLUSD_CURRENCY for l in lines)
     except Exception as e:
         logger.warning(f"⚠️ Trustline check failed for {address}: {e}")
+        return False
+
+
+async def check_rlusd_escrow_supported() -> bool:
+    """
+    Returns True if the RLUSD issuer has lsfAllowTrustLineLocking set,
+    meaning XLS-85 token escrow is live for RLUSD.
+    Result is cached for RLUSD_ESCROW_CACHE_TTL seconds to avoid hammering the ledger.
+    """
+    import time
+    cache = _rlusd_escrow_supported_cache
+    if cache["value"] is not None and (time.time() - cache["checked_at"]) < RLUSD_ESCROW_CACHE_TTL:
+        return cache["value"]
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(
+                XRPL_URL,
+                json={"method": "account_info", "params": [{"account": RLUSD_ISSUER, "ledger_index": "validated"}]},
+            )
+            flags = res.json().get("result", {}).get("account_data", {}).get("Flags", 0)
+            supported = bool(flags & LSF_ALLOW_TRUSTLINE_LOCKING)
+            cache["value"]      = supported
+            cache["checked_at"] = time.time()
+            logger.info(f"🔍 RLUSD escrow supported (lsfAllowTrustLineLocking): {supported} (flags={hex(flags)})")
+            return supported
+    except Exception as e:
+        logger.warning(f"⚠️ RLUSD escrow flag check failed: {e} — assuming not supported")
         return False
 
 
@@ -1938,6 +1972,21 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             )
     if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
         raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
+
+    # For RLUSD escrow, first check the issuer has enabled trust line locking (XLS-85 requirement)
+    if currency == "RLUSD":
+        if not await check_rlusd_escrow_supported():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "RLUSD escrow is not currently available. "
+                    "XLS-85 token escrow is live on XRPL mainnet, but the RLUSD issuer (Ripple) "
+                    "has not yet enabled the lsfAllowTrustLineLocking flag on their issuer account — "
+                    "this is required before RLUSD can be held in escrow. "
+                    "In the meantime, use XRP escrow: the seller can swap to RLUSD via the XRPL DEX after release. "
+                    "This message will disappear automatically once Ripple enables the flag."
+                ),
+            )
 
     # For RLUSD escrow, validate both wallets have trustlines
     if currency == "RLUSD":
