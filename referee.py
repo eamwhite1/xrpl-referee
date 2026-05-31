@@ -1362,17 +1362,14 @@ async def send_bid_received_email(
   <h1>Your bid has been received</h1>
   <p>Hi{' ' + worker_name if worker_name else ''}, your bid of <strong>{proposed_xrp} XRP</strong>
      on the following job has been successfully submitted:</p>
-  <div class="detail"><span>Job</span><br><strong>{job_title}</strong></div>
-  <div class="detail"><span>Bid ID</span><br><strong>{bid_id}</strong></div>
+  <div class="detail"><span>Job ID</span><br><strong style="font-size:1.1rem;letter-spacing:.03em;">{job_id}</strong>
+    <br><span style="font-size:.78rem;color:#5c5c6e;">← paste this into "Track job ID" on the marketplace</span></div>
+  <div class="detail"><span>Job title</span><br><strong>{job_title}</strong></div>
   <div class="detail"><span>Your offer</span><br><strong>{proposed_xrp} XRP</strong></div>
+  <div class="detail"><span>Your bid reference</span><br><span style="font-size:.85rem;color:#5c5c6e;">{bid_id}</span></div>
   <p>The buyer will review all bids and you'll receive another email if yours is accepted.
      No action is needed from you right now.</p>
   {chat_section}
-  <p style="font-size:.85rem;color:#5c5c6e;">
-     Track your bid on the
-     <a href="{track_url}" style="color:#0066FF;">AgentTrust marketplace</a>
-     — paste <strong>{job_id}</strong> into the "Track job ID" box in the top navigation.
-  </p>
   <div class="footer">
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
   </div>
@@ -3188,6 +3185,15 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
             + (f" {worker_email_hint}" if worker_email_hint else "")
         ),
     }
+
+
+@app.get("/bids/{bid_id}")
+async def get_bid(bid_id: str, db: Session = Depends(get_db)):
+    """Look up a bid by ID — returns its job_id so the UI can redirect to the job tracker."""
+    bid = db.query(Bid).filter(Bid.id == bid_id).first()
+    if not bid:
+        raise HTTPException(status_code=404, detail=f"Bid '{bid_id}' not found.")
+    return {"bid_id": bid.id, "job_id": bid.job_id, "status": bid.status}
 
 
 # ---------------------------------------------------------------------------
