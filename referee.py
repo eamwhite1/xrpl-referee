@@ -3185,6 +3185,47 @@ class SkillListingRequest(BaseModel):
     tags:        Optional[list[str]] = None
 
 
+@app.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Cancel an open job posting. Requires the award_token issued when the job was posted.
+    Not permitted once an escrow has been created — the on-chain escrow governs from that point.
+    """
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    award_token = (body.get("award_token") or "").strip()
+    if not award_token:
+        raise HTTPException(status_code=403, detail="award_token is required to cancel a job.")
+    token_hash = hashlib.sha256(award_token.encode()).hexdigest()
+    if not job.award_token_hash or not secrets.compare_digest(token_hash, job.award_token_hash):
+        raise HTTPException(status_code=403, detail="Invalid award_token.")
+
+    if job.escrow_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This job has an active escrow ({job.escrow_id}) and cannot be cancelled here. "
+                "The escrow is held on the XRP Ledger — funds will automatically return to the buyer "
+                "if the worker does not complete the task before the escrow's cancel-after time."
+            ),
+        )
+
+    if job.status in ("cancelled", "expired"):
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' is already {job.status}.")
+
+    job.status = "cancelled"
+    db.commit()
+
+    logger.info(f"🗑️ JOB CANCELLED: {job_id} | was={job.status}")
+    return {
+        "status":  "cancelled",
+        "job_id":  job_id,
+        "message": "Job has been cancelled and removed from the marketplace.",
+    }
+
+
 @app.get("/marketplace/skills")
 async def marketplace_skills(
     category:  str   = "all",
