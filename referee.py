@@ -447,10 +447,24 @@ class Bid(Base):
     worker_name    = Column(String,   nullable=True)
     worker_email   = Column(String,   nullable=True)   # optional — triggers award + escrow emails
     callback_url   = Column(String,   nullable=True)   # optional — agent webhook on award
+    chat_token     = Column(String,   nullable=True)   # plaintext token for worker to access chat
+    chat_token_hash= Column(String,   nullable=True)   # SHA-256 hash stored for verification
     proposed_xrp   = Column(Float,    nullable=False)
     proposal       = Column(Text,     nullable=False)   # pitch / approach
     status         = Column(String,   default="pending")  # pending, accepted, rejected
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class JobMessage(Base):
+    """A chat message between buyer and worker on a job."""
+    __tablename__ = "job_message"
+    id           = Column(Integer,  primary_key=True, autoincrement=True)
+    job_id       = Column(String,   nullable=False, index=True)
+    bid_id       = Column(String,   nullable=True)   # which worker's thread (if worker)
+    sender_role  = Column(String,   nullable=False)  # "buyer" or "worker"
+    sender_name  = Column(String,   nullable=True)
+    message      = Column(Text,     nullable=False)
+    created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class SkillListing(Base):
@@ -544,6 +558,17 @@ def run_migrations():
         )""",
         "ALTER TABLE bid ADD COLUMN IF NOT EXISTS worker_email        VARCHAR",
         "ALTER TABLE bid ADD COLUMN IF NOT EXISTS callback_url        VARCHAR",
+        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS chat_token          VARCHAR",
+        "ALTER TABLE bid ADD COLUMN IF NOT EXISTS chat_token_hash     VARCHAR",
+        """CREATE TABLE IF NOT EXISTS job_message (
+            id           SERIAL PRIMARY KEY,
+            job_id       VARCHAR NOT NULL,
+            bid_id       VARCHAR,
+            sender_role  VARCHAR NOT NULL,
+            sender_name  VARCHAR,
+            message      TEXT    NOT NULL,
+            created_at   TIMESTAMP
+        )""",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS buyer_email         VARCHAR",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS buyer_callback_url  VARCHAR",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS award_token_hash    VARCHAR",
@@ -1313,10 +1338,19 @@ async def send_bid_received_email(
     job_id:       str,
     job_title:    str,
     proposed_xrp: float,
+    chat_token:   str = "",
 ):
     """Confirm to a human bidder that their bid was received."""
     if not RESEND_API_KEY or not worker_email:
         return
+    chat_url  = f"{SITE_URL}/marketplace?chat_job={job_id}&chat_token={chat_token}" if chat_token else None
+    track_url = f"{SITE_URL}/marketplace?chat_job={job_id}&chat_token={chat_token}" if chat_token else f"{SITE_URL}/marketplace"
+    chat_section = (
+        f'<p style="margin-top:1rem;"><a href="{chat_url}" '
+        f'style="display:inline-block;padding:10px 24px;background:#0066FF;color:#fff;border-radius:6px;'
+        f'text-decoration:none;font-weight:600;font-size:.9rem;">💬 Open Job Chat</a></p>'
+        f'<p style="font-size:.8rem;color:#5c5c6e;">Use this link to chat with the buyer about the job. Keep it private.</p>'
+    ) if chat_token else ""
     try:
         resend.Emails.send({
             "from":    RESEND_FROM,
@@ -1333,9 +1367,10 @@ async def send_bid_received_email(
   <div class="detail"><span>Your offer</span><br><strong>{proposed_xrp} XRP</strong></div>
   <p>The buyer will review all bids and you'll receive another email if yours is accepted.
      No action is needed from you right now.</p>
+  {chat_section}
   <p style="font-size:.85rem;color:#5c5c6e;">
      Track your bid on the
-     <a href="{SITE_URL}/marketplace" style="color:#0066FF;">AgentTrust marketplace</a>
+     <a href="{track_url}" style="color:#0066FF;">AgentTrust marketplace</a>
      — paste <strong>{job_id}</strong> into the "Track job ID" box in the top navigation.
   </p>
   <div class="footer">
@@ -2974,6 +3009,8 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
     worker_address = (body.get("worker_address") or "").strip()
     proposed_xrp   = body.get("proposed_xrp")
     proposal       = (body.get("proposal") or "").strip()
+    worker_email   = (body.get("worker_email") or "").strip() or None
+    callback_url   = (body.get("callback_url") or "").strip() or None
 
     if not worker_address or not worker_address.startswith("r"):
         raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
@@ -2981,19 +3018,29 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="proposed_xrp must be > 0.")
     if not proposal:
         raise HTTPException(status_code=400, detail="proposal is required — describe your approach.")
+    if not worker_email and not callback_url:
+        raise HTTPException(
+            status_code=400,
+            detail="worker_email is required for human bidders. AI agents may provide callback_url instead."
+        )
 
     import uuid
     bid_id = f"BID-{uuid.uuid4().hex[:8].upper()}"
 
+    raw_chat_token  = secrets.token_urlsafe(32)
+    chat_token_hash = hashlib.sha256(raw_chat_token.encode()).hexdigest()
+
     bid = Bid(
-        id             = bid_id,
-        job_id         = job_id,
-        worker_address = worker_address,
-        worker_name    = body.get("worker_name") or "",
-        worker_email   = body.get("worker_email") or None,
-        callback_url   = body.get("callback_url") or None,
-        proposed_xrp   = float(proposed_xrp),
-        proposal       = proposal,
+        id              = bid_id,
+        job_id          = job_id,
+        worker_address  = worker_address,
+        worker_name     = body.get("worker_name") or "",
+        worker_email    = worker_email,
+        callback_url    = callback_url,
+        chat_token      = raw_chat_token,
+        chat_token_hash = chat_token_hash,
+        proposed_xrp    = float(proposed_xrp),
+        proposal        = proposal,
     )
     db.add(bid)
     db.commit()
@@ -3014,6 +3061,7 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
             job_id       = job_id,
             job_title    = job.title,
             proposed_xrp = bid.proposed_xrp,
+            chat_token   = bid.chat_token or "",
         ))
     # Notify the job poster (buyer) — works for both humans (email) and agents (webhook)
     if job.buyer_email:
@@ -3044,13 +3092,15 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         ))
 
     return {
-        "status":         "submitted",
-        "bid_id":         bid_id,
-        "job_id":         job_id,
-        "proposed_xrp":   float(proposed_xrp),
+        "status":            "submitted",
+        "bid_id":            bid_id,
+        "job_id":            job_id,
+        "proposed_xrp":      float(proposed_xrp),
         "email_on_award":    has_email,
         "webhook_on_award":  has_callback,
-        "next_step":      "The buyer will review bids and award the job. Check back via GET /jobs/{job_id}.",
+        "chat_token":        raw_chat_token,
+        "chat_url":          f"{SITE_URL}/marketplace?chat_job={job_id}&chat_token={raw_chat_token}",
+        "next_step":         "The buyer will review bids and award the job. Check back via GET /jobs/{job_id}. Use chat_url to message the buyer.",
     }
 
 
@@ -3138,6 +3188,78 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
             + (f" {worker_email_hint}" if worker_email_hint else "")
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# JOB CHAT
+# ---------------------------------------------------------------------------
+
+def _resolve_chat_sender(job, token: str, db):
+    """Return (role, name, bid_id) or raise HTTPException if token invalid."""
+    # Check buyer token
+    if job.award_token_hash:
+        t_hash = hashlib.sha256(token.encode()).hexdigest()
+        if secrets.compare_digest(t_hash, job.award_token_hash):
+            return "buyer", job.buyer_name or "Buyer", None
+    # Check worker chat tokens across all bids
+    bids = db.query(Bid).filter(Bid.job_id == job.id).all()
+    for bid in bids:
+        if bid.chat_token_hash:
+            t_hash = hashlib.sha256(token.encode()).hexdigest()
+            if secrets.compare_digest(t_hash, bid.chat_token_hash):
+                return "worker", bid.worker_name or "Worker", bid.id
+    raise HTTPException(status_code=403, detail="Invalid token. Use your award token (buyer) or chat token (worker).")
+
+
+@app.get("/jobs/{job_id}/messages")
+async def get_messages(job_id: str, token: str = "", db: Session = Depends(get_db)):
+    """Fetch chat messages for a job. Requires award_token (buyer) or chat_token (worker)."""
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    if not token:
+        raise HTTPException(status_code=403, detail="token query parameter required.")
+    role, name, bid_id = _resolve_chat_sender(job, token, db)
+    msgs = db.query(JobMessage).filter(JobMessage.job_id == job_id).order_by(JobMessage.created_at).all()
+    return {
+        "job_id":   job_id,
+        "role":     role,
+        "messages": [
+            {
+                "id":          m.id,
+                "sender_role": m.sender_role,
+                "sender_name": m.sender_name,
+                "message":     m.message,
+                "created_at":  m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in msgs
+        ],
+    }
+
+
+@app.post("/jobs/{job_id}/messages")
+async def post_message(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """Post a chat message. Body: {token, message}."""
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    token   = (body.get("token") or "").strip()
+    message = (body.get("message") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required.")
+    if not message:
+        raise HTTPException(status_code=400, detail="message cannot be empty.")
+    role, name, bid_id = _resolve_chat_sender(job, token, db)
+    msg = JobMessage(
+        job_id      = job_id,
+        bid_id      = bid_id,
+        sender_role = role,
+        sender_name = name,
+        message     = message,
+    )
+    db.add(msg)
+    db.commit()
+    return {"status": "sent", "id": msg.id, "sender_role": role}
 
 
 # ---------------------------------------------------------------------------
