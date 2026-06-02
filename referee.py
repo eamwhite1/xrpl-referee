@@ -3023,7 +3023,7 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
             "proposed_xrp":  b.proposed_xrp,
             "proposal":      b.proposal,
             "status":        b.status,
-            "created_at":    b.created_at.strftime("%Y-%m-%d %H:%M UTC") if b.created_at else None,
+            "created_at":    b.created_at.isoformat() if b.created_at else None,
         }
         for b in bids
     ]
@@ -3075,6 +3075,14 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=400,
             detail="worker_email is required for human bidders. AI agents may provide callback_url instead."
+        )
+
+    # Prevent duplicate bids from the same wallet on the same job
+    existing_bid = db.query(Bid).filter(Bid.job_id == job_id, Bid.worker_address == worker_address).first()
+    if existing_bid:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Wallet {worker_address} has already submitted a bid ({existing_bid.id}) on this job. Update your proposal by contacting the buyer via chat."
         )
 
     import uuid
