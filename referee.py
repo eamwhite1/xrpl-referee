@@ -3003,15 +3003,33 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
     bids = db.query(Bid).filter(Bid.job_id == job_id).order_by(Bid.created_at.asc()).all()
+
+    # Fetch message metadata per bid in one query to avoid N+1
+    all_msgs = (
+        db.query(JobMessage.bid_id, JobMessage.sender_role, JobMessage.created_at)
+        .filter(JobMessage.job_id == job_id)
+        .all()
+    )
+    from collections import defaultdict
+    worker_msg_counts: dict = defaultdict(int)
+    last_msg_at: dict = {}
+    for m in all_msgs:
+        if m.sender_role == "worker":
+            worker_msg_counts[m.bid_id] += 1
+        if m.bid_id not in last_msg_at or (m.created_at and m.created_at > last_msg_at[m.bid_id]):
+            last_msg_at[m.bid_id] = m.created_at
+
     bids_out = [
         {
-            "bid_id":        b.id,
-            "worker_address": b.worker_address,
-            "worker_name":   b.worker_name or "",
-            "proposed_xrp":  b.proposed_xrp,
-            "proposal":      b.proposal,
-            "status":        b.status,
-            "created_at":    b.created_at.isoformat() if b.created_at else None,
+            "bid_id":               b.id,
+            "worker_address":       b.worker_address,
+            "worker_name":          b.worker_name or "",
+            "proposed_xrp":         b.proposed_xrp,
+            "proposal":             b.proposal,
+            "status":               b.status,
+            "created_at":           b.created_at.isoformat() if b.created_at else None,
+            "worker_message_count": worker_msg_counts[b.id],
+            "last_message_at":      last_msg_at[b.id].isoformat() if last_msg_at.get(b.id) else None,
         }
         for b in bids
     ]
