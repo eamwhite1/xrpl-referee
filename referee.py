@@ -1387,8 +1387,8 @@ async def send_bid_received_email(
     """Confirm to a human bidder that their bid was received."""
     if not RESEND_API_KEY or not worker_email:
         return
-    chat_url  = f"{SITE_URL}/marketplace?chat_job={job_id}&chat_token={chat_token}" if chat_token else None
-    track_url = f"{SITE_URL}/marketplace?chat_job={job_id}&chat_token={chat_token}" if chat_token else f"{SITE_URL}/marketplace"
+    chat_url  = f"{SITE_URL}/marketplace?chat_bid={bid_id}&chat_token={chat_token}" if chat_token else None
+    track_url = chat_url or f"{SITE_URL}/marketplace"
     chat_section = (
         f'<p style="margin-top:1rem;"><a href="{chat_url}" '
         f'style="display:inline-block;padding:10px 24px;background:#0066FF;color:#fff;border-radius:6px;'
@@ -3253,39 +3253,49 @@ async def get_bid(bid_id: str, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# JOB CHAT
+# BID CHAT  (one private thread per bid, between buyer and that worker only)
 # ---------------------------------------------------------------------------
 
-def _resolve_chat_sender(job, token: str, db):
-    """Return (role, name, bid_id) or raise HTTPException if token invalid."""
-    # Check buyer token
-    if job.award_token_hash:
-        t_hash = hashlib.sha256(token.encode()).hexdigest()
-        if secrets.compare_digest(t_hash, job.award_token_hash):
-            return "buyer", job.buyer_name or "Buyer", None
-    # Check worker chat tokens across all bids
-    bids = db.query(Bid).filter(Bid.job_id == job.id).all()
-    for bid in bids:
-        if bid.chat_token_hash:
-            t_hash = hashlib.sha256(token.encode()).hexdigest()
-            if secrets.compare_digest(t_hash, bid.chat_token_hash):
-                return "worker", bid.worker_name or "Worker", bid.id
-    raise HTTPException(status_code=403, detail="Invalid token. Use your award token (buyer) or chat token (worker).")
+def _resolve_bid_chat_sender(bid: "Bid", job: "JobPosting", token: str):
+    """
+    Return (role, name) or raise 403.
+    - Buyer proves identity with the job's award_token.
+    - Worker proves identity with their bid's chat_token.
+    Both tokens are verified as SHA-256 hashes.
+    """
+    t_hash = hashlib.sha256(token.encode()).hexdigest()
+    if job.award_token_hash and secrets.compare_digest(t_hash, job.award_token_hash):
+        return "buyer", job.buyer_name or "Buyer"
+    if bid.chat_token_hash and secrets.compare_digest(t_hash, bid.chat_token_hash):
+        return "worker", bid.worker_name or "Worker"
+    raise HTTPException(
+        status_code=403,
+        detail="Invalid token. Buyers use their award token; workers use the chat token from their bid confirmation email."
+    )
 
 
-@app.get("/jobs/{job_id}/messages")
-async def get_messages(job_id: str, token: str = "", db: Session = Depends(get_db)):
-    """Fetch chat messages for a job. Requires award_token (buyer) or chat_token (worker)."""
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+@app.get("/bids/{bid_id}/messages")
+async def get_bid_messages(bid_id: str, token: str = "", db: Session = Depends(get_db)):
+    """Fetch the private chat thread for a bid. Auth: award_token (buyer) or chat_token (worker)."""
+    bid = db.query(Bid).filter(Bid.id == bid_id).first()
+    if not bid:
+        raise HTTPException(status_code=404, detail=f"Bid '{bid_id}' not found.")
     if not token:
         raise HTTPException(status_code=403, detail="token query parameter required.")
-    role, name, bid_id = _resolve_chat_sender(job, token, db)
-    msgs = db.query(JobMessage).filter(JobMessage.job_id == job_id).order_by(JobMessage.created_at).all()
+    job = db.query(JobPosting).filter(JobPosting.id == bid.job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Parent job not found.")
+    role, name = _resolve_bid_chat_sender(bid, job, token)
+    msgs = (
+        db.query(JobMessage)
+        .filter(JobMessage.bid_id == bid_id)
+        .order_by(JobMessage.created_at)
+        .all()
+    )
     return {
-        "job_id":   job_id,
-        "role":     role,
+        "bid_id":  bid_id,
+        "job_id":  bid.job_id,
+        "role":    role,
         "messages": [
             {
                 "id":          m.id,
@@ -3299,21 +3309,24 @@ async def get_messages(job_id: str, token: str = "", db: Session = Depends(get_d
     }
 
 
-@app.post("/jobs/{job_id}/messages")
-async def post_message(job_id: str, body: dict, db: Session = Depends(get_db)):
-    """Post a chat message. Body: {token, message}."""
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+@app.post("/bids/{bid_id}/messages")
+async def post_bid_message(bid_id: str, body: dict, db: Session = Depends(get_db)):
+    """Send a message in a bid's private chat. Body: {token, message}."""
+    bid = db.query(Bid).filter(Bid.id == bid_id).first()
+    if not bid:
+        raise HTTPException(status_code=404, detail=f"Bid '{bid_id}' not found.")
     token   = (body.get("token") or "").strip()
     message = (body.get("message") or "").strip()
     if not token:
         raise HTTPException(status_code=400, detail="token is required.")
     if not message:
         raise HTTPException(status_code=400, detail="message cannot be empty.")
-    role, name, bid_id = _resolve_chat_sender(job, token, db)
+    job = db.query(JobPosting).filter(JobPosting.id == bid.job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Parent job not found.")
+    role, name = _resolve_bid_chat_sender(bid, job, token)
     msg = JobMessage(
-        job_id      = job_id,
+        job_id      = bid.job_id,
         bid_id      = bid_id,
         sender_role = role,
         sender_name = name,
@@ -3321,6 +3334,7 @@ async def post_message(job_id: str, body: dict, db: Session = Depends(get_db)):
     )
     db.add(msg)
     db.commit()
+    logger.info(f"💬 CHAT: {bid_id} | role={role} | msg_id={msg.id}")
     return {"status": "sent", "id": msg.id, "sender_role": role}
 
 
