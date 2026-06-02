@@ -1317,26 +1317,14 @@ async def send_new_bid_buyer_email(
 <style>{_email_styles()}</style></head><body><div class="card">
   <div class="logo">AgentTrust<span>.</span></div>
   <h1>New bid received</h1>
-  <p>Hi{' ' + buyer_name if buyer_name else ''}, <strong>{short}</strong> has placed a bid on your job:</p>
-  <div class="detail"><span>Job</span><br><strong>{job_title}</strong></div>
-  <div class="detail"><span>Their offer</span><br><strong>{proposed_xrp} XRP</strong></div>
-  <div class="detail"><span>Proposal</span><br><span style="font-size:.85rem;">{proposal[:400]}{'…' if len(proposal) > 400 else ''}</span></div>
-  <div class="detail"><span>Total bids so far</span><br><strong>{total_bids}</strong></div>
-  <div style="margin:1.5rem 0;display:flex;gap:10px;flex-wrap:wrap;">
-    <a href="{award_url}" style="display:inline-block;padding:10px 20px;background:#10b981;color:#000;font-weight:700;font-family:'IBM Plex Sans',sans-serif;font-size:.9rem;border-radius:8px;text-decoration:none;">
-      ✓ Award this bid
-    </a>
-    <a href="{view_url}" style="display:inline-block;padding:10px 20px;background:#1a2230;color:#e2e8f0;font-weight:600;font-family:'IBM Plex Sans',sans-serif;font-size:.9rem;border-radius:8px;text-decoration:none;border:1px solid rgba(255,255,255,.12);">
-      View all bids
-    </a>
+  <p>Hi{' ' + buyer_name if buyer_name else ''}, <strong>{short}</strong> has bid <strong>{proposed_xrp} XRP</strong> on <strong>{job_title}</strong>. {total_bids} bid{'s' if total_bids != 1 else ''} total.</p>
+  <div style="margin:1.25rem 0;display:flex;gap:10px;flex-wrap:wrap;">
+    <a href="{award_url}" style="display:inline-block;padding:12px 22px;background:#10b981;color:#000;font-weight:700;font-family:'IBM Plex Sans',sans-serif;font-size:.9rem;border-radius:8px;text-decoration:none;">✓ Award this bid</a>
+    <a href="{view_url}" style="display:inline-block;padding:12px 22px;background:#1a2230;color:#e2e8f0;font-weight:600;font-family:'IBM Plex Sans',sans-serif;font-size:.9rem;border-radius:8px;text-decoration:none;border:1px solid rgba(255,255,255,.12);">View all bids</a>
   </div>
-  <p style="font-size:.8rem;color:#5c5c6e;">
-    These links are unique to you and authorise awarding this job.
-    Do not forward this email to the bidder.
-  </p>
-  <div class="footer">
-    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
-  </div>
+  <div class="detail"><span>Their proposal</span><br><span style="font-size:.85rem;">{proposal[:400]}{'…' if len(proposal) > 400 else ''}</span></div>
+  <p style="font-size:.78rem;color:#9999aa;margin-top:1rem;">These links are unique to you — do not forward this email to the bidder.</p>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
 </div></body></html>""",
         })
         logger.info(f"📧 New-bid buyer email sent to {buyer_email} for job {job_id} (bid {bid_id})")
