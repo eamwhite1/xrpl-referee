@@ -1242,6 +1242,50 @@ async def send_worker_receipt_email(
         logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
 
 
+async def send_job_posted_email(
+    buyer_email:  str,
+    buyer_name:   str,
+    job_id:       str,
+    job_title:    str,
+    award_token:  str,
+):
+    """Confirm to a human job poster that their job is live, and deliver their award token."""
+    if not RESEND_API_KEY or not buyer_email:
+        return
+    manage_url = f"{SITE_URL}/marketplace?track_job={job_id}&token={award_token}"
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      buyer_email,
+            "subject": f"Job posted — {job_title}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Your job is live</h1>
+  <p>Hi{' ' + buyer_name if buyer_name else ''}, your job has been posted to the AgentTrust marketplace
+     and is now open for bids.</p>
+  <div class="detail"><span>Job ID</span><br>
+    <strong style="font-size:1.1rem;letter-spacing:.03em;">{job_id}</strong>
+    <br><span style="font-size:.78rem;color:#5c5c6e;">← paste this into "Track job ID" to check bids</span>
+  </div>
+  <div class="detail"><span>Job title</span><br><strong>{job_title}</strong></div>
+  <div style="margin:1rem 0;padding:.9rem;background:#1e1e2e;border:1px solid #f59e0b;border-radius:6px;">
+    <div style="font-weight:700;color:#f59e0b;margin-bottom:.4rem;">⚠️ Your Award Token — keep this safe</div>
+    <div style="font-family:monospace;word-break:break-all;font-size:.8rem;color:#e2e2e2;">{award_token}</div>
+    <div style="margin-top:.5rem;font-size:.75rem;color:#888;">This token lets you accept a bid and cancel the job. Never share it. If you lose it, contact support.</div>
+  </div>
+  <p style="margin-top:1rem;">
+    <a href="{manage_url}" style="display:inline-block;padding:10px 24px;background:#0066FF;color:#fff;border-radius:6px;text-decoration:none;font-weight:600;font-size:.9rem;">Manage your job</a>
+  </p>
+  <p style="font-size:.82rem;color:#5c5c6e;">You'll receive another email each time a bid is submitted, with a one-click award link.</p>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Job posted email sent to {buyer_email} for {job_id}")
+    except Exception as e:
+        logger.error(f"❌ Job posted email failed for {job_id}: {e}")
+
+
 async def send_new_bid_buyer_email(
     buyer_email:    str,
     buyer_name:     str,
@@ -2885,6 +2929,17 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
     db.commit()
 
     logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={body.get('budget_xrp')} XRP")
+
+    import asyncio
+    if job.buyer_email:
+        asyncio.create_task(send_job_posted_email(
+            buyer_email = job.buyer_email,
+            buyer_name  = job.buyer_name or "",
+            job_id      = job_id,
+            job_title   = job.title,
+            award_token = award_token,
+        ))
+
     return {
         "status":      "posted",
         "job_id":      job_id,
