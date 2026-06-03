@@ -1800,11 +1800,11 @@ async def run_ai_audit(
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
     candidates = [
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
+        "gemini-2.5-flash",   # fast — try first to beat Render's 30s request timeout
         "gemini-2.0-flash",
-        "gemini-1.5-pro",
+        "gemini-2.5-pro",     # slower — fallback only
         "gemini-1.5-flash",
+        "gemini-1.5-pro",
     ]
 
     domain_context = DOMAIN_PROMPTS.get(task_category, DOMAIN_PROMPTS["default"])
@@ -1875,13 +1875,24 @@ async def run_ai_audit(
             mime = att.get("mime_type", "application/octet-stream")
             if mime in ("application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"):
                 parts.append({"inline_data": {"mime_type": mime, "data": att.get("data")}})
+            elif mime.startswith("text/") or mime in ("application/json", "application/xml"):
+                try:
+                    text_content = base64.b64decode(att.get("data", "")).decode("utf-8", errors="replace")
+                    prompt_text += f"\n--- BUYER ATTACHMENT: {att.get('filename','file')} ---\n{text_content}\n--- END ATTACHMENT ---\n"
+                except Exception:
+                    pass
 
     if worker_attachments:
         for att in worker_attachments:
             mime = att.get("mime_type", "application/octet-stream")
             if mime in ("application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"):
                 parts.append({"inline_data": {"mime_type": mime, "data": att.get("data")}})
-
+            elif mime.startswith("text/") or mime in ("application/json", "application/xml"):
+                try:
+                    text_content = base64.b64decode(att.get("data", "")).decode("utf-8", errors="replace")
+                    prompt_text += f"\n--- WORKER ATTACHMENT: {att.get('filename','file')} ---\n{text_content}\n--- END ATTACHMENT ---\n"
+                except Exception:
+                    pass
     parts.append({"text": prompt_text})
     payload = {"contents": [{"parts": parts}]}
 
@@ -1892,7 +1903,7 @@ async def run_ai_audit(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{model_id}:generateContent?key={api_key}"
                 )
-                res = await client.post(url, json=payload, timeout=60.0)
+                res = await client.post(url, json=payload, timeout=25.0)
 
                 if res.status_code == 200:
                     data         = res.json()
