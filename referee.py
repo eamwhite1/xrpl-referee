@@ -1800,11 +1800,11 @@ async def run_ai_audit(
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
     candidates = [
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
+        "gemini-2.5-flash",   # fast — try first to beat Render's 30s request timeout
         "gemini-2.0-flash",
-        "gemini-1.5-pro",
+        "gemini-2.5-pro",     # slower — fallback only
         "gemini-1.5-flash",
+        "gemini-1.5-pro",
     ]
 
     domain_context = DOMAIN_PROMPTS.get(task_category, DOMAIN_PROMPTS["default"])
@@ -1903,7 +1903,7 @@ async def run_ai_audit(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{model_id}:generateContent?key={api_key}"
                 )
-                res = await client.post(url, json=payload, timeout=60.0)
+                res = await client.post(url, json=payload, timeout=25.0)
 
                 if res.status_code == 200:
                     data         = res.json()
