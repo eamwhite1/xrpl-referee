@@ -2996,7 +2996,7 @@ async def list_jobs(
             "tags":         tags,
             "status":       j.status,
             "bid_count":    bid_count,
-            "created_at":   j.created_at.isoformat() if j.created_at else None,
+            "created_at":   (j.created_at.isoformat() + "Z") if j.created_at else None,
             "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
             "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
         })
@@ -3038,9 +3038,9 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
             "proposed_xrp":         b.proposed_xrp,
             "proposal":             b.proposal,
             "status":               b.status,
-            "created_at":           b.created_at.isoformat() if b.created_at else None,
+            "created_at":           (b.created_at.isoformat() + "Z") if b.created_at else None,
             "worker_message_count": worker_msg_counts[b.id],
-            "last_message_at":      last_msg_at[b.id].isoformat() if last_msg_at.get(b.id) else None,
+            "last_message_at":      (last_msg_at[b.id].isoformat() + "Z") if last_msg_at.get(b.id) else None,
         }
         for b in bids
     ]
