@@ -1875,13 +1875,24 @@ async def run_ai_audit(
             mime = att.get("mime_type", "application/octet-stream")
             if mime in ("application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"):
                 parts.append({"inline_data": {"mime_type": mime, "data": att.get("data")}})
+            elif mime.startswith("text/") or mime in ("application/json", "application/xml"):
+                try:
+                    text_content = base64.b64decode(att.get("data", "")).decode("utf-8", errors="replace")
+                    prompt_text += f"\n--- BUYER ATTACHMENT: {att.get('filename','file')} ---\n{text_content}\n--- END ATTACHMENT ---\n"
+                except Exception:
+                    pass
 
     if worker_attachments:
         for att in worker_attachments:
             mime = att.get("mime_type", "application/octet-stream")
             if mime in ("application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"):
                 parts.append({"inline_data": {"mime_type": mime, "data": att.get("data")}})
-
+            elif mime.startswith("text/") or mime in ("application/json", "application/xml"):
+                try:
+                    text_content = base64.b64decode(att.get("data", "")).decode("utf-8", errors="replace")
+                    prompt_text += f"\n--- WORKER ATTACHMENT: {att.get('filename','file')} ---\n{text_content}\n--- END ATTACHMENT ---\n"
+                except Exception:
+                    pass
     parts.append({"text": prompt_text})
     payload = {"contents": [{"parts": parts}]}
 
