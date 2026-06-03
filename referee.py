@@ -1999,12 +1999,16 @@ async def standalone_audit(
 # ---------------------------------------------------------------------------
 # 14. XUMM ENDPOINTS
 # ---------------------------------------------------------------------------
+class FeePayloadRequest(BaseModel):
+    amount_xrp: Optional[float] = None  # override fee amount; defaults to MIN_FEE_XRP
+
 @app.post("/xumm/fee-payload")
-async def create_fee_payload():
+async def create_fee_payload(req: FeePayloadRequest = FeePayloadRequest()):
+    xrp = req.amount_xrp if req.amount_xrp and req.amount_xrp > 0 else MIN_FEE_XRP
     tx = {
         "TransactionType": "Payment",
         "Destination":     PROTOCOL_WALLET,
-        "Amount":          str(int(MIN_FEE_XRP * 1_000_000)),
+        "Amount":          str(int(xrp * 1_000_000)),
     }
     return await xumm_create_payload(tx)
 
