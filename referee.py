@@ -411,6 +411,9 @@ class EscrowVault(Base):
     marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
     # Open bounty — v9: tracks who created the on-chain EscrowCreate (buyer or referee)
     escrow_owner      = Column(String,  nullable=True)      # Account field of EscrowCreate tx
+    # NFT proof requirements — v10
+    required_nft_issuer   = Column(String, nullable=True)   # issuer wallet address
+    required_nft_metadata = Column(Text,   nullable=True)   # JSON: required key-value pairs in NFT URI
 
 
 class JobPosting(Base):
@@ -436,6 +439,8 @@ class JobPosting(Base):
     buyer_callback_url = Column(String,   nullable=True)    # optional — agent webhook on new bids
     award_token_hash   = Column(String,   nullable=True)    # SHA-256 of the one-time award token
     award_token        = Column(String,   nullable=True)    # plaintext — needed to embed in bid emails
+    required_nft_issuer   = Column(String,   nullable=True)  # require NFT from this issuer wallet
+    required_nft_metadata = Column(Text,     nullable=True)  # JSON: required key-value pairs in NFT URI
 
 
 class Bid(Base):
@@ -465,6 +470,18 @@ class JobMessage(Base):
     sender_name  = Column(String,   nullable=True)
     message      = Column(Text,     nullable=False)
     created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class NftIssuer(Base):
+    __tablename__ = "nft_issuer"
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    wallet_address = Column(String, unique=True, nullable=False, index=True)
+    name           = Column(String, nullable=False)
+    category       = Column(String, nullable=True)   # e.g. "logistics", "freelance", "iot"
+    description    = Column(String, nullable=True)
+    website        = Column(String, nullable=True)
+    verified       = Column(String, default="pending")  # "pending", "verified", "revoked"
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class SkillListing(Base):
@@ -589,6 +606,22 @@ def run_migrations():
             status      VARCHAR DEFAULT 'ACTIVE'
         )""",
         "ALTER TABLE skill_listing ADD COLUMN IF NOT EXISTS rate_xrp FLOAT",
+        # v10 NFT proof columns
+        """CREATE TABLE IF NOT EXISTS nft_issuer (
+            id             SERIAL PRIMARY KEY,
+            wallet_address VARCHAR UNIQUE NOT NULL,
+            name           VARCHAR NOT NULL,
+            category       VARCHAR,
+            description    VARCHAR,
+            website        VARCHAR,
+            verified       VARCHAR DEFAULT 'pending',
+            created_at     TIMESTAMP
+        )""",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_nft_issuer   VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_nft_metadata  TEXT",
+        # v10 job_posting NFT columns
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_nft_issuer   VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_nft_metadata  TEXT",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -886,6 +919,9 @@ class EscrowSetupRequest(BaseModel):
     # Marketplace metadata
     category:           str             = "default"
     tags:               Optional[list[str]] = None
+    # NFT proof requirements
+    required_nft_issuer:   Optional[str]  = None  # require NFT from this issuer wallet
+    required_nft_metadata: Optional[dict] = None  # require these key-value pairs in NFT URI
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -896,6 +932,9 @@ class AuditRequest(BaseModel):
     require_consensus:   bool           = False
     # Evidence links — up to 3 URLs the seller provides as proof
     evidence_links:      Optional[list[str]] = None
+    # NFT proof fields
+    nft_token_id: Optional[str] = None   # NFT token ID as proof
+    nft_wallet:   Optional[str] = None   # wallet holding the NFT (defaults to worker_address)
 
 class StandaloneAuditRequest(BaseModel):
     task:                str
@@ -1783,6 +1822,73 @@ async def extract_and_verify_xrpl_hashes(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 11c. XRPL NFT OWNERSHIP VERIFICATION
+# ---------------------------------------------------------------------------
+async def verify_nft_ownership(wallet_address: str, nft_token_id: str, required_issuer: str = None, required_metadata: dict = None) -> dict:
+    """
+    Verify an NFT exists on XRPL, is owned by wallet_address,
+    optionally issued by required_issuer, and optionally contains required_metadata fields.
+    Returns dict with verified bool and detail string.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(XRPL_URL, json={
+            "method": "account_nfts",
+            "params": [{"account": wallet_address, "limit": 400}]
+        })
+        data = res.json()
+
+    nfts = data.get("result", {}).get("account_nfts", [])
+    target = next((n for n in nfts if n.get("NFTokenID") == nft_token_id), None)
+
+    if not target:
+        return {"verified": False, "detail": f"NFT {nft_token_id} not found in wallet {wallet_address}."}
+
+    if required_issuer and target.get("Issuer") != required_issuer:
+        actual = target.get("Issuer", "unknown")
+        return {"verified": False, "detail": f"NFT was not issued by the required issuer. Expected {required_issuer}, got {actual}."}
+
+    # Decode URI (hex-encoded)
+    uri_hex = target.get("URI", "")
+    uri_str = ""
+    if uri_hex:
+        try:
+            uri_str = bytes.fromhex(uri_hex).decode("utf-8", errors="replace")
+        except Exception:
+            uri_str = uri_hex
+
+    # Check required metadata fields if specified
+    if required_metadata:
+        nft_data = {}
+        # Try parsing URI as JSON
+        try:
+            nft_data = json.loads(uri_str)
+        except Exception:
+            # Try as URL with query params or just treat as string
+            pass
+
+        missing = []
+        mismatched = []
+        for key, expected_val in required_metadata.items():
+            if key not in nft_data:
+                missing.append(key)
+            elif str(nft_data[key]).lower() != str(expected_val).lower():
+                mismatched.append(f"{key}: expected '{expected_val}', got '{nft_data[key]}'")
+
+        if missing:
+            return {"verified": False, "detail": f"NFT metadata missing required fields: {', '.join(missing)}. NFT URI: {uri_str[:200]}"}
+        if mismatched:
+            return {"verified": False, "detail": f"NFT metadata mismatch: {'; '.join(mismatched)}"}
+
+    return {
+        "verified": True,
+        "detail": f"NFT verified. Issuer: {target.get('Issuer')}, URI: {uri_str[:200]}",
+        "issuer": target.get("Issuer"),
+        "uri": uri_str,
+        "nft_token_id": nft_token_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 12. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
 async def run_ai_audit(
@@ -2131,6 +2237,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         delivery_status       = "PENDING",
         submission_count      = 0,
         max_submissions       = max(1, min(req.max_submissions, 10)),  # clamp 1–10
+        required_nft_issuer   = req.required_nft_issuer or None,
+        required_nft_metadata = json.dumps(req.required_nft_metadata) if req.required_nft_metadata else None,
     )
     db.add(vault)
     db.commit()
@@ -2325,6 +2433,32 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         except Exception:
             logger.warning("⚠️ Could not parse stored spec link snapshots")
 
+    # ── NFT PROOF VERIFICATION (if required by buyer) ──
+    nft_proof_note = None
+    if vault.required_nft_issuer:
+        if not req.nft_token_id:
+            raise HTTPException(
+                status_code=400,
+                detail="This escrow requires NFT-verified proof. Please provide nft_token_id in your submission.",
+            )
+        nft_wallet = req.nft_wallet or vault.worker_address
+        required_meta = None
+        if vault.required_nft_metadata:
+            try:
+                required_meta = json.loads(vault.required_nft_metadata)
+            except Exception:
+                pass
+        nft_result = await verify_nft_ownership(
+            wallet_address=nft_wallet,
+            nft_token_id=req.nft_token_id,
+            required_issuer=vault.required_nft_issuer,
+            required_metadata=required_meta,
+        )
+        if not nft_result["verified"]:
+            raise HTTPException(status_code=400, detail=f"NFT verification failed: {nft_result['detail']}")
+        nft_proof_note = f"🔗 NFT PROOF VERIFIED ON-CHAIN: {nft_result['detail']}"
+        logger.info(f"✅ NFT proof verified for {req.escrow_id}: {nft_result['detail']}")
+
     # Fetch evidence link snapshots now (at submission time = tamper-proof snapshot)
     evidence_snapshots = None
     if req.evidence_links:
@@ -2336,9 +2470,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         failed = sum(1 for s in evidence_snapshots if s.get("error"))
         logger.info(f"🔗 Evidence links: {ok} fetched, {failed} failed for {req.escrow_id}")
 
+    work_with_nft = req.work
+    if nft_proof_note:
+        work_with_nft = req.work + f"\n\n{nft_proof_note}"
+
     verdict_dict, model_used = await run_ai_audit(
         task                    = vault.task_description,
-        work                    = req.work,
+        work                    = work_with_nft,
         buyer_attachments       = stored_buyer_attachments,
         worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
         task_category           = req.task_category,
@@ -2927,6 +3065,8 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         buyer_callback_url = body.get("buyer_callback_url") or None,
         award_token_hash   = award_token_hash,
         award_token        = award_token,
+        required_nft_issuer   = body.get("required_nft_issuer") or None,
+        required_nft_metadata = json.dumps(body.get("required_nft_metadata")) if body.get("required_nft_metadata") else None,
     )
     db.add(job)
     db.commit()
@@ -3003,6 +3143,7 @@ async def list_jobs(
             "created_at":   (j.created_at.isoformat() + "Z") if j.created_at else None,
             "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
             "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
+            "required_nft_issuer": j.required_nft_issuer or None,
         })
         if len(result) >= limit:
             break
@@ -3067,6 +3208,7 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
         "awarded_bid_id": job.awarded_bid_id,
         "escrow_id":     job.escrow_id,
         "expires_at":    job.expires_at.strftime("%Y-%m-%d %H:%M UTC") if job.expires_at else None,
+        "required_nft_issuer": job.required_nft_issuer or None,
         "bids":          bids_out,
     }
 
@@ -3594,6 +3736,62 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
         "expires_at": expires_at.isoformat(),
         "message":    "Your skill listing is now live for 30 days.",
     }
+
+
+# ---------------------------------------------------------------------------
+# NFT ISSUER ENDPOINTS
+# ---------------------------------------------------------------------------
+
+class NftVerifyRequest(BaseModel):
+    wallet_address:    str
+    nft_token_id:      str
+    required_issuer:   Optional[str]  = None
+    required_metadata: Optional[dict] = None
+
+class NftIssuerRequest(BaseModel):
+    wallet_address: str
+    name:           str
+    category:       Optional[str] = None
+    description:    Optional[str] = None
+    website:        Optional[str] = None
+
+@app.get("/nft/issuers")
+async def list_nft_issuers(category: str = None, db: Session = Depends(get_db)):
+    q = db.query(NftIssuer).filter(NftIssuer.verified == "verified")
+    if category:
+        q = q.filter(NftIssuer.category == category)
+    issuers = q.order_by(NftIssuer.name).all()
+    return {"issuers": [
+        {"wallet_address": i.wallet_address, "name": i.name, "category": i.category,
+         "description": i.description, "website": i.website}
+        for i in issuers
+    ]}
+
+@app.post("/nft/verify")
+async def verify_nft(req: NftVerifyRequest):
+    result = await verify_nft_ownership(
+        wallet_address=req.wallet_address,
+        nft_token_id=req.nft_token_id,
+        required_issuer=req.required_issuer,
+        required_metadata=req.required_metadata,
+    )
+    if not result["verified"]:
+        raise HTTPException(status_code=400, detail=result["detail"])
+    return result
+
+@app.post("/nft/issuers")
+async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_db)):
+    existing = db.query(NftIssuer).filter(NftIssuer.wallet_address == req.wallet_address).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Issuer already registered.")
+    issuer = NftIssuer(
+        wallet_address=req.wallet_address, name=req.name,
+        category=req.category, description=req.description,
+        website=req.website, verified="pending",
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(issuer); db.commit()
+    return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallet_address": req.wallet_address}
 
 
 # ---------------------------------------------------------------------------
