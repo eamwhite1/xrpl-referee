@@ -299,8 +299,20 @@ def serve_mcp_server_card():
             {"name": "direct_hire",               "description": "Get a skill provider's wallet address for immediate escrow creation — no bidding needed."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
+            {"name": "get_wallet_trust_score",    "description": "GET /wallet/score/{address} — compute an XRPL wallet's trust score (0–100) from on-chain signals: account age, balance, transaction count, NFTs held, domain field. Higher scores indicate more established, trustworthy wallets."},
+            {"name": "verify_nft_proof",          "description": "POST /nft/verify — verify that an XRPL NFT exists in a wallet, was minted by a required issuer, and contains required metadata fields. Used to confirm event-based proof (ticket purchased, cargo shipped, etc)."},
+            {"name": "verify_domain_ownership",   "description": "POST /domain/verify — verify that an XRPL wallet is cryptographically linked to a domain via the account Domain field and xrp-ledger.toml. Proves the wallet owner controls the specified organisation's domain."},
+            {"name": "verify_vc",                 "description": "POST /vc/verify — verify a W3C Verifiable Credential JWT. Checks expiry, issuer DID, credential type, and optionally resolves the DID via the Universal Resolver. Accepts credentials from any W3C-compliant issuer."},
+            {"name": "register_nft_dvp_offer",    "description": "POST /escrow/{id}/nft-offer — after a PASS verdict on an NFT DvP escrow, seller registers their on-chain NFTokenCreateOffer (Destination=buyer, Amount=0). System verifies the offer on XRPL and emails buyer to accept. Payment releases automatically once buyer accepts."},
+            {"name": "check_nft_dvp_status",      "description": "GET /escrow/{id}/nft-status — poll whether the buyer has accepted the NFT offer yet. Returns accepted/pending/expired. Triggers automatic escrow release when accepted."},
+            {"name": "search_verified_companies", "description": "GET /gleif/search?q= — search the GLEIF global database of verified legal entities by name. Returns LEI, legal name, jurisdiction. Use to find a company's verified identity before requiring their XRPL wallet as a trusted NFT issuer."},
+            {"name": "gleif_xrpl_lookup",         "description": "GET /gleif/xrpl-lookup?q= — search for a company by name, verify via GLEIF, and attempt to find their registered XRPL wallet address. Green result = GLEIF verified + XRPL wallet confirmed."},
+            {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain and GLEIF record."},
+            {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification against GLEIF + domain records."},
+            {"name": "create_eth_challenge",      "description": "POST /eth/challenge — generate an EIP-191 challenge string for an Ethereum address. The address holder must sign this with their ETH wallet to prove ownership. Use before submitting an Ethereum address as identity proof."},
+            {"name": "verify_eth_signature",      "description": "POST /eth/verify-signature — verify that an Ethereum address signed the challenge string. Confirms the submitter genuinely controls the ETH address, preventing fake address claims."},
         ],
-        "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3"],
+        "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3", "nft", "trust", "identity"],
     }
 
 
