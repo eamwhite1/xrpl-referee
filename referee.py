@@ -88,7 +88,23 @@ async def _lifespan(app):
         yield
 
 
-app = FastAPI(title="AgentTrust Protocol Core", lifespan=_lifespan)
+app = FastAPI(
+    title="AgentTrust Protocol Core",
+    description=(
+        "Trustless AI task verification with automatic XRPL payment release. "
+        "Post a task spec and work submission — get a structured PASS/FAIL verdict. "
+        "Escrowed XRP or RLUSD releases automatically on AI approval.\n\n"
+        "**Trust layer stack:** four independent proof mechanisms buyers can require from sellers — "
+        "(1) NFT from a trusted issuer, (2) XRPL domain verification, "
+        "(3) W3C Verifiable Credential, (4) XRPL wallet trust score.\n\n"
+        "**NFT Delivery-vs-Payment (DvP):** when the job deliverable is an NFT itself, "
+        "enable DvP mode. On PASS the escrow enters PASS_AWAITING_NFT state; payment holds until "
+        "the seller creates an NFTokenCreateOffer (Destination=buyer, Amount=0) and the buyer accepts "
+        "it on-chain — both transfer and payment are then settled automatically. "
+        "Register the offer via POST /escrow/{id}/nft-offer and poll status via GET /escrow/{id}/nft-status."
+    ),
+    lifespan=_lifespan,
+)
 
 
 @app.exception_handler(PaymentRequired)
@@ -253,6 +269,10 @@ def serve_mcp_server_card():
             "Post a task spec and work submission — get PASS/FAIL from an AI referee. "
             "Escrowed XRP releases automatically to the worker on approval. "
             "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents. "
+            "Supports four trust layers: NFT from trusted issuer, XRPL domain verification, "
+            "W3C Verifiable Credential, and XRPL wallet trust score — buyers can require any combination. "
+            "NFT Delivery-vs-Payment (DvP) mode: payment holds until the seller transfers an NFT to the buyer "
+            "on-chain, then releases automatically — no sequential transaction risk. "
             "Implements the x402 payment protocol: call any paid endpoint without payment to receive "
             "a 402 with an X-Payment-Required header describing exactly how to pay in XRP."
         ),
@@ -264,9 +284,9 @@ def serve_mcp_server_card():
         "auth":        {"type": "none"},
         "tools": [
             {"name": "audit_task",               "description": "Verify completed work against a task spec for 0.1 XRP. Returns PASS/FAIL with score and feedback."},
-            {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict."},
+            {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict. Optional trust-layer fields: nft_dvp (bool — require NFT transfer before payment releases), required_nft_issuer (wallet address), required_domain (XRPL domain verification), required_vc_issuer_did (W3C VC issuer DID), proof_policy ('ALL' or 'ANY')."},
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
-            {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed."},
+            {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed. For NFT DvP jobs (nft_dvp=true), PASS sets status to PASS_AWAITING_NFT — seller must then create an NFTokenCreateOffer (Destination=buyer, Amount=0) and register it via POST /escrow/{id}/nft-offer before payment releases."},
             {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
             {"name": "list_marketplace_jobs",     "description": "Browse live XRPL escrow bounties. Returns structured job data."},
             {"name": "post_job",                  "description": "Post a job to the job board. No fee or funds — workers bid, you negotiate and award."},
