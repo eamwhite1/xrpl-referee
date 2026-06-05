@@ -411,6 +411,14 @@ class EscrowVault(Base):
     marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
     # Open bounty — v9: tracks who created the on-chain EscrowCreate (buyer or referee)
     escrow_owner      = Column(String,  nullable=True)      # Account field of EscrowCreate tx
+    # NFT proof requirements — v10
+    required_nft_issuer   = Column(String, nullable=True)   # issuer wallet address
+    required_nft_metadata = Column(Text,   nullable=True)   # JSON: required key-value pairs in NFT URI
+    # Trust layer v11
+    required_domain       = Column(String, nullable=True)   # XRPL domain field requirement
+    required_vc_issuer_did = Column(String, nullable=True)  # W3C VC required issuer DID
+    required_vc_type      = Column(String, nullable=True)   # W3C VC required type
+    min_passport_score    = Column(Float,  nullable=True)   # Gitcoin Passport min score
 
 
 class JobPosting(Base):
@@ -436,6 +444,13 @@ class JobPosting(Base):
     buyer_callback_url = Column(String,   nullable=True)    # optional — agent webhook on new bids
     award_token_hash   = Column(String,   nullable=True)    # SHA-256 of the one-time award token
     award_token        = Column(String,   nullable=True)    # plaintext — needed to embed in bid emails
+    required_nft_issuer   = Column(String,   nullable=True)  # require NFT from this issuer wallet
+    required_nft_metadata = Column(Text,     nullable=True)  # JSON: required key-value pairs in NFT URI
+    # Trust layer v11
+    required_domain        = Column(String,  nullable=True)
+    required_vc_issuer_did = Column(String,  nullable=True)
+    required_vc_type       = Column(String,  nullable=True)
+    min_passport_score     = Column(Float,   nullable=True)
 
 
 class Bid(Base):
@@ -465,6 +480,18 @@ class JobMessage(Base):
     sender_name  = Column(String,   nullable=True)
     message      = Column(Text,     nullable=False)
     created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class NftIssuer(Base):
+    __tablename__ = "nft_issuer"
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    wallet_address = Column(String, unique=True, nullable=False, index=True)
+    name           = Column(String, nullable=False)
+    category       = Column(String, nullable=True)   # e.g. "logistics", "freelance", "iot"
+    description    = Column(String, nullable=True)
+    website        = Column(String, nullable=True)
+    verified       = Column(String, default="pending")  # "pending", "verified", "revoked"
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class SkillListing(Base):
@@ -589,6 +616,31 @@ def run_migrations():
             status      VARCHAR DEFAULT 'ACTIVE'
         )""",
         "ALTER TABLE skill_listing ADD COLUMN IF NOT EXISTS rate_xrp FLOAT",
+        # v10 NFT proof columns
+        """CREATE TABLE IF NOT EXISTS nft_issuer (
+            id             SERIAL PRIMARY KEY,
+            wallet_address VARCHAR UNIQUE NOT NULL,
+            name           VARCHAR NOT NULL,
+            category       VARCHAR,
+            description    VARCHAR,
+            website        VARCHAR,
+            verified       VARCHAR DEFAULT 'pending',
+            created_at     TIMESTAMP
+        )""",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_nft_issuer   VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_nft_metadata  TEXT",
+        # v10 job_posting NFT columns
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_nft_issuer   VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_nft_metadata  TEXT",
+        # v11 trust layer columns
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_domain        VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_vc_issuer_did VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_vc_type       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS min_passport_score     FLOAT",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_domain         VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_vc_issuer_did  VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS required_vc_type        VARCHAR",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS min_passport_score      FLOAT",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -629,6 +681,9 @@ RLUSD_HEX      = "524C555344000000000000000000000000000000"
 LSF_ALLOW_TRUSTLINE_LOCKING = 0x20000000
 _rlusd_escrow_supported_cache: dict = {"value": None, "checked_at": 0}
 RLUSD_ESCROW_CACHE_TTL = 3600  # seconds
+
+GITCOIN_API_KEY    = os.getenv("GITCOIN_API_KEY", "")
+GITCOIN_SCORER_ID  = os.getenv("GITCOIN_SCORER_ID", "335")
 
 RESEND_API_KEY       = os.getenv("RESEND_API_KEY")
 RESEND_FROM          = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
@@ -886,6 +941,14 @@ class EscrowSetupRequest(BaseModel):
     # Marketplace metadata
     category:           str             = "default"
     tags:               Optional[list[str]] = None
+    # NFT proof requirements
+    required_nft_issuer:   Optional[str]  = None  # require NFT from this issuer wallet
+    required_nft_metadata: Optional[dict] = None  # require these key-value pairs in NFT URI
+    # Trust layer v11
+    required_domain:        Optional[str]   = None
+    required_vc_issuer_did: Optional[str]   = None
+    required_vc_type:       Optional[str]   = None
+    min_passport_score:     Optional[float] = None
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -896,6 +959,12 @@ class AuditRequest(BaseModel):
     require_consensus:   bool           = False
     # Evidence links — up to 3 URLs the seller provides as proof
     evidence_links:      Optional[list[str]] = None
+    # NFT proof fields
+    nft_token_id: Optional[str] = None   # NFT token ID as proof
+    nft_wallet:   Optional[str] = None   # wallet holding the NFT (defaults to worker_address)
+    # Trust layer v11
+    vc_jwt:              Optional[str] = None   # W3C Verifiable Credential JWT
+    passport_eth_address: Optional[str] = None  # Ethereum address for Gitcoin Passport
 
 class StandaloneAuditRequest(BaseModel):
     task:                str
@@ -1783,6 +1852,241 @@ async def extract_and_verify_xrpl_hashes(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 11c. XRPL NFT OWNERSHIP VERIFICATION
+# ---------------------------------------------------------------------------
+async def verify_nft_ownership(wallet_address: str, nft_token_id: str, required_issuer: str = None, required_metadata: dict = None) -> dict:
+    """
+    Verify an NFT exists on XRPL, is owned by wallet_address,
+    optionally issued by required_issuer, and optionally contains required_metadata fields.
+    Returns dict with verified bool and detail string.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(XRPL_URL, json={
+            "method": "account_nfts",
+            "params": [{"account": wallet_address, "limit": 400}]
+        })
+        data = res.json()
+
+    nfts = data.get("result", {}).get("account_nfts", [])
+    target = next((n for n in nfts if n.get("NFTokenID") == nft_token_id), None)
+
+    if not target:
+        return {"verified": False, "detail": f"NFT {nft_token_id} not found in wallet {wallet_address}."}
+
+    if required_issuer and target.get("Issuer") != required_issuer:
+        actual = target.get("Issuer", "unknown")
+        return {"verified": False, "detail": f"NFT was not issued by the required issuer. Expected {required_issuer}, got {actual}."}
+
+    # Decode URI (hex-encoded)
+    uri_hex = target.get("URI", "")
+    uri_str = ""
+    if uri_hex:
+        try:
+            uri_str = bytes.fromhex(uri_hex).decode("utf-8", errors="replace")
+        except Exception:
+            uri_str = uri_hex
+
+    # Check required metadata fields if specified
+    if required_metadata:
+        nft_data = {}
+        # Try parsing URI as JSON
+        try:
+            nft_data = json.loads(uri_str)
+        except Exception:
+            # Try as URL with query params or just treat as string
+            pass
+
+        missing = []
+        mismatched = []
+        for key, expected_val in required_metadata.items():
+            if key not in nft_data:
+                missing.append(key)
+            elif str(nft_data[key]).lower() != str(expected_val).lower():
+                mismatched.append(f"{key}: expected '{expected_val}', got '{nft_data[key]}'")
+
+        if missing:
+            return {"verified": False, "detail": f"NFT metadata missing required fields: {', '.join(missing)}. NFT URI: {uri_str[:200]}"}
+        if mismatched:
+            return {"verified": False, "detail": f"NFT metadata mismatch: {'; '.join(mismatched)}"}
+
+    return {
+        "verified": True,
+        "detail": f"NFT verified. Issuer: {target.get('Issuer')}, URI: {uri_str[:200]}",
+        "issuer": target.get("Issuer"),
+        "uri": uri_str,
+        "nft_token_id": nft_token_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 11d. XRPL DOMAIN FIELD VERIFICATION
+# ---------------------------------------------------------------------------
+async def verify_domain_ownership(wallet_address: str, expected_domain: str = None) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(XRPL_URL, json={
+            "method": "account_info",
+            "params": [{"account": wallet_address, "ledger_index": "current"}]
+        })
+        data = res.json()
+
+    account_data = data.get("result", {}).get("account_data", {})
+    domain_hex = account_data.get("Domain")
+    if not domain_hex:
+        return {"verified": False, "detail": f"Wallet {wallet_address} has no Domain field set on the XRPL ledger."}
+
+    try:
+        domain = bytes.fromhex(domain_hex).decode("ascii")
+    except Exception:
+        return {"verified": False, "detail": "Domain field could not be decoded."}
+
+    if expected_domain and domain.lower() != expected_domain.lower():
+        return {"verified": False, "detail": f"Wallet domain is '{domain}', expected '{expected_domain}'."}
+
+    toml_url = f"https://{domain}/.well-known/xrp-ledger.toml"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            toml_res = await client.get(toml_url, follow_redirects=True)
+            toml_content = toml_res.text
+        except Exception as e:
+            return {"verified": False, "detail": f"Could not fetch {toml_url}: {e}"}
+
+    if wallet_address not in toml_content:
+        return {"verified": False, "detail": f"Wallet {wallet_address} not found in {toml_url}. The domain has not listed this wallet."}
+
+    return {
+        "verified": True,
+        "detail": f"Domain verified: {wallet_address} ↔ {domain}",
+        "domain": domain,
+        "toml_url": toml_url,
+    }
+
+
+class DomainVerifyRequest(BaseModel):
+    wallet_address: str
+    expected_domain: Optional[str] = None
+
+@app.post("/domain/verify")
+async def verify_domain(req: DomainVerifyRequest):
+    result = await verify_domain_ownership(req.wallet_address, req.expected_domain)
+    if not result["verified"]:
+        raise HTTPException(status_code=400, detail=result["detail"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 11e. W3C VERIFIABLE CREDENTIAL VERIFICATION
+# ---------------------------------------------------------------------------
+async def verify_w3c_credential(vc_jwt: str, required_issuer_did: str = None, required_type: str = None) -> dict:
+    try:
+        parts = vc_jwt.split(".")
+        if len(parts) == 3:
+            payload_b64 = parts[1]
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+            vc = payload.get("vc", payload)
+        else:
+            payload = {}
+            vc = json.loads(vc_jwt)
+    except Exception as e:
+        return {"verified": False, "detail": f"Could not decode credential: {e}"}
+
+    issuer = vc.get("issuer") or payload.get("iss", "")
+    if isinstance(issuer, dict):
+        issuer = issuer.get("id", "")
+
+    subject = vc.get("credentialSubject", {})
+    vc_types = vc.get("type", [])
+    expiry = vc.get("expirationDate") or payload.get("exp")
+
+    if expiry:
+        try:
+            if isinstance(expiry, int):
+                exp_dt = datetime.fromtimestamp(expiry, tz=timezone.utc)
+            else:
+                exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > exp_dt:
+                return {"verified": False, "detail": f"Credential expired on {expiry}."}
+        except Exception:
+            pass
+
+    if required_issuer_did and issuer != required_issuer_did:
+        return {"verified": False, "detail": f"Credential issuer is '{issuer}', expected '{required_issuer_did}'."}
+
+    if required_type and required_type not in vc_types:
+        return {"verified": False, "detail": f"Credential type '{required_type}' not found. Types present: {vc_types}"}
+
+    did_verified = False
+    did_detail = "DID resolution skipped"
+    if issuer and issuer.startswith("did:"):
+        resolver_url = f"https://dev.uniresolver.io/1.0/identifiers/{issuer}"
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(resolver_url)
+                if r.status_code == 200:
+                    did_verified = True
+                    did_detail = f"DID {issuer} resolved successfully"
+                else:
+                    did_detail = f"DID {issuer} could not be resolved (status {r.status_code})"
+        except Exception as e:
+            did_detail = f"DID resolution failed: {e}"
+
+    return {
+        "verified": True,
+        "detail": f"Credential decoded. Issuer: {issuer}. {did_detail}",
+        "issuer": issuer,
+        "subject": subject,
+        "types": vc_types,
+        "did_resolved": did_verified,
+    }
+
+
+class VCVerifyRequest(BaseModel):
+    vc_jwt: str
+    required_issuer_did: Optional[str] = None
+    required_type: Optional[str] = None
+
+@app.post("/vc/verify")
+async def verify_vc(req: VCVerifyRequest):
+    result = await verify_w3c_credential(req.vc_jwt, req.required_issuer_did, req.required_type)
+    if not result["verified"]:
+        raise HTTPException(status_code=400, detail=result["detail"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 11f. GITCOIN PASSPORT SCORE
+# ---------------------------------------------------------------------------
+async def get_gitcoin_passport_score(eth_address: str) -> dict:
+    if not GITCOIN_API_KEY:
+        return {"verified": False, "detail": "Gitcoin Passport API key not configured.", "score": None}
+
+    url = f"https://api.scorer.gitcoin.co/registry/score/{GITCOIN_SCORER_ID}/{eth_address}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.get(url, headers={"X-API-KEY": GITCOIN_API_KEY})
+
+    if res.status_code == 404:
+        return {"verified": False, "detail": f"No Passport found for {eth_address}. The wallet may not have a Gitcoin Passport.", "score": 0}
+
+    data = res.json()
+    score = float(data.get("score") or 0)
+    status = data.get("status", "")
+
+    return {
+        "verified": True,
+        "score": score,
+        "status": status,
+        "detail": f"Gitcoin Passport score: {score:.1f} (status: {status})",
+        "address": eth_address,
+    }
+
+
+@app.get("/passport/score/{eth_address}")
+async def passport_score(eth_address: str):
+    result = await get_gitcoin_passport_score(eth_address)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 12. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
 async def run_ai_audit(
@@ -2131,6 +2435,12 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         delivery_status       = "PENDING",
         submission_count      = 0,
         max_submissions       = max(1, min(req.max_submissions, 10)),  # clamp 1–10
+        required_nft_issuer   = req.required_nft_issuer or None,
+        required_nft_metadata = json.dumps(req.required_nft_metadata) if req.required_nft_metadata else None,
+        required_domain        = req.required_domain or None,
+        required_vc_issuer_did = req.required_vc_issuer_did or None,
+        required_vc_type       = req.required_vc_type or None,
+        min_passport_score     = req.min_passport_score if req.min_passport_score is not None else None,
     )
     db.add(vault)
     db.commit()
@@ -2325,6 +2635,70 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         except Exception:
             logger.warning("⚠️ Could not parse stored spec link snapshots")
 
+    # ── NFT PROOF VERIFICATION (if required by buyer) ──
+    nft_proof_note = None
+    if vault.required_nft_issuer:
+        if not req.nft_token_id:
+            raise HTTPException(
+                status_code=400,
+                detail="This escrow requires NFT-verified proof. Please provide nft_token_id in your submission.",
+            )
+        nft_wallet = req.nft_wallet or vault.worker_address
+        required_meta = None
+        if vault.required_nft_metadata:
+            try:
+                required_meta = json.loads(vault.required_nft_metadata)
+            except Exception:
+                pass
+        nft_result = await verify_nft_ownership(
+            wallet_address=nft_wallet,
+            nft_token_id=req.nft_token_id,
+            required_issuer=vault.required_nft_issuer,
+            required_metadata=required_meta,
+        )
+        if not nft_result["verified"]:
+            raise HTTPException(status_code=400, detail=f"NFT verification failed: {nft_result['detail']}")
+        nft_proof_note = f"🔗 NFT PROOF VERIFIED ON-CHAIN: {nft_result['detail']}"
+        logger.info(f"✅ NFT proof verified for {req.escrow_id}: {nft_result['detail']}")
+
+    # ── DOMAIN VERIFICATION (if required by buyer) ──
+    domain_proof_note = None
+    if vault.required_domain:
+        worker_addr_for_domain = vault.worker_address
+        domain_result = await verify_domain_ownership(worker_addr_for_domain, vault.required_domain)
+        if not domain_result["verified"]:
+            raise HTTPException(status_code=400, detail=f"Domain verification failed: {domain_result['detail']}")
+        domain_proof_note = f"🌐 DOMAIN VERIFIED: {domain_result['detail']}"
+        logger.info(f"✅ Domain verified for {req.escrow_id}: {domain_result['detail']}")
+
+    # ── W3C VC VERIFICATION (if required by buyer) ──
+    vc_proof_note = None
+    if vault.required_vc_issuer_did or vault.required_vc_type:
+        if not req.vc_jwt:
+            raise HTTPException(
+                status_code=400,
+                detail="This escrow requires a W3C Verifiable Credential. Please provide vc_jwt in your submission.",
+            )
+        vc_result = await verify_w3c_credential(req.vc_jwt, vault.required_vc_issuer_did, vault.required_vc_type)
+        if not vc_result["verified"]:
+            raise HTTPException(status_code=400, detail=f"VC verification failed: {vc_result['detail']}")
+        vc_proof_note = f"📜 VERIFIABLE CREDENTIAL VERIFIED: {vc_result['detail']}"
+        logger.info(f"✅ VC verified for {req.escrow_id}: {vc_result['detail']}")
+
+    # ── GITCOIN PASSPORT (supplementary evidence — warning only, not blocking) ──
+    passport_note = None
+    if vault.min_passport_score is not None and req.passport_eth_address:
+        passport_result = await get_gitcoin_passport_score(req.passport_eth_address)
+        score = passport_result.get("score") or 0
+        if passport_result.get("verified"):
+            if score >= vault.min_passport_score:
+                passport_note = f"🛡️ GITCOIN PASSPORT: Score {score:.1f} (required ≥{vault.min_passport_score}) — MEETS THRESHOLD for {req.passport_eth_address}"
+            else:
+                passport_note = f"🛡️ GITCOIN PASSPORT WARNING: Score {score:.1f} is below required minimum {vault.min_passport_score} for {req.passport_eth_address}. This is supplementary evidence — consider it in your evaluation."
+        else:
+            passport_note = f"🛡️ GITCOIN PASSPORT: Could not retrieve score for {req.passport_eth_address}. {passport_result.get('detail', '')}"
+        logger.info(f"🛡️ Passport note for {req.escrow_id}: {passport_note}")
+
     # Fetch evidence link snapshots now (at submission time = tamper-proof snapshot)
     evidence_snapshots = None
     if req.evidence_links:
@@ -2336,9 +2710,22 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         failed = sum(1 for s in evidence_snapshots if s.get("error"))
         logger.info(f"🔗 Evidence links: {ok} fetched, {failed} failed for {req.escrow_id}")
 
+    work_with_nft = req.work
+    extra_notes = []
+    if nft_proof_note:
+        extra_notes.append(nft_proof_note)
+    if domain_proof_note:
+        extra_notes.append(domain_proof_note)
+    if vc_proof_note:
+        extra_notes.append(vc_proof_note)
+    if passport_note:
+        extra_notes.append(passport_note)
+    if extra_notes:
+        work_with_nft = req.work + "\n\n" + "\n".join(extra_notes)
+
     verdict_dict, model_used = await run_ai_audit(
         task                    = vault.task_description,
-        work                    = req.work,
+        work                    = work_with_nft,
         buyer_attachments       = stored_buyer_attachments,
         worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
         task_category           = req.task_category,
@@ -2927,6 +3314,12 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         buyer_callback_url = body.get("buyer_callback_url") or None,
         award_token_hash   = award_token_hash,
         award_token        = award_token,
+        required_nft_issuer   = body.get("required_nft_issuer") or None,
+        required_nft_metadata = json.dumps(body.get("required_nft_metadata")) if body.get("required_nft_metadata") else None,
+        required_domain        = body.get("required_domain") or None,
+        required_vc_issuer_did = body.get("required_vc_issuer_did") or None,
+        required_vc_type       = body.get("required_vc_type") or None,
+        min_passport_score     = body.get("min_passport_score") if body.get("min_passport_score") is not None else None,
     )
     db.add(job)
     db.commit()
@@ -3003,6 +3396,11 @@ async def list_jobs(
             "created_at":   (j.created_at.isoformat() + "Z") if j.created_at else None,
             "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
             "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
+            "required_nft_issuer":   j.required_nft_issuer or None,
+            "required_domain":        j.required_domain or None,
+            "required_vc_issuer_did": j.required_vc_issuer_did or None,
+            "required_vc_type":       j.required_vc_type or None,
+            "min_passport_score":     j.min_passport_score,
         })
         if len(result) >= limit:
             break
@@ -3067,6 +3465,7 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
         "awarded_bid_id": job.awarded_bid_id,
         "escrow_id":     job.escrow_id,
         "expires_at":    job.expires_at.strftime("%Y-%m-%d %H:%M UTC") if job.expires_at else None,
+        "required_nft_issuer": job.required_nft_issuer or None,
         "bids":          bids_out,
     }
 
@@ -3594,6 +3993,62 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
         "expires_at": expires_at.isoformat(),
         "message":    "Your skill listing is now live for 30 days.",
     }
+
+
+# ---------------------------------------------------------------------------
+# NFT ISSUER ENDPOINTS
+# ---------------------------------------------------------------------------
+
+class NftVerifyRequest(BaseModel):
+    wallet_address:    str
+    nft_token_id:      str
+    required_issuer:   Optional[str]  = None
+    required_metadata: Optional[dict] = None
+
+class NftIssuerRequest(BaseModel):
+    wallet_address: str
+    name:           str
+    category:       Optional[str] = None
+    description:    Optional[str] = None
+    website:        Optional[str] = None
+
+@app.get("/nft/issuers")
+async def list_nft_issuers(category: str = None, db: Session = Depends(get_db)):
+    q = db.query(NftIssuer).filter(NftIssuer.verified == "verified")
+    if category:
+        q = q.filter(NftIssuer.category == category)
+    issuers = q.order_by(NftIssuer.name).all()
+    return {"issuers": [
+        {"wallet_address": i.wallet_address, "name": i.name, "category": i.category,
+         "description": i.description, "website": i.website}
+        for i in issuers
+    ]}
+
+@app.post("/nft/verify")
+async def verify_nft(req: NftVerifyRequest):
+    result = await verify_nft_ownership(
+        wallet_address=req.wallet_address,
+        nft_token_id=req.nft_token_id,
+        required_issuer=req.required_issuer,
+        required_metadata=req.required_metadata,
+    )
+    if not result["verified"]:
+        raise HTTPException(status_code=400, detail=result["detail"])
+    return result
+
+@app.post("/nft/issuers")
+async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_db)):
+    existing = db.query(NftIssuer).filter(NftIssuer.wallet_address == req.wallet_address).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Issuer already registered.")
+    issuer = NftIssuer(
+        wallet_address=req.wallet_address, name=req.name,
+        category=req.category, description=req.description,
+        website=req.website, verified="pending",
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(issuer); db.commit()
+    return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallet_address": req.wallet_address}
 
 
 # ---------------------------------------------------------------------------
