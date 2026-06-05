@@ -36,7 +36,7 @@ from xrpl.utils import xrp_to_drops
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text, or_
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -419,6 +419,12 @@ class EscrowVault(Base):
     required_vc_issuer_did = Column(String, nullable=True)  # W3C VC required issuer DID
     required_vc_type      = Column(String, nullable=True)   # W3C VC required type
     proof_policy          = Column(String, default="ALL")   # "ALL" or "ANY"
+    # NFT Delivery vs Payment (DvP) — v10
+    nft_dvp              = Column(Boolean,  default=False)   # True if NFT transfer required
+    nft_dvp_token_id     = Column(String,   nullable=True)   # The NFT token ID to be transferred
+    nft_dvp_offer_id     = Column(String,   nullable=True)   # The NFTokenCreateOffer ID on XRPL
+    nft_dvp_offer_expiry = Column(DateTime, nullable=True)   # When the offer expires
+    nft_dvp_status       = Column(String,   nullable=True)   # "pending_offer" | "offer_created" | "accepted" | "expired"
 
 
 class JobPosting(Base):
@@ -646,6 +652,12 @@ def run_migrations():
         "ALTER TABLE bid ADD COLUMN IF NOT EXISTS xrpl_trust_score INTEGER",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS proof_policy VARCHAR DEFAULT 'ALL'",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS proof_policy VARCHAR DEFAULT 'ALL'",
+        # v10 NFT DvP columns
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp              BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_token_id     VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_offer_id     VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_offer_expiry TIMESTAMP",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_status       VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -956,6 +968,8 @@ class EscrowSetupRequest(BaseModel):
     proof_policy:           Optional[str]   = "ALL"
     # Gitcoin Passport removed — fields kept here for backwards compat with old clients
     min_passport_score:     Optional[float] = None  # ignored, kept for API compatibility
+    # NFT Delivery-vs-Payment mode
+    nft_dvp: bool = False  # enable NFT delivery-vs-payment mode
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -2570,6 +2584,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         required_vc_issuer_did = req.required_vc_issuer_did or None,
         required_vc_type       = req.required_vc_type or None,
         proof_policy           = req.proof_policy or "ALL",
+        nft_dvp                = req.nft_dvp or False,
     )
     db.add(vault)
     db.commit()
@@ -2700,6 +2715,9 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "submission_count":     vault.submission_count or 0,
         "max_submissions":      vault.max_submissions  or DEFAULT_MAX_SUBMISSIONS,
         "attempts_remaining":   max(0, (vault.max_submissions or DEFAULT_MAX_SUBMISSIONS) - (vault.submission_count or 0)),
+        "nft_dvp":              vault.nft_dvp or False,
+        "nft_dvp_status":       vault.nft_dvp_status,
+        "nft_dvp_token_id":     vault.nft_dvp_token_id,
     }
 
 
@@ -2867,6 +2885,52 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             logger.error(f"❌ Could not decrypt fulfillment for {req.escrow_id}: {e}")
             raise HTTPException(status_code=500, detail="Internal error: could not decrypt fulfillment key. Contact support.")
 
+        # ── NFT DvP: if enabled, hold payment until buyer accepts the NFT offer ──
+        if vault.nft_dvp:
+            vault.status              = "PASS_AWAITING_NFT"
+            vault.nft_dvp_status      = "pending_offer"
+            vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
+            vault.worker_submission = json.dumps({
+                "work":               req.work,
+                "attachments":        [a.dict() for a in (req.worker_attachments or [])],
+                "evidence_links":     req.evidence_links or [],
+                "evidence_snapshots": evidence_snapshots or [],
+                "verdict":            verdict_dict,
+                "delivered_at":       datetime.now(timezone.utc).isoformat(),
+                "escrow_id":          req.escrow_id,
+            })
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            logger.info(f"🔄 NFT DvP: PASS_AWAITING_NFT for {req.escrow_id}")
+            return {
+                "escrow_id":            req.escrow_id,
+                "status":               "pass_awaiting_nft",
+                "verdict":              verdict_dict,
+                "model_used":           model_used,
+                "fulfillment":          None,
+                "condition":            None,
+                "worker_address":       vault.worker_address,
+                "buyer_address":        vault.buyer_address,
+                "escrow_sequence":      vault.escrow_sequence,
+                "amount_xrp":           vault.amount_xrp,
+                "amount_rlusd":         vault.amount_rlusd,
+                "currency":             vault.currency,
+                "auto_finish_queued":   False,
+                "dex_quote_rlusd":      None,
+                "rlusd_issuer":         None,
+                "seller_currency":      vault.seller_currency,
+                "nft_dvp_required":     True,
+                "nft_dvp_instructions": (
+                    f"Your work passed! Before payment releases, you must transfer the NFT to the buyer.\n\n"
+                    f"1. In Xaman: create an NFTokenCreateOffer for your NFT\n"
+                    f"2. Set Destination = {vault.buyer_address}\n"
+                    f"3. Set Amount = 0 (payment comes via escrow)\n"
+                    f"4. Submit the NFT Token ID at POST /escrow/{vault.escrow_id}/nft-offer\n\n"
+                    f"Payment releases automatically once the buyer accepts."
+                ),
+            }
+
         revealed_fulfillment      = plaintext_fulfillment
         vault.status              = "RELEASED"
         vault.delivery_status     = "RELEASED"
@@ -3016,6 +3080,231 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         "max_submissions":   vault.max_submissions,
         "submission_count":  vault.submission_count or 0,
         "attempts_remaining": attempts_remaining,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 16c. NFT DELIVERY-VS-PAYMENT (DvP) — helpers + endpoints
+# ---------------------------------------------------------------------------
+async def verify_nft_sell_offer(nft_token_id: str, seller_address: str, buyer_address: str) -> dict:
+    """Check that an NFTokenCreateOffer exists for this NFT, from seller, to buyer, at price 0."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(XRPL_URL, json={
+                "method": "nft_sell_offers",
+                "params": [{"nft_id": nft_token_id}]
+            })
+            data = res.json()
+    except Exception as e:
+        return {"verified": False, "detail": f"XRPL request failed: {e}"}
+
+    result = data.get("result", {})
+    if result.get("status") == "error" or "error" in result:
+        return {"verified": False, "detail": f"XRPL error: {result.get('error_message', result.get('error', 'unknown'))}"}
+
+    offers = result.get("offers", [])
+    if not offers:
+        return {"verified": False, "detail": f"No sell offers found for NFT {nft_token_id}."}
+
+    for offer in offers:
+        dest   = offer.get("destination", "")
+        amount = offer.get("amount", "")
+        if dest == buyer_address and (amount == "0" or amount == 0):
+            return {
+                "verified": True,
+                "offer_index": offer.get("nft_offer_index", ""),
+                "expiration": offer.get("expiration"),
+                "detail": f"Valid sell offer found: NFT {nft_token_id} offered to {buyer_address} at price 0.",
+            }
+
+    return {
+        "verified": False,
+        "detail": (
+            f"No valid offer found for NFT {nft_token_id} to buyer {buyer_address} at price 0. "
+            f"Found {len(offers)} offer(s) but none matched."
+        ),
+    }
+
+
+async def check_nft_accepted(nft_token_id: str, buyer_address: str) -> bool:
+    """Return True if the NFT is now owned by buyer_address."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(XRPL_URL, json={
+                "method": "account_nfts",
+                "params": [{"account": buyer_address, "limit": 400}]
+            })
+            data = res.json()
+        nfts = data.get("result", {}).get("account_nfts", [])
+        return any(n.get("NFTokenID") == nft_token_id for n in nfts)
+    except Exception as e:
+        logger.warning(f"check_nft_accepted failed for {nft_token_id}: {e}")
+        return False
+
+
+async def _send_nft_accept_email(buyer_email: str, buyer_name: str, escrow_id: str, nft_token_id: str, worker_name: str):
+    if not RESEND_API_KEY:
+        return
+    subject = f"🎟️ Your NFT is ready to collect — {escrow_id}"
+    body = f"""
+    <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:2rem;background:#0d1117;color:#e2e8f0;border-radius:12px;">
+        <h2 style="color:#10b981;">Your NFT is ready!</h2>
+        <p>Hi {buyer_name or 'there'},</p>
+        <p>The work on escrow <strong>{escrow_id}</strong> has passed the AI audit. The seller ({worker_name}) has created an NFT transfer offer for you on the XRPL.</p>
+        <div style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.2);border-radius:8px;padding:1rem;margin:1.5rem 0;">
+            <div style="font-size:.8rem;color:#10b981;font-weight:700;margin-bottom:.5rem;">NFT TOKEN ID</div>
+            <div style="font-family:monospace;font-size:.8rem;word-break:break-all;">{nft_token_id}</div>
+        </div>
+        <p><strong>To release payment to the seller, accept the NFT offer:</strong></p>
+        <ol style="color:#94a3b8;line-height:1.8;">
+            <li>Open <strong>Xaman</strong> on your phone</li>
+            <li>Go to NFTs → Pending Offers</li>
+            <li>Accept the incoming offer for token <code>{nft_token_id[:16]}...</code></li>
+        </ol>
+        <p style="color:#94a3b8;font-size:.85rem;">Once you accept, payment releases automatically to the seller. You cannot be charged — the NFT transfer is free (payment comes from the escrow you already funded).</p>
+        <a href="https://www.cryptovault.co.uk?track={escrow_id}" style="display:inline-block;background:#10b981;color:#fff;padding:.75rem 1.5rem;border-radius:8px;text-decoration:none;font-weight:700;margin-top:1rem;">Track Escrow</a>
+    </div>
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                json={"from": "AgentTrust <noreply@agenttrust.io>", "to": [buyer_email], "subject": subject, "html": body},
+            )
+    except Exception as e:
+        logger.warning(f"NFT accept email failed: {e}")
+
+
+async def _auto_finish_after_nft_accepted(escrow_id: str):
+    """Fire EscrowFinish after NFT acceptance confirmed."""
+    await asyncio.sleep(3)
+    with SessionLocal() as db:
+        vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+        if not vault or vault.status == "RELEASED":
+            return
+        escrow_owner = vault.escrow_owner or vault.buyer_address
+        if not escrow_owner or not vault.escrow_sequence or not vault.worker_address or not referee_wallet:
+            logger.error(f"❌ NFT DvP auto-finish skipped for {escrow_id}: missing fields")
+            return
+        try:
+            plaintext_fulfillment = decrypt_fulfillment(vault.fulfillment)
+            vault.status          = "RELEASED"
+            vault.delivery_status = "RELEASED"
+            db.commit()
+        except Exception as e:
+            logger.error(f"NFT DvP auto-finish: could not decrypt fulfillment for {escrow_id}: {e}")
+            vault.auto_finish_error = str(e)
+            db.commit()
+            return
+        try:
+            await auto_finish_escrow(
+                escrow_id          = escrow_id,
+                sequence           = vault.escrow_sequence,
+                owner              = escrow_owner,
+                fulfillment        = plaintext_fulfillment,
+                condition          = vault.condition,
+                worker_addr        = vault.worker_address,
+                db_session_factory = SessionLocal,
+            )
+        except Exception as e:
+            logger.error(f"NFT DvP auto-finish failed for {escrow_id}: {e}")
+            with SessionLocal() as db2:
+                v2 = db2.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+                if v2:
+                    v2.auto_finish_error = str(e)
+                    db2.commit()
+
+
+class NftDvpOfferRequest(BaseModel):
+    escrow_id:    str
+    nft_token_id: str
+
+
+@app.post("/escrow/{escrow_id}/nft-offer")
+async def register_nft_dvp_offer(escrow_id: str, req: NftDvpOfferRequest, db: Session = Depends(get_db)):
+    """
+    Seller has created an NFTokenCreateOffer on XRPL (Destination=buyer, Amount=0).
+    Register it here so the system can monitor for buyer acceptance.
+    """
+    import asyncio
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+    if not vault.nft_dvp:
+        raise HTTPException(status_code=400, detail="This escrow does not have NFT DvP enabled.")
+    if vault.status != "PASS_AWAITING_NFT":
+        raise HTTPException(status_code=400, detail=f"Escrow is not in PASS_AWAITING_NFT state (current: {vault.status}).")
+
+    buyer_address = vault.buyer_address
+    if not buyer_address:
+        raise HTTPException(status_code=400, detail="Buyer address not set on this escrow.")
+
+    offer_check = await verify_nft_sell_offer(req.nft_token_id, vault.worker_address or "", buyer_address)
+    if not offer_check["verified"]:
+        raise HTTPException(status_code=400, detail=offer_check["detail"])
+
+    vault.nft_dvp_token_id = req.nft_token_id
+    vault.nft_dvp_offer_id = offer_check.get("offer_index", "")
+    vault.nft_dvp_status   = "offer_created"
+
+    xrpl_expiry = offer_check.get("expiration")
+    if xrpl_expiry:
+        XRPL_EPOCH_OFFSET = 946684800
+        expiry_unix = xrpl_expiry + XRPL_EPOCH_OFFSET
+        vault.nft_dvp_offer_expiry = datetime.fromtimestamp(expiry_unix, tz=timezone.utc).replace(tzinfo=None)
+
+    db.commit()
+
+    if vault.buyer_email:
+        asyncio.create_task(_send_nft_accept_email(
+            buyer_email  = vault.buyer_email,
+            buyer_name   = vault.buyer_name or "",
+            escrow_id    = escrow_id,
+            nft_token_id = req.nft_token_id,
+            worker_name  = vault.worker_address or "the seller",
+        ))
+
+    return {
+        "status":       "offer_registered",
+        "nft_token_id": req.nft_token_id,
+        "offer_index":  vault.nft_dvp_offer_id,
+        "message":      "NFT sell offer verified on-chain. Buyer has been notified to accept it. Payment will release automatically once accepted.",
+    }
+
+
+@app.get("/escrow/{escrow_id}/nft-status")
+async def nft_dvp_status(escrow_id: str, db: Session = Depends(get_db)):
+    """Check whether the buyer has accepted the NFT offer yet."""
+    import asyncio
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+
+    if not vault.nft_dvp or not vault.nft_dvp_token_id:
+        return {"nft_dvp": False}
+
+    if vault.nft_dvp_status == "accepted":
+        return {"nft_dvp": True, "status": "accepted", "message": "NFT accepted. Escrow released."}
+
+    if vault.nft_dvp_offer_expiry and datetime.now(timezone.utc) > vault.nft_dvp_offer_expiry.replace(tzinfo=timezone.utc):
+        vault.nft_dvp_status = "expired"
+        db.commit()
+        return {"nft_dvp": True, "status": "expired", "message": "NFT offer expired. Seller must create a new offer."}
+
+    if vault.buyer_address and vault.nft_dvp_token_id:
+        accepted = await check_nft_accepted(vault.nft_dvp_token_id, vault.buyer_address)
+        if accepted:
+            vault.nft_dvp_status = "accepted"
+            db.commit()
+            asyncio.create_task(_auto_finish_after_nft_accepted(escrow_id))
+            return {"nft_dvp": True, "status": "accepted", "message": "NFT accepted! Releasing payment to seller now."}
+
+    return {
+        "nft_dvp":       True,
+        "status":        vault.nft_dvp_status or "offer_created",
+        "nft_token_id":  vault.nft_dvp_token_id,
+        "message":       "Waiting for buyer to accept the NFT offer in Xaman.",
     }
 
 
