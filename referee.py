@@ -4686,7 +4686,9 @@ async def _send_issuer_registration_email(issuer):
 # Paths kept as /gleif/* for backward compatibility with existing API consumers
 # ---------------------------------------------------------------------------
 
-EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
+EDGAR_COMPANY_SEARCH = "https://efts.sec.gov/LATEST/search-index"
+EDGAR_BROWSE = "https://www.sec.gov/cgi-bin/browse-edgar"
+EDGAR_HEADERS = {"User-Agent": "AgentTrust/1.0 admin@cryptovault.co.uk", "Accept": "application/json"}
 
 def _edgar_parse(hit: dict) -> dict:
     src = hit.get("_source", {})
@@ -4704,19 +4706,57 @@ def _edgar_parse(hit: dict) -> dict:
 async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
     """Search SEC EDGAR for US public companies by name."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(EDGAR_SEARCH, params={"q": q, "forms": "10-K"},
-                               headers={"User-Agent": "AgentTrust/1.0 admin@cryptovault.co.uk"})
+        # browse-edgar with action=getcompany searches company names specifically
+        res = await client.get(
+            EDGAR_BROWSE,
+            params={"company": q, "action": "getcompany", "type": "10-K",
+                    "dateb": "", "owner": "include", "count": min(limit, 40),
+                    "search_text": "", "output": "atom"},
+            headers=EDGAR_HEADERS,
+        )
     if res.status_code != 200:
         return {"results": [], "error": f"SEC EDGAR returned {res.status_code}"}
-    hits = res.json().get("hits", {}).get("hits", [])
-    seen = set()
+    # Parse Atom XML response
+    import xml.etree.ElementTree as ET
+    ns = {"atom": "http://www.w3.org/2005/Atom", "company": "http://www.sec.gov/cgi-bin/browse-edgar"}
+    try:
+        root = ET.fromstring(res.text)
+    except ET.ParseError:
+        return {"results": [], "error": "Could not parse EDGAR response"}
+    seen: set = set()
     results = []
-    for hit in hits:
-        name = hit.get("_source", {}).get("entity_name", "")
+    for entry in root.findall("atom:entry", ns):
+        name_el = entry.find("atom:company-info/atom:conformed-name", ns) \
+                  or entry.find("{http://www.sec.gov}company-info/{http://www.sec.gov}conformed-name") \
+                  or entry.find("atom:title", ns)
+        name = (name_el.text or "").strip() if name_el is not None else ""
+        if not name:
+            # Try title which is "company (CIK) (type)" format
+            title_el = entry.find("atom:title", ns)
+            if title_el is not None and title_el.text:
+                name = title_el.text.split("(")[0].strip()
         if not name or name.lower() in seen:
             continue
         seen.add(name.lower())
-        results.append(_edgar_parse(hit))
+        # Extract CIK from id element
+        id_el = entry.find("atom:id", ns)
+        cik = ""
+        if id_el is not None and id_el.text:
+            import re
+            m = re.search(r"CIK=(\d+)", id_el.text)
+            if m:
+                cik = m.group(1)
+        results.append({
+            "name": name,
+            "company_number": cik,
+            "jurisdiction_code": "us",
+            "registered_address": "",
+            "status": "active",
+            "source": "sec-edgar",
+        })
+        if len(results) >= limit:
+            break
+    return {"results": results}
         if len(results) >= limit:
             break
     return {"results": results}
