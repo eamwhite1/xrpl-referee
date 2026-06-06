@@ -4642,6 +4642,38 @@ class NftIssuerWalletUpdate(BaseModel):
     contact_email: str           # must match registered email to authorise
     wallets:       list          # complete new list of wallets (replaces existing)
 
+@app.get("/nft/issuers/debug-seed")
+async def debug_seed(db: Session = Depends(get_db)):
+    """Manually run the seed and report results — for diagnostics only."""
+    results = []
+    errors = []
+    for entry in _PUBLIC_ISSUERS:
+        try:
+            existing = db.query(NftIssuer).filter(
+                NftIssuer.wallet_address == entry["wallet_address"]
+            ).first()
+            if existing:
+                results.append({"name": entry["name"], "status": "already exists", "verified": existing.verified})
+                continue
+            issuer = NftIssuer(
+                wallet_address=entry["wallet_address"],
+                name=entry["name"],
+                category=entry["category"],
+                description=entry["description"],
+                website=entry["website"],
+                verified="public",
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(issuer)
+            db.commit()
+            results.append({"name": entry["name"], "status": "inserted"})
+        except Exception as e:
+            db.rollback()
+            errors.append({"name": entry["name"], "error": str(e)})
+    total = db.query(NftIssuer).count()
+    return {"seeded": results, "errors": errors, "total_issuers_in_db": total, "database_url_set": bool(os.getenv("DATABASE_URL"))}
+
+
 @app.get("/nft/issuers")
 async def list_nft_issuers(category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
     q = db.query(NftIssuer)
