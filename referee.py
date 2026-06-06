@@ -524,7 +524,8 @@ class JobMessage(Base):
 class NftIssuer(Base):
     __tablename__ = "nft_issuer"
     id             = Column(Integer, primary_key=True, autoincrement=True)
-    wallet_address = Column(String, unique=True, nullable=False, index=True)
+    wallet_address = Column(String, nullable=False, index=True)  # primary / first wallet
+    wallet_addresses = Column(Text, nullable=True)               # JSON array of all wallets
     name           = Column(String, nullable=False)
     category       = Column(String, nullable=True)   # e.g. "logistics", "freelance", "iot"
     description    = Column(String, nullable=True)
@@ -534,6 +535,26 @@ class NftIssuer(Base):
     contact_email  = Column(String, nullable=True)
     lei            = Column(String, nullable=True)
     nft_types      = Column(String, nullable=True)
+
+    def all_wallets(self) -> list:
+        """Return all registered wallets for this issuer."""
+        try:
+            parsed = json.loads(self.wallet_addresses or "[]")
+            wallets = [w for w in parsed if w]
+        except Exception:
+            wallets = []
+        # Always include primary wallet
+        if self.wallet_address and self.wallet_address not in wallets:
+            wallets.insert(0, self.wallet_address)
+        return wallets
+
+    def set_wallets(self, wallets: list):
+        """Persist a wallet list, keeping primary in sync."""
+        wallets = [w.strip() for w in wallets if w and w.strip()]
+        wallets = list(dict.fromkeys(wallets))  # deduplicate, preserve order
+        if wallets:
+            self.wallet_address = wallets[0]
+        self.wallet_addresses = json.dumps(wallets)
 
 
 class SkillListing(Base):
@@ -2837,12 +2858,45 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                     required_meta = json.loads(vault.required_nft_metadata)
                 except Exception:
                     pass
-            nft_result = await verify_nft_ownership(
-                wallet_address=nft_wallet,
-                nft_token_id=req.nft_token_id,
-                required_issuer=vault.required_nft_issuer,
-                required_metadata=required_meta,
-            )
+            # Resolve required_issuer: if it matches an issuer in the registry,
+            # accept NFTs from ANY of that issuer's registered wallets.
+            resolved_issuer = vault.required_nft_issuer
+            try:
+                reg_issuer = db.query(NftIssuer).filter(
+                    NftIssuer.wallet_addresses.contains(vault.required_nft_issuer) |
+                    (NftIssuer.wallet_address == vault.required_nft_issuer)
+                ).first()
+                if reg_issuer and len(reg_issuer.all_wallets()) > 1:
+                    # Try each wallet; use first that passes
+                    for candidate in reg_issuer.all_wallets():
+                        _r = await verify_nft_ownership(
+                            wallet_address=nft_wallet,
+                            nft_token_id=req.nft_token_id,
+                            required_issuer=candidate,
+                            required_metadata=required_meta,
+                        )
+                        if _r["verified"]:
+                            nft_result = _r
+                            break
+                    else:
+                        nft_result = _r  # last failure
+                    # Skip the single-call path below
+                    if nft_result["verified"]:
+                        note = f"🔗 NFT PROOF VERIFIED ON-CHAIN: {nft_result['detail']}"
+                        proof_results.append(("NFT", True, note))
+                    else:
+                        proof_results.append(("NFT", False, f"NFT proof failed: {nft_result['detail']}"))
+                    resolved_issuer = None  # already handled
+            except Exception:
+                pass
+
+            if resolved_issuer is not None:
+                nft_result = await verify_nft_ownership(
+                    wallet_address=nft_wallet,
+                    nft_token_id=req.nft_token_id,
+                    required_issuer=resolved_issuer,
+                    required_metadata=required_meta,
+                )
             if nft_result["verified"]:
                 note = f"🔗 NFT PROOF VERIFIED ON-CHAIN: {nft_result['detail']}"
                 proof_results.append(("NFT", True, note))
@@ -4460,14 +4514,19 @@ class NftVerifyRequest(BaseModel):
     required_metadata: Optional[dict] = None
 
 class NftIssuerRequest(BaseModel):
-    wallet_address: str
-    name:           str
-    category:       Optional[str] = None
-    description:    Optional[str] = None
-    website:        Optional[str] = None
-    contact_email:  Optional[str] = None
-    lei:            Optional[str] = None
-    nft_types:      Optional[str] = None
+    wallet_address:   str                    # primary wallet (required)
+    wallet_addresses: Optional[list] = None  # additional wallets
+    name:             str
+    category:         Optional[str] = None
+    description:      Optional[str] = None
+    website:          Optional[str] = None
+    contact_email:    Optional[str] = None
+    lei:              Optional[str] = None
+    nft_types:        Optional[str] = None
+
+class NftIssuerWalletUpdate(BaseModel):
+    contact_email: str           # must match registered email to authorise
+    wallets:       list          # complete new list of wallets (replaces existing)
 
 @app.get("/nft/issuers")
 async def list_nft_issuers(category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
@@ -4483,12 +4542,16 @@ async def list_nft_issuers(category: str = None, include_pending: bool = False, 
     return {
         "issuers": [
             {
-                "wallet_address": i.wallet_address,
-                "name": i.name,
-                "category": i.category,
-                "description": i.description,
-                "website": i.website,
-                "verified": i.verified,
+                "id":              i.id,
+                "wallet_address":  i.wallet_address,
+                "wallet_addresses": i.all_wallets(),
+                "name":            i.name,
+                "category":        i.category,
+                "description":     i.description,
+                "website":         i.website,
+                "verified":        i.verified,
+                "lei":             i.lei,
+                "nft_types":       i.nft_types,
             }
             for i in issuers
         ],
@@ -4511,22 +4574,62 @@ async def verify_nft(req: NftVerifyRequest):
 @app.post("/nft/issuers")
 async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_db)):
     import asyncio
-    existing = db.query(NftIssuer).filter(NftIssuer.wallet_address == req.wallet_address).first()
+    # Build consolidated wallet list
+    all_wallets = [req.wallet_address] + (req.wallet_addresses or [])
+    all_wallets = list(dict.fromkeys(w.strip() for w in all_wallets if w and w.strip()))
+
+    # Check if any of the submitted wallets already exists under another issuer
+    for w in all_wallets:
+        existing = db.query(NftIssuer).filter(
+            NftIssuer.wallet_addresses.contains(w) | (NftIssuer.wallet_address == w)
+        ).first()
+        if existing and existing.name.lower() != req.name.lower():
+            raise HTTPException(status_code=409, detail=f"Wallet {w} is already registered under a different issuer.")
+
+    # Upsert: if same name + email already exists, update it
+    existing = db.query(NftIssuer).filter(
+        NftIssuer.name.ilike(req.name),
+        NftIssuer.contact_email == req.contact_email,
+    ).first() if req.contact_email else None
+
     if existing:
-        raise HTTPException(status_code=409, detail="Issuer already registered.")
+        existing.set_wallets(existing.all_wallets() + all_wallets)
+        existing.category    = req.category    or existing.category
+        existing.description = req.description or existing.description
+        existing.website     = req.website     or existing.website
+        existing.lei         = req.lei         or existing.lei
+        existing.nft_types   = req.nft_types   or existing.nft_types
+        db.commit()
+        return {"status": "updated", "message": "Issuer record updated.", "wallets": existing.all_wallets()}
+
     issuer = NftIssuer(
-        wallet_address=req.wallet_address, name=req.name,
+        wallet_address=all_wallets[0], name=req.name,
         category=req.category, description=req.description,
         website=req.website, verified="pending",
         created_at=datetime.now(timezone.utc),
         contact_email=req.contact_email,
-        lei=req.lei,
-        nft_types=req.nft_types,
+        lei=req.lei, nft_types=req.nft_types,
     )
+    issuer.set_wallets(all_wallets)
     db.add(issuer); db.commit()
     if RESEND_API_KEY:
         asyncio.create_task(_send_issuer_registration_email(issuer))
-    return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallet_address": req.wallet_address}
+    return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallets": issuer.all_wallets()}
+
+
+@app.patch("/nft/issuers/{issuer_id}/wallets")
+async def update_issuer_wallets(issuer_id: int, req: NftIssuerWalletUpdate, db: Session = Depends(get_db)):
+    """Add or remove wallets for an issuer. Authenticated by matching contact_email."""
+    issuer = db.query(NftIssuer).filter(NftIssuer.id == issuer_id).first()
+    if not issuer:
+        raise HTTPException(status_code=404, detail="Issuer not found.")
+    if not issuer.contact_email or issuer.contact_email.lower() != req.contact_email.lower():
+        raise HTTPException(status_code=403, detail="Email does not match registered contact for this issuer.")
+    if not req.wallets:
+        raise HTTPException(status_code=400, detail="Wallet list cannot be empty.")
+    issuer.set_wallets(req.wallets)
+    db.commit()
+    return {"status": "updated", "wallets": issuer.all_wallets(), "name": issuer.name}
 
 
 async def _send_issuer_registration_email(issuer):
