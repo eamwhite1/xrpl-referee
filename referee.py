@@ -75,8 +75,101 @@ class PaymentRequired(Exception):
         self.response = response
 
 
+_PUBLIC_ISSUERS = [
+    {
+        "wallet_address": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+        "name": "Ripple Labs (RLUSD)",
+        "category": "Stablecoin issuer",
+        "description": "Issuer of RLUSD, a USD-backed stablecoin on the XRP Ledger. Launched December 2024.",
+        "website": "ripple.com",
+    },
+    {
+        "wallet_address": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+        "name": "Bitstamp",
+        "category": "Exchange / Gateway",
+        "description": "One of the longest-standing XRPL gateways, issuing USD, EUR, BTC and ETH IOUs. Domain verified on XRPL.",
+        "website": "bitstamp.net",
+    },
+    {
+        "wallet_address": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq",
+        "name": "GateHub",
+        "category": "Exchange / Gateway",
+        "description": "Multi-currency XRPL gateway issuing USD, EUR, GBP, ETH and BTC IOUs. Publishes all wallet addresses at gatehub.net/legal/xrpl-addresses.",
+        "website": "gatehub.net",
+    },
+    {
+        "wallet_address": "rsoLo2S1kiGeCcn6hCUXVrCpGMWLrRrLZz",
+        "name": "Sologenic",
+        "category": "DeFi / Asset tokenisation",
+        "description": "Real-world asset tokenisation platform on XRPL. Issues SOLO token and tokenised stocks. Domain verified on XRPL.",
+        "website": "sologenic.com",
+    },
+    {
+        "wallet_address": "rCSCManTZ8ME9EoLrSHHYKW8PPwWMgkwr",
+        "name": "CasinoCoin Foundation",
+        "category": "Regulated gaming",
+        "description": "Digital currency for the regulated gaming industry. Listed as the canonical example in the XRPL Foundation XLS-26 xrp-ledger.toml standard.",
+        "website": "casinocoin.im",
+    },
+    {
+        "wallet_address": "rDBMvpjV6DoWvr3LqMUG8JBgd4QbBoU1E2",
+        "name": "BPM Wallet (Twotixx)",
+        "category": "NFT ticketing",
+        "description": "XRPL-native NFT ticketing platform issuing event tickets to KYC'd wallets. XRPL Foundation Wave 4 Grant recipient. Combats touting and scalping.",
+        "website": "missionbpm.com",
+    },
+    {
+        "wallet_address": "rJBUybW3ng7nrnbT4X9iyieXRuFXct3Q3j",
+        "name": "IslandXchange",
+        "category": "Real-world asset tokenisation",
+        "description": "Blockchain platform for buying, selling and trading privately owned islands via fractional NFT ownership on XRPL. XRPL Foundation self-assessed.",
+        "website": "islandixc.tech",
+    },
+    {
+        "wallet_address": "rrno7Nj4RkFJLzC4nRaZiLF5aHwcTVon3d",
+        "name": "onXRP",
+        "category": "NFT marketplace / DeFi",
+        "description": "Largest NFT marketplace and launchpad on XRPL, plus a DEX, Play2Win game and fiat on-ramp. Issues OXP token.",
+        "website": "onxrp.com",
+    },
+]
+
+
+def _seed_public_issuers():
+    """Insert known public XRPL organisations into the registry if not already present.
+    These are seeded from publicly verifiable sources. Entries stay read-only until the
+    organisation claims their listing via xrp-ledger.toml verification.
+    """
+    db = SessionLocal()
+    try:
+        for entry in _PUBLIC_ISSUERS:
+            existing = db.query(NftIssuer).filter(
+                NftIssuer.wallet_address == entry["wallet_address"]
+            ).first()
+            if existing:
+                continue
+            issuer = NftIssuer(
+                wallet_address=entry["wallet_address"],
+                name=entry["name"],
+                category=entry["category"],
+                description=entry["description"],
+                website=entry["website"],
+                verified="public",
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(issuer)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Issuer seed failed: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def _lifespan(app):
+    # Seed public registry entries from known XRPL organisations
+    _seed_public_issuers()
     # XUMM connectivity check
     await _verify_xumm()
     if _mcp_http_app is not None:
@@ -4553,9 +4646,9 @@ class NftIssuerWalletUpdate(BaseModel):
 async def list_nft_issuers(category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
     q = db.query(NftIssuer)
     if include_pending:
-        q = q.filter(NftIssuer.verified.in_(["verified", "pending"]))
+        q = q.filter(NftIssuer.verified.in_(["verified", "public", "pending"]))
     else:
-        q = q.filter(NftIssuer.verified == "verified")
+        q = q.filter(NftIssuer.verified.in_(["verified", "public"]))
     if category:
         q = q.filter(NftIssuer.category == category)
     issuers = q.order_by(NftIssuer.name).all()
