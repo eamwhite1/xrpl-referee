@@ -305,10 +305,9 @@ def serve_mcp_server_card():
             {"name": "verify_vc",                 "description": "POST /vc/verify — verify a W3C Verifiable Credential JWT. Checks expiry, issuer DID, credential type, and optionally resolves the DID via the Universal Resolver. Accepts credentials from any W3C-compliant issuer."},
             {"name": "register_nft_dvp_offer",    "description": "POST /escrow/{id}/nft-offer — after a PASS verdict on an NFT DvP escrow, seller registers their on-chain NFTokenCreateOffer (Destination=buyer, Amount=0). System verifies the offer on XRPL and emails buyer to accept. Payment releases automatically once buyer accepts."},
             {"name": "check_nft_dvp_status",      "description": "GET /escrow/{id}/nft-status — poll whether the buyer has accepted the NFT offer yet. Returns accepted/pending/expired. Triggers automatic escrow release when accepted."},
-            {"name": "search_verified_companies", "description": "GET /gleif/search?q= — search SEC EDGAR for US public companies by name. Returns file number and company name. Use to find a company's verified identity before requiring their XRPL wallet as a trusted NFT issuer."},
-            {"name": "company_xrpl_lookup",       "description": "GET /gleif/xrpl-lookup?q= — search for a company by name via SEC EDGAR, then attempt to find their registered XRPL wallet address in the AgentTrust registry. Green result = SEC EDGAR verified + XRPL wallet confirmed."},
-            {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain and SEC EDGAR record."},
-            {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification against SEC EDGAR + domain records."},
+            {"name": "company_xrpl_lookup",       "description": "GET /gleif/xrpl-lookup?q= — search the AgentTrust registry for a company by name and return their verified XRPL wallet address."},
+            {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain."},
+            {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification via domain records."},
             {"name": "create_eth_challenge",      "description": "POST /eth/challenge — generate an EIP-191 challenge string for an Ethereum address. The address holder must sign this with their ETH wallet to prove ownership. Use before submitting an Ethereum address as identity proof."},
             {"name": "verify_eth_signature",      "description": "POST /eth/verify-signature — verify that an Ethereum address signed the challenge string. Confirms the submitter genuinely controls the ETH address, preventing fake address claims."},
         ],
@@ -4682,90 +4681,9 @@ async def _send_issuer_registration_email(issuer):
 
 
 # ---------------------------------------------------------------------------
-# COMPANY SEARCH + ISSUER LOOKUP  (SEC EDGAR — US public companies, free, no key)
-# Paths kept as /gleif/* for backward compatibility with existing API consumers
+# ISSUER LOOKUP  (AgentTrust registry only)
+# Path kept as /gleif/xrpl-lookup for backward compatibility
 # ---------------------------------------------------------------------------
-
-EDGAR_COMPANY_SEARCH = "https://efts.sec.gov/LATEST/search-index"
-EDGAR_BROWSE = "https://www.sec.gov/cgi-bin/browse-edgar"
-EDGAR_HEADERS = {"User-Agent": "AgentTrust/1.0 admin@cryptovault.co.uk", "Accept": "application/json"}
-
-def _edgar_parse(hit: dict) -> dict:
-    src = hit.get("_source", {})
-    return {
-        "name":              src.get("entity_name", ""),
-        "company_number":    src.get("file_num", ""),
-        "jurisdiction_code": "us",
-        "registered_address": "",
-        "status":            "active",
-        "source":            "sec-edgar",
-    }
-
-
-@app.get("/gleif/search")
-async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
-    """Search SEC EDGAR for US public companies by name."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # action=getcompany searches registered company names — no form type filter
-        res = await client.get(
-            EDGAR_BROWSE,
-            params={"company": q, "action": "getcompany", "type": "",
-                    "dateb": "", "owner": "include", "count": min(limit, 40),
-                    "search_text": "", "output": "atom"},
-            headers=EDGAR_HEADERS,
-        )
-    if res.status_code != 200:
-        logger.warning(f"EDGAR company search returned {res.status_code} for q={q!r}: {res.text[:200]}")
-        return {"results": [], "error": f"SEC EDGAR returned {res.status_code}"}
-    # Parse Atom XML — EDGAR uses a custom namespace for company-info
-    import xml.etree.ElementTree as ET
-    SEC_NS = "http://www.sec.gov/cgi-bin/browse-edgar"
-    ATOM_NS = "http://www.w3.org/2005/Atom"
-    try:
-        root = ET.fromstring(res.text)
-    except ET.ParseError:
-        return {"results": [], "error": "Could not parse EDGAR response"}
-    seen: set = set()
-    results = []
-    for entry in root.findall(f"{{{ATOM_NS}}}entry"):
-        # Company name lives in <company-info xmlns="...sec.gov/cgi-bin/browse-edgar"><conformed-name>
-        name_el = entry.find(f"{{{SEC_NS}}}company-info/{{{SEC_NS}}}conformed-name")
-        name = (name_el.text or "").strip() if name_el is not None else ""
-        if not name:
-            continue
-        if name.lower() in seen:
-            continue
-        seen.add(name.lower())
-        # CIK from <company-info><cik>
-        cik_el = entry.find(f"{{{SEC_NS}}}company-info/{{{SEC_NS}}}cik")
-        cik = (cik_el.text or "").strip() if cik_el is not None else ""
-        results.append({
-            "name": name,
-            "company_number": cik,
-            "jurisdiction_code": "us",
-            "registered_address": "",
-            "status": "active",
-            "source": "sec-edgar",
-        })
-        if len(results) >= limit:
-            break
-    logger.info(f"EDGAR search q={q!r} → {len(results)} results")
-    return {"results": results}
-
-
-@app.get("/gleif/debug-edgar")
-async def debug_edgar(q: str):
-    """Return raw EDGAR XML for debugging."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.get(
-            EDGAR_BROWSE,
-            params={"company": q, "action": "getcompany", "type": "",
-                    "dateb": "", "owner": "include", "count": 5,
-                    "search_text": "", "output": "atom"},
-            headers=EDGAR_HEADERS,
-        )
-    return {"status": res.status_code, "body": res.text[:3000]}
-
 
 @app.get("/gleif/xrpl-lookup")
 async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
@@ -4790,20 +4708,17 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
             })
     except Exception:
         pass
-
     if not results:
         results.append({
-            "name":         q,
-            "source":       "sec-edgar",
-            "xrpl_wallet":  None,
+            "name":          q,
+            "source":        "agentrust",
+            "xrpl_wallet":   None,
             "xrpl_verified": False,
-            "domain":       None,
-            "register_url": "https://www.cryptovault.co.uk/marketplace#issuers",
-            "message":      "No XRPL wallet found. If you represent this company, register at the AgentTrust Trusted Issuer Registry.",
+            "domain":        None,
+            "register_url":  "https://www.cryptovault.co.uk/marketplace#issuers",
+            "message":       "Not in the AgentTrust registry. Ask the organisation to register their XRPL wallet.",
         })
-
     return {"results": results}
-
 
 # ---------------------------------------------------------------------------
 # STARTUP
