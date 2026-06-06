@@ -4705,20 +4705,20 @@ def _edgar_parse(hit: dict) -> dict:
 @app.get("/gleif/search")
 async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
     """Search SEC EDGAR for US public companies by name."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # browse-edgar with action=getcompany searches company names specifically
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # action=getcompany searches registered company names — no form type filter
         res = await client.get(
             EDGAR_BROWSE,
-            params={"company": q, "action": "getcompany", "type": "10-K",
+            params={"company": q, "action": "getcompany", "type": "",
                     "dateb": "", "owner": "include", "count": min(limit, 40),
                     "search_text": "", "output": "atom"},
             headers=EDGAR_HEADERS,
         )
     if res.status_code != 200:
+        logger.warning(f"EDGAR company search returned {res.status_code} for q={q!r}: {res.text[:200]}")
         return {"results": [], "error": f"SEC EDGAR returned {res.status_code}"}
     # Parse Atom XML — EDGAR uses a custom namespace for company-info
     import xml.etree.ElementTree as ET
-    import re as _re
     SEC_NS = "http://www.sec.gov/cgi-bin/browse-edgar"
     ATOM_NS = "http://www.w3.org/2005/Atom"
     try:
@@ -4749,7 +4749,22 @@ async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
         })
         if len(results) >= limit:
             break
+    logger.info(f"EDGAR search q={q!r} → {len(results)} results")
     return {"results": results}
+
+
+@app.get("/gleif/debug-edgar")
+async def debug_edgar(q: str):
+    """Return raw EDGAR XML for debugging."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(
+            EDGAR_BROWSE,
+            params={"company": q, "action": "getcompany", "type": "",
+                    "dateb": "", "owner": "include", "count": 5,
+                    "search_text": "", "output": "atom"},
+            headers=EDGAR_HEADERS,
+        )
+    return {"status": res.status_code, "body": res.text[:3000]}
 
 
 @app.get("/gleif/xrpl-lookup")
