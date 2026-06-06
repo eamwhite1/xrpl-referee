@@ -4819,6 +4819,91 @@ async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_d
     return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallets": issuer.all_wallets()}
 
 
+@app.get("/nft/issuers/feed")
+async def issuer_registry_feed(
+    page: int = 1,
+    per_page: int = 100,
+    since: str = None,
+    category: str = None,
+    verified: str = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Paginated, versioned JSON feed of the AgentTrust Issuer Registry.
+    Designed for wallets, explorers, and DEXs to consume and cache.
+
+    - page / per_page: standard pagination (max 200 per page)
+    - since: ISO 8601 timestamp — return only records created or updated after this time
+    - category: filter by category slug
+    - verified: filter by status ('verified', 'public', or omit for both)
+    """
+    per_page = min(per_page, 200)
+    offset = (page - 1) * per_page
+
+    where_clauses = ["verified IN ('verified','public')"]
+    params: dict = {}
+
+    if verified in ("verified", "public", "pending"):
+        where_clauses = [f"verified = :verified"]
+        params["verified"] = verified
+    if category:
+        where_clauses.append("category = :category")
+        params["category"] = category
+    if since:
+        where_clauses.append("created_at > :since")
+        params["since"] = since
+
+    where_sql = " AND ".join(where_clauses)
+
+    existing_cols = {r[0] for r in db.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer'"
+    )).fetchall()}
+
+    opt_wa  = ", wallet_addresses" if "wallet_addresses" in existing_cols else ", NULL as wallet_addresses"
+    opt_lei = ", lei"              if "lei"              in existing_cols else ", NULL as lei"
+    opt_nft = ", nft_types"        if "nft_types"        in existing_cols else ", NULL as nft_types"
+    opt_cat = ", created_at"       if "created_at"       in existing_cols else ", NULL as created_at"
+
+    total = db.execute(text(f"SELECT COUNT(*) FROM nft_issuer WHERE {where_sql}"), params).scalar()
+
+    rows = db.execute(text(
+        f"SELECT id, wallet_address{opt_wa}, name, category, description, website, verified{opt_lei}{opt_nft}{opt_cat}"
+        f" FROM nft_issuer WHERE {where_sql} ORDER BY id LIMIT :limit OFFSET :offset"
+    ), {**params, "limit": per_page, "offset": offset}).fetchall()
+
+    def rv(r, k): return getattr(r, k, None)
+
+    return {
+        "spec_version": "1.0.0",
+        "spec": "https://www.cryptovault.co.uk/docs/issuer-registry-spec.md",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": max(1, -(-total // per_page)),
+            "next": f"https://xrpl-referee.onrender.com/nft/issuers/feed?page={page+1}&per_page={per_page}" if (page * per_page) < total else None,
+        },
+        "filters": {"category": category, "verified": verified, "since": since},
+        "issuers": [
+            {
+                "id":               rv(r, "id"),
+                "wallet_address":   rv(r, "wallet_address"),
+                "wallet_addresses": json.loads(rv(r, "wallet_addresses") or "[]") or [rv(r, "wallet_address")],
+                "name":             rv(r, "name"),
+                "category":         rv(r, "category"),
+                "description":      rv(r, "description"),
+                "website":          rv(r, "website"),
+                "verified":         rv(r, "verified"),
+                "lei":              rv(r, "lei"),
+                "nft_types":        rv(r, "nft_types"),
+                "created_at":       rv(r, "created_at").isoformat() if rv(r, "created_at") else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.patch("/nft/issuers/{issuer_id}/wallets")
 async def update_issuer_wallets(issuer_id: int, req: NftIssuerWalletUpdate, db: Session = Depends(get_db)):
     """Add or remove wallets for an issuer. Authenticated by matching contact_email."""
