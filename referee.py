@@ -4682,52 +4682,44 @@ async def _send_issuer_registration_email(issuer):
 
 
 # ---------------------------------------------------------------------------
-# COMPANY SEARCH + ISSUER LOOKUP  (OpenCorporates — 200M+ companies, 140 jurisdictions)
+# COMPANY SEARCH + ISSUER LOOKUP  (SEC EDGAR — US public companies, free, no key)
 # Paths kept as /gleif/* for backward compatibility with existing API consumers
 # ---------------------------------------------------------------------------
 
-OC_BASE = "https://api.opencorporates.com/v0.4"
+EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
 
-def _oc_parse(company: dict) -> dict:
-    """Normalise an OpenCorporates company record to our standard shape."""
+def _edgar_parse(hit: dict) -> dict:
+    src = hit.get("_source", {})
     return {
-        "name":              company.get("name", ""),
-        "company_number":    company.get("company_number", ""),
-        "jurisdiction_code": company.get("jurisdiction_code", ""),
-        "registered_address": (company.get("registered_address") or {}).get("in_full", ""),
-        "status":            company.get("current_status") or company.get("inactive", ""),
-        "source":            "opencorporates",
+        "name":              src.get("entity_name", ""),
+        "company_number":    src.get("file_num", ""),
+        "jurisdiction_code": "us",
+        "registered_address": "",
+        "status":            "active",
+        "source":            "sec-edgar",
     }
 
 
 @app.get("/gleif/search")
 async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
-    """Search OpenCorporates for legal entities by name (replaces GLEIF search)."""
-    params = {"q": q, "per_page": min(limit, 30), "format": "json"}
-    if jurisdiction:
-        params["jurisdiction_code"] = jurisdiction
+    """Search SEC EDGAR for US public companies by name."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(f"{OC_BASE}/companies/search", params=params,
-                               headers={"Accept": "application/json"})
+        res = await client.get(EDGAR_SEARCH, params={"q": q, "forms": "10-K"},
+                               headers={"User-Agent": "AgentTrust/1.0 admin@cryptovault.co.uk"})
     if res.status_code != 200:
-        return {"results": [], "error": f"OpenCorporates returned {res.status_code}"}
-    companies = res.json().get("results", {}).get("companies", [])
-    results = [_oc_parse(c["company"]) for c in companies[:limit] if "company" in c]
+        return {"results": [], "error": f"SEC EDGAR returned {res.status_code}"}
+    hits = res.json().get("hits", {}).get("hits", [])
+    seen = set()
+    results = []
+    for hit in hits:
+        name = hit.get("_source", {}).get("entity_name", "")
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        results.append(_edgar_parse(hit))
+        if len(results) >= limit:
+            break
     return {"results": results}
-
-
-@app.get("/gleif/entity/{company_number}")
-async def company_entity(company_number: str, jurisdiction_code: str = "gb"):
-    """Get full OpenCorporates entity details."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(
-            f"{OC_BASE}/companies/{jurisdiction_code}/{company_number}",
-            headers={"Accept": "application/json"}
-        )
-    if res.status_code != 200:
-        raise HTTPException(status_code=404, detail=f"Company {company_number} not found in {jurisdiction_code}.")
-    company = res.json().get("results", {}).get("company", {})
-    return _oc_parse(company)
 
 
 @app.get("/gleif/xrpl-lookup")
