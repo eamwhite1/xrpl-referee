@@ -444,7 +444,8 @@ class EscrowVault(Base):
     # Open bounty — v9: tracks who created the on-chain EscrowCreate (buyer or referee)
     escrow_owner      = Column(String,  nullable=True)      # Account field of EscrowCreate tx
     # NFT proof requirements — v10
-    required_nft_issuer   = Column(String, nullable=True)   # issuer wallet address
+    require_nft_proof     = Column(Boolean, default=False)   # True = NFT proof required (any issuer)
+    required_nft_issuer   = Column(String, nullable=True)   # optional: restrict to this issuer wallet
     required_nft_metadata = Column(Text,   nullable=True)   # JSON: required key-value pairs in NFT URI
     # Trust layer v11
     required_domain       = Column(String, nullable=True)   # XRPL domain field requirement
@@ -690,6 +691,7 @@ def run_migrations():
             verified       VARCHAR DEFAULT 'pending',
             created_at     TIMESTAMP
         )""",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS require_nft_proof     BOOLEAN DEFAULT FALSE",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_nft_issuer   VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS required_nft_metadata  TEXT",
         # v10 job_posting NFT columns
@@ -1019,8 +1021,9 @@ class EscrowSetupRequest(BaseModel):
     category:           str             = "default"
     tags:               Optional[list[str]] = None
     # NFT proof requirements
-    required_nft_issuer:   Optional[str]  = None  # require NFT from this issuer wallet
-    required_nft_metadata: Optional[dict] = None  # require these key-value pairs in NFT URI
+    require_nft_proof:     Optional[bool] = None  # True = any valid NFT accepted
+    required_nft_issuer:   Optional[str]  = None  # optional: restrict to this issuer wallet
+    required_nft_metadata: Optional[dict] = None  # optional: require key-value pairs in NFT URI
     # Trust layer v11
     required_domain:        Optional[str]   = None
     required_vc_issuer_did: Optional[str]   = None
@@ -2638,6 +2641,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         delivery_status       = "PENDING",
         submission_count      = 0,
         max_submissions       = max(1, min(req.max_submissions, 10)),  # clamp 1–10
+        require_nft_proof     = bool(req.require_nft_proof or req.required_nft_issuer),
         required_nft_issuer   = req.required_nft_issuer or None,
         required_nft_metadata = json.dumps(req.required_nft_metadata) if req.required_nft_metadata else None,
         required_domain        = req.required_domain or None,
@@ -2847,9 +2851,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     proof_results = []   # list of (name, passed, note)
 
     # NFT proof
-    if vault.required_nft_issuer:
+    if vault.require_nft_proof or vault.required_nft_issuer:
         if not req.nft_token_id:
-            proof_results.append(("NFT", False, "NFT Token ID not provided (required_nft_issuer set but nft_token_id missing)."))
+            proof_results.append(("NFT", False, "NFT Token ID not provided — seller must supply an NFT Token ID as proof."))
         else:
             nft_wallet = req.nft_wallet or vault.worker_address
             required_meta = None
@@ -2904,9 +2908,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             else:
                 proof_results.append(("NFT", False, f"NFT verification failed: {nft_result['detail']}"))
 
-    # Domain proof
+    # Domain proof — "ANY" means any verified domain passes; specific value restricts to that domain
     if vault.required_domain:
-        domain_result = await verify_domain_ownership(vault.worker_address, vault.required_domain)
+        expected = None if vault.required_domain == "ANY" else vault.required_domain
+        domain_result = await verify_domain_ownership(vault.worker_address, expected)
         if domain_result["verified"]:
             note = f"🌐 DOMAIN VERIFIED: {domain_result['detail']}"
             proof_results.append(("Domain", True, note))
