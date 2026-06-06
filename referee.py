@@ -622,27 +622,34 @@ _PUBLIC_ISSUERS = [
 
 
 def _seed_public_issuers():
-    """Insert known public XRPL organisations into the registry if not already present."""
+    """Insert known public XRPL organisations using raw SQL to avoid ORM schema mismatches."""
     db = SessionLocal()
     try:
+        inserted = 0
         for entry in _PUBLIC_ISSUERS:
-            existing = db.query(NftIssuer).filter(
-                NftIssuer.wallet_address == entry["wallet_address"]
-            ).first()
-            if existing:
+            exists = db.execute(
+                text("SELECT id FROM nft_issuer WHERE wallet_address = :w"),
+                {"w": entry["wallet_address"]}
+            ).fetchone()
+            if exists:
                 continue
-            issuer = NftIssuer(
-                wallet_address=entry["wallet_address"],
-                name=entry["name"],
-                category=entry["category"],
-                description=entry["description"],
-                website=entry["website"],
-                verified="public",
-                created_at=datetime.now(timezone.utc),
-            )
-            db.add(issuer)
+            db.execute(text("""
+                INSERT INTO nft_issuer
+                    (wallet_address, name, category, description, website, verified, created_at)
+                VALUES
+                    (:wallet_address, :name, :category, :description, :website, :verified, :created_at)
+            """), {
+                "wallet_address": entry["wallet_address"],
+                "name":           entry["name"],
+                "category":       entry["category"],
+                "description":    entry["description"],
+                "website":        entry["website"],
+                "verified":       "public",
+                "created_at":     datetime.now(timezone.utc).isoformat(),
+            })
+            inserted += 1
         db.commit()
-        logger.info("Public issuer seed complete.")
+        logger.info(f"Public issuer seed complete — {inserted} inserted.")
     except Exception as e:
         logger.warning(f"Issuer seed failed: {e}")
         db.rollback()
