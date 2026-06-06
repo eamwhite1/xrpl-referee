@@ -4650,35 +4650,49 @@ class NftIssuerWalletUpdate(BaseModel):
     wallets:       list          # complete new list of wallets (replaces existing)
 
 @app.get("/nft/issuers/debug-seed")
-async def debug_seed(db: Session = Depends(get_db)):
+async def debug_seed():
     """Manually run the seed and report results — for diagnostics only."""
+    db_url = os.getenv("DATABASE_URL", "NOT SET")
+    db_url_safe = db_url[:40] + "..." if len(db_url) > 40 else db_url
     results = []
     errors = []
-    for entry in _PUBLIC_ISSUERS:
+    try:
+        db = SessionLocal()
         try:
-            existing = db.query(NftIssuer).filter(
-                NftIssuer.wallet_address == entry["wallet_address"]
-            ).first()
-            if existing:
-                results.append({"name": entry["name"], "status": "already exists", "verified": existing.verified})
-                continue
-            issuer = NftIssuer(
-                wallet_address=entry["wallet_address"],
-                name=entry["name"],
-                category=entry["category"],
-                description=entry["description"],
-                website=entry["website"],
-                verified="public",
-                created_at=datetime.now(timezone.utc),
-            )
-            db.add(issuer)
-            db.commit()
-            results.append({"name": entry["name"], "status": "inserted"})
-        except Exception as e:
-            db.rollback()
-            errors.append({"name": entry["name"], "error": str(e)})
-    total = db.query(NftIssuer).count()
-    return {"seeded": results, "errors": errors, "total_issuers_in_db": total, "database_url_set": bool(os.getenv("DATABASE_URL"))}
+            for entry in _PUBLIC_ISSUERS:
+                try:
+                    exists = db.execute(
+                        text("SELECT id FROM nft_issuer WHERE wallet_address = :w"),
+                        {"w": entry["wallet_address"]}
+                    ).fetchone()
+                    if exists:
+                        results.append({"name": entry["name"], "status": "already exists"})
+                        continue
+                    db.execute(text("""
+                        INSERT INTO nft_issuer
+                            (wallet_address, name, category, description, website, verified, created_at)
+                        VALUES
+                            (:wallet_address, :name, :category, :description, :website, :verified, :created_at)
+                    """), {
+                        "wallet_address": entry["wallet_address"],
+                        "name": entry["name"],
+                        "category": entry["category"],
+                        "description": entry["description"],
+                        "website": entry["website"],
+                        "verified": "public",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    db.commit()
+                    results.append({"name": entry["name"], "status": "inserted"})
+                except Exception as e:
+                    db.rollback()
+                    errors.append({"name": entry["name"], "error": str(e)})
+            total = db.execute(text("SELECT COUNT(*) FROM nft_issuer")).scalar()
+        finally:
+            db.close()
+    except Exception as e:
+        return {"fatal_error": str(e), "database_url": db_url_safe}
+    return {"seeded": results, "errors": errors, "total_issuers_in_db": total, "database_url": db_url_safe}
 
 
 @app.get("/nft/issuers")
