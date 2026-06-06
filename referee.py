@@ -4716,36 +4716,29 @@ async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
         )
     if res.status_code != 200:
         return {"results": [], "error": f"SEC EDGAR returned {res.status_code}"}
-    # Parse Atom XML response
+    # Parse Atom XML — EDGAR uses a custom namespace for company-info
     import xml.etree.ElementTree as ET
-    ns = {"atom": "http://www.w3.org/2005/Atom", "company": "http://www.sec.gov/cgi-bin/browse-edgar"}
+    import re as _re
+    SEC_NS = "http://www.sec.gov/cgi-bin/browse-edgar"
+    ATOM_NS = "http://www.w3.org/2005/Atom"
     try:
         root = ET.fromstring(res.text)
     except ET.ParseError:
         return {"results": [], "error": "Could not parse EDGAR response"}
     seen: set = set()
     results = []
-    for entry in root.findall("atom:entry", ns):
-        name_el = entry.find("atom:company-info/atom:conformed-name", ns) \
-                  or entry.find("{http://www.sec.gov}company-info/{http://www.sec.gov}conformed-name") \
-                  or entry.find("atom:title", ns)
+    for entry in root.findall(f"{{{ATOM_NS}}}entry"):
+        # Company name lives in <company-info xmlns="...sec.gov/cgi-bin/browse-edgar"><conformed-name>
+        name_el = entry.find(f"{{{SEC_NS}}}company-info/{{{SEC_NS}}}conformed-name")
         name = (name_el.text or "").strip() if name_el is not None else ""
         if not name:
-            # Try title which is "company (CIK) (type)" format
-            title_el = entry.find("atom:title", ns)
-            if title_el is not None and title_el.text:
-                name = title_el.text.split("(")[0].strip()
-        if not name or name.lower() in seen:
+            continue
+        if name.lower() in seen:
             continue
         seen.add(name.lower())
-        # Extract CIK from id element
-        id_el = entry.find("atom:id", ns)
-        cik = ""
-        if id_el is not None and id_el.text:
-            import re
-            m = re.search(r"CIK=(\d+)", id_el.text)
-            if m:
-                cik = m.group(1)
+        # CIK from <company-info><cik>
+        cik_el = entry.find(f"{{{SEC_NS}}}company-info/{{{SEC_NS}}}cik")
+        cik = (cik_el.text or "").strip() if cik_el is not None else ""
         results.append({
             "name": name,
             "company_number": cik,
@@ -4761,55 +4754,38 @@ async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
 
 @app.get("/gleif/xrpl-lookup")
 async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
-    """Search for a company by name and attempt to find their XRPL wallet via AgentTrust registry + domain."""
-    # Step 1: search OpenCorporates
-    params = {"q": q, "per_page": 5, "format": "json"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        search_res = await client.get(f"{OC_BASE}/companies/search", params=params,
-                                      headers={"Accept": "application/json"})
-
+    """Search AgentTrust registry by company name to find their XRPL wallet."""
     results = []
-    companies = []
-    if search_res.status_code == 200:
-        companies = search_res.json().get("results", {}).get("companies", [])[:5]
+    try:
+        issuers = (
+            db.query(NftIssuer)
+            .filter(NftIssuer.name.ilike(f"%{q[:50]}%"))
+            .limit(5)
+            .all()
+        )
+        for issuer in issuers:
+            results.append({
+                "name":          issuer.name,
+                "source":        "agentrust",
+                "xrpl_wallet":   issuer.wallet_address,
+                "xrpl_verified": issuer.verified == "verified",
+                "domain":        issuer.website,
+                "register_url":  None,
+                "message":       None,
+            })
+    except Exception:
+        pass
 
-    for item in companies:
-        c = item.get("company", {})
-        name   = c.get("name", "")
-        number = c.get("company_number", "")
-        jcode  = c.get("jurisdiction_code", "")
-
-        # Check AgentTrust registry for a matching name
-        xrpl_wallet = None
-        xrpl_verified = False
-        domain = None
-        try:
-            issuer = (
-                db.query(NftIssuer)
-                .filter(NftIssuer.name.ilike(f"%{name[:30]}%"))
-                .first()
-            )
-            if issuer:
-                xrpl_wallet = issuer.wallet_address
-                xrpl_verified = issuer.verified == "verified"
-                domain = issuer.website
-        except Exception:
-            pass
-
-        result = {
-            "name":              name,
-            "company_number":    number,
-            "jurisdiction_code": jcode,
-            "source":            "opencorporates",
-            "oc_verified":       True,
-            "xrpl_wallet":       xrpl_wallet,
-            "xrpl_verified":     xrpl_verified,
-            "domain":            domain,
-        }
-        if not xrpl_wallet:
-            result["register_url"] = "https://www.cryptovault.co.uk/marketplace#issuers"
-            result["message"] = "No XRPL wallet found. If you represent this company, register at the AgentTrust Trusted Issuer Registry."
-        results.append(result)
+    if not results:
+        results.append({
+            "name":         q,
+            "source":       "sec-edgar",
+            "xrpl_wallet":  None,
+            "xrpl_verified": False,
+            "domain":       None,
+            "register_url": "https://www.cryptovault.co.uk/marketplace#issuers",
+            "message":      "No XRPL wallet found. If you represent this company, register at the AgentTrust Trusted Issuer Registry.",
+        })
 
     return {"results": results}
 
