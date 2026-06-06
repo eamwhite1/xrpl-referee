@@ -305,10 +305,10 @@ def serve_mcp_server_card():
             {"name": "verify_vc",                 "description": "POST /vc/verify — verify a W3C Verifiable Credential JWT. Checks expiry, issuer DID, credential type, and optionally resolves the DID via the Universal Resolver. Accepts credentials from any W3C-compliant issuer."},
             {"name": "register_nft_dvp_offer",    "description": "POST /escrow/{id}/nft-offer — after a PASS verdict on an NFT DvP escrow, seller registers their on-chain NFTokenCreateOffer (Destination=buyer, Amount=0). System verifies the offer on XRPL and emails buyer to accept. Payment releases automatically once buyer accepts."},
             {"name": "check_nft_dvp_status",      "description": "GET /escrow/{id}/nft-status — poll whether the buyer has accepted the NFT offer yet. Returns accepted/pending/expired. Triggers automatic escrow release when accepted."},
-            {"name": "search_verified_companies", "description": "GET /gleif/search?q= — search the GLEIF global database of verified legal entities by name. Returns LEI, legal name, jurisdiction. Use to find a company's verified identity before requiring their XRPL wallet as a trusted NFT issuer."},
-            {"name": "gleif_xrpl_lookup",         "description": "GET /gleif/xrpl-lookup?q= — search for a company by name, verify via GLEIF, and attempt to find their registered XRPL wallet address. Green result = GLEIF verified + XRPL wallet confirmed."},
-            {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain and GLEIF record."},
-            {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification against GLEIF + domain records."},
+            {"name": "search_verified_companies", "description": "GET /gleif/search?q= — search OpenCorporates (200M+ companies, 140 jurisdictions) for legal entities by name. Returns company number, jurisdiction, registered address. Use to find a company's verified identity before requiring their XRPL wallet as a trusted NFT issuer."},
+            {"name": "company_xrpl_lookup",       "description": "GET /gleif/xrpl-lookup?q= — search for a company by name via OpenCorporates, then attempt to find their registered XRPL wallet address in the AgentTrust registry. Green result = OpenCorporates verified + XRPL wallet confirmed."},
+            {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain and OpenCorporates record."},
+            {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification against OpenCorporates + domain records."},
             {"name": "create_eth_challenge",      "description": "POST /eth/challenge — generate an EIP-191 challenge string for an Ethereum address. The address holder must sign this with their ETH wallet to prove ownership. Use before submitting an Ethereum address as identity proof."},
             {"name": "verify_eth_signature",      "description": "POST /eth/verify-signature — verify that an Ethereum address signed the challenge string. Confirms the submitter genuinely controls the ETH address, preventing fake address claims."},
         ],
@@ -4682,91 +4682,78 @@ async def _send_issuer_registration_email(issuer):
 
 
 # ---------------------------------------------------------------------------
-# GLEIF COMPANY SEARCH + ISSUER LOOKUP
+# COMPANY SEARCH + ISSUER LOOKUP  (OpenCorporates — 200M+ companies, 140 jurisdictions)
+# Paths kept as /gleif/* for backward compatibility with existing API consumers
 # ---------------------------------------------------------------------------
 
-@app.get("/gleif/search")
-async def gleif_search(q: str, limit: int = 10):
-    """Search GLEIF for verified legal entities by name."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(
-            "https://api.gleif.org/api/v1/fuzzycompletions",
-            params={"term": q, "field": "entity.legalName"},
-            headers={"Accept": "application/json"}
-        )
+OC_BASE = "https://api.opencorporates.com/v0.4"
 
-    if res.status_code != 200:
-        return {"results": [], "error": f"GLEIF API returned {res.status_code}"}
-
-    data = res.json()
-    completions = data.get("data", [])[:limit]
-
-    results = []
-    for item in completions:
-        attrs = item.get("attributes", {})
-        lei = attrs.get("lei", "")
-        name = attrs.get("value", "")
-        results.append({"lei": lei, "name": name})
-
-    return {"results": results}
-
-
-@app.get("/gleif/entity/{lei}")
-async def gleif_entity(lei: str):
-    """Get full GLEIF entity details."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(
-            f"https://api.gleif.org/api/v1/lei-records/{lei}",
-            headers={"Accept": "application/json"}
-        )
-
-    if res.status_code != 200:
-        raise HTTPException(status_code=404, detail=f"LEI {lei} not found.")
-
-    data = res.json().get("data", {})
-    attrs = data.get("attributes", {})
-    entity = attrs.get("entity", {})
-
-    legal_name = entity.get("legalName", {}).get("name", "")
-    jurisdiction = entity.get("jurisdiction", "")
-    status = entity.get("status", "")
-
+def _oc_parse(company: dict) -> dict:
+    """Normalise an OpenCorporates company record to our standard shape."""
     return {
-        "lei": lei,
-        "name": legal_name,
-        "jurisdiction": jurisdiction,
-        "status": status,
-        "entity_category": attrs.get("entityCategory", ""),
+        "name":              company.get("name", ""),
+        "company_number":    company.get("company_number", ""),
+        "jurisdiction_code": company.get("jurisdiction_code", ""),
+        "registered_address": (company.get("registered_address") or {}).get("in_full", ""),
+        "status":            company.get("current_status") or company.get("inactive", ""),
+        "source":            "opencorporates",
     }
 
 
-@app.get("/gleif/xrpl-lookup")
-async def gleif_xrpl_lookup(q: str, db: Session = Depends(get_db)):
-    """Search for a company and attempt to find their verified XRPL wallet."""
-    # Step 1: search GLEIF
+@app.get("/gleif/search")
+async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
+    """Search OpenCorporates for legal entities by name (replaces GLEIF search)."""
+    params = {"q": q, "per_page": min(limit, 30), "format": "json"}
+    if jurisdiction:
+        params["jurisdiction_code"] = jurisdiction
     async with httpx.AsyncClient(timeout=10.0) as client:
-        search_res = await client.get(
-            "https://api.gleif.org/api/v1/fuzzycompletions",
-            params={"term": q, "field": "entity.legalName"},
+        res = await client.get(f"{OC_BASE}/companies/search", params=params,
+                               headers={"Accept": "application/json"})
+    if res.status_code != 200:
+        return {"results": [], "error": f"OpenCorporates returned {res.status_code}"}
+    companies = res.json().get("results", {}).get("companies", [])
+    results = [_oc_parse(c["company"]) for c in companies[:limit] if "company" in c]
+    return {"results": results}
+
+
+@app.get("/gleif/entity/{company_number}")
+async def company_entity(company_number: str, jurisdiction_code: str = "gb"):
+    """Get full OpenCorporates entity details."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.get(
+            f"{OC_BASE}/companies/{jurisdiction_code}/{company_number}",
             headers={"Accept": "application/json"}
         )
+    if res.status_code != 200:
+        raise HTTPException(status_code=404, detail=f"Company {company_number} not found in {jurisdiction_code}.")
+    company = res.json().get("results", {}).get("company", {})
+    return _oc_parse(company)
 
-    if search_res.status_code != 200:
-        return {"results": []}
 
-    completions = search_res.json().get("data", [])[:5]
+@app.get("/gleif/xrpl-lookup")
+async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
+    """Search for a company by name and attempt to find their XRPL wallet via AgentTrust registry + domain."""
+    # Step 1: search OpenCorporates
+    params = {"q": q, "per_page": 5, "format": "json"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        search_res = await client.get(f"{OC_BASE}/companies/search", params=params,
+                                      headers={"Accept": "application/json"})
+
     results = []
+    companies = []
+    if search_res.status_code == 200:
+        companies = search_res.json().get("results", {}).get("companies", [])[:5]
 
-    for item in completions:
-        attrs = item.get("attributes", {})
-        lei = attrs.get("lei", "")
-        name = attrs.get("value", "")
+    for item in companies:
+        c = item.get("company", {})
+        name   = c.get("name", "")
+        number = c.get("company_number", "")
+        jcode  = c.get("jurisdiction_code", "")
 
-        # Check our NftIssuer registry for a matching name
+        # Check AgentTrust registry for a matching name
         xrpl_wallet = None
         xrpl_verified = False
         domain = None
-
         try:
             issuer = (
                 db.query(NftIssuer)
@@ -4781,16 +4768,18 @@ async def gleif_xrpl_lookup(q: str, db: Session = Depends(get_db)):
             pass
 
         result = {
-            "lei": lei,
-            "name": name,
-            "gleif_verified": True,
-            "xrpl_wallet": xrpl_wallet,
-            "xrpl_verified": xrpl_verified,
-            "domain": domain,
+            "name":              name,
+            "company_number":    number,
+            "jurisdiction_code": jcode,
+            "source":            "opencorporates",
+            "oc_verified":       True,
+            "xrpl_wallet":       xrpl_wallet,
+            "xrpl_verified":     xrpl_verified,
+            "domain":            domain,
         }
         if not xrpl_wallet:
             result["register_url"] = "https://www.cryptovault.co.uk/marketplace#issuers"
-            result["message"] = "No XRPL wallet found for this company. If you represent this organisation, register at the AgentTrust Trusted Issuer Registry."
+            result["message"] = "No XRPL wallet found. If you represent this company, register at the AgentTrust Trusted Issuer Registry."
         results.append(result)
 
     return {"results": results}
