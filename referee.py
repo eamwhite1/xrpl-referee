@@ -4697,30 +4697,34 @@ async def debug_seed():
 
 @app.get("/nft/issuers")
 async def list_nft_issuers(category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
-    q = db.query(NftIssuer)
     if include_pending:
-        q = q.filter(NftIssuer.verified.in_(["verified", "public", "pending"]))
+        statuses = ("verified", "public", "pending")
     else:
-        q = q.filter(NftIssuer.verified.in_(["verified", "public"]))
+        statuses = ("verified", "public")
+    placeholders = ",".join(f":s{i}" for i in range(len(statuses)))
+    params = {f"s{i}": s for i, s in enumerate(statuses)}
+    sql = f"SELECT id, wallet_address, wallet_addresses, name, category, description, website, verified, lei, nft_types FROM nft_issuer WHERE verified IN ({placeholders})"
     if category:
-        q = q.filter(NftIssuer.category == category)
-    issuers = q.order_by(NftIssuer.name).all()
+        sql += " AND category = :category"
+        params["category"] = category
+    sql += " ORDER BY name"
+    rows = db.execute(text(sql), params).fetchall()
     base_url = "https://xrpl-referee.onrender.com"
     return {
         "issuers": [
             {
-                "id":              i.id,
-                "wallet_address":  i.wallet_address,
-                "wallet_addresses": i.all_wallets(),
-                "name":            i.name,
-                "category":        i.category,
-                "description":     i.description,
-                "website":         i.website,
-                "verified":        i.verified,
-                "lei":             i.lei,
-                "nft_types":       i.nft_types,
+                "id":               r.id,
+                "wallet_address":   r.wallet_address,
+                "wallet_addresses": json.loads(r.wallet_addresses or "[]") or [r.wallet_address],
+                "name":             r.name,
+                "category":         r.category,
+                "description":      r.description,
+                "website":          r.website,
+                "verified":         r.verified,
+                "lei":              r.lei,
+                "nft_types":        r.nft_types,
             }
-            for i in issuers
+            for r in rows
         ],
         "register_url": "https://www.cryptovault.co.uk/marketplace#issuers",
         "register_api": f"{base_url}/nft/issuers",
