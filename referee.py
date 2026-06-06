@@ -4692,7 +4692,8 @@ async def debug_seed():
             db.close()
     except Exception as e:
         return {"fatal_error": str(e), "database_url": db_url_safe}
-    return {"seeded": results, "errors": errors, "total_issuers_in_db": total, "database_url": db_url_safe}
+    return {"seeded": results, "errors": errors, "total_issuers_in_db": total, "database_url": db_url_safe,
+            "columns": [r[0] for r in db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer' ORDER BY ordinal_position")).fetchall()]}
 
 
 @app.get("/nft/issuers")
@@ -4703,26 +4704,44 @@ async def list_nft_issuers(category: str = None, include_pending: bool = False, 
         statuses = ("verified", "public")
     placeholders = ",".join(f":s{i}" for i in range(len(statuses)))
     params = {f"s{i}": s for i, s in enumerate(statuses)}
-    sql = f"SELECT id, wallet_address, wallet_addresses, name, category, description, website, verified, lei, nft_types FROM nft_issuer WHERE verified IN ({placeholders})"
-    if category:
+    # Only select core columns guaranteed to exist; newer optional columns added safely
+    existing_cols = {r[0] for r in db.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer'"
+    )).fetchall()}
+    optional = {c: f", {c}" if c in existing_cols else ", NULL" for c in ["wallet_addresses", "verified", "lei", "nft_types"]}
+    sql = (
+        f"SELECT id, wallet_address{optional['wallet_addresses']}{optional['verified']}"
+        f"{optional['lei']}{optional['nft_types']}, name, category, description, website"
+        f" FROM nft_issuer WHERE verified IN ({placeholders})"
+        if "verified" in existing_cols else
+        f"SELECT id, wallet_address{optional['wallet_addresses']}, NULL as verified"
+        f"{optional['lei']}{optional['nft_types']}, name, category, description, website"
+        f" FROM nft_issuer"
+    )
+    if "verified" in existing_cols and category:
         sql += " AND category = :category"
+        params["category"] = category
+    elif category:
+        sql += " WHERE category = :category"
         params["category"] = category
     sql += " ORDER BY name"
     rows = db.execute(text(sql), params).fetchall()
     base_url = "https://xrpl-referee.onrender.com"
+    keys = list(rows[0]._fields) if rows else []
+    def row_val(r, k): return getattr(r, k, None)
     return {
         "issuers": [
             {
-                "id":               r.id,
-                "wallet_address":   r.wallet_address,
-                "wallet_addresses": json.loads(r.wallet_addresses or "[]") or [r.wallet_address],
-                "name":             r.name,
-                "category":         r.category,
-                "description":      r.description,
-                "website":          r.website,
-                "verified":         r.verified,
-                "lei":              r.lei,
-                "nft_types":        r.nft_types,
+                "id":               row_val(r, "id"),
+                "wallet_address":   row_val(r, "wallet_address"),
+                "wallet_addresses": json.loads(row_val(r, "wallet_addresses") or "[]") or [row_val(r, "wallet_address")],
+                "name":             row_val(r, "name"),
+                "category":         row_val(r, "category"),
+                "description":      row_val(r, "description"),
+                "website":          row_val(r, "website"),
+                "verified":         row_val(r, "verified") or "public",
+                "lei":              row_val(r, "lei"),
+                "nft_types":        row_val(r, "nft_types"),
             }
             for r in rows
         ],
