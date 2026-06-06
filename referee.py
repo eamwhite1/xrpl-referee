@@ -4757,9 +4757,6 @@ async def company_search(q: str, limit: int = 10, jurisdiction: str = None):
         if len(results) >= limit:
             break
     return {"results": results}
-        if len(results) >= limit:
-            break
-    return {"results": results}
 
 
 @app.get("/gleif/xrpl-lookup")
