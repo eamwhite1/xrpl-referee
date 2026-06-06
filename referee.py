@@ -334,6 +334,18 @@ def serve_mcp_config():
     }
 
 
+@app.get("/.well-known/xrpl-issuer-registry")
+def serve_issuer_registry_discovery():
+    return {
+        "registry_api": "https://xrpl-referee.onrender.com/nft/issuers",
+        "spec": "https://www.cryptovault.co.uk/docs/issuer-registry-spec.md",
+        "version": "1.0.0",
+        "mcp_endpoint": "https://xrpl-referee.onrender.com/mcp",
+        "contact": "admin@cryptovault.co.uk",
+        "published": "2026-06-06",
+    }
+
+
 @app.get("/.well-known/ai-plugin.json")
 def serve_ai_plugin():
     path = ".well-known/ai-plugin.json"
