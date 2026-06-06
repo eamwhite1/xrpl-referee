@@ -531,6 +531,9 @@ class NftIssuer(Base):
     website        = Column(String, nullable=True)
     verified       = Column(String, default="pending")  # "pending", "verified", "revoked"
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    contact_email  = Column(String, nullable=True)
+    lei            = Column(String, nullable=True)
+    nft_types      = Column(String, nullable=True)
 
 
 class SkillListing(Base):
@@ -690,6 +693,10 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_offer_id     VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_offer_expiry TIMESTAMP",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_status       VARCHAR",
+        # trusted issuer registry extended fields
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS contact_email VARCHAR",
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS lei            VARCHAR",
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS nft_types      VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -4458,18 +4465,36 @@ class NftIssuerRequest(BaseModel):
     category:       Optional[str] = None
     description:    Optional[str] = None
     website:        Optional[str] = None
+    contact_email:  Optional[str] = None
+    lei:            Optional[str] = None
+    nft_types:      Optional[str] = None
 
 @app.get("/nft/issuers")
-async def list_nft_issuers(category: str = None, db: Session = Depends(get_db)):
-    q = db.query(NftIssuer).filter(NftIssuer.verified == "verified")
+async def list_nft_issuers(category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
+    q = db.query(NftIssuer)
+    if include_pending:
+        q = q.filter(NftIssuer.verified.in_(["verified", "pending"]))
+    else:
+        q = q.filter(NftIssuer.verified == "verified")
     if category:
         q = q.filter(NftIssuer.category == category)
     issuers = q.order_by(NftIssuer.name).all()
-    return {"issuers": [
-        {"wallet_address": i.wallet_address, "name": i.name, "category": i.category,
-         "description": i.description, "website": i.website}
-        for i in issuers
-    ]}
+    base_url = "https://xrpl-referee.onrender.com"
+    return {
+        "issuers": [
+            {
+                "wallet_address": i.wallet_address,
+                "name": i.name,
+                "category": i.category,
+                "description": i.description,
+                "website": i.website,
+                "verified": i.verified,
+            }
+            for i in issuers
+        ],
+        "register_url": "https://www.cryptovault.co.uk/marketplace#issuers",
+        "register_api": f"{base_url}/nft/issuers",
+    }
 
 @app.post("/nft/verify")
 async def verify_nft(req: NftVerifyRequest):
@@ -4485,6 +4510,7 @@ async def verify_nft(req: NftVerifyRequest):
 
 @app.post("/nft/issuers")
 async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_db)):
+    import asyncio
     existing = db.query(NftIssuer).filter(NftIssuer.wallet_address == req.wallet_address).first()
     if existing:
         raise HTTPException(status_code=409, detail="Issuer already registered.")
@@ -4493,9 +4519,41 @@ async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_d
         category=req.category, description=req.description,
         website=req.website, verified="pending",
         created_at=datetime.now(timezone.utc),
+        contact_email=req.contact_email,
+        lei=req.lei,
+        nft_types=req.nft_types,
     )
     db.add(issuer); db.commit()
+    if RESEND_API_KEY:
+        asyncio.create_task(_send_issuer_registration_email(issuer))
     return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallet_address": req.wallet_address}
+
+
+async def _send_issuer_registration_email(issuer):
+    subject = f"New issuer registration: {issuer.name}"
+    body = f"""
+    <div style="font-family:sans-serif;padding:1.5rem;background:#0d1117;color:#e2e8f0;border-radius:10px;">
+        <h2 style="color:#10b981;">New Issuer Registration</h2>
+        <table style="width:100%;border-collapse:collapse;font-size:.88rem;">
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">Name</td><td><strong>{issuer.name}</strong></td></tr>
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">Wallet</td><td style="font-family:monospace;">{issuer.wallet_address}</td></tr>
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">Category</td><td>{issuer.category or '—'}</td></tr>
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">Website</td><td>{issuer.website or '—'}</td></tr>
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">Contact</td><td>{issuer.contact_email or '—'}</td></tr>
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">LEI</td><td>{issuer.lei or '—'}</td></tr>
+            <tr><td style="padding:.4rem 0;color:#94a3b8;">Description</td><td>{issuer.description or '—'}</td></tr>
+        </table>
+        <p style="margin-top:1.5rem;font-size:.82rem;color:#94a3b8;">Review and verify at your earliest convenience. Once verified, set their record to verified="verified" in the database.</p>
+    </div>
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post("https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                json={"from": "AgentTrust <noreply@agenttrust.io>", "to": ["eamwhite1@gmail.com"], "subject": subject, "html": body}
+            )
+    except Exception as e:
+        logger.warning(f"Issuer registration email failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -4605,6 +4663,9 @@ async def gleif_xrpl_lookup(q: str, db: Session = Depends(get_db)):
             "xrpl_verified": xrpl_verified,
             "domain": domain,
         }
+        if not xrpl_wallet:
+            result["register_url"] = "https://www.cryptovault.co.uk/marketplace#issuers"
+            result["message"] = "No XRPL wallet found for this company. If you represent this organisation, register at the AgentTrust Trusted Issuer Registry."
         results.append(result)
 
     return {"results": results}
