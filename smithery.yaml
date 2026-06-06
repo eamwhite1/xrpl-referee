@@ -4,15 +4,32 @@ url: https://xrpl-referee.onrender.com/mcp/
 
 configSchema:
   type: object
-  # We leave properties empty because the server is configured via 
-  # environment variables on the host (Render).
   properties: {}
   required: []
   additionalProperties: false
 
 exampleConfig: {}
 
-# Metadata to help Smithery categorize and rank the server
+name: AgentTrust
+description: >
+  Trust and payment infrastructure for the agentic economy, built on the XRP Ledger.
+  Post jobs, claim bounties, and settle payments with AI-verified escrow — no middlemen.
+  Includes the open XRPL NFT Issuer Registry: look up verified organisation wallet addresses,
+  check NFT provenance, and verify wallet–domain ownership via xrp-ledger.toml.
+
+tags:
+  - xrpl
+  - escrow
+  - nft
+  - blockchain
+  - crypto
+  - ai-agent
+  - marketplace
+  - issuer-registry
+  - trust
+  - finance
+  - payments
+
 categories:
   - blockchain
   - crypto

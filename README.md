@@ -128,6 +128,43 @@ else:
 
 ---
 
+## XRPL NFT Issuer Registry
+
+An open, machine-readable registry mapping real-world organisations to their XRPL NFT-issuing wallet addresses. Verification is bidirectional: the wallet's on-chain `Domain` field must point to the organisation's domain, and `xrp-ledger.toml` at that domain must list the wallet (XLS-26 compatible).
+
+**Spec:** https://www.cryptovault.co.uk/docs/issuer-registry-spec.md  
+**Discovery:** `GET https://xrpl-referee.onrender.com/.well-known/xrpl-issuer-registry`
+
+### Registry endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET`  | `/nft/issuers` | List verified and public issuers. Filter by `?category=` |
+| `GET`  | `/nft/issuers/feed` | Paginated versioned feed for wallets, explorers, DEXs. Supports `page`, `per_page`, `since` (incremental sync), `category`, `verified` |
+| `POST` | `/nft/issuers` | Register your organisation as an NFT issuer |
+| `POST` | `/domain/verify` | Verify wallet ↔ domain ownership via `xrp-ledger.toml` |
+| `GET`  | `/gleif/xrpl-lookup?q=` | Look up an organisation's verified XRPL wallet by name |
+
+### MCP tools for agents
+
+| Tool | Description |
+|------|-------------|
+| `list_trusted_issuers` | Query the registry by name or category |
+| `company_xrpl_lookup` | Find a verified XRPL wallet address by organisation name |
+| `verify_domain_ownership` | Confirm wallet ↔ domain link via `xrp-ledger.toml` |
+| `verify_nft_proof` | Verify an NFT exists in a wallet, was minted by a required issuer, and contains required metadata |
+| `register_as_issuer` | Submit a new issuer registration |
+
+### Incremental sync example
+
+```
+GET https://xrpl-referee.onrender.com/nft/issuers/feed?since=2026-06-01T00:00:00Z&verified=verified
+```
+
+Returns a versioned envelope with `spec_version`, `generated_at`, and `pagination.next` so any wallet, DEX, or explorer can cache and incrementally update the registry.
+
+---
+
 ## API Reference
 
 | Method | Endpoint | Description |
