@@ -2021,7 +2021,7 @@ async def verify_nft_ownership(wallet_address: str, nft_token_id: str, required_
 
     return {
         "verified": True,
-        "detail": f"NFT verified. Issuer: {target.get('Issuer')}, URI: {uri_str[:200]}",
+        "detail": f"NFT verified. Issuer: {target.get('Issuer')}, URI: {uri_str[:500]}",
         "issuer": target.get("Issuer"),
         "uri": uri_str,
         "nft_token_id": nft_token_id,
@@ -2902,7 +2902,24 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                     required_metadata=required_meta,
                 )
             if nft_result["verified"]:
-                note = f"🔗 NFT PROOF VERIFIED ON-CHAIN: {nft_result['detail']}"
+                # Enrich with registry name so the AI sees "Maersk Line" not just rXXX...
+                issuer_wallet = nft_result.get("issuer", "")
+                issuer_label  = issuer_wallet
+                try:
+                    reg = db.query(NftIssuer).filter(
+                        NftIssuer.wallet_addresses.contains(issuer_wallet) |
+                        (NftIssuer.wallet_address == issuer_wallet)
+                    ).first()
+                    if reg:
+                        issuer_label = f"{reg.name} ({issuer_wallet}) [AgentTrust verified issuer]"
+                except Exception:
+                    pass
+                note = (
+                    f"🔗 NFT PROOF VERIFIED ON-CHAIN\n"
+                    f"  Token ID : {req.nft_token_id}\n"
+                    f"  Issuer   : {issuer_label}\n"
+                    f"  Metadata : {nft_result.get('uri', '')[:500]}"
+                )
                 proof_results.append(("NFT", True, note))
                 logger.info(f"✅ NFT proof verified for {req.escrow_id}: {nft_result['detail']}")
             else:
