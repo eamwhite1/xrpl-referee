@@ -1,7 +1,7 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-06-18/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.eamwhite1/xrpl-referee",
-  "description": "Trust and payment layer for the agentic economy on the XRP Ledger. AI-verified escrow with automatic payment release, an open XRPL NFT Issuer Registry, and domain/credential verification for autonomous agents.",
+  "description": "Trust and payment layer for the agentic economy on the XRP Ledger.",
   "repository": {
     "url": "https://github.com/eamwhite1/xrpl-referee",
     "source": "github"
