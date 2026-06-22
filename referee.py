@@ -858,6 +858,12 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
+
+# Temporary reviewer bypass for directory submissions (e.g. Claude Connectors Directory).
+# Lets a reviewer exercise paid endpoints without a funded XRPL wallet. Set
+# REVIEWER_BYPASS_TOKEN in the environment only for the duration of a review,
+# then unset it — this must NOT be left enabled in production.
+REVIEWER_BYPASS_TOKEN = os.getenv("REVIEWER_BYPASS_TOKEN")
 MIN_ESCROW_XRP  = 0.000001   # 1 drop — XRPL EscrowCreate minimum
 RIPPLE_EPOCH    = 946684800  # Unix timestamp of the XRP Ledger epoch (2000-01-01T00:00:00Z)
 
@@ -1182,8 +1188,13 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/") -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None) -> dict:
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
+
+    if REVIEWER_BYPASS_TOKEN and reviewer_token and reviewer_token == REVIEWER_BYPASS_TOKEN:
+        logger.warning(f"⚠️ REVIEWER BYPASS used for {resource} (escrow_id={escrow_id}) — fee check skipped.")
+        return {"bypassed": True, "sender": "reviewer-bypass", "amount_xrp": required_xrp}
+
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == fee_hash).first()
     if already_used:
         raise HTTPException(
@@ -2580,18 +2591,19 @@ async def standalone_audit(
     req: StandaloneAuditRequest,
     x_payment_hash: Optional[str] = Header(None),
     x_payment: Optional[str] = Header(None),  # x402 standard header
+    x_reviewer_token: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
     fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
-    if not fee_hash:
+    if not fee_hash and not x_reviewer_token:
         _raise_402(
             "/audit",
             f"Payment required. Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL, "
             "then include the transaction hash as the X-PAYMENT header (or fee_hash body field).",
         )
 
-    audit_id = f"audit-{fee_hash[:16].lower()}"
-    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit")
+    audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
+    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token)
 
     verdict_dict, model_used = await run_ai_audit(
         task               = req.task,
@@ -2649,12 +2661,12 @@ async def create_xumm_payload(req: XummPayloadRequest):
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
 @app.post("/escrow/generate")
-async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)):
+async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None)):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate")
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token)
 
     # Validate currency + amount
     currency = req.currency.upper()
@@ -3272,7 +3284,7 @@ class PurchaseAttemptRequest(BaseModel):
     fee_hash:  str   # 0.05 XRP payment hash
 
 @app.post("/evaluate/purchase-attempt")
-async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db)):
+async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None)):
     """
     Seller pays EXTRA_ATTEMPT_FEE_XRP (0.05 XRP) to unlock one more submission.
     Returns updated attempts_remaining.
@@ -3292,6 +3304,7 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         db        = db,
         min_xrp   = EXTRA_ATTEMPT_FEE_XRP,
         resource  = "/evaluate/purchase-attempt",
+        reviewer_token = x_reviewer_token,
     )
 
     # Grant one extra submission
@@ -4600,7 +4613,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/marketplace/skills")
-async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db)):
+async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None)):
     """
     Create a new skill listing. Requires a valid 0.1 XRP fee payment.
     Both humans (via the marketplace UI) and agents (via MCP) can post skills.
@@ -4609,7 +4622,7 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
     if existing:
         raise HTTPException(status_code=400, detail=f"Skill ID '{req.id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills")
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills", reviewer_token=x_reviewer_token)
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     listing = SkillListing(
