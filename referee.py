@@ -1191,7 +1191,7 @@ class QuoteRequest(BaseModel):
 async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None) -> dict:
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
 
-    if REVIEWER_BYPASS_TOKEN and reviewer_token and reviewer_token == REVIEWER_BYPASS_TOKEN:
+    if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
         logger.warning(f"⚠️ REVIEWER BYPASS used for {resource} (escrow_id={escrow_id}) — fee check skipped.")
         return {"bypassed": True, "sender": "reviewer-bypass", "amount_xrp": required_xrp}
 
