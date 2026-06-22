@@ -41,6 +41,7 @@ REFEREE_BASE = "https://xrpl-referee.onrender.com"
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Audit Task",
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
@@ -98,6 +99,7 @@ async def audit_task(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Create Escrow Vault",
     readOnlyHint=False,
     destructiveHint=True,
     idempotentHint=False,
@@ -197,6 +199,7 @@ async def create_escrow_vault(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Confirm Escrow Transaction",
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=True,
@@ -232,6 +235,7 @@ async def confirm_escrow_transaction(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Evaluate Escrow Work",
     readOnlyHint=False,
     destructiveHint=True,
     idempotentHint=False,
@@ -296,6 +300,7 @@ async def evaluate_escrow_work(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Get Escrow Info",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -323,6 +328,7 @@ async def get_escrow_info(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="List Marketplace Jobs",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -383,6 +389,7 @@ async def list_marketplace_jobs(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Get RLUSD Quote",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -418,6 +425,7 @@ async def get_rlusd_quote(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="List Marketplace Skills",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -474,6 +482,7 @@ async def list_marketplace_skills(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Create Skill Listing",
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
@@ -559,6 +568,7 @@ async def create_skill_listing(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Direct Hire",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -616,6 +626,7 @@ async def direct_hire(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Get XRP Price",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -642,6 +653,7 @@ async def get_xrp_price() -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Post Job",
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
@@ -709,6 +721,7 @@ async def post_job(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="List Open Jobs",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -757,6 +770,7 @@ async def list_open_jobs(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Submit Bid",
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
@@ -820,6 +834,7 @@ async def submit_bid(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="View Job",
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
@@ -847,6 +862,7 @@ async def view_job(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Award Job",
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
