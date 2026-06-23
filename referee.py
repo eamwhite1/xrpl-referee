@@ -1,4 +1,5 @@
 import os
+import time
 import httpx
 import logging
 import sys
@@ -10,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Request
+from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
@@ -31,6 +32,7 @@ from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx
 from xrpl.models.transactions import EscrowFinish
 from xrpl.core.addresscodec import decode_seed
+from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
 from xrpl.utils import xrp_to_drops
 
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
@@ -988,16 +990,60 @@ EXTRA_ATTEMPT_FEE_XRP   = 0.05  # charged per extra submission beyond the limit
 # ---------------------------------------------------------------------------
 # x402 PAYMENT REQUIRED HELPER
 # ---------------------------------------------------------------------------
+# x402 v2 / XRPL "exact" scheme support (https://xrpl-x402.t54.ai/docs).
+# Lets agents pay via a presigned, unsubmitted XRPL Payment transaction
+# (PAYMENT-SIGNATURE header) instead of submitting it themselves and
+# proving it after the fact. AgentTrust acts as its own facilitator: it
+# decodes, validates, and submits the signed blob itself, since it's
+# already the resource server and already holds a submission pipeline.
+XRPL_CAIP2_NETWORK    = "xrpl:0"  # mainnet, per x402 CAIP-2 convention
+X402_DEFAULT_SOURCE_TAG = 804681468
+X402_CHALLENGE_TTL_SECONDS = 600
+
+_x402_challenges: dict = {}  # invoice_id -> {resource, payTo, asset, issuer, amount, created_at}
+
+
+def _x402_v2_envelope(resource: str, required_xrp: float) -> tuple[dict, str]:
+    """Builds a v2 'accepts' entry + invoice id, and registers the challenge."""
+    invoice_id = secrets.token_hex(8)
+    amount_drops = str(int(round(required_xrp * 1_000_000)))
+    _x402_challenges[invoice_id] = {
+        "resource":     resource,
+        "payTo":        PROTOCOL_WALLET,
+        "asset":        "XRP",
+        "issuer":       None,
+        "amount_drops": amount_drops,
+        "created_at":   time.time(),
+    }
+    entry = {
+        "scheme":  "exact",
+        "network": XRPL_CAIP2_NETWORK,
+        "asset":   "XRP",
+        "payTo":   PROTOCOL_WALLET,
+        "amount":  amount_drops,
+        "maxTimeoutSeconds": X402_CHALLENGE_TTL_SECONDS,
+        "extra": {
+            "sourceTag": X402_DEFAULT_SOURCE_TAG,
+            "invoiceId": invoice_id,
+        },
+    }
+    return entry, invoice_id
+
+
 def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
     """Raise an x402-compliant 402 Payment Required exception.
 
-    Includes a base64-encoded X-Payment-Required header so that any HTTP
-    client or AI agent implementing the x402 standard can auto-discover
-    payment requirements without reading documentation.
+    Emits both the legacy v1 X-Payment-Required header (tx-hash-after-the-fact
+    flow, used by the Xaman/human checkout) and a proper x402 v2
+    PAYMENT-REQUIRED header (presigned-transaction flow, for agents using
+    the official x402-XRPL client libraries).
 
-    Spec: https://x402.org
+    Spec: https://x402.org, https://xrpl-x402.t54.ai/docs
     """
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
+
+    v2_entry, invoice_id = _x402_v2_envelope(resource, required_xrp)
+
     body = {
         "x402Version": 1,
         "accepts": [{
@@ -1011,15 +1057,104 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
             "extra": {
                 "instruction": (
                     f"Send {required_xrp} XRP to {PROTOCOL_WALLET} on the XRPL, "
-                    "then include the transaction hash as the X-PAYMENT header."
+                    "then include the transaction hash as the X-PAYMENT header. "
+                    "Agents using the x402-XRPL presigned-transaction flow should "
+                    "instead use the PAYMENT-REQUIRED header below."
                 ),
                 "headerName": "X-PAYMENT",
             },
         }],
         "error": error,
     }
-    encoded = base64.b64encode(json.dumps(body).encode()).decode()
-    raise PaymentRequired(JSONResponse(status_code=402, content=body, headers={"X-Payment-Required": encoded}))
+    v2_body = {"x402Version": 2, "accepts": [v2_entry]}
+
+    encoded    = base64.b64encode(json.dumps(body).encode()).decode()
+    encoded_v2 = base64.b64encode(json.dumps(v2_body).encode()).decode()
+    raise PaymentRequired(JSONResponse(
+        status_code=402,
+        content=body,
+        headers={"X-Payment-Required": encoded, "PAYMENT-REQUIRED": encoded_v2},
+    ))
+
+
+def _x402_invoice_binding_ok(tx: dict, invoice_id: str) -> bool:
+    expected_hex = hashlib.sha256(invoice_id.encode()).hexdigest().upper()
+    if str(tx.get("InvoiceID", "")).upper() == expected_hex:
+        return True
+    expected_memo = invoice_id.encode("utf-8").hex().upper()
+    for memo in (tx.get("Memos") or []):
+        if str(memo.get("Memo", {}).get("MemoData", "")).upper() == expected_memo:
+            return True
+    return False
+
+
+async def verify_x402_v2_payment(payment_signature_b64: str, escrow_id: str, db: Session, resource: str) -> dict:
+    """Verifies and settles a presigned XRPL Payment per the x402 v2 'exact' scheme."""
+    try:
+        envelope = json.loads(base64.b64decode(payment_signature_b64).decode())
+        accepted = envelope["accepted"]
+        signed_blob = envelope["payload"]["signedTxBlob"]
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_tx_blob: malformed PAYMENT-SIGNATURE payload.")
+
+    if envelope.get("x402Version") != 2 or accepted.get("scheme") != "exact":
+        raise HTTPException(status_code=400, detail="payment_requirements_mismatch: expected x402Version 2, scheme 'exact'.")
+    if accepted.get("network") != XRPL_CAIP2_NETWORK:
+        raise HTTPException(status_code=400, detail=f"invalid_network: expected {XRPL_CAIP2_NETWORK}.")
+
+    invoice_id = (accepted.get("extra") or {}).get("invoiceId")
+    challenge  = _x402_challenges.get(invoice_id)
+    if not challenge or (time.time() - challenge["created_at"]) > X402_CHALLENGE_TTL_SECONDS:
+        _raise_402(resource, "Payment challenge expired or unknown invoiceId. Request a new PAYMENT-REQUIRED challenge.")
+
+    try:
+        tx = xrpl_decode_tx_blob(signed_blob)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_tx_blob: could not decode signedTxBlob.")
+
+    if tx.get("TransactionType") != "Payment":
+        raise HTTPException(status_code=400, detail="not_payment_tx")
+    if str(tx.get("Destination", "")).strip().lower() != challenge["payTo"].lower():
+        raise HTTPException(status_code=400, detail="destination_mismatch")
+    if not tx.get("LastLedgerSequence"):
+        raise HTTPException(status_code=400, detail="missing_last_ledger_sequence")
+    if not _x402_invoice_binding_ok(tx, invoice_id):
+        raise HTTPException(status_code=400, detail="invoice_binding_missing")
+
+    tx_amount = tx.get("Amount")
+    if challenge["asset"] == "XRP":
+        if isinstance(tx_amount, dict) or int(tx_amount or 0) < int(challenge["amount_drops"]):
+            raise HTTPException(status_code=400, detail="amount_mismatch")
+        amount_xrp = round(int(tx_amount) / 1_000_000, 6)
+    else:
+        if not isinstance(tx_amount, dict) or tx_amount.get("issuer") != challenge["issuer"]:
+            raise HTTPException(status_code=400, detail="amount_mismatch")
+        amount_xrp = None
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(XRPL_URL, json={"method": "submit", "params": [{"tx_blob": signed_blob}]})
+    result = res.json().get("result", {})
+    engine_result = result.get("engine_result", "")
+    tx_hash = (result.get("tx_json") or {}).get("hash") or result.get("hash")
+
+    if engine_result != "tesSUCCESS" or not tx_hash:
+        raise HTTPException(status_code=400, detail=f"Settlement failed: {engine_result or 'unknown error'}.")
+
+    del _x402_challenges[invoice_id]  # consume — single use, per spec
+
+    sender = tx.get("Account", "unknown")
+    db.add(PaymentLog(payment_hash=tx_hash, purpose="x402_v2", sender=sender, amount_xrp=amount_xrp, escrow_id=escrow_id))
+    db.commit()
+
+    logger.info(f"✅ x402 v2 SETTLED: {tx_hash} from {sender} for escrow '{escrow_id}'")
+
+    settlement = {"success": True, "transaction": tx_hash, "network": XRPL_CAIP2_NETWORK, "payer": sender}
+    return {
+        "sender": sender,
+        "amount_xrp": amount_xrp,
+        "tx_hash": tx_hash,
+        "payment_response_header": base64.b64encode(json.dumps(settlement).encode()).decode(),
+    }
 
 
 try:
@@ -1188,12 +1323,18 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None) -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None) -> dict:
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
 
     if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
         logger.warning(f"⚠️ REVIEWER BYPASS used for {resource} (escrow_id={escrow_id}) — fee check skipped.")
         return {"bypassed": True, "sender": "reviewer-bypass", "amount_xrp": required_xrp}
+
+    if payment_signature:
+        return await verify_x402_v2_payment(payment_signature, escrow_id, db, resource)
+
+    if not fee_hash:
+        _raise_402(resource, "Payment required. Provide a fee_hash (x402 v1) or PAYMENT-SIGNATURE header (x402 v2).", min_xrp=required_xrp)
 
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == fee_hash).first()
     if already_used:
@@ -2592,18 +2733,20 @@ async def standalone_audit(
     x_payment_hash: Optional[str] = Header(None),
     x_payment: Optional[str] = Header(None),  # x402 standard header
     x_reviewer_token: Optional[str] = Header(None),
+    payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"),
     db: Session = Depends(get_db),
 ):
     fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
-    if not fee_hash and not x_reviewer_token:
+    if not fee_hash and not x_reviewer_token and not payment_signature:
         _raise_402(
             "/audit",
             f"Payment required. Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL, "
-            "then include the transaction hash as the X-PAYMENT header (or fee_hash body field).",
+            "then include the transaction hash as the X-PAYMENT header (or fee_hash body field), "
+            "or provide a PAYMENT-SIGNATURE header (x402 v2).",
         )
 
     audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
-    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token)
+    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
 
     verdict_dict, model_used = await run_ai_audit(
         task               = req.task,
@@ -2661,12 +2804,12 @@ async def create_xumm_payload(req: XummPayloadRequest):
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
 @app.post("/escrow/generate")
-async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None)):
+async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE")):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token)
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
 
     # Validate currency + amount
     currency = req.currency.upper()
@@ -3284,7 +3427,7 @@ class PurchaseAttemptRequest(BaseModel):
     fee_hash:  str   # 0.05 XRP payment hash
 
 @app.post("/evaluate/purchase-attempt")
-async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None)):
+async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE")):
     """
     Seller pays EXTRA_ATTEMPT_FEE_XRP (0.05 XRP) to unlock one more submission.
     Returns updated attempts_remaining.
@@ -3305,6 +3448,7 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         min_xrp   = EXTRA_ATTEMPT_FEE_XRP,
         resource  = "/evaluate/purchase-attempt",
         reviewer_token = x_reviewer_token,
+        payment_signature = payment_signature,
     )
 
     # Grant one extra submission
@@ -4613,7 +4757,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/marketplace/skills")
-async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None)):
+async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE")):
     """
     Create a new skill listing. Requires a valid 0.1 XRP fee payment.
     Both humans (via the marketplace UI) and agents (via MCP) can post skills.
@@ -4622,7 +4766,7 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
     if existing:
         raise HTTPException(status_code=400, detail=f"Skill ID '{req.id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills", reviewer_token=x_reviewer_token)
+    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     listing = SkillListing(
