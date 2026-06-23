@@ -1,6 +1,7 @@
 import os
 import time
 import httpx
+from decimal import Decimal, InvalidOperation
 import logging
 import sys
 import hashlib
@@ -1000,11 +1001,16 @@ XRPL_CAIP2_NETWORK    = "xrpl:0"  # mainnet, per x402 CAIP-2 convention
 X402_DEFAULT_SOURCE_TAG = 804681468
 X402_CHALLENGE_TTL_SECONDS = 600
 
-_x402_challenges: dict = {}  # invoice_id -> {resource, payTo, asset, issuer, amount, created_at}
+_x402_challenges: dict = {}  # invoice_id -> {resource, payTo, asset, issuer, currency, amount, created_at}
 
 
 def _x402_v2_envelope(resource: str, required_xrp: float) -> tuple[dict, str]:
-    """Builds a v2 'accepts' entry + invoice id, and registers the challenge."""
+    """Builds a v2 'accepts' entry + invoice id, and registers the challenge.
+
+    Protocol fees are always charged in XRP today; the IOU/RLUSD branch in
+    verify_x402_v2_payment exists for forward-compat with RLUSD-denominated
+    fees but is not yet reachable from here.
+    """
     invoice_id = secrets.token_hex(8)
     amount_drops = str(int(round(required_xrp * 1_000_000)))
     _x402_challenges[invoice_id] = {
@@ -1012,7 +1018,9 @@ def _x402_v2_envelope(resource: str, required_xrp: float) -> tuple[dict, str]:
         "payTo":        PROTOCOL_WALLET,
         "asset":        "XRP",
         "issuer":       None,
+        "currency":     None,
         "amount_drops": amount_drops,
+        "amount_value": None,
         "created_at":   time.time(),
     }
     entry = {
@@ -1127,7 +1135,15 @@ async def verify_x402_v2_payment(payment_signature_b64: str, escrow_id: str, db:
             raise HTTPException(status_code=400, detail="amount_mismatch")
         amount_xrp = round(int(tx_amount) / 1_000_000, 6)
     else:
-        if not isinstance(tx_amount, dict) or tx_amount.get("issuer") != challenge["issuer"]:
+        if not isinstance(tx_amount, dict):
+            raise HTTPException(status_code=400, detail="amount_mismatch")
+        currency_ok = str(tx_amount.get("currency", "")).upper() == str(challenge["currency"] or "").upper()
+        issuer_ok    = tx_amount.get("issuer") == challenge["issuer"]
+        try:
+            value_ok = Decimal(str(tx_amount.get("value", "0"))) >= Decimal(str(challenge["amount_value"]))
+        except (InvalidOperation, TypeError):
+            value_ok = False
+        if not (currency_ok and issuer_ok and value_ok):
             raise HTTPException(status_code=400, detail="amount_mismatch")
         amount_xrp = None
 
@@ -2735,6 +2751,7 @@ async def standalone_audit(
     x_reviewer_token: Optional[str] = Header(None),
     payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"),
     db: Session = Depends(get_db),
+    response: Response = None,
 ):
     fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
     if not fee_hash and not x_reviewer_token and not payment_signature:
@@ -2746,7 +2763,9 @@ async def standalone_audit(
         )
 
     audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
-    await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    fee_result = await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    if response is not None and fee_result.get("payment_response_header"):
+        response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
     verdict_dict, model_used = await run_ai_audit(
         task               = req.task,
@@ -2804,12 +2823,14 @@ async def create_xumm_payload(req: XummPayloadRequest):
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
 @app.post("/escrow/generate")
-async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE")):
+async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    if response is not None and fee_result.get("payment_response_header"):
+        response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
     # Validate currency + amount
     currency = req.currency.upper()
@@ -3427,7 +3448,7 @@ class PurchaseAttemptRequest(BaseModel):
     fee_hash:  str   # 0.05 XRP payment hash
 
 @app.post("/evaluate/purchase-attempt")
-async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE")):
+async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     """
     Seller pays EXTRA_ATTEMPT_FEE_XRP (0.05 XRP) to unlock one more submission.
     Returns updated attempts_remaining.
@@ -3441,7 +3462,7 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         raise HTTPException(status_code=409, detail="Escrow is cancelled.")
 
     # Verify the 0.05 XRP payment
-    await verify_fee_payment(
+    fee_result = await verify_fee_payment(
         fee_hash  = req.fee_hash,
         escrow_id = f"{req.escrow_id}-attempt",
         db        = db,
@@ -3450,6 +3471,8 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         reviewer_token = x_reviewer_token,
         payment_signature = payment_signature,
     )
+    if response is not None and fee_result.get("payment_response_header"):
+        response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
     # Grant one extra submission
     vault.max_submissions = (vault.max_submissions or DEFAULT_MAX_SUBMISSIONS) + 1
@@ -4757,7 +4780,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/marketplace/skills")
-async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE")):
+async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     """
     Create a new skill listing. Requires a valid 0.1 XRP fee payment.
     Both humans (via the marketplace UI) and agents (via MCP) can post skills.
@@ -4766,7 +4789,9 @@ async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get
     if existing:
         raise HTTPException(status_code=400, detail=f"Skill ID '{req.id}' already exists.")
 
-    await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.id, db=db, resource="/marketplace/skills", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    if response is not None and fee_result.get("payment_response_header"):
+        response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=30)
     listing = SkillListing(
