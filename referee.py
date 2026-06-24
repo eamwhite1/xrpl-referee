@@ -5086,6 +5086,58 @@ async def issuer_registry_feed(
     }
 
 
+class NftIssuerClaimRequest(BaseModel):
+    contact_email: str
+
+
+@app.get("/nft/issuers/{issuer_id}")
+async def get_nft_issuer(issuer_id: int, db: Session = Depends(get_db)):
+    issuer = db.query(NftIssuer).filter(NftIssuer.id == issuer_id).first()
+    if not issuer:
+        raise HTTPException(status_code=404, detail="Issuer not found.")
+    return {
+        "id": issuer.id,
+        "name": issuer.name,
+        "wallet_address": issuer.wallet_address,
+        "wallet_addresses": issuer.all_wallets(),
+        "category": issuer.category,
+        "description": issuer.description,
+        "website": issuer.website,
+        "verified": issuer.verified,
+        "claimed": bool(issuer.contact_email),
+    }
+
+
+@app.post("/nft/issuers/{issuer_id}/claim")
+async def claim_nft_issuer(issuer_id: int, req: NftIssuerClaimRequest, db: Session = Depends(get_db)):
+    """
+    Self-serve claim for a seeded ("public") registry entry. The caller proves control of the
+    issuer's wallet by publishing it in their own domain's xrp-ledger.toml — the same convention
+    XRPL already uses for Domain-field verification. No manual review needed once that check passes.
+    """
+    issuer = db.query(NftIssuer).filter(NftIssuer.id == issuer_id).first()
+    if not issuer:
+        raise HTTPException(status_code=404, detail="Issuer not found.")
+    if issuer.contact_email:
+        raise HTTPException(status_code=409, detail="This entry has already been claimed.")
+    if not issuer.website:
+        raise HTTPException(status_code=400, detail="This entry has no domain on file to verify against. Contact support to claim it manually.")
+
+    result = await verify_domain_ownership(issuer.wallet_address, issuer.website)
+    if not result["verified"]:
+        raise HTTPException(status_code=400, detail=result["detail"])
+
+    issuer.contact_email = req.contact_email
+    issuer.verified = "verified"
+    db.commit()
+    return {
+        "status": "verified",
+        "message": f"Claim confirmed via {issuer.website}. {issuer.name} is now marked 'verified' in the registry.",
+        "name": issuer.name,
+        "wallet_address": issuer.wallet_address,
+    }
+
+
 @app.patch("/nft/issuers/{issuer_id}/wallets")
 async def update_issuer_wallets(issuer_id: int, req: NftIssuerWalletUpdate, db: Session = Depends(get_db)):
     """Add or remove wallets for an issuer. Authenticated by matching contact_email."""
