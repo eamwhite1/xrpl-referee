@@ -620,13 +620,6 @@ _PUBLIC_ISSUERS = [
         "website": "missionbpm.com",
     },
     {
-        "wallet_address": "rJBUybW3ng7nrnbT4X9iyieXRuFXct3Q3j",
-        "name": "IslandXchange",
-        "category": "Real-world asset tokenisation",
-        "description": "Blockchain platform for buying, selling and trading privately owned islands via fractional NFT ownership on XRPL. XRPL Foundation self-assessed.",
-        "website": "islandixc.tech",
-    },
-    {
         "wallet_address": "rrno7Nj4RkFJLzC4nRaZiLF5aHwcTVon3d",
         "name": "onXRP",
         "category": "NFT marketplace / DeFi",
@@ -5157,6 +5150,19 @@ async def claim_nft_issuer(issuer_id: int, req: NftIssuerClaimRequest, db: Sessi
         "name": issuer["name"],
         "wallet_address": issuer["wallet_address"],
     }
+
+
+@app.delete("/nft/issuers/{issuer_id}")
+async def delete_nft_issuer(issuer_id: int, token: str = None, db: Session = Depends(get_db)):
+    """Admin-only removal of a registry entry (e.g. defunct/blackholed issuer). Guarded by REVIEWER_BYPASS_TOKEN."""
+    if not REVIEWER_BYPASS_TOKEN or token != REVIEWER_BYPASS_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing admin token.")
+    issuer = _fetch_issuer_row(db, issuer_id)
+    if not issuer:
+        raise HTTPException(status_code=404, detail="Issuer not found.")
+    db.execute(text("DELETE FROM nft_issuer WHERE id = :id"), {"id": issuer_id})
+    db.commit()
+    return {"status": "deleted", "name": issuer["name"], "id": issuer_id}
 
 
 @app.patch("/nft/issuers/{issuer_id}/wallets")
