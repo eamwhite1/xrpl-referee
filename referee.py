@@ -5090,21 +5090,40 @@ class NftIssuerClaimRequest(BaseModel):
     contact_email: str
 
 
+def _fetch_issuer_row(db: Session, issuer_id: int):
+    """Fetch a single issuer via raw SQL, selecting only columns guaranteed to exist
+    (mirrors list_nft_issuers — the live table may predate newer optional columns)."""
+    existing_cols = {r[0] for r in db.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer'"
+    )).fetchall()}
+    cols = ["id", "wallet_address", "name", "category", "description", "website"]
+    optional_cols = ["wallet_addresses", "verified", "contact_email"]
+    select_cols = cols + [c for c in optional_cols if c in existing_cols]
+    sql = f"SELECT {', '.join(select_cols)} FROM nft_issuer WHERE id = :id"
+    row = db.execute(text(sql), {"id": issuer_id}).fetchone()
+    if not row:
+        return None
+    data = dict(zip(select_cols, row))
+    for c in optional_cols:
+        data.setdefault(c, None)
+    return data
+
+
 @app.get("/nft/issuers/{issuer_id}")
 async def get_nft_issuer(issuer_id: int, db: Session = Depends(get_db)):
-    issuer = db.query(NftIssuer).filter(NftIssuer.id == issuer_id).first()
+    issuer = _fetch_issuer_row(db, issuer_id)
     if not issuer:
         raise HTTPException(status_code=404, detail="Issuer not found.")
     return {
-        "id": issuer.id,
-        "name": issuer.name,
-        "wallet_address": issuer.wallet_address,
-        "wallet_addresses": issuer.all_wallets(),
-        "category": issuer.category,
-        "description": issuer.description,
-        "website": issuer.website,
-        "verified": issuer.verified,
-        "claimed": bool(issuer.contact_email),
+        "id": issuer["id"],
+        "name": issuer["name"],
+        "wallet_address": issuer["wallet_address"],
+        "wallet_addresses": json.loads(issuer["wallet_addresses"] or "[]") or [issuer["wallet_address"]],
+        "category": issuer["category"],
+        "description": issuer["description"],
+        "website": issuer["website"],
+        "verified": issuer["verified"] or "public",
+        "claimed": bool(issuer["contact_email"]),
     }
 
 
@@ -5115,26 +5134,28 @@ async def claim_nft_issuer(issuer_id: int, req: NftIssuerClaimRequest, db: Sessi
     issuer's wallet by publishing it in their own domain's xrp-ledger.toml — the same convention
     XRPL already uses for Domain-field verification. No manual review needed once that check passes.
     """
-    issuer = db.query(NftIssuer).filter(NftIssuer.id == issuer_id).first()
+    issuer = _fetch_issuer_row(db, issuer_id)
     if not issuer:
         raise HTTPException(status_code=404, detail="Issuer not found.")
-    if issuer.contact_email:
+    if issuer["contact_email"]:
         raise HTTPException(status_code=409, detail="This entry has already been claimed.")
-    if not issuer.website:
+    if not issuer["website"]:
         raise HTTPException(status_code=400, detail="This entry has no domain on file to verify against. Contact support to claim it manually.")
 
-    result = await verify_domain_ownership(issuer.wallet_address, issuer.website)
+    result = await verify_domain_ownership(issuer["wallet_address"], issuer["website"])
     if not result["verified"]:
         raise HTTPException(status_code=400, detail=result["detail"])
 
-    issuer.contact_email = req.contact_email
-    issuer.verified = "verified"
+    db.execute(
+        text("UPDATE nft_issuer SET contact_email = :email, verified = 'verified' WHERE id = :id"),
+        {"email": req.contact_email, "id": issuer_id},
+    )
     db.commit()
     return {
         "status": "verified",
-        "message": f"Claim confirmed via {issuer.website}. {issuer.name} is now marked 'verified' in the registry.",
-        "name": issuer.name,
-        "wallet_address": issuer.wallet_address,
+        "message": f"Claim confirmed via {issuer['website']}. {issuer['name']} is now marked 'verified' in the registry.",
+        "name": issuer["name"],
+        "wallet_address": issuer["wallet_address"],
     }
 
 
