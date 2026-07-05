@@ -5232,10 +5232,19 @@ async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_d
         db.commit()
         return {"status": "updated", "message": "Issuer record updated.", "wallets": existing.all_wallets()}
 
+    # Try auto-verification via xrp-ledger.toml before creating the record
+    auto_verified = False
+    if req.website and req.wallet_address:
+        try:
+            vr = await verify_domain_ownership(req.wallet_address, req.website)
+            auto_verified = vr.get("verified", False)
+        except Exception:
+            pass
+
     issuer = NftIssuer(
         wallet_address=all_wallets[0], name=req.name,
         category=req.category, description=req.description,
-        website=req.website, verified="pending",
+        website=req.website, verified="verified" if auto_verified else "pending",
         created_at=datetime.now(timezone.utc),
         contact_email=req.contact_email,
         lei=req.lei, nft_types=req.nft_types,
@@ -5244,7 +5253,9 @@ async def register_nft_issuer(req: NftIssuerRequest, db: Session = Depends(get_d
     db.add(issuer); db.commit()
     if RESEND_API_KEY:
         asyncio.create_task(_send_issuer_registration_email(issuer))
-    return {"status": "pending", "message": "Issuer registration received. Verification typically takes 1-2 business days.", "wallets": issuer.all_wallets()}
+    if auto_verified:
+        return {"status": "verified", "message": "Registered and verified! Your listing is now live.", "wallets": issuer.all_wallets()}
+    return {"status": "pending", "message": "Registration received. Once you publish your xrp-ledger.toml file, return here to complete verification.", "wallets": issuer.all_wallets()}
 
 
 @app.get("/nft/issuers/feed")
@@ -5353,6 +5364,37 @@ def _fetch_issuer_row(db: Session, issuer_id: int):
     for c in optional_cols:
         data.setdefault(c, None)
     return data
+
+
+@app.get("/nft/issuers/by-wallet/{wallet_address}")
+async def get_nft_issuer_by_wallet(wallet_address: str, db: Session = Depends(get_db)):
+    """Look up a registry entry by wallet address. Returns 404 if not found."""
+    existing_cols = {r[0] for r in db.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer'"
+    )).fetchall()}
+    cols = ["id", "wallet_address", "name", "category", "description", "website"]
+    optional_cols = ["wallet_addresses", "verified", "contact_email"]
+    select_cols = cols + [c for c in optional_cols if c in existing_cols]
+    row = db.execute(
+        text(f"SELECT {', '.join(select_cols)} FROM nft_issuer WHERE wallet_address = :w LIMIT 1"),
+        {"w": wallet_address},
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Wallet not found in registry.")
+    data = dict(zip(select_cols, row))
+    for c in optional_cols:
+        data.setdefault(c, None)
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "wallet_address": data["wallet_address"],
+        "wallet_addresses": json.loads(data["wallet_addresses"] or "[]") or [data["wallet_address"]],
+        "category": data["category"],
+        "description": data["description"],
+        "website": data["website"],
+        "verified": data["verified"] or "public",
+        "claimed": bool(data["contact_email"]),
+    }
 
 
 @app.get("/nft/issuers/{issuer_id}")
