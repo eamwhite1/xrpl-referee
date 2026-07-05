@@ -2517,9 +2517,11 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         has_domain  = bool(acct.get("Domain"))
         owner_count = acct.get("OwnerCount", 0)
 
-        # Account age via Ripple Data API — returns inception date directly.
-        # xrplcluster.com is a load balancer without full history so account_tx
-        # forward=True is unreliable there; data.ripple.com is authoritative.
+        # Account age — three-tier approach so ANY wallet gets a correct reading:
+        # 1. data.ripple.com REST API returns inception date directly (fast, accurate)
+        # 2. s2.ripple.com full-history node via account_tx forward=True (universal fallback)
+        # 3. Give up gracefully — score 0 for age rather than a wrong number
+        from datetime import datetime, timezone
         age_days = 0
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
@@ -2530,11 +2532,33 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             if data_res.status_code == 200:
                 inception_str = data_res.json().get("account", {}).get("inception")
                 if inception_str:
-                    from datetime import datetime, timezone
                     inception_dt = datetime.fromisoformat(inception_str.rstrip("Z")).replace(tzinfo=timezone.utc)
                     age_days = (datetime.now(timezone.utc) - inception_dt).days
         except Exception:
             pass
+
+        if age_days == 0:
+            # Fallback: s2.ripple.com is a full-history node that supports forward traversal
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    tx_res = await client.post("https://s2.ripple.com:51234", json={
+                        "method": "account_tx",
+                        "params": [{"account": wallet_address, "limit": 1, "forward": True,
+                                    "ledger_index_min": 0, "ledger_index_max": -1}]
+                    })
+                txs = tx_res.json().get("result", {}).get("transactions", [])
+                if txs:
+                    tx_entry = txs[0]
+                    creation_ledger = (
+                        tx_entry.get("ledger_index")
+                        or tx_entry.get("tx", {}).get("ledger_index")
+                        or tx_entry.get("tx_json", {}).get("ledger_index")
+                    )
+                    if creation_ledger:
+                        ledger_gap = max(0, current_ledger - creation_ledger)
+                        age_days = int(ledger_gap * 3.5 / 86400)
+            except Exception:
+                pass
 
         async with httpx.AsyncClient(timeout=8.0) as client:
             nft_res = await client.post(XRPL_URL, json={
