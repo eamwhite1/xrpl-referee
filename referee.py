@@ -2518,18 +2518,24 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         owner_count = acct.get("OwnerCount", 0)
 
         # Account age: fetch the earliest transaction to find the creation ledger.
-        # Using Sequence as a proxy breaks for high-activity wallets (e.g. Ripple RLUSD
-        # issuer has Sequence ~90M from frequent txs, giving a near-zero ledger gap).
+        # ledger_index_min must be 0 (not -1) for forward=True to work correctly on
+        # most public nodes; -1 means "validated" and conflicts with forward traversal.
         age_days = 0
         async with httpx.AsyncClient(timeout=8.0) as client:
             tx_res = await client.post(XRPL_URL, json={
                 "method": "account_tx",
-                "params": [{"account": wallet_address, "limit": 1, "forward": True, "ledger_index_min": -1, "ledger_index_max": -1}]
+                "params": [{"account": wallet_address, "limit": 1, "forward": True, "ledger_index_min": 0, "ledger_index_max": -1}]
             })
             tx_data = tx_res.json().get("result", {})
             txs = tx_data.get("transactions", [])
             if txs:
-                creation_ledger = txs[0].get("tx", txs[0]).get("ledger_index", None) or txs[0].get("ledger_index")
+                tx_entry = txs[0]
+                # ledger_index may be at top level or inside tx/tx_json depending on node version
+                creation_ledger = (
+                    tx_entry.get("ledger_index")
+                    or tx_entry.get("tx", {}).get("ledger_index")
+                    or tx_entry.get("tx_json", {}).get("ledger_index")
+                )
                 if creation_ledger:
                     ledger_gap = max(0, current_ledger - creation_ledger)
                     age_days = int(ledger_gap * 3.5 / 86400)
@@ -2580,6 +2586,26 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             except Exception:
                 pass
 
+        # Verified issuer badge — check our own registry first, then Bithomp
+        verified_issuer = None
+        if db:
+            try:
+                row = db.execute(text(
+                    "SELECT name, website, verified FROM nft_issuer WHERE wallet_address = :w LIMIT 1"
+                ), {"w": wallet_address}).fetchone()
+                if row and row[2] == "verified":
+                    verified_issuer = {"name": row[0], "domain": row[1], "source": "agenttrust"}
+            except Exception:
+                pass
+        if not verified_issuer:
+            bithomp = await _verify_domain_via_bithomp(wallet_address)
+            if bithomp and bithomp.get("verified"):
+                verified_issuer = {
+                    "name": None,
+                    "domain": bithomp.get("domain"),
+                    "source": "bithomp",
+                }
+
         total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score
 
         signals = {
@@ -2601,7 +2627,12 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             **peer_stats,
         }
 
-        return {"score": min(100, total), "detail": f"AgentTrust wallet trust score: {min(100,total)}/100", "signals": signals}
+        return {
+            "score": min(100, total),
+            "detail": f"AgentTrust wallet trust score: {min(100,total)}/100",
+            "signals": signals,
+            "verified_issuer": verified_issuer,
+        }
     except Exception as e:
         return {"score": 0, "detail": f"Could not compute score: {e}", "signals": {}}
 
