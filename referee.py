@@ -2512,14 +2512,27 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
 
         acct = info["account_data"]
 
-        ledger_index = info.get("ledger_current_index", 90_000_000)
-        account_index = acct.get("Sequence", ledger_index)
-        ledger_gap = max(0, ledger_index - account_index)
-        age_days = int(ledger_gap * 3.5 / 86400)
-
+        current_ledger = info.get("ledger_current_index", 90_000_000)
         balance_xrp = int(acct.get("Balance", 0)) / 1_000_000
         has_domain  = bool(acct.get("Domain"))
         owner_count = acct.get("OwnerCount", 0)
+
+        # Account age: fetch the earliest transaction to find the creation ledger.
+        # Using Sequence as a proxy breaks for high-activity wallets (e.g. Ripple RLUSD
+        # issuer has Sequence ~90M from frequent txs, giving a near-zero ledger gap).
+        age_days = 0
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            tx_res = await client.post(XRPL_URL, json={
+                "method": "account_tx",
+                "params": [{"account": wallet_address, "limit": 1, "forward": True, "ledger_index_min": -1, "ledger_index_max": -1}]
+            })
+            tx_data = tx_res.json().get("result", {})
+            txs = tx_data.get("transactions", [])
+            if txs:
+                creation_ledger = txs[0].get("tx", txs[0]).get("ledger_index", None) or txs[0].get("ledger_index")
+                if creation_ledger:
+                    ledger_gap = max(0, current_ledger - creation_ledger)
+                    age_days = int(ledger_gap * 3.5 / 86400)
 
         async with httpx.AsyncClient(timeout=8.0) as client:
             nft_res = await client.post(XRPL_URL, json={
