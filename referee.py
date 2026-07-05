@@ -2517,48 +2517,35 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         has_domain  = bool(acct.get("Domain"))
         owner_count = acct.get("OwnerCount", 0)
 
-        # Account age — three-tier approach so ANY wallet gets a correct reading:
-        # 1. data.ripple.com REST API returns inception date directly (fast, accurate)
-        # 2. s2.ripple.com full-history node via account_tx forward=True (universal fallback)
-        # 3. Give up gracefully — score 0 for age rather than a wrong number
+        # Account age via first transaction's date field (XRPL epoch = seconds since
+        # Jan 1 2000). Using ledger arithmetic was unreliable because account_info with
+        # ledger_index="validated" returns ledger_index not ledger_current_index, so the
+        # current_ledger defaulted to 90_000_000 — only 74k ledgers above the RLUSD wallet.
+        # xrplcluster.com supports forward=True and returns the correct first tx.
         from datetime import datetime, timezone
+        XRPL_EPOCH = 946684800  # Jan 1 2000 in Unix seconds
         age_days = 0
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                data_res = await client.get(
-                    f"https://data.ripple.com/v2/accounts/{wallet_address}",
-                    headers={"Accept": "application/json"},
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                tx_res = await client.post(XRPL_URL, json={
+                    "method": "account_tx",
+                    "params": [{"account": wallet_address, "limit": 1, "forward": True,
+                                "ledger_index_min": 0, "ledger_index_max": -1}]
+                })
+            txs = tx_res.json().get("result", {}).get("transactions", [])
+            if txs:
+                tx_entry = txs[0]
+                # date is XRPL epoch seconds; present in tx or tx_json depending on node
+                xrpl_date = (
+                    tx_entry.get("tx", {}).get("date")
+                    or tx_entry.get("tx_json", {}).get("date")
+                    or tx_entry.get("date")
                 )
-            if data_res.status_code == 200:
-                inception_str = data_res.json().get("account", {}).get("inception")
-                if inception_str:
-                    inception_dt = datetime.fromisoformat(inception_str.rstrip("Z")).replace(tzinfo=timezone.utc)
-                    age_days = (datetime.now(timezone.utc) - inception_dt).days
+                if xrpl_date:
+                    creation_dt = datetime.fromtimestamp(xrpl_date + XRPL_EPOCH, tz=timezone.utc)
+                    age_days = (datetime.now(timezone.utc) - creation_dt).days
         except Exception:
             pass
-
-        if age_days == 0:
-            # Fallback: s2.ripple.com is a full-history node that supports forward traversal
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    tx_res = await client.post("https://s2.ripple.com:51234", json={
-                        "method": "account_tx",
-                        "params": [{"account": wallet_address, "limit": 1, "forward": True,
-                                    "ledger_index_min": 0, "ledger_index_max": -1}]
-                    })
-                txs = tx_res.json().get("result", {}).get("transactions", [])
-                if txs:
-                    tx_entry = txs[0]
-                    creation_ledger = (
-                        tx_entry.get("ledger_index")
-                        or tx_entry.get("tx", {}).get("ledger_index")
-                        or tx_entry.get("tx_json", {}).get("ledger_index")
-                    )
-                    if creation_ledger:
-                        ledger_gap = max(0, current_ledger - creation_ledger)
-                        age_days = int(ledger_gap * 3.5 / 86400)
-            except Exception:
-                pass
 
         async with httpx.AsyncClient(timeout=8.0) as client:
             nft_res = await client.post(XRPL_URL, json={
