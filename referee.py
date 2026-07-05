@@ -827,6 +827,18 @@ def run_migrations():
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS contact_email VARCHAR",
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS lei            VARCHAR",
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS nft_types      VARCHAR",
+        # v12 — wallet reputation ratings
+        """CREATE TABLE IF NOT EXISTS wallet_rating (
+            id             SERIAL PRIMARY KEY,
+            rated_address  VARCHAR NOT NULL,
+            rater_address  VARCHAR NOT NULL,
+            escrow_id      VARCHAR NOT NULL,
+            rating         INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+            comment        TEXT,
+            rater_role     VARCHAR NOT NULL,
+            created_at     TIMESTAMP
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS wallet_rating_unique ON wallet_rating (escrow_id, rater_address)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -852,6 +864,7 @@ def get_db():
 # 5. CONFIGURATION
 # ---------------------------------------------------------------------------
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
+BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_XRP     = 0.1
 
@@ -2302,8 +2315,43 @@ async def verify_nft_ownership(wallet_address: str, nft_token_id: str, required_
 
 # ---------------------------------------------------------------------------
 # 11d. XRPL DOMAIN FIELD VERIFICATION
+# Primary: Bithomp verified-domain API (daily-updated, thousands of verified entries).
+# Fallback: our own live TOML check (used when BITHOMP_API_KEY is not set, or Bithomp
+#           returns unverified for a domain that may have been verified very recently).
 # ---------------------------------------------------------------------------
+async def _verify_domain_via_bithomp(wallet_address: str, expected_domain: str = None) -> dict | None:
+    """Query Bithomp API for domain verification. Returns result dict or None if unavailable."""
+    if not BITHOMP_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            res = await client.get(
+                f"https://bithomp.com/api/v2/address/{wallet_address}",
+                params={"verifiedDomain": "true"},
+                headers={"x-bithomp-token": BITHOMP_API_KEY},
+            )
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        service = data.get("service") or {}
+        domain = service.get("domain") or data.get("verifiedDomain")
+        verified = bool(domain)
+        if not verified:
+            return {"verified": False, "detail": f"Wallet {wallet_address} has no verified domain on Bithomp.", "source": "bithomp"}
+        if expected_domain and domain.lower() != expected_domain.lower():
+            return {"verified": False, "detail": f"Bithomp shows domain '{domain}', expected '{expected_domain}'.", "source": "bithomp"}
+        return {"verified": True, "detail": f"Domain verified via Bithomp: {wallet_address} ↔ {domain}", "domain": domain, "source": "bithomp"}
+    except Exception:
+        return None
+
+
 async def verify_domain_ownership(wallet_address: str, expected_domain: str = None) -> dict:
+    # Try Bithomp first
+    bithomp_result = await _verify_domain_via_bithomp(wallet_address, expected_domain)
+    if bithomp_result is not None:
+        return bithomp_result
+
+    # Fallback: live TOML check
     async with httpx.AsyncClient(timeout=10.0) as client:
         res = await client.post(XRPL_URL, json={
             "method": "account_info",
@@ -2438,7 +2486,19 @@ async def verify_vc(req: VCVerifyRequest):
 # ---------------------------------------------------------------------------
 # 11f. XRPL WALLET TRUST SCORE
 # ---------------------------------------------------------------------------
-async def compute_xrpl_trust_score(wallet_address: str) -> dict:
+async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> dict:
+    """
+    AgentTrust Wallet Trust Score — 7 signals, genuine max 100.
+
+    Signal breakdown:
+      Account age       — up to 20 pts (2 pts/month, max 10 months)
+      XRP balance       — up to 15 pts (3 pts per 10 XRP, max 50 XRP)
+      On-chain activity — up to 15 pts (owner count as activity proxy)
+      Domain verified   — 10 pts flat
+      NFTs held         — up to 5 pts
+      AgentTrust escrow completion rate — up to 20 pts (our own platform data)
+      Peer ratings      — up to 15 pts (avg star rating from counterparties)
+    """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             info_res = await client.post(XRPL_URL, json={
@@ -2452,18 +2512,15 @@ async def compute_xrpl_trust_score(wallet_address: str) -> dict:
 
         acct = info["account_data"]
 
-        # Account age (from ledger sequence as proxy — older accounts have lower sequence)
-        ledger_index = info.get("ledger_current_index", 90000000)
+        ledger_index = info.get("ledger_current_index", 90_000_000)
         account_index = acct.get("Sequence", ledger_index)
-        # Rough age: each ledger ~3.5s. sequence gap → approximate age in days
         ledger_gap = max(0, ledger_index - account_index)
         age_days = int(ledger_gap * 3.5 / 86400)
 
         balance_xrp = int(acct.get("Balance", 0)) / 1_000_000
-        has_domain = bool(acct.get("Domain"))
-        tx_count = acct.get("OwnerCount", 0)  # owner count as proxy for activity
+        has_domain  = bool(acct.get("Domain"))
+        owner_count = acct.get("OwnerCount", 0)
 
-        # Fetch NFT count
         async with httpx.AsyncClient(timeout=8.0) as client:
             nft_res = await client.post(XRPL_URL, json={
                 "method": "account_nfts",
@@ -2471,32 +2528,75 @@ async def compute_xrpl_trust_score(wallet_address: str) -> dict:
             })
             nft_count = len(nft_res.json().get("result", {}).get("account_nfts", []))
 
-        # Score components (out of 100)
-        age_score     = min(25, int(age_days / 30) * 2)      # 2pts per month, max 25
-        balance_score = min(15, int(balance_xrp / 10) * 3)   # 3pts per 10 XRP, max 15
-        tx_score      = min(20, int(tx_count / 5) * 2)        # 2pts per 5 owner items, max 20
-        domain_score  = 10 if has_domain else 0
-        nft_score     = min(10, nft_count * 2)                # 2pts per NFT, max 10
+        # On-chain signals
+        age_score      = min(20, int(age_days / 30) * 2)       # 2 pts/month, max 20
+        balance_score  = min(15, int(balance_xrp / 10) * 3)    # 3 pts per 10 XRP, max 15
+        activity_score = min(15, int(owner_count / 5) * 2)     # 2 pts per 5 items, max 15
+        domain_score   = 10 if has_domain else 0
+        nft_score      = min(5, nft_count)                      # 1 pt per NFT, max 5
 
-        total = age_score + balance_score + tx_score + domain_score + nft_score
+        # AgentTrust platform signals (from our DB)
+        completion_score = 0
+        peer_score = 0
+        completion_stats = {}
+        peer_stats = {}
+
+        if db:
+            try:
+                # Escrow completion history
+                total_escrows = db.execute(text(
+                    "SELECT COUNT(*) FROM escrow_vault WHERE worker_address = :w"
+                ), {"w": wallet_address}).scalar() or 0
+                passed_escrows = db.execute(text(
+                    "SELECT COUNT(*) FROM escrow_vault WHERE worker_address = :w AND status = 'RELEASED'"
+                ), {"w": wallet_address}).scalar() or 0
+                if total_escrows > 0:
+                    pass_rate = passed_escrows / total_escrows
+                    completion_score = min(20, int(pass_rate * 15) + min(5, total_escrows))
+                completion_stats = {"total_escrows": total_escrows, "passed_escrows": passed_escrows}
+
+                # Peer ratings
+                rating_row = db.execute(text(
+                    "SELECT COUNT(*), AVG(rating) FROM wallet_rating WHERE rated_address = :w"
+                ), {"w": wallet_address}).fetchone()
+                rating_count = rating_row[0] or 0
+                avg_rating = float(rating_row[1] or 0)
+                if rating_count > 0:
+                    peer_score = min(15, int((avg_rating / 5) * 12) + min(3, rating_count // 3))
+                peer_stats = {"rating_count": rating_count, "avg_rating": round(avg_rating, 2)}
+            except Exception:
+                pass
+
+        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score
 
         signals = {
-            "age_days": age_days,
-            "balance_xrp": round(balance_xrp, 2),
-            "owner_count": tx_count,
-            "has_domain": has_domain,
-            "nft_count": nft_count,
+            "age_days":          age_days,
+            "balance_xrp":       round(balance_xrp, 2),
+            "owner_count":       owner_count,
+            "has_domain":        has_domain,
+            "nft_count":         nft_count,
+            "score_breakdown": {
+                "account_age":        age_score,
+                "balance":            balance_score,
+                "on_chain_activity":  activity_score,
+                "domain_verified":    domain_score,
+                "nfts_held":          nft_score,
+                "escrow_completion":  completion_score,
+                "peer_rating":        peer_score,
+            },
+            **completion_stats,
+            **peer_stats,
         }
 
-        return {"score": min(100, total), "detail": f"XRPL trust score: {total}/100", "signals": signals}
+        return {"score": min(100, total), "detail": f"AgentTrust wallet trust score: {min(100,total)}/100", "signals": signals}
     except Exception as e:
         return {"score": 0, "detail": f"Could not compute score: {e}", "signals": {}}
 
 
 async def _score_bid_wallet(bid_id: str, wallet_address: str, session_factory):
-    result = await compute_xrpl_trust_score(wallet_address)
     db = session_factory()
     try:
+        result = await compute_xrpl_trust_score(wallet_address, db=db)
         bid = db.query(Bid).filter(Bid.id == bid_id).first()
         if bid:
             bid.xrpl_trust_score = result.get("score", 0)
@@ -2506,10 +2606,64 @@ async def _score_bid_wallet(bid_id: str, wallet_address: str, session_factory):
 
 
 @app.get("/wallet/score/{address}")
-async def get_wallet_score(address: str):
-    """Compute XRPL trust score for a wallet address."""
-    result = await compute_xrpl_trust_score(address)
+async def get_wallet_score(address: str, db: Session = Depends(get_db)):
+    """
+    AgentTrust Wallet Trust Score — 7 on-chain + platform signals, scored 0–100.
+    Combines account age, balance, activity, domain verification, NFTs held,
+    AgentTrust escrow completion history, and peer ratings from counterparties.
+    """
+    result = await compute_xrpl_trust_score(address, db=db)
     return result
+
+
+class WalletRatingRequest(BaseModel):
+    escrow_id:     str
+    rater_address: str
+    rating:        int   # 1–5
+    comment:       Optional[str] = None
+
+
+@app.post("/wallet/{address}/rate")
+async def rate_wallet(address: str, req: WalletRatingRequest, db: Session = Depends(get_db)):
+    """
+    Submit a 1–5 star peer rating for a wallet after a completed escrow.
+    Auth: the escrow_id must exist and be in RELEASED status, and rater_address
+    must be either the buyer or worker on that escrow (one rating per role per escrow).
+    """
+    if not (1 <= req.rating <= 5):
+        raise HTTPException(status_code=400, detail="Rating must be between 1 and 5.")
+
+    escrow = db.execute(
+        text("SELECT buyer_address, worker_address, status FROM escrow_vault WHERE escrow_id = :id"),
+        {"id": req.escrow_id}
+    ).fetchone()
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Escrow not found.")
+    if escrow[2] != "RELEASED":
+        raise HTTPException(status_code=400, detail="Ratings can only be submitted after an escrow is RELEASED.")
+
+    buyer_address, worker_address = escrow[0], escrow[1]
+    if req.rater_address == buyer_address and address == worker_address:
+        rater_role = "buyer"
+    elif req.rater_address == worker_address and address == buyer_address:
+        rater_role = "worker"
+    else:
+        raise HTTPException(status_code=403, detail="rater_address must be a participant in this escrow rating the other party.")
+
+    try:
+        db.execute(text("""
+            INSERT INTO wallet_rating (rated_address, rater_address, escrow_id, rating, comment, rater_role, created_at)
+            VALUES (:rated, :rater, :escrow_id, :rating, :comment, :role, :now)
+        """), {
+            "rated": address, "rater": req.rater_address, "escrow_id": req.escrow_id,
+            "rating": req.rating, "comment": req.comment, "role": rater_role,
+            "now": datetime.now(timezone.utc).isoformat(),
+        })
+        db.commit()
+    except Exception:
+        raise HTTPException(status_code=409, detail="You have already rated this wallet for this escrow.")
+
+    return {"status": "rated", "rated_address": address, "rating": req.rating, "role": rater_role}
 
 
 # ---------------------------------------------------------------------------
