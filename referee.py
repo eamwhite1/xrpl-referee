@@ -2680,6 +2680,54 @@ async def get_wallet_score(address: str, db: Session = Depends(get_db)):
     return result
 
 
+@app.get("/wallet/debug-age/{address}")
+async def debug_wallet_age(address: str):
+    """Debug endpoint: shows raw result from each age-calculation source."""
+    from datetime import datetime, timezone
+    results = {}
+
+    # Source 1: data.ripple.com
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"https://data.ripple.com/v2/accounts/{address}",
+                                 headers={"Accept": "application/json"})
+        results["data_ripple_com"] = {"status": r.status_code, "body": r.json()}
+    except Exception as e:
+        results["data_ripple_com"] = {"error": str(e)}
+
+    # Source 2: s2.ripple.com JSON-RPC
+    for url in ["https://s2.ripple.com:51234", "https://s1.ripple.com:51234"]:
+        key = url.split("//")[1].split(":")[0]
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(url, json={
+                    "method": "account_tx",
+                    "params": [{"account": address, "limit": 1, "forward": True,
+                                "ledger_index_min": 0, "ledger_index_max": -1}]
+                })
+            txs = r.json().get("result", {}).get("transactions", [])
+            results[key] = {"status": r.status_code, "tx_count": len(txs),
+                            "first_tx": txs[0] if txs else None}
+        except Exception as e:
+            results[key] = {"error": str(e)}
+
+    # Source 3: xrplcluster.com (no-forward, just to see what it returns)
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(XRPL_URL, json={
+                "method": "account_tx",
+                "params": [{"account": address, "limit": 1, "forward": True,
+                            "ledger_index_min": 0, "ledger_index_max": -1}]
+            })
+        txs = r.json().get("result", {}).get("transactions", [])
+        results["xrplcluster_forward"] = {"status": r.status_code, "tx_count": len(txs),
+                                          "first_tx": txs[0] if txs else None}
+    except Exception as e:
+        results["xrplcluster_forward"] = {"error": str(e)}
+
+    return results
+
+
 class WalletRatingRequest(BaseModel):
     escrow_id:     str
     rater_address: str
