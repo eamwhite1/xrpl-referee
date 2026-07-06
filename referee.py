@@ -2429,7 +2429,31 @@ async def domain_preview(domain: str, db: Session = Depends(get_db)):
         return {"status": "registry_listed", "name": row[0], "domain": clean,
                 "detail": f"{row[0]} is listed in the AgentTrust registry (pending verification)."}
 
-    # 2. Fetch xrp-ledger.toml from the domain (try https then http)
+    # 2. Bithomp services list — reverse lookup by domain name.
+    # Bithomp exposes GET /api/v2/services which lists all verified services with their domains.
+    # We search it for an exact or subdomain match before trying TOML.
+    if BITHOMP_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                svc_res = await client.get(
+                    "https://bithomp.com/api/v2/services",
+                    headers={"x-bithomp-token": BITHOMP_API_KEY},
+                )
+            if svc_res.status_code == 200:
+                services = svc_res.json()
+                # services may be a list or dict with a list inside
+                svc_list = services if isinstance(services, list) else services.get("services", [])
+                for svc in svc_list:
+                    svc_domain = (svc.get("domain") or "").lower().strip()
+                    if svc_domain and (svc_domain == clean or clean.endswith("." + svc_domain) or svc_domain.endswith("." + clean)):
+                        wallet = svc.get("address") or svc.get("wallet") or svc.get("account")
+                        name   = svc.get("name") or svc.get("service") or svc_domain
+                        return {"status": "bithomp_verified", "domain": clean, "wallet": wallet, "name": name,
+                                "detail": f"{name} ({clean}) is verified on Bithomp."}
+        except Exception:
+            pass
+
+    # 3. Fetch xrp-ledger.toml from the domain (try https then http)
     toml_content = None
     toml_status = None
     toml_error = None
