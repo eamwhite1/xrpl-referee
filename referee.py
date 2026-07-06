@@ -2403,6 +2403,19 @@ async def verify_domain(req: DomainVerifyRequest):
     return result
 
 
+@app.get("/debug/bithomp-services")
+async def debug_bithomp_services():
+    """Debug: show raw Bithomp /api/v2/services response (first 3 items)."""
+    if not BITHOMP_API_KEY:
+        return {"error": "BITHOMP_API_KEY not set"}
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        r = await client.get("https://bithomp.com/api/v2/services",
+                             headers={"x-bithomp-token": BITHOMP_API_KEY})
+    data = r.json()
+    sample = data[:3] if isinstance(data, list) else {k: v[:3] if isinstance(v, list) else v for k, v in list(data.items())[:5]}
+    return {"status": r.status_code, "type": type(data).__name__, "sample": sample}
+
+
 @app.get("/domain/preview")
 async def domain_preview(domain: str, db: Session = Depends(get_db)):
     """
