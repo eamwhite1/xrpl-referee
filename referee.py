@@ -2429,19 +2429,25 @@ async def domain_preview(domain: str, db: Session = Depends(get_db)):
         return {"status": "registry_listed", "name": row[0], "domain": clean,
                 "detail": f"{row[0]} is listed in the AgentTrust registry (pending verification)."}
 
-    # 2. Fetch xrp-ledger.toml from the domain
-    toml_url = f"https://{clean}/.well-known/xrp-ledger.toml"
+    # 2. Fetch xrp-ledger.toml from the domain (try https then http)
     toml_content = None
-    try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-            r = await client.get(toml_url)
-        if r.status_code == 200:
-            toml_content = r.text
-    except Exception:
-        pass
+    toml_status = None
+    toml_error = None
+    for scheme in ("https", "http"):
+        toml_url = f"{scheme}://{clean}/.well-known/xrp-ledger.toml"
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True,
+                                         headers={"User-Agent": "AgentTrust/1.0"}) as client:
+                r = await client.get(toml_url)
+            toml_status = r.status_code
+            if r.status_code == 200 and r.text.strip():
+                toml_content = r.text
+                break
+        except Exception as e:
+            toml_error = str(e)
 
     if not toml_content:
-        return {"status": "unknown", "domain": clean,
+        return {"status": "unknown", "domain": clean, "toml_status": toml_status, "toml_error": toml_error,
                 "detail": f"No xrp-ledger.toml found at {clean}. The seller must publish one listing their wallet address."}
 
     # 3. Extract wallet addresses from the TOML (look for r... addresses)
