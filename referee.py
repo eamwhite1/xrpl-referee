@@ -2403,6 +2403,69 @@ async def verify_domain(req: DomainVerifyRequest):
     return result
 
 
+@app.get("/domain/preview")
+async def domain_preview(domain: str, db: Session = Depends(get_db)):
+    """
+    Buyer-facing domain preview: given a domain name, return what we know about it.
+    1. Check our issuer registry.
+    2. Fetch xrp-ledger.toml from the domain (server-side — no CORS constraints).
+    3. For each wallet listed in the TOML, check Bithomp for verified-domain confirmation.
+    Returns enough for the UI to show a meaningful status without a wallet address.
+    """
+    import re
+    clean = domain.replace("https://", "").replace("http://", "").rstrip("/").lower()
+
+    # 1. Registry lookup
+    try:
+        row = db.execute(text(
+            "SELECT name, wallet_address, verified FROM nft_issuer WHERE LOWER(website) LIKE :d LIMIT 1"
+        ), {"d": f"%{clean}%"}).fetchone()
+    except Exception:
+        row = None
+    if row and row[2] == "verified":
+        return {"status": "registry_verified", "name": row[0], "domain": clean,
+                "detail": f"{row[0]} is a verified issuer in the AgentTrust registry."}
+    if row:
+        return {"status": "registry_listed", "name": row[0], "domain": clean,
+                "detail": f"{row[0]} is listed in the AgentTrust registry (pending verification)."}
+
+    # 2. Fetch xrp-ledger.toml from the domain
+    toml_url = f"https://{clean}/.well-known/xrp-ledger.toml"
+    toml_content = None
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            r = await client.get(toml_url)
+        if r.status_code == 200:
+            toml_content = r.text
+    except Exception:
+        pass
+
+    if not toml_content:
+        return {"status": "unknown", "domain": clean,
+                "detail": f"No xrp-ledger.toml found at {clean}. The seller must publish one listing their wallet address."}
+
+    # 3. Extract wallet addresses from the TOML (look for r... addresses)
+    wallets = list(dict.fromkeys(re.findall(r"\br[1-9A-HJ-NP-Za-km-z]{24,33}\b", toml_content)))[:5]
+    if not wallets:
+        return {"status": "toml_found", "domain": clean,
+                "detail": f"xrp-ledger.toml exists at {clean} but lists no wallet addresses yet."}
+
+    # 4. Check Bithomp for each wallet to confirm domain linkage
+    bithomp_verified_wallet = None
+    for w in wallets:
+        result = await _verify_domain_via_bithomp(w, clean)
+        if result and result.get("verified"):
+            bithomp_verified_wallet = w
+            break
+
+    if bithomp_verified_wallet:
+        return {"status": "bithomp_verified", "domain": clean, "wallet": bithomp_verified_wallet,
+                "detail": f"{clean} is verified on Bithomp — wallet {bithomp_verified_wallet[:8]}… is confirmed as the domain owner."}
+
+    return {"status": "toml_found", "domain": clean, "wallets": wallets,
+            "detail": f"xrp-ledger.toml found at {clean} listing {len(wallets)} wallet(s). Bithomp verification not confirmed — seller's wallet must have its XRPL Domain field set to this domain."}
+
+
 # ---------------------------------------------------------------------------
 # 11e. W3C VERIFIABLE CREDENTIAL VERIFICATION
 # ---------------------------------------------------------------------------
