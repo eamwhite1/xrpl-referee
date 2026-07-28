@@ -638,6 +638,143 @@ async def is_ofac_sanctioned(wallet_address: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# AnChain.ai BEI API — AI-powered wallet risk scoring + multi-jurisdiction sanctions
+# Free for XRPL developers (XRPL Foundation grant). Set ANCHAIN_API_KEY in env.
+# Covers: OFAC, UN, UK, EU, Canada, Australia sanctions + entity/risk graph scoring.
+# Falls back to OFAC XML if BEI key is absent or call fails.
+# ---------------------------------------------------------------------------
+ANCHAIN_API_KEY = os.getenv("ANCHAIN_API_KEY", "")
+ANCHAIN_BASE    = "https://bei.anchainai.com/api"
+
+async def _check_bei_risk(wallet_address: str) -> Optional[dict]:
+    """
+    Query AnChain.ai BEI for risk score, sanctions status, and entity label.
+    Returns dict with keys: sanctioned, risk_score, risk_level, entity, category.
+    Returns None if BEI key not set or call fails (fallback to OFAC XML).
+    """
+    if not ANCHAIN_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(
+                f"{ANCHAIN_BASE}/address_risk_score",
+                params={"proto": "xrp", "address": wallet_address, "apikey": ANCHAIN_API_KEY},
+            )
+        if r.status_code != 200:
+            return None
+        data = r.json().get("data", {}).get(wallet_address, {})
+        category = data.get("self", {}).get("detail", {}).get("category", "")
+        entity   = data.get("self", {}).get("detail", {}).get("entity", "")
+        risk     = data.get("risk", {})
+        sanctioned = (
+            "sanction" in (category or "").lower()
+            or "ofac" in (entity or "").lower()
+            or "sdn"   in (entity or "").lower()
+        )
+        return {
+            "sanctioned":  sanctioned,
+            "risk_score":  risk.get("score"),
+            "risk_level":  risk.get("level", "unknown"),
+            "entity":      entity or None,
+            "category":    category or None,
+            "source":      "anchain_bei",
+        }
+    except Exception as e:
+        logger.debug(f"BEI risk check failed for {wallet_address}: {e}")
+        return None
+
+
+async def is_wallet_sanctioned(wallet_address: str) -> tuple[bool, dict]:
+    """
+    Primary sanctions check. Uses AnChain.ai BEI if key is set (multi-jurisdiction);
+    falls back to OFAC SDN XML. Returns (is_sanctioned, detail_dict).
+    """
+    bei = await _check_bei_risk(wallet_address)
+    if bei is not None:
+        return bei["sanctioned"], bei
+
+    # Fallback: OFAC SDN XML only
+    sanctioned = await is_ofac_sanctioned(wallet_address)
+    return sanctioned, {
+        "sanctioned": sanctioned,
+        "risk_score": None,
+        "risk_level": "unknown",
+        "entity": None,
+        "category": None,
+        "source": "ofac_sdn_xml",
+    }
+
+
+# ---------------------------------------------------------------------------
+# REGULATORY THRESHOLD CHECKS
+# FATF Travel Rule: $1,000 USD — VASPs must exchange originator/beneficiary data
+# FinCEN recordkeeping: $3,000 USD — threshold above which AgentTrust has no KYC
+# ---------------------------------------------------------------------------
+THRESHOLD_WARN_USD  = 1_000   # Travel Rule trigger — issue compliance_warning
+THRESHOLD_BLOCK_USD = 3_000   # FinCEN recordkeeping — block until KYC available
+
+async def _get_xrp_price_usd() -> Optional[float]:
+    """Return cached XRP/USD price, or None if unavailable."""
+    import time as _time2
+    global _xrp_price_cache, _xrp_price_cache_ts
+    if _xrp_price_cache:
+        return _xrp_price_cache.get("usd")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
+            return float(r.json()["price"])
+    except Exception:
+        return None
+
+
+async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optional[float], currency: str) -> dict:
+    """
+    Check transaction value against regulatory thresholds.
+    Returns {"ok": True} if below warning level, or a dict with "warn"/"block" and a message.
+    RLUSD is ~1 USD, so 1 RLUSD ≈ 1 USD for threshold purposes.
+    """
+    usd_value: Optional[float] = None
+
+    if currency == "RLUSD" and amount_rlusd:
+        usd_value = float(amount_rlusd)  # RLUSD ≈ 1 USD
+
+    elif currency == "XRP" and amount_xrp:
+        price = await _get_xrp_price_usd()
+        if price:
+            usd_value = float(amount_xrp) * price
+
+    if usd_value is None:
+        return {"ok": True}  # can't determine value — don't block
+
+    if usd_value >= THRESHOLD_BLOCK_USD:
+        return {
+            "ok": False,
+            "level": "block",
+            "usd_value": round(usd_value, 2),
+            "message": (
+                f"This escrow value (~${usd_value:,.0f} USD) exceeds our current transaction limit of "
+                f"${THRESHOLD_BLOCK_USD:,} USD. AgentTrust does not yet implement KYC identity "
+                f"verification required by FinCEN for transactions of this size. "
+                f"Please contact hello@cryptovault.co.uk if you need to arrange a higher-value escrow."
+            ),
+        }
+    if usd_value >= THRESHOLD_WARN_USD:
+        return {
+            "ok": True,
+            "level": "warn",
+            "usd_value": round(usd_value, 2),
+            "compliance_warning": (
+                f"This escrow (~${usd_value:,.0f} USD) meets or exceeds the FATF Travel Rule threshold "
+                f"of $1,000 USD. In many jurisdictions, VASPs are required to exchange originator and "
+                f"beneficiary identity data for transfers of this size. AgentTrust does not currently "
+                f"implement the Travel Rule. Participants should ensure their own compliance with "
+                f"applicable regulations. See cryptovault.co.uk/compliance for details."
+            ),
+        }
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # In-memory store for on-chain verification challenges (TTL 30 min)
 # ---------------------------------------------------------------------------
 _verify_challenges: dict = {}  # wallet_address -> (challenge_str, expires_at)
@@ -2748,22 +2885,24 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             except Exception:
                 pass
 
-        # OFAC sanctions check — hard zero if sanctioned, +7 pts bonus signal if clean
+        # Multi-jurisdiction sanctions check — BEI primary, OFAC XML fallback
+        # Hard zero if sanctioned; +7 pts if clean
         sanctions_clear = None
         sanctions_score = 0
+        sanctions_detail = {}
         try:
-            sanctioned = await is_ofac_sanctioned(wallet_address)
+            sanctioned, sanctions_detail = await is_wallet_sanctioned(wallet_address)
             sanctions_clear = not sanctioned
             if sanctioned:
                 return {
                     "score": 0,
-                    "detail": "Wallet address appears on the OFAC SDN sanctions list. Score withheld.",
-                    "signals": {"sanctions_clear": False},
+                    "detail": f"Wallet address flagged on sanctions list (source: {sanctions_detail.get('source','unknown')}). Score withheld.",
+                    "signals": {"sanctions_clear": False, "sanctions_detail": sanctions_detail},
                     "verified_issuer": None,
                 }
             sanctions_score = 7
         except Exception:
-            pass  # OFAC list unavailable — skip gracefully
+            pass  # screening unavailable — skip gracefully
 
         # Verified issuer badge — check our own registry first, then Bithomp
         verified_issuer = None
@@ -2795,6 +2934,9 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             "nft_count":             nft_count,
             "wallet_sig_verified":   wallet_sig_verified,
             "sanctions_clear":       sanctions_clear,
+            "risk_score":            sanctions_detail.get("risk_score") if sanctions_detail else None,
+            "risk_level":            sanctions_detail.get("risk_level") if sanctions_detail else None,
+            "known_entity":          sanctions_detail.get("entity") if sanctions_detail else None,
             "score_breakdown": {
                 "account_age":            age_score,
                 "balance":                balance_score,
@@ -3254,15 +3396,24 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     for addr_to_check in [req.buyer_address, req.worker_address]:
         if addr_to_check:
             try:
-                if await is_ofac_sanctioned(addr_to_check):
+                sanctioned, s_detail = await is_wallet_sanctioned(addr_to_check)
+                if sanctioned:
                     raise HTTPException(
                         status_code=403,
-                        detail=f"Wallet {addr_to_check} appears on the OFAC SDN sanctions list. Escrow creation is not permitted."
+                        detail=f"Wallet {addr_to_check} is flagged on a sanctions list (source: {s_detail.get('source','unknown')}). Escrow creation is not permitted."
                     )
             except HTTPException:
                 raise
             except Exception:
-                pass  # SDN list unavailable — don't block, log and continue
+                pass  # screening unavailable — don't block, log and continue
+
+    # Regulatory threshold check — warn at $1k (Travel Rule), block at $3k (no KYC)
+    threshold = await check_value_threshold(req.amount_xrp, req.amount_rlusd, req.currency.upper() if req.currency else "XRP")
+    if not threshold["ok"]:
+        raise HTTPException(
+            status_code=451,  # Unavailable For Legal Reasons
+            detail=threshold["message"],
+        )
 
     fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
     if response is not None and fee_result.get("payment_response_header"):
@@ -3409,7 +3560,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     else:
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
-    return {
+    response_body = {
         "escrow_id":           req.escrow_id,
         "condition":           final_condition,
         "escrow_amount":       escrow_amount,      # ready for EscrowCreate tx
@@ -3419,6 +3570,9 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
         "worker_email_sent":   bool(req.worker_email),
     }
+    if threshold.get("level") == "warn":
+        response_body["compliance_warning"] = threshold["compliance_warning"]
+    return response_body
 
 
 @app.post("/escrow/{escrow_id}/confirm")
@@ -5777,17 +5931,18 @@ async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session 
 @app.get("/wallet/sanctions/{address}")
 async def check_sanctions(address: str):
     """
-    Check whether an XRPL wallet address appears on the US OFAC SDN sanctions list.
-    Data sourced directly from the US Treasury and refreshed every 24 hours.
-    Returns sanctioned: true/false. Always returns a result — never raises on missing data.
+    Screen an XRPL wallet address against multi-jurisdiction sanctions lists.
+    Primary: AnChain.ai BEI (OFAC + UN + UK + EU + Canada + Australia + AI risk graph).
+    Fallback: US Treasury OFAC SDN XML (refreshed every 24 h).
+    Returns sanctioned, risk_score, risk_level, entity, category, source.
+    Always returns a result — never raises on data unavailability.
     """
-    sanctioned = await is_ofac_sanctioned(address)
+    sanctioned, detail = await is_wallet_sanctioned(address)
     return {
-        "address": address,
+        "address":    address,
         "sanctioned": sanctioned,
-        "list": "OFAC SDN",
-        "source": "https://www.treasury.gov/ofac/downloads/sdn.xml",
-        "note": "Refreshed every 24 h. Not a substitute for professional compliance advice.",
+        **{k: v for k, v in detail.items() if k != "sanctioned"},
+        "note": "Not a substitute for professional compliance advice.",
     }
 
 
