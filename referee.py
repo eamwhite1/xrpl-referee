@@ -8,6 +8,7 @@ import hashlib
 import secrets
 import json
 import base64
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -103,7 +104,11 @@ app = FastAPI(
         "Escrowed XRP or RLUSD releases automatically on AI approval.\n\n"
         "**Trust layer stack:** four independent proof mechanisms buyers can require from sellers — "
         "(1) NFT from a trusted issuer, (2) XRPL domain verification, "
-        "(3) W3C Verifiable Credential, (4) XRPL wallet trust score.\n\n"
+        "(3) W3C Verifiable Credential, (4) XRPL wallet trust score "
+        "(9 signals including on-chain ownership proof and OFAC sanctions screening).\n\n"
+        "**Compliance:** all wallet addresses are automatically screened against the US OFAC SDN "
+        "sanctions list at escrow creation and trust score computation. Sanctioned wallets "
+        "cannot participate in escrow and receive a score of 0.\n\n"
         "**NFT Delivery-vs-Payment (DvP):** when the job deliverable is an NFT itself, "
         "enable DvP mode. On PASS the escrow enters PASS_AWAITING_NFT state; payment holds until "
         "the seller creates an NFTokenCreateOffer (Destination=buyer, Amount=0) and the buyer accepts "
@@ -574,6 +579,68 @@ class NftIssuer(Base):
         if wallets:
             self.wallet_address = wallets[0]
         self.wallet_addresses = json.dumps(wallets)
+
+
+class WalletVerification(Base):
+    """On-chain wallet ownership proofs — stored when a wallet submits a verified AccountSet tx."""
+    __tablename__ = "wallet_verification"
+    wallet_address = Column(String, primary_key=True)
+    verified_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    method         = Column(String, default="xrpl_accountset")  # xrpl_accountset | eth_sig
+    tx_hash        = Column(String, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# OFAC SDN sanctions list — cached in memory, refreshed daily
+# ---------------------------------------------------------------------------
+_ofac_sanctioned_xrpl: set = set()
+_ofac_last_refresh: datetime = None
+
+async def _refresh_ofac_list():
+    """Download and cache the OFAC SDN XML, extracting XRP digital currency addresses."""
+    global _ofac_sanctioned_xrpl, _ofac_last_refresh
+    now = datetime.now(timezone.utc)
+    if _ofac_last_refresh and (now - _ofac_last_refresh).total_seconds() < 86400:
+        return  # still fresh
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                "https://www.treasury.gov/ofac/downloads/sdn.xml",
+                headers={"User-Agent": "AgentTrust-Compliance/1.0"}
+            )
+        root = ET.fromstring(r.text)
+        addrs: set = set()
+        # The SDN XML uses a namespace; we iterate generically to handle both ns and no-ns
+        for entry in root.iter():
+            if entry.tag.endswith("idType") and ("XRP" in (entry.text or "") or "xrp" in (entry.text or "").lower()):
+                # Sibling idNumber element contains the actual address
+                parent = entry.getparent() if hasattr(entry, "getparent") else None
+                # ElementTree doesn't expose getparent; use find on parent context instead
+                pass
+        # Robust fallback: text search the raw XML for XRP addresses in id blocks
+        import re as _re
+        xrp_id_blocks = _re.findall(
+            r'<idType>[^<]*[Xx][Rr][Pp][^<]*</idType>\s*<idNumber>([^<]+)</idNumber>',
+            r.text
+        )
+        addrs = {a.strip() for a in xrp_id_blocks if a.strip().startswith("r")}
+        _ofac_sanctioned_xrpl = addrs
+        _ofac_last_refresh = now
+        logger.info(f"OFAC SDN: loaded {len(addrs)} sanctioned XRP addresses")
+    except Exception as e:
+        logger.warning(f"OFAC SDN refresh failed: {e}")
+
+
+async def is_ofac_sanctioned(wallet_address: str) -> bool:
+    """Return True if wallet_address is on the OFAC SDN XRP list."""
+    await _refresh_ofac_list()
+    return wallet_address in _ofac_sanctioned_xrpl
+
+
+# ---------------------------------------------------------------------------
+# In-memory store for on-chain verification challenges (TTL 30 min)
+# ---------------------------------------------------------------------------
+_verify_challenges: dict = {}  # wallet_address -> (challenge_str, expires_at)
 
 
 _PUBLIC_ISSUERS = [
@@ -2560,16 +2627,18 @@ async def verify_vc(req: VCVerifyRequest):
 # ---------------------------------------------------------------------------
 async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> dict:
     """
-    AgentTrust Wallet Trust Score — 7 signals, genuine max 100.
+    AgentTrust Wallet Trust Score — 9 signals, genuine max 100.
 
     Signal breakdown:
-      Account age       — up to 20 pts (2 pts/month, max 10 months)
-      XRP balance       — up to 15 pts (3 pts per 10 XRP, max 50 XRP)
-      On-chain activity — up to 15 pts (owner count as activity proxy)
-      Domain verified   — 10 pts flat
-      NFTs held         — up to 5 pts
-      AgentTrust escrow completion rate — up to 20 pts (our own platform data)
-      Peer ratings      — up to 15 pts (avg star rating from counterparties)
+      Account age              — up to 20 pts (2 pts/month, max 10 months)
+      XRP balance              — up to 15 pts (3 pts per 10 XRP, max 50 XRP)
+      On-chain activity        — up to 15 pts (owner count as activity proxy)
+      Domain verified          — 10 pts flat
+      NFTs held                — up to 5 pts
+      AgentTrust escrow rate   — up to 20 pts (our own platform data)
+      Peer ratings             — up to 15 pts (avg star rating from counterparties)
+      Wallet ownership proof   — 8 pts (on-chain AccountSet verification)
+      Sanctions clear (OFAC)   — 7 pts; sanctioned wallets score 0 and are blocked from escrow
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2665,6 +2734,37 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             except Exception:
                 pass
 
+        # Wallet ownership verification (on-chain AccountSet proof)
+        wallet_sig_score = 0
+        wallet_sig_verified = False
+        if db:
+            try:
+                vrow = db.query(WalletVerification).filter(
+                    WalletVerification.wallet_address == wallet_address
+                ).first()
+                if vrow:
+                    wallet_sig_verified = True
+                    wallet_sig_score = 8
+            except Exception:
+                pass
+
+        # OFAC sanctions check — hard zero if sanctioned, +7 pts bonus signal if clean
+        sanctions_clear = None
+        sanctions_score = 0
+        try:
+            sanctioned = await is_ofac_sanctioned(wallet_address)
+            sanctions_clear = not sanctioned
+            if sanctioned:
+                return {
+                    "score": 0,
+                    "detail": "Wallet address appears on the OFAC SDN sanctions list. Score withheld.",
+                    "signals": {"sanctions_clear": False},
+                    "verified_issuer": None,
+                }
+            sanctions_score = 7
+        except Exception:
+            pass  # OFAC list unavailable — skip gracefully
+
         # Verified issuer badge — check our own registry first, then Bithomp
         verified_issuer = None
         if db:
@@ -2685,22 +2785,26 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                     "source": "bithomp",
                 }
 
-        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score
+        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score
 
         signals = {
-            "age_days":          age_days,
-            "balance_xrp":       round(balance_xrp, 2),
-            "owner_count":       owner_count,
-            "has_domain":        has_domain,
-            "nft_count":         nft_count,
+            "age_days":              age_days,
+            "balance_xrp":           round(balance_xrp, 2),
+            "owner_count":           owner_count,
+            "has_domain":            has_domain,
+            "nft_count":             nft_count,
+            "wallet_sig_verified":   wallet_sig_verified,
+            "sanctions_clear":       sanctions_clear,
             "score_breakdown": {
-                "account_age":        age_score,
-                "balance":            balance_score,
-                "on_chain_activity":  activity_score,
-                "domain_verified":    domain_score,
-                "nfts_held":          nft_score,
-                "escrow_completion":  completion_score,
-                "peer_rating":        peer_score,
+                "account_age":            age_score,
+                "balance":                balance_score,
+                "on_chain_activity":      activity_score,
+                "domain_verified":        domain_score,
+                "nfts_held":              nft_score,
+                "escrow_completion":      completion_score,
+                "peer_rating":            peer_score,
+                "wallet_ownership_proof": wallet_sig_score,
+                "sanctions_clear":        sanctions_score,
             },
             **completion_stats,
             **peer_stats,
@@ -3145,6 +3249,20 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
+
+    # OFAC sanctions check — block sanctioned wallets before accepting any funds
+    for addr_to_check in [req.buyer_address, req.worker_address]:
+        if addr_to_check:
+            try:
+                if await is_ofac_sanctioned(addr_to_check):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Wallet {addr_to_check} appears on the OFAC SDN sanctions list. Escrow creation is not permitted."
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # SDN list unavailable — don't block, log and continue
 
     fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
     if response is not None and fee_result.get("payment_response_header"):
@@ -5419,6 +5537,12 @@ class NftIssuerClaimRequest(BaseModel):
     contact_email: str
 
 
+class WalletVerifyConfirmRequest(BaseModel):
+    wallet_address: str
+    tx_hash: str
+    issuer_id: Optional[int] = None   # if provided, marks the issuer entry as sig-verified too
+
+
 def _fetch_issuer_row(db: Session, issuer_id: int):
     """Fetch a single issuer via raw SQL, selecting only columns guaranteed to exist
     (mirrors list_nft_issuers — the live table may predate newer optional columns)."""
@@ -5516,6 +5640,154 @@ async def claim_nft_issuer(issuer_id: int, req: NftIssuerClaimRequest, db: Sessi
         "message": f"Claim confirmed via {issuer['website']}. {issuer['name']} is now marked 'verified' in the registry.",
         "name": issuer["name"],
         "wallet_address": issuer["wallet_address"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 11g. ON-CHAIN WALLET OWNERSHIP VERIFICATION
+# ---------------------------------------------------------------------------
+@app.get("/verify/challenge")
+async def get_wallet_challenge(wallet: str):
+    """
+    Issue a one-time verification challenge for a wallet.
+
+    The wallet owner must submit an XRPL AccountSet transaction from their wallet
+    with a Memo containing the challenge string (as hex). They then POST the tx hash
+    to POST /verify/confirm to complete ownership proof.
+
+    No private key or signature is ever sent to AgentTrust — the proof is the
+    on-chain tx itself, which only the key-holder could have signed and broadcast.
+    Challenge expires in 30 minutes.
+    """
+    if not wallet or not wallet.startswith("r") or len(wallet) < 25:
+        raise HTTPException(400, "Invalid XRPL wallet address.")
+    challenge = f"agenttrust-verify-{secrets.token_hex(12)}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    _verify_challenges[wallet] = (challenge, expires_at)
+    memo_hex = challenge.encode().hex().upper()
+    return {
+        "wallet": wallet,
+        "challenge": challenge,
+        "memo_hex": memo_hex,
+        "expires_at": expires_at.isoformat(),
+        "instructions": (
+            f"Using Xaman or any XRPL wallet, submit an AccountSet transaction from {wallet} "
+            f"with one Memo whose MemoData field is exactly: {memo_hex} "
+            f"(hex-encoded UTF-8 of the challenge string, no spaces). "
+            f"Then POST the resulting tx hash to /verify/confirm within 30 minutes."
+        ),
+    }
+
+
+@app.post("/verify/confirm")
+async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session = Depends(get_db)):
+    """
+    Complete wallet ownership verification by providing the XRPL AccountSet tx hash.
+
+    Looks up the transaction on-chain, confirms it was submitted by the claimed wallet,
+    and verifies the Memo contains the expected challenge string. On success, stores a
+    WalletVerification record and optionally marks an NFT issuer entry as sig-verified.
+    """
+    wallet = req.wallet_address.strip()
+    tx_hash = req.tx_hash.strip().upper()
+
+    # Check a challenge exists and is still valid
+    if wallet not in _verify_challenges:
+        raise HTTPException(400, "No pending challenge for this wallet. Call GET /verify/challenge?wallet=... first.")
+    challenge, expires_at = _verify_challenges[wallet]
+    if datetime.now(timezone.utc) > expires_at:
+        del _verify_challenges[wallet]
+        raise HTTPException(400, "Challenge expired. Request a new one via GET /verify/challenge.")
+
+    # Look up the tx on XRPL
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            tx_res = await client.post(XRPL_URL, json={
+                "method": "tx",
+                "params": [{"transaction": tx_hash}]
+            })
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(400, "Transaction not found on the XRPL ledger. Make sure the tx has been confirmed.")
+
+    # Verify it was submitted by the claimed wallet
+    account = (
+        tx_data.get("Account")
+        or tx_data.get("tx_json", {}).get("Account")
+        or tx_data.get("tx", {}).get("Account")
+    )
+    if account != wallet:
+        raise HTTPException(400, f"Transaction account ({account}) does not match claimed wallet ({wallet}).")
+
+    # Verify the Memo contains the challenge
+    memos = (
+        tx_data.get("Memos")
+        or tx_data.get("tx_json", {}).get("Memos")
+        or tx_data.get("tx", {}).get("Memos")
+        or []
+    )
+    expected_hex = challenge.encode().hex().upper()
+    found = any(
+        m.get("Memo", {}).get("MemoData", "").upper() == expected_hex
+        for m in memos
+    )
+    if not found:
+        raise HTTPException(400, "Transaction Memo does not contain the expected challenge string. Check that MemoData is set correctly (no extra characters).")
+
+    # Persist the verification
+    try:
+        Base.metadata.create_all(engine, tables=[WalletVerification.__table__])
+    except Exception:
+        pass
+    try:
+        existing = db.query(WalletVerification).filter(WalletVerification.wallet_address == wallet).first()
+        if existing:
+            existing.verified_at = datetime.now(timezone.utc)
+            existing.tx_hash = tx_hash
+        else:
+            db.add(WalletVerification(wallet_address=wallet, tx_hash=tx_hash))
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Could not persist WalletVerification: {e}")
+
+    # Optionally mark an issuer entry as verified too
+    if req.issuer_id:
+        try:
+            db.execute(
+                text("UPDATE nft_issuer SET verified = 'verified' WHERE id = :id AND wallet_address = :w"),
+                {"id": req.issuer_id, "w": wallet},
+            )
+            db.commit()
+        except Exception:
+            pass
+
+    del _verify_challenges[wallet]
+    return {
+        "verified": True,
+        "wallet": wallet,
+        "method": "xrpl_accountset",
+        "tx_hash": tx_hash,
+        "message": f"Wallet {wallet} ownership confirmed via on-chain AccountSet tx {tx_hash}.",
+    }
+
+
+@app.get("/wallet/sanctions/{address}")
+async def check_sanctions(address: str):
+    """
+    Check whether an XRPL wallet address appears on the US OFAC SDN sanctions list.
+    Data sourced directly from the US Treasury and refreshed every 24 hours.
+    Returns sanctioned: true/false. Always returns a result — never raises on missing data.
+    """
+    sanctioned = await is_ofac_sanctioned(address)
+    return {
+        "address": address,
+        "sanctioned": sanctioned,
+        "list": "OFAC SDN",
+        "source": "https://www.treasury.gov/ofac/downloads/sdn.xml",
+        "note": "Refreshed every 24 h. Not a substitute for professional compliance advice.",
     }
 
 

@@ -21,7 +21,7 @@ import httpx
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from typing import Annotated
+from typing import Annotated, Optional
 
 mcp = FastMCP(
     name="AgentTrust Referee",
@@ -905,6 +905,117 @@ async def award_job(
         if res.status_code == 409:
             data = res.json()
             return {"error": "not_open", "message": data.get("detail", "Job is not open.")}
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
+# Wallet Verification & Compliance Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Check Wallet Sanctions",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def check_wallet_sanctions(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) to screen against the OFAC SDN sanctions list.",
+    )],
+) -> dict:
+    """
+    Screen an XRPL wallet address against the US Office of Foreign Assets Control (OFAC)
+    Specially Designated Nationals (SDN) sanctions list.
+
+    Data is sourced directly from the US Treasury and cached for 24 hours. Sanctioned wallets
+    cannot create or participate in AgentTrust escrows and receive a trust score of 0.
+
+    Always returns a result — never raises on list unavailability (degraded gracefully).
+
+    Returns:
+        address, sanctioned (bool), list, source, note.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/wallet/sanctions/{wallet_address}")
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get Wallet Verification Challenge",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+))
+async def get_wallet_verification_challenge(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) whose ownership you want to prove.",
+    )],
+) -> dict:
+    """
+    Request a one-time verification challenge to prove ownership of an XRPL wallet.
+
+    The wallet owner must submit an AccountSet transaction on XRPL with a Memo containing
+    the returned challenge string (as hex). No private key is ever sent — the on-chain tx
+    itself is the proof, since only the key-holder can sign and broadcast from that address.
+
+    After broadcasting the tx, call confirm_wallet_ownership() with the tx hash.
+    Challenge expires in 30 minutes.
+
+    Returns:
+        wallet, challenge, memo_hex, expires_at, instructions.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(
+            f"{REFEREE_BASE}/verify/challenge",
+            params={"wallet": wallet_address},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Confirm Wallet Ownership",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def confirm_wallet_ownership(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) you are verifying.",
+    )],
+    tx_hash: Annotated[str, Field(
+        title="Transaction Hash",
+        description="The XRPL transaction hash of the AccountSet tx you submitted with the challenge in a Memo.",
+    )],
+    issuer_id: Annotated[Optional[int], Field(
+        title="Issuer ID (optional)",
+        description="If you are verifying ownership for an NFT issuer registry entry, provide its ID to mark it verified.",
+        default=None,
+    )] = None,
+) -> dict:
+    """
+    Complete wallet ownership verification using the XRPL AccountSet transaction you broadcast.
+
+    Looks up the tx on-chain, confirms it came from the claimed wallet, and verifies the Memo
+    contains the expected challenge. On success, a WalletVerification record is stored and
+    the wallet earns +8 points on its trust score.
+
+    Returns:
+        verified (bool), wallet, method, tx_hash, message.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/verify/confirm",
+            json={"wallet_address": wallet_address, "tx_hash": tx_hash, "issuer_id": issuer_id},
+        )
         res.raise_for_status()
         return res.json()
 
