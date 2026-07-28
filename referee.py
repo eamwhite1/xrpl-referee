@@ -590,6 +590,21 @@ class WalletVerification(Base):
     tx_hash        = Column(String, nullable=True)
 
 
+class SanctionsLog(Base):
+    """Timestamped audit trail of every sanctions screening decision."""
+    __tablename__ = "sanctions_log"
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    wallet_address = Column(String, nullable=False, index=True)
+    screened_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    sanctioned     = Column(Boolean, nullable=False)
+    risk_score     = Column(Float, nullable=True)
+    risk_level     = Column(String, nullable=True)   # low / medium / high / severe
+    entity_label   = Column(String, nullable=True)   # e.g. "Binance", "WannaCry"
+    source         = Column(String, nullable=False)  # anchain_bei | ofac_xml
+    escrow_id      = Column(String, nullable=True)   # linked escrow if applicable
+    raw_response   = Column(Text, nullable=True)     # JSON blob from screening provider
+
+
 # ---------------------------------------------------------------------------
 # OFAC SDN sanctions list — cached in memory, refreshed daily
 # ---------------------------------------------------------------------------
@@ -684,25 +699,50 @@ async def _check_bei_risk(wallet_address: str) -> Optional[dict]:
         return None
 
 
-async def is_wallet_sanctioned(wallet_address: str) -> tuple[bool, dict]:
+async def is_wallet_sanctioned(
+    wallet_address: str,
+    escrow_id: str | None = None,
+) -> tuple[bool, dict]:
     """
     Primary sanctions check. Uses AnChain.ai BEI if key is set (multi-jurisdiction);
     falls back to OFAC SDN XML. Returns (is_sanctioned, detail_dict).
+    Every call is written to the SanctionsLog table for compliance audit purposes.
     """
     bei = await _check_bei_risk(wallet_address)
     if bei is not None:
-        return bei["sanctioned"], bei
+        detail = bei
+    else:
+        sanctioned = await is_ofac_sanctioned(wallet_address)
+        detail = {
+            "sanctioned": sanctioned,
+            "risk_score": None,
+            "risk_level": "unknown",
+            "entity": None,
+            "category": None,
+            "source": "ofac_sdn_xml",
+        }
 
-    # Fallback: OFAC SDN XML only
-    sanctioned = await is_ofac_sanctioned(wallet_address)
-    return sanctioned, {
-        "sanctioned": sanctioned,
-        "risk_score": None,
-        "risk_level": "unknown",
-        "entity": None,
-        "category": None,
-        "source": "ofac_sdn_xml",
-    }
+    # Write audit record
+    try:
+        db: Session = SessionLocal()
+        log_entry = SanctionsLog(
+            wallet_address=wallet_address,
+            screened_at=datetime.now(timezone.utc),
+            sanctioned=detail.get("sanctioned", False),
+            risk_score=detail.get("risk_score"),
+            risk_level=detail.get("risk_level"),
+            entity_label=detail.get("entity"),
+            source=detail.get("source", "unknown"),
+            escrow_id=escrow_id,
+            raw_response=json.dumps(detail),
+        )
+        db.add(log_entry)
+        db.commit()
+        db.close()
+    except Exception as log_err:
+        logger.warning(f"SanctionsLog write failed (non-fatal): {log_err}")
+
+    return detail["sanctioned"], detail
 
 
 # ---------------------------------------------------------------------------
@@ -3396,7 +3436,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     for addr_to_check in [req.buyer_address, req.worker_address]:
         if addr_to_check:
             try:
-                sanctioned, s_detail = await is_wallet_sanctioned(addr_to_check)
+                sanctioned, s_detail = await is_wallet_sanctioned(addr_to_check, escrow_id=req.escrow_id)
                 if sanctioned:
                     raise HTTPException(
                         status_code=403,
