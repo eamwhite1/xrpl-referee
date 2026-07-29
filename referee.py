@@ -658,6 +658,71 @@ async def is_ofac_sanctioned(wallet_address: str) -> bool:
 # Covers: OFAC, UN, UK, EU, Canada, Australia sanctions + entity/risk graph scoring.
 # Falls back to OFAC XML if BEI key is absent or call fails.
 # ---------------------------------------------------------------------------
+# XRPScan — entity labels, account flags, activation lineage (no API key required)
+# ---------------------------------------------------------------------------
+XRPSCAN_BASE = "https://api.xrpscan.com/api/v1"
+_xrpscan_well_known: dict = {}   # address -> {name, desc, verified}
+_xrpscan_wk_fetched: bool = False
+
+async def _load_xrpscan_well_known():
+    """Cache XRPScan's curated entity list. Called once per process."""
+    global _xrpscan_well_known, _xrpscan_wk_fetched
+    if _xrpscan_wk_fetched:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{XRPSCAN_BASE}/names/well-known",
+                                 headers={"User-Agent": "AgentTrust/1.0"})
+            if r.status_code == 200:
+                for entry in r.json():
+                    addr = entry.get("account")
+                    if addr:
+                        _xrpscan_well_known[addr] = entry
+        _xrpscan_wk_fetched = True
+        logger.info(f"XRPScan well-known loaded: {len(_xrpscan_well_known)} entities")
+    except Exception as e:
+        logger.warning(f"XRPScan well-known fetch failed: {e}")
+
+async def _get_xrpscan_account(wallet_address: str) -> dict | None:
+    """
+    Fetch account info from XRPScan. Returns parsed dict with:
+      entity_name, entity_verified, account_flags, inception (ISO str), parent
+    Returns None on failure — trust score continues without this signal.
+    """
+    await _load_xrpscan_well_known()
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{XRPSCAN_BASE}/account/{wallet_address}",
+                                 headers={"User-Agent": "AgentTrust/1.0"})
+            if r.status_code != 200:
+                return None
+            data = r.json()
+
+        # Entity label — from inline accountName or well-known cache
+        acct_name = data.get("accountName") or _xrpscan_well_known.get(wallet_address, {})
+        entity_name     = acct_name.get("name") if acct_name else None
+        entity_verified = acct_name.get("verified", False) if acct_name else False
+
+        # Account security flags
+        settings = data.get("settings", {})
+        master_key_disabled  = settings.get("disableMasterKey", False)
+        require_dest_tag     = settings.get("requireDestinationTag", False)
+        deposit_auth         = settings.get("depositAuth", False)
+
+        return {
+            "entity_name":        entity_name,
+            "entity_verified":    entity_verified,
+            "master_key_disabled": master_key_disabled,
+            "require_dest_tag":   require_dest_tag,
+            "deposit_auth":       deposit_auth,
+            "inception":          data.get("inception"),
+            "parent":             data.get("parent"),
+        }
+    except Exception as e:
+        logger.warning(f"XRPScan account fetch failed for {wallet_address}: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
 ANCHAIN_API_KEY = os.getenv("ANCHAIN_API_KEY", "")
 ANCHAIN_BASE    = "https://bei.anchainai.com/api"
 
@@ -2802,9 +2867,22 @@ async def verify_vc(req: VCVerifyRequest):
 # ---------------------------------------------------------------------------
 # 11f. XRPL WALLET TRUST SCORE
 # ---------------------------------------------------------------------------
+async def _fetch_nft_count(wallet_address: str) -> int:
+    """Fetch NFT count from XRPL for use in trust score."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(XRPL_URL, json={
+                "method": "account_nfts",
+                "params": [{"account": wallet_address, "limit": 10}]
+            })
+            return len(r.json().get("result", {}).get("account_nfts", []))
+    except Exception:
+        return 0
+
+
 async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> dict:
     """
-    AgentTrust Wallet Trust Score — 9 signals, genuine max 100.
+    AgentTrust Wallet Trust Score — 10 signals, genuine max 100.
 
     Signal breakdown:
       Account age              — up to 20 pts (2 pts/month, max 10 months)
@@ -2815,7 +2893,8 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
       AgentTrust escrow rate   — up to 20 pts (our own platform data)
       Peer ratings             — up to 15 pts (avg star rating from counterparties)
       Wallet ownership proof   — 8 pts (on-chain AccountSet verification)
-      Sanctions clear (OFAC)   — 7 pts; sanctioned wallets score 0 and are blocked from escrow
+      Sanctions clear          — 7 pts; sanctioned wallets score 0 and are blocked from escrow
+      Entity reputation        — up to 8 pts (XRPScan: verified entity +5, security flags +1 each)
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2865,12 +2944,33 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         except Exception:
             pass
 
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            nft_res = await client.post(XRPL_URL, json={
-                "method": "account_nfts",
-                "params": [{"account": wallet_address, "limit": 10}]
-            })
-            nft_count = len(nft_res.json().get("result", {}).get("account_nfts", []))
+        # Fetch NFTs and XRPScan data concurrently
+        import asyncio as _asyncio
+        nft_task      = _asyncio.create_task(_fetch_nft_count(wallet_address))
+        xrpscan_task  = _asyncio.create_task(_get_xrpscan_account(wallet_address))
+        nft_count, xrpscan = await _asyncio.gather(nft_task, xrpscan_task)
+
+        # XRPScan entity + security flags signal
+        xrpscan_score   = 0
+        xrpscan_entity  = None
+        xrpscan_flags   = {}
+        if xrpscan:
+            xrpscan_entity = xrpscan.get("entity_name")
+            # Verified known entity (exchange, market maker etc.) — 5 pts
+            if xrpscan.get("entity_verified"):
+                xrpscan_score += 5
+            # Account security hardening — up to 3 pts
+            if xrpscan.get("master_key_disabled"):
+                xrpscan_score += 1
+            if xrpscan.get("require_dest_tag"):
+                xrpscan_score += 1
+            if xrpscan.get("deposit_auth"):
+                xrpscan_score += 1
+            xrpscan_flags = {
+                "master_key_disabled": xrpscan.get("master_key_disabled", False),
+                "require_dest_tag":    xrpscan.get("require_dest_tag", False),
+                "deposit_auth":        xrpscan.get("deposit_auth", False),
+            }
 
         # On-chain signals
         age_score      = min(20, int(age_days / 30) * 2)       # 2 pts/month, max 20
@@ -2964,7 +3064,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                     "source": "bithomp",
                 }
 
-        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score
+        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score + xrpscan_score
 
         signals = {
             "age_days":              age_days,
@@ -2976,7 +3076,9 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             "sanctions_clear":       sanctions_clear,
             "risk_score":            sanctions_detail.get("risk_score") if sanctions_detail else None,
             "risk_level":            sanctions_detail.get("risk_level") if sanctions_detail else None,
-            "known_entity":          sanctions_detail.get("entity") if sanctions_detail else None,
+            "known_entity":          xrpscan_entity or (sanctions_detail.get("entity") if sanctions_detail else None),
+            "xrpscan_entity":        xrpscan_entity,
+            "xrpscan_flags":         xrpscan_flags,
             "score_breakdown": {
                 "account_age":            age_score,
                 "balance":                balance_score,
@@ -2987,6 +3089,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "peer_rating":            peer_score,
                 "wallet_sig_verified":    wallet_sig_score,
                 "sanctions_clear":        sanctions_score,
+                "entity_reputation":      xrpscan_score,
             },
             **completion_stats,
             **peer_stats,
