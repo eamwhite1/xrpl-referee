@@ -710,17 +710,35 @@ async def _get_xrpscan_account(wallet_address: str) -> dict | None:
         deposit_auth         = settings.get("depositAuth", False)
 
         return {
-            "entity_name":        entity_name,
-            "entity_verified":    entity_verified,
+            "entity_name":         entity_name,
+            "entity_verified":     entity_verified,
             "master_key_disabled": master_key_disabled,
-            "require_dest_tag":   require_dest_tag,
-            "deposit_auth":       deposit_auth,
-            "inception":          data.get("inception"),
-            "parent":             data.get("parent"),
+            "require_dest_tag":    require_dest_tag,
+            "deposit_auth":        deposit_auth,
+            "inception":           data.get("inception"),
+            "parent":              data.get("parent"),
         }
     except Exception as e:
         logger.warning(f"XRPScan account fetch failed for {wallet_address}: {e}")
         return None
+
+
+async def _get_xaman_kyc(wallet_address: str) -> bool:
+    """
+    Check Xaman (XUMM) KYC status via XRPScan.
+    Returns True if the wallet holder has completed Xaman KYC, False otherwise.
+    Xaman KYC is a human identity verification — AI agent wallets will always return False.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(f"{XRPSCAN_BASE}/account/{wallet_address}/xumm_kyc",
+                                 headers={"User-Agent": "AgentTrust/1.0"})
+            if r.status_code == 200:
+                data = r.json()
+                return bool(data.get("kycApproved") or data.get("kyc_approved") or data.get("approved"))
+    except Exception as e:
+        logger.warning(f"Xaman KYC check failed for {wallet_address}: {e}")
+    return False
 
 # ---------------------------------------------------------------------------
 ANCHAIN_API_KEY = os.getenv("ANCHAIN_API_KEY", "")
@@ -2882,7 +2900,7 @@ async def _fetch_nft_count(wallet_address: str) -> int:
 
 async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> dict:
     """
-    AgentTrust Wallet Trust Score — 10 signals, genuine max 100.
+    AgentTrust Wallet Trust Score — 11 signals, genuine max 100.
 
     Signal breakdown:
       Account age              — up to 20 pts (2 pts/month, max 10 months)
@@ -2895,6 +2913,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
       Wallet ownership proof   — 8 pts (on-chain AccountSet verification)
       Sanctions clear          — 7 pts; sanctioned wallets score 0 and are blocked from escrow
       Entity reputation        — up to 8 pts (XRPScan: verified entity +5, security flags +1 each)
+      Xaman KYC                — 5 pts (Xaman identity verification via XRPScan; human-only signal)
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2944,11 +2963,12 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         except Exception:
             pass
 
-        # Fetch NFTs and XRPScan data concurrently
+        # Fetch NFTs, XRPScan entity data, and Xaman KYC concurrently
         import asyncio as _asyncio
         nft_task      = _asyncio.create_task(_fetch_nft_count(wallet_address))
         xrpscan_task  = _asyncio.create_task(_get_xrpscan_account(wallet_address))
-        nft_count, xrpscan = await _asyncio.gather(nft_task, xrpscan_task)
+        xaman_task    = _asyncio.create_task(_get_xaman_kyc(wallet_address))
+        nft_count, xrpscan, xaman_kyc = await _asyncio.gather(nft_task, xrpscan_task, xaman_task)
 
         # XRPScan entity + security flags signal
         xrpscan_score   = 0
@@ -2971,6 +2991,10 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "require_dest_tag":    xrpscan.get("require_dest_tag", False),
                 "deposit_auth":        xrpscan.get("deposit_auth", False),
             }
+
+        # Xaman KYC signal — 5 pts if wallet holder has completed Xaman identity verification
+        # AI agent wallets will never have this; it distinguishes verified humans from agents
+        xaman_kyc_score = 5 if xaman_kyc else 0
 
         # On-chain signals
         age_score      = min(20, int(age_days / 30) * 2)       # 2 pts/month, max 20
@@ -3064,7 +3088,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                     "source": "bithomp",
                 }
 
-        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score + xrpscan_score
+        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score + xrpscan_score + xaman_kyc_score
 
         signals = {
             "age_days":              age_days,
@@ -3079,6 +3103,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             "known_entity":          xrpscan_entity or (sanctions_detail.get("entity") if sanctions_detail else None),
             "xrpscan_entity":        xrpscan_entity,
             "xrpscan_flags":         xrpscan_flags,
+            "xaman_kyc":             xaman_kyc,
             "score_breakdown": {
                 "account_age":            age_score,
                 "balance":                balance_score,
@@ -3090,6 +3115,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "wallet_sig_verified":    wallet_sig_score,
                 "sanctions_clear":        sanctions_score,
                 "entity_reputation":      xrpscan_score,
+                "xaman_kyc":              xaman_kyc_score,
             },
             **completion_stats,
             **peer_stats,
