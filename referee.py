@@ -2985,7 +2985,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "nfts_held":              nft_score,
                 "escrow_completion":      completion_score,
                 "peer_rating":            peer_score,
-                "wallet_ownership_proof": wallet_sig_score,
+                "wallet_sig_verified":    wallet_sig_score,
                 "sanctions_clear":        sanctions_score,
             },
             **completion_stats,
