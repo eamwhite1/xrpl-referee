@@ -3017,9 +3017,11 @@ async def _score_bid_wallet(bid_id: str, wallet_address: str, session_factory):
 @app.get("/wallet/score/{address}")
 async def get_wallet_score(address: str, db: Session = Depends(get_db)):
     """
-    AgentTrust Wallet Trust Score — 7 on-chain + platform signals, scored 0–100.
-    Combines account age, balance, activity, domain verification, NFTs held,
-    AgentTrust escrow completion history, and peer ratings from counterparties.
+    AgentTrust Wallet Trust Score — 9 on-chain + platform signals, scored 0–100.
+    Combines account age, balance, activity, domain verification, on-chain wallet
+    ownership proof, multi-jurisdiction sanctions screening (AnChain.ai BEI),
+    NFTs held, AgentTrust escrow completion history, and peer ratings.
+    A sanctioned wallet receives a hard score of 0 regardless of other signals.
     """
     result = await compute_xrpl_trust_score(address, db=db)
     return result
