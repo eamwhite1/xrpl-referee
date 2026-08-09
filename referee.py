@@ -105,7 +105,7 @@ app = FastAPI(
         "**Trust layer stack:** four independent proof mechanisms buyers can require from sellers — "
         "(1) NFT from a trusted issuer, (2) XRPL domain verification, "
         "(3) W3C Verifiable Credential, (4) XRPL wallet trust score "
-        "(9 signals including on-chain ownership proof and OFAC sanctions screening).\n\n"
+        "(11 signals including on-chain ownership proof, Xaman KYC, XRPScan entity reputation, and OFAC sanctions screening).\n\n"
         "**Compliance:** all wallet addresses are automatically screened against the US OFAC SDN "
         "sanctions list at escrow creation and trust score computation. Sanctioned wallets "
         "cannot participate in escrow and receive a score of 0.\n\n"
@@ -3285,10 +3285,11 @@ async def _score_bid_wallet(bid_id: str, wallet_address: str, session_factory):
 @app.get("/wallet/score/{address}")
 async def get_wallet_score(address: str, db: Session = Depends(get_db)):
     """
-    AgentTrust Wallet Trust Score — 9 on-chain + platform signals, scored 0–100.
+    AgentTrust Wallet Trust Score — 11 on-chain + platform signals, scored 0–100.
     Combines account age, balance, activity, domain verification, on-chain wallet
     ownership proof, multi-jurisdiction sanctions screening (AnChain.ai BEI),
-    NFTs held, AgentTrust escrow completion history, and peer ratings.
+    entity reputation (XRPScan), Xaman KYC, NFTs held, AgentTrust escrow
+    completion history, and peer ratings.
     A sanctioned wallet receives a hard score of 0 regardless of other signals.
     """
     result = await compute_xrpl_trust_score(address, db=db)
