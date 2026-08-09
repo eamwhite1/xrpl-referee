@@ -28,7 +28,8 @@ mcp = FastMCP(
     instructions=(
         "The AgentTrust Referee is a trustless AI verdict engine built on the XRP Ledger. "
         "Use audit_task to verify whether completed work meets a task specification — "
-        "requires a 0.1 XRP fee paid to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet. "
+        "fee is 0.1 XRP on XRPL Mainnet OR $0.10 USDC on Base (chain 8453). "
+        "Call with no fee to receive a 402 with full payment instructions for both options. "
         "Use create_escrow_vault to lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. "
         "Use evaluate_escrow_work to submit proof against an existing vault — payment releases "
         "automatically to the worker's wallet on approval. No EscrowFinish needed. "
@@ -58,7 +59,7 @@ async def audit_task(
     )],
     fee_hash: Annotated[str, Field(
         title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Each hash is single-use.",
+        description="Transaction hash of the fee payment. For XRP: 64-char hex of an XRPL Payment tx. For USDC on Base: 0x-prefixed 66-char EVM tx hash. Each hash is single-use.",
     )],
     task_category: Annotated[str, Field(
         title="Task Category",
@@ -72,7 +73,9 @@ async def audit_task(
     """
     Verify whether completed work meets a task specification using AI.
 
-    Before calling, send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet.
+    Before calling, pay the fee via one of two options:
+      Option 1: Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet.
+      Option 2: Send $0.10 USDC on Base (chain 8453) — call with no fee first to get the address.
     Each fee_hash is single-use (anti-replay protection).
 
     Returns:

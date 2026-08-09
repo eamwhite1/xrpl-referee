@@ -295,7 +295,7 @@ def serve_mcp_server_card():
         "transport":   ["http"],
         "auth":        {"type": "none"},
         "tools": [
-            {"name": "audit_task",               "description": "Verify completed work against a task spec for 0.1 XRP. Returns PASS/FAIL with score and feedback."},
+            {"name": "audit_task",               "description": "Verify completed work against a task spec. Fee: 0.1 XRP on XRPL or $0.10 USDC on Base (chain 8453). Returns PASS/FAIL with score and feedback."},
             {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict. Optional trust-layer fields: nft_dvp (bool — require NFT transfer before payment releases), required_nft_issuer (wallet address), required_domain (XRPL domain verification), required_vc_issuer_did (W3C VC issuer DID), proof_policy ('ALL' or 'ANY')."},
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
             {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed. For NFT DvP jobs (nft_dvp=true), PASS sets status to PASS_AWAITING_NFT — seller must then create an NFTokenCreateOffer (Destination=buyer, Amount=0) and register it via POST /escrow/{id}/nft-offer before payment releases."},
@@ -1192,8 +1192,14 @@ def get_db():
 # ---------------------------------------------------------------------------
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
-PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
-MIN_FEE_XRP     = 0.1
+PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+MIN_FEE_XRP        = 0.1
+
+# Base chain USDC payment constants
+BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
+BASE_RPC_URL        = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+USDC_CONTRACT_BASE  = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC on Base mainnet
+MIN_FEE_USDC        = 0.10   # USD — 100000 in USDC's 6-decimal units
 
 # Temporary reviewer bypass for directory submissions (e.g. Claude Connectors Directory).
 # Lets a reviewer exercise paid endpoints without a funded XRPL wallet. Set
@@ -1385,6 +1391,26 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
 
     v2_entry, invoice_id = _x402_v2_envelope(resource, required_xrp)
 
+    usdc_accepts = []
+    if BASE_WALLET_ADDRESS:
+        usdc_accepts = [{
+            "scheme":   "exact",
+            "network":  "eip155:8453",
+            "asset":    "USDC",
+            "payTo":    BASE_WALLET_ADDRESS,
+            "amount":   str(int(MIN_FEE_USDC * 1_000_000)),  # 6 decimals
+            "resource": resource,
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "contractAddress": USDC_CONTRACT_BASE,
+                "instruction": (
+                    f"Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS} on Base (chain 8453), "
+                    "then include the transaction hash as the X-PAYMENT header."
+                ),
+                "headerName": "X-PAYMENT",
+            },
+        }]
+
     body = {
         "x402Version": 1,
         "accepts": [{
@@ -1404,10 +1430,10 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
                 ),
                 "headerName": "X-PAYMENT",
             },
-        }],
+        }] + usdc_accepts,
         "error": error,
     }
-    v2_body = {"x402Version": 2, "accepts": [v2_entry]}
+    v2_body = {"x402Version": 2, "accepts": [v2_entry] + usdc_accepts}
 
     encoded    = base64.b64encode(json.dumps(body).encode()).decode()
     encoded_v2 = base64.b64encode(json.dumps(v2_body).encode()).decode()
@@ -1502,6 +1528,115 @@ async def verify_x402_v2_payment(payment_signature_b64: str, escrow_id: str, db:
         "sender": sender,
         "amount_xrp": amount_xrp,
         "tx_hash": tx_hash,
+        "payment_response_header": base64.b64encode(json.dumps(settlement).encode()).decode(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# x402 — Base chain USDC payment verification
+# ---------------------------------------------------------------------------
+# Verifies a USDC transfer on Base mainnet via JSON-RPC eth_getTransactionReceipt.
+# We check the ERC-20 Transfer event log: from=payer, to=our wallet, token=USDC,
+# amount>=MIN_FEE_USDC. No API key required — uses the public Base RPC.
+#
+# USDC Transfer event topic:
+#   Transfer(address indexed from, address indexed to, uint256 value)
+#   keccak256("Transfer(address,address,uint256)")
+_USDC_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def _pad_address(addr: str) -> str:
+    return "0x" + addr.lower().replace("0x", "").zfill(64)
+
+
+async def verify_usdc_base_payment(tx_hash: str, escrow_id: str, db: Session, resource: str) -> dict:
+    """Verify a USDC payment on Base mainnet and record it in PaymentLog."""
+    if not BASE_WALLET_ADDRESS:
+        raise HTTPException(status_code=503, detail="USDC payments on Base are not yet configured on this server.")
+
+    already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == tx_hash).first()
+    if already_used:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Payment hash already used for '{already_used.escrow_id}' on {already_used.timestamp.strftime('%Y-%m-%d %H:%M UTC')}.",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(BASE_RPC_URL, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "eth_getTransactionReceipt",
+                "params": [tx_hash],
+            })
+        receipt = resp.json().get("result")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Base RPC lookup failed: {e}")
+
+    if not receipt:
+        raise HTTPException(status_code=400, detail="Transaction not found on Base — it may still be pending. Wait for confirmation and retry.")
+
+    if receipt.get("status") != "0x1":
+        raise HTTPException(status_code=400, detail="Transaction failed on Base (status=0x0).")
+
+    our_address_padded = _pad_address(BASE_WALLET_ADDRESS)
+    usdc_contract      = USDC_CONTRACT_BASE.lower()
+    min_units          = int(MIN_FEE_USDC * 1_000_000)  # USDC has 6 decimals
+
+    transfer_found = False
+    payer          = None
+    usdc_amount    = 0.0
+
+    for log in receipt.get("logs", []):
+        if log.get("address", "").lower() != usdc_contract:
+            continue
+        topics = log.get("topics", [])
+        if len(topics) < 3 or topics[0].lower() != _USDC_TRANSFER_TOPIC:
+            continue
+        if topics[2].lower() != our_address_padded:
+            continue
+        raw_value = int(log.get("data", "0x0"), 16)
+        if raw_value < min_units:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient USDC. Required ≥${MIN_FEE_USDC:.2f} ({min_units} units), received {raw_value} units.",
+            )
+        payer          = "0x" + topics[1][-40:]
+        usdc_amount    = raw_value / 1_000_000
+        transfer_found = True
+        break
+
+    if not transfer_found:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No USDC Transfer to {BASE_WALLET_ADDRESS} found in this transaction. Ensure you sent USDC (not ETH) to the correct address on Base.",
+        )
+
+    db.add(PaymentLog(
+        payment_hash=tx_hash,
+        purpose="usdc_base",
+        sender=payer,
+        amount_xrp=None,
+        escrow_id=escrow_id,
+    ))
+    db.commit()
+
+    logger.info(f"✅ USDC BASE: ${usdc_amount:.4f} from {payer} for '{escrow_id}' tx={tx_hash[:16]}…")
+
+    import asyncio as _asyncio2
+    _asyncio2.create_task(_telegram_notify(
+        f"💵 *USDC payment received (Base)*\n"
+        f"Amount: `${usdc_amount:.4f} USDC`\n"
+        f"From: `{payer}`\n"
+        f"Escrow: `{escrow_id}`\n"
+        f"Resource: `{resource}`\n"
+        f"Tx: `{tx_hash[:20]}…`"
+    ))
+
+    settlement = {"success": True, "transaction": tx_hash, "network": "eip155:8453", "payer": payer}
+    return {
+        "sender":                  payer,
+        "amount_usdc":             usdc_amount,
+        "tx_hash":                 tx_hash,
         "payment_response_header": base64.b64encode(json.dumps(settlement).encode()).decode(),
     }
 
@@ -1684,6 +1819,10 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
 
     if not fee_hash:
         _raise_402(resource, "Payment required. Provide a fee_hash (x402 v1) or PAYMENT-SIGNATURE header (x402 v2).", min_xrp=required_xrp)
+
+    # Route EVM transaction hashes (0x-prefixed, 66 chars) to Base USDC verification
+    if fee_hash.startswith("0x") and len(fee_hash) == 66:
+        return await verify_usdc_base_payment(fee_hash, escrow_id, db, resource)
 
     already_used = db.query(PaymentLog).filter(PaymentLog.payment_hash == fee_hash).first()
     if already_used:
@@ -3492,9 +3631,10 @@ async def standalone_audit(
     if not fee_hash and not x_reviewer_token and not payment_signature:
         _raise_402(
             "/audit",
-            f"Payment required. Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL, "
-            "then include the transaction hash as the X-PAYMENT header (or fee_hash body field), "
-            "or provide a PAYMENT-SIGNATURE header (x402 v2).",
+            f"Payment required. Option 1: Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL. "
+            f"Option 2: Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS or '(not configured)'} on Base (chain 8453). "
+            "Include the transaction hash as the X-PAYMENT header (or fee_hash body field). "
+            "Or provide a PAYMENT-SIGNATURE header (x402 v2 XRPL presigned flow).",
         )
 
     audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
