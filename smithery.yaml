@@ -17,7 +17,7 @@ description: >
   Includes the open XRPL NFT Issuer Registry: look up verified organisation wallet addresses,
   check NFT provenance, and verify wallet–domain ownership via xrp-ledger.toml.
   Pairs with the XRPL AI Starter Kit: use AgentTrust for trust scoring, escrow, and AI audit
-  on top of the starter kit's wallet and ledger tools. Guide: https://www.agenttrust.co.uk/docs/xrpl-ai-starter-kit/
+  on top of the starter kit's wallet and ledger tools. Guide: https://www.agenttrust.co.uk/xrpl-ai-starter-kit/
 
 tags:
   - xrpl
