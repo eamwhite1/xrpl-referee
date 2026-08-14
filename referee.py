@@ -481,6 +481,8 @@ class EscrowVault(Base):
     nft_dvp_offer_id     = Column(String,   nullable=True)   # The NFTokenCreateOffer ID on XRPL
     nft_dvp_offer_expiry = Column(DateTime, nullable=True)   # When the offer expires
     nft_dvp_status       = Column(String,   nullable=True)   # "pending_offer" | "offer_created" | "accepted" | "expired"
+    # Invoice requirements — v13
+    invoice_requirements = Column(Text,    nullable=True)   # JSON: {po_number, supplier_name, services_description, require_date, require_line_items}
 
 
 class JobPosting(Base):
@@ -1150,6 +1152,8 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_offer_id     VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_offer_expiry TIMESTAMP",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_status       VARCHAR",
+        # v13 — invoice requirements
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS invoice_requirements  TEXT",
         # trusted issuer registry extended fields
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS contact_email VARCHAR",
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS lei            VARCHAR",
@@ -1769,6 +1773,11 @@ class EscrowSetupRequest(BaseModel):
     min_passport_score:     Optional[float] = None  # ignored, kept for API compatibility
     # NFT Delivery-vs-Payment mode
     nft_dvp: bool = False  # enable NFT delivery-vs-payment mode
+    # Invoice requirements — buyer can require seller to submit a matching invoice
+    invoice_requirements: Optional[dict] = None
+    # Expected fields: po_number, supplier_name, services_description,
+    # require_date (bool), require_line_items (bool)
+    # Amount/currency are always required when this is set (mirrored from escrow amount)
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -2091,20 +2100,50 @@ def _email_styles() -> str:
 
 
 async def send_worker_receipt_email(
-    worker_email: str,
-    worker_name:  str,
-    escrow_id:    str,
-    buyer_name:   str,
-    amount:       float,
-    currency:     str,
-    task_preview: str,
-    deadline:     str,
+    worker_email:         str,
+    worker_name:          str,
+    escrow_id:            str,
+    buyer_name:           str,
+    amount:               float,
+    currency:             str,
+    task_preview:         str,
+    deadline:             str,
+    invoice_requirements: Optional[dict] = None,
 ):
     if not RESEND_API_KEY or not worker_email:
         return
     worker_url   = f"{SITE_URL}?worker={escrow_id}"
     preview_safe = task_preview[:300] + ("…" if len(task_preview) > 300 else "")
     amount_str   = f"{amount} {currency}"
+
+    # Build invoice requirements block if present
+    inv_block = ""
+    if invoice_requirements:
+        ir = invoice_requirements
+        rows = []
+        if ir.get("po_number"):
+            rows.append(f"<tr><td>PO / Reference</td><td><strong>{ir['po_number']}</strong></td></tr>")
+        if ir.get("supplier_name"):
+            rows.append(f"<tr><td>Supplier name</td><td><strong>{ir['supplier_name']}</strong></td></tr>")
+        rows.append(f"<tr><td>Amount</td><td><strong>{amount_str}</strong></td></tr>")
+        if ir.get("services_description"):
+            rows.append(f"<tr><td>Services / goods</td><td><strong>{ir['services_description']}</strong></td></tr>")
+        rows.append(f"<tr><td>Invoice number</td><td><strong>Required</strong></td></tr>")
+        rows.append(f"<tr><td>Invoice date</td><td><strong>{'Required' if ir.get('require_date') else 'Not required'}</strong></td></tr>")
+        rows.append(f"<tr><td>Line items</td><td><strong>{'Itemised breakdown required' if ir.get('require_line_items') else 'Summary total is fine'}</strong></td></tr>")
+        inv_block = f"""
+  <p style="font-size:.85rem;font-weight:700;margin:20px 0 .4rem;color:#0d0d12;">Invoice required — your invoice must include:</p>
+  <table style="width:100%;border-collapse:collapse;font-size:.85rem;margin-bottom:20px;">
+    <colgroup><col style="width:40%"><col style="width:60%"></colgroup>
+    {''.join(f'<tr style="border-bottom:1px solid #eef0f6;">{r[4:]}'
+             .replace('<tr style="border-bottom:1px solid #eef0f6;"><td>', '<tr style="border-bottom:1px solid #eef0f6;"><td style="padding:7px 4px;color:#666;">')
+             .replace('</td><td>', '</td><td style="padding:7px 4px;">')
+             for r in rows)}
+  </table>
+  <p style="font-size:.82rem;color:#666;margin-bottom:20px;">
+    Submit your proof of work <em>and</em> include an invoice matching every field above.
+    The AI referee verifies both before releasing payment.
+  </p>"""
 
     try:
         resend.Emails.send({
@@ -2131,6 +2170,7 @@ async def send_worker_receipt_email(
   <div class="detail"><span>Deadline</span><br><strong>{deadline}</strong></div>
   <p style="font-size:.85rem;font-weight:700;margin-bottom:.4rem;color:#0d0d12;">Task brief:</p>
   <div class="task-box">{preview_safe}</div>
+  {inv_block}
   <a href="{worker_url}" class="btn">Submit Your Work →</a>
   <p style="font-size:.85rem;">Enter your receipt code <strong>{escrow_id}</strong> on the
      Seller tab to load the full job details and submit your work. Payment arrives in your
@@ -3835,6 +3875,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         required_vc_type       = req.required_vc_type or None,
         proof_policy           = req.proof_policy or "ALL",
         nft_dvp                = req.nft_dvp or False,
+        invoice_requirements   = json.dumps(req.invoice_requirements) if req.invoice_requirements else None,
     )
     db.add(vault)
     db.commit()
@@ -3847,14 +3888,15 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         deadline_str = cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC") if cancel_after_ts else "Not specified"
         amount_val   = amount_rlusd if currency == "RLUSD" else amount_xrp
         asyncio.create_task(send_worker_receipt_email(
-            worker_email = req.worker_email,
-            worker_name  = "",
-            escrow_id    = req.escrow_id,
-            buyer_name   = req.buyer_name,
-            amount       = amount_val,
-            currency     = currency,
-            task_preview = req.task_description,
-            deadline     = deadline_str,
+            worker_email         = req.worker_email,
+            worker_name          = "",
+            escrow_id            = req.escrow_id,
+            buyer_name           = req.buyer_name,
+            amount               = amount_val,
+            currency             = currency,
+            task_preview         = req.task_description,
+            deadline             = deadline_str,
+            invoice_requirements = req.invoice_requirements or None,
         ))
 
     cancel_after_ripple = (
