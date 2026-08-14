@@ -263,7 +263,7 @@ def serve_agent_json():
         "payment": {"currency": "XRP", "amount": "0.1", "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR", "network": "XRPL Mainnet"},
         "skills": [
             {"id": "standalone-audit",  "name": "AI Verdict",                   "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit",            "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow"]},
-            {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict.",              "endpoint": "/escrow/generate",  "method": "POST"},
+            {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. Pass `invoice_requirements` (po_number, supplier_name, services_description, require_date, require_line_items) to require the seller to submit a matching invoice alongside their proof of work — the AI referee verifies every field before releasing payment. Verified invoices are forwarded to the buyer's accounts team via the `accounts_email` field.",              "endpoint": "/escrow/generate",  "method": "POST"},
             {"id": "escrow-evaluate",   "name": "Submit Work for Escrow Audit",  "description": "Seller submits proof. On PASS the referee auto-releases funds to seller.",        "endpoint": "/evaluate",         "method": "POST"},
         ],
         "defaultInputModes": ["application/json"],
