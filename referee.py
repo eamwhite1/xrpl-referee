@@ -608,16 +608,16 @@ class SanctionsLog(Base):
 
 
 class KycRecord(Base):
-    """Stripe Identity KYC verification records — one row per wallet operator."""
+    """KYC verification records — one row per verified wallet operator. Method: xaman."""
     __tablename__ = "kyc_record"
     id                 = Column(Integer, primary_key=True, autoincrement=True)
     wallet_address     = Column(String, nullable=False, index=True)
-    stripe_session_id  = Column(String, nullable=True, unique=True)
-    stripe_vs_id       = Column(String, nullable=True)   # VerificationSession id
+    stripe_session_id  = Column(String, nullable=True, unique=True)  # kept for schema compat
+    stripe_vs_id       = Column(String, nullable=True)               # kept for schema compat
     status             = Column(String, default="pending")  # pending | verified | failed
     created_at         = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     verified_at        = Column(DateTime, nullable=True)
-    return_url         = Column(String, nullable=True)
+    return_url         = Column(String, nullable=True)  # repurposed: stores method (e.g. "xaman")
 
 
 # ---------------------------------------------------------------------------
@@ -852,15 +852,6 @@ THRESHOLD_WARN_USD       = 1_000   # Travel Rule trigger — issue compliance_wa
 THRESHOLD_BLOCK_USD      = 3_000   # Require KYC for non-verified wallets
 THRESHOLD_BLOCK_KYC_USD  = 10_000  # Hard ceiling even for KYC-verified wallets
 
-# Stripe — KYC via Stripe Identity + Checkout
-STRIPE_SECRET_KEY     = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-KYC_PRICE_GBP_PENCE   = 500   # £5.00 charged to user via Stripe Checkout
-
-if STRIPE_SECRET_KEY:
-    import stripe as _stripe
-    _stripe.api_key = STRIPE_SECRET_KEY
-
 async def _get_xrp_price_usd() -> Optional[float]:
     """Return cached XRP/USD price, or None if unavailable."""
     import time as _time2
@@ -894,7 +885,7 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
     if usd_value is None:
         return {"ok": True}  # can't determine value — don't block
 
-    # Check KYC status for the buyer wallet
+    # Check KYC status for the buyer wallet — AgentTrust cache first, then live Xaman query
     kyc_verified = False
     if buyer_address and db:
         try:
@@ -905,6 +896,24 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
             kyc_verified = kyc_row is not None
         except Exception:
             pass
+        if not kyc_verified:
+            try:
+                xaman_ok = await _get_xaman_kyc(buyer_address)
+                if xaman_ok:
+                    kyc_verified = True
+                    # Cache the Xaman result so future calls skip the HTTP round-trip
+                    try:
+                        db.add(KycRecord(
+                            wallet_address=buyer_address,
+                            status="verified",
+                            verified_at=datetime.now(timezone.utc),
+                            return_url=None,
+                        ))
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+            except Exception:
+                pass
 
     effective_limit = THRESHOLD_BLOCK_KYC_USD if kyc_verified else THRESHOLD_BLOCK_USD
 
@@ -925,7 +934,7 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
             "level": "kyc_required",
             "usd_value": round(usd_value, 2),
             "error": "kyc_required",
-            "kyc_url": "/kyc/initiate",
+            "kyc_url": "/kyc/verify",
             "message": (
                 f"This escrow value (~${usd_value:,.0f} USD) exceeds the ${THRESHOLD_BLOCK_USD:,} USD "
                 f"limit for unverified wallets. Complete identity verification to unlock escrows up to "
@@ -3850,7 +3859,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
                 status_code=403,
                 detail={
                     "error": "kyc_required",
-                    "kyc_url": "/kyc/initiate",
+                    "kyc_url": "/kyc/verify",
                     "message": threshold["message"],
                 },
             )
@@ -6491,197 +6500,78 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
 # KYC — Stripe Identity + Checkout
 # ---------------------------------------------------------------------------
 
-class KycInitiateRequest(BaseModel):
-    wallet_address: str
-    return_url: str  # where to redirect after Stripe flow completes
-
-
-@app.post("/kyc/initiate")
-async def kyc_initiate(req: KycInitiateRequest, db: Session = Depends(get_db)):
+@app.post("/kyc/verify")
+async def kyc_verify(wallet_address: str, db: Session = Depends(get_db)):
     """
-    Start a KYC verification session for a wallet operator.
-    Creates a Stripe Checkout + Identity session and returns the hosted URL.
-    The operator pays £5; Stripe Identity runs inline. On completion, the
-    webhook marks the wallet as kyc_verified.
-    """
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=503, detail="KYC is not yet enabled on this instance.")
+    Check whether a wallet has Xaman KYC and cache the result.
+    Agents call this after the operator completes Xaman KYC to refresh
+    their verified status without waiting for the next trust score query.
 
-    # Idempotency: return existing pending session if created in the last hour
-    from datetime import timedelta
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    Returns {"kyc_verified": true} if Xaman reports the wallet as KYC-approved.
+    The result is cached in kyc_record so future escrow requests bypass the
+    live Xaman query.
+    """
+    # Return cached result if already verified
     existing = db.query(KycRecord).filter(
-        KycRecord.wallet_address == req.wallet_address,
-        KycRecord.status == "pending",
-        KycRecord.created_at >= cutoff,
-    ).first()
-    if existing and existing.stripe_session_id:
-        try:
-            session = _stripe.checkout.Session.retrieve(existing.stripe_session_id)
-            if session.status == "open":
-                return {"kyc_url": session.url, "session_id": session.id, "status": "pending"}
-        except Exception:
-            pass  # session expired — create a fresh one
-
-    # Check already verified
-    verified = db.query(KycRecord).filter(
-        KycRecord.wallet_address == req.wallet_address,
+        KycRecord.wallet_address == wallet_address,
         KycRecord.status == "verified",
     ).first()
-    if verified:
-        return {"status": "already_verified", "verified_at": verified.verified_at.isoformat()}
+    if existing:
+        return {
+            "wallet_address": wallet_address,
+            "kyc_verified": True,
+            "method": existing.return_url or "xaman",
+            "verified_at": existing.verified_at.isoformat() if existing.verified_at else None,
+        }
 
-    base_url = os.getenv("BASE_URL", "https://xrpl-referee.onrender.com")
-    webhook_return = f"{base_url}/kyc/complete?wallet={req.wallet_address}"
+    xaman_ok = await _get_xaman_kyc(wallet_address)
+    if xaman_ok:
+        try:
+            row = KycRecord(
+                wallet_address=wallet_address,
+                status="verified",
+                verified_at=datetime.now(timezone.utc),
+                return_url="xaman",
+            )
+            db.add(row)
+            db.commit()
+        except Exception:
+            db.rollback()
+        return {"wallet_address": wallet_address, "kyc_verified": True, "method": "xaman"}
 
-    try:
-        # Create Stripe Identity VerificationSession
-        vs = _stripe.identity.VerificationSession.create(
-            type="document",
-            metadata={"wallet_address": req.wallet_address},
-            options={"document": {"require_live_capture": True, "require_matching_selfie": True}},
-        )
-
-        # Create Stripe Checkout session — charges £5, embeds Identity
-        session = _stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "gbp",
-                    "product_data": {"name": "AgentTrust KYC Verification"},
-                    "unit_amount": KYC_PRICE_GBP_PENCE,
-                },
-                "quantity": 1,
-            }],
-            mode="payment",
-            success_url=f"{webhook_return}&stripe_session_id={{CHECKOUT_SESSION_ID}}&result=success",
-            cancel_url=f"{req.return_url}?kyc=cancelled",
-            metadata={
-                "wallet_address": req.wallet_address,
-                "vs_id": vs.id,
-            },
-            consent_collection={"terms_of_service": "required"},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to create Stripe session: {e}")
-
-    record = KycRecord(
-        wallet_address=req.wallet_address,
-        stripe_session_id=session.id,
-        stripe_vs_id=vs.id,
-        status="pending",
-        return_url=req.return_url,
-    )
-    db.add(record)
-    db.commit()
-
-    return {"kyc_url": session.url, "session_id": session.id, "status": "pending"}
+    return {
+        "wallet_address": wallet_address,
+        "kyc_verified": False,
+        "message": "Xaman KYC not detected for this wallet. Complete identity verification in the Xaman app (xumm.app) then call this endpoint again.",
+        "xaman_kyc_url": "https://xumm.app/kyc",
+    }
 
 
 @app.get("/kyc/status/{wallet_address}")
-def kyc_status(wallet_address: str, db: Session = Depends(get_db)):
-    """Check the KYC verification status for a wallet address."""
+async def kyc_status(wallet_address: str, db: Session = Depends(get_db)):
+    """
+    Check KYC verification status for a wallet address.
+    Checks the local cache first, then queries Xaman live if no cached record exists.
+    """
     row = db.query(KycRecord).filter(
         KycRecord.wallet_address == wallet_address,
         KycRecord.status == "verified",
     ).first()
     if row:
-        return {"wallet_address": wallet_address, "kyc_verified": True, "verified_at": row.verified_at.isoformat()}
-    return {"wallet_address": wallet_address, "kyc_verified": False}
+        return {
+            "wallet_address": wallet_address,
+            "kyc_verified": True,
+            "method": row.return_url or "xaman",
+            "verified_at": row.verified_at.isoformat() if row.verified_at else None,
+        }
 
-
-@app.post("/kyc/webhook")
-async def kyc_webhook(request: Request, db: Session = Depends(get_db)):
-    """
-    Stripe webhook handler. Listens for checkout.session.completed to mark
-    the wallet as KYC-verified once payment + identity check succeed.
-    """
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="Webhook not configured.")
-
-    payload = await request.body()
-    sig = request.headers.get("stripe-signature", "")
-
-    try:
-        event = _stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except _stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        wallet_address = session.get("metadata", {}).get("wallet_address")
-        vs_id = session.get("metadata", {}).get("vs_id")
-        session_id = session.get("id")
-
-        if not wallet_address:
-            return {"status": "ignored"}
-
-        # Verify the Identity session status directly with Stripe
-        identity_verified = False
-        if vs_id:
-            try:
-                vs = _stripe.identity.VerificationSession.retrieve(vs_id)
-                identity_verified = vs.status == "verified"
-            except Exception:
-                pass
-
-        row = db.query(KycRecord).filter(KycRecord.stripe_session_id == session_id).first()
-        if not row:
-            row = KycRecord(wallet_address=wallet_address, stripe_session_id=session_id, stripe_vs_id=vs_id)
-            db.add(row)
-
-        if identity_verified:
-            row.status = "verified"
-            row.verified_at = datetime.now(timezone.utc)
-            logger.info(f"KYC verified: {wallet_address}")
-        else:
-            row.status = "failed"
-            logger.warning(f"KYC payment received but identity not verified for {wallet_address} (vs_id={vs_id})")
-
-        db.commit()
-
-    return {"status": "ok"}
-
-
-@app.get("/kyc/complete")
-async def kyc_complete(wallet: str, result: str = "success", stripe_session_id: str = None, db: Session = Depends(get_db)):
-    """
-    Redirect landing page after Stripe Checkout. Stripe success_url lands here.
-    Checks the Checkout + Identity status and updates the DB record, then
-    redirects the user to their original return_url with a status param.
-    """
-    return_url = "/"
-    if stripe_session_id:
-        try:
-            session = _stripe.checkout.Session.retrieve(stripe_session_id)
-            wallet_meta = session.get("metadata", {}).get("wallet_address", wallet)
-            vs_id = session.get("metadata", {}).get("vs_id")
-            return_url_base = None
-
-            row = db.query(KycRecord).filter(KycRecord.stripe_session_id == stripe_session_id).first()
-            if row:
-                return_url_base = row.return_url
-
-            identity_verified = False
-            if vs_id:
-                try:
-                    vs = _stripe.identity.VerificationSession.retrieve(vs_id)
-                    identity_verified = vs.status == "verified"
-                except Exception:
-                    pass
-
-            if row and identity_verified:
-                row.status = "verified"
-                row.verified_at = datetime.now(timezone.utc)
-                db.commit()
-
-            status_param = "verified" if identity_verified else "pending"
-            if return_url_base:
-                return_url = f"{return_url_base}?kyc={status_param}"
-        except Exception as e:
-            logger.warning(f"KYC complete redirect error: {e}")
-
-    return RedirectResponse(url=return_url, status_code=303)
+    # Live Xaman check
+    xaman_ok = await _get_xaman_kyc(wallet_address)
+    return {
+        "wallet_address": wallet_address,
+        "kyc_verified": xaman_ok,
+        "method": "xaman" if xaman_ok else None,
+    }
 
 
 # ---------------------------------------------------------------------------
