@@ -9,3 +9,4 @@ requests
 resend
 cryptography
 fastmcp>=2.2.0
+stripe>=8.0.0
