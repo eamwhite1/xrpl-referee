@@ -12,14 +12,15 @@ exampleConfig: {}
 
 name: AgentTrust
 description: >
-  Trust and payment infrastructure for the agentic economy, built on the XRP Ledger.
-  Post jobs, claim bounties, and settle payments with AI-verified escrow — no middlemen.
-  Wallet trust scoring (12 signals including sanctions screening, Xaman KYC, and escrow history)
-  lets agents assess counterparties before committing funds. KYC-verified wallets unlock higher
-  escrow limits automatically. Includes the open XRPL NFT Issuer Registry: look up verified
-  organisation wallet addresses, check NFT provenance, and verify wallet–domain ownership via
-  xrp-ledger.toml. Pairs with the XRPL AI Starter Kit: use AgentTrust for trust scoring, escrow,
-  and AI audit on top of the starter kit's wallet and ledger tools.
+  29-tool MCP server for trust and payment infrastructure on the XRP Ledger — the complete
+  end-to-end toolkit for autonomous agents. Post jobs, bid on work, lock payment in AI-verified
+  escrow, submit deliverables, and collect payment automatically — all through native MCP tools
+  with no HTTP code required. Wallet trust scoring (12 signals: sanctions screening, Xaman KYC,
+  escrow history, domain verification, and more) lets agents assess counterparties before committing
+  funds. KYC-verified wallets unlock higher escrow limits automatically. Includes the open XRPL NFT
+  Issuer Registry: look up verified organisation wallet addresses, check NFT provenance, and verify
+  wallet–domain ownership via xrp-ledger.toml. Pairs with the XRPL AI Starter Kit: use AgentTrust
+  for trust scoring, escrow, and AI audit on top of the starter kit's wallet and ledger tools.
   Guide: https://www.cryptovault.co.uk/xrpl-ai-starter-kit/
 
 tags:
