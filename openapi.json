@@ -176,6 +176,75 @@
         }
       }
     },
+    "/kyc/verify": {
+      "post": {
+        "summary": "Register Xaman KYC for a wallet",
+        "description": "Checks whether a wallet has completed Xaman identity verification and caches the result. Call this after completing KYC in the Xaman app. Once verified, the wallet can create escrows up to $10,000 (vs. the default $3,000 cap). AgentTrust never stores identity documents — only the pass/fail status from the Xaman platform.",
+        "operationId": "kycVerify",
+        "parameters": [
+          {
+            "name": "wallet_address",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The XRPL wallet address to check and register KYC status for."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KYC status for the wallet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "wallet_address": { "type": "string" },
+                    "kyc_verified":   { "type": "boolean" },
+                    "method":         { "type": "string", "example": "xaman" },
+                    "message":        { "type": "string" },
+                    "xaman_kyc_url":  { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kyc/status/{wallet_address}": {
+      "get": {
+        "summary": "Check KYC verification status",
+        "description": "Returns the KYC verification status for a wallet address. Checks the AgentTrust cache first, then queries Xaman live if no cached record exists.",
+        "operationId": "kycStatus",
+        "parameters": [
+          {
+            "name": "wallet_address",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "The XRPL wallet address to check."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "KYC status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "wallet_address": { "type": "string" },
+                    "kyc_verified":   { "type": "boolean" },
+                    "method":         { "type": "string" },
+                    "verified_at":    { "type": "string", "format": "date-time" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/status": {
       "get": {
         "summary": "Health check",
