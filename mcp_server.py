@@ -1092,6 +1092,338 @@ async def check_wallet_kyc(
 
 
 # ---------------------------------------------------------------------------
+# NFT Issuer Registry
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Look Up NFT Issuer",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def lookup_nft_issuer(
+    query: Annotated[str, Field(
+        title="Company Name or Wallet Address",
+        description="Company name (e.g. 'Ripple') or XRPL wallet address to look up in the issuer registry.",
+    )],
+) -> dict:
+    """
+    Look up an organisation in the AgentTrust XRPL NFT Issuer Registry.
+
+    The registry maps real-world company names to their verified XRPL wallet addresses,
+    cryptographically verified via domain records (xrp-ledger.toml). Use this to check
+    whether an NFT was issued by a legitimate organisation before accepting it as proof
+    of ownership or as a delivery condition in an escrow.
+
+    Returns: name, xrpl_wallet, verified status, domain, and a register_url if not found.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/nft/issuers", params={"q": query})
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get NFT Issuer by Wallet",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def get_nft_issuer_by_wallet(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) of the NFT issuer to look up.",
+    )],
+) -> dict:
+    """
+    Look up a registered NFT issuer by their XRPL wallet address.
+
+    Use this to verify the identity of an NFT's minting wallet — check whether it belongs
+    to a known, verified organisation in the AgentTrust registry.
+
+    Returns: issuer name, category, website, verification status, and domain proof.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/nft/issuers/by-wallet/{wallet_address}")
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Verify NFT Ownership",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def verify_nft_ownership(
+    wallet_address: Annotated[str, Field(
+        title="Holder Wallet Address",
+        description="The XRPL wallet address (r...) that should hold the NFT.",
+    )],
+    issuer_wallet: Annotated[str, Field(
+        title="Issuer Wallet Address",
+        description="The XRPL wallet address (r...) of the NFT's issuer.",
+    )],
+    required_metadata: Annotated[Optional[str], Field(
+        title="Required Metadata (JSON)",
+        description="Optional JSON string of metadata fields that must be present on the NFT, e.g. '{\"type\": \"licence\"}'.",
+        default=None,
+    )] = None,
+) -> dict:
+    """
+    Verify that a wallet holds an NFT from a specific issuer, optionally matching metadata.
+
+    Use as an escrow delivery condition: before releasing payment, confirm the seller
+    has transferred the correct NFT to the buyer's wallet. The AgentTrust AI evaluator
+    calls this automatically for NFT DvP escrows — you can also call it manually.
+
+    Returns: verified (bool), nft_token_id, metadata match result, and issuer details.
+    """
+    payload = {"wallet_address": wallet_address, "issuer_wallet": issuer_wallet}
+    if required_metadata:
+        payload["required_metadata"] = required_metadata
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(f"{REFEREE_BASE}/nft/verify", json=payload)
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
+# Wallet ratings
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Rate Counterparty",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+))
+async def rate_wallet(
+    wallet_address: Annotated[str, Field(
+        title="Wallet to Rate",
+        description="The XRPL wallet address (r...) of the counterparty you are rating.",
+    )],
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The escrow ID for the completed transaction. One rating allowed per escrow per rater.",
+    )],
+    rating: Annotated[int, Field(
+        title="Rating (1–5)",
+        description="Star rating from 1 (poor) to 5 (excellent).",
+        ge=1,
+        le=5,
+    )],
+    rater_address: Annotated[str, Field(
+        title="Your Wallet Address",
+        description="Your XRPL wallet address (r...) — the rater.",
+    )],
+    rater_role: Annotated[str, Field(
+        title="Your Role",
+        description="Your role in the escrow: 'buyer' or 'worker'.",
+    )],
+    comment: Annotated[Optional[str], Field(
+        title="Comment",
+        description="Optional short comment about the counterparty.",
+        default=None,
+    )] = None,
+) -> dict:
+    """
+    Leave a 1–5 star peer rating for a counterparty after a completed escrow.
+
+    Peer ratings feed directly into the counterparty's AgentTrust Wallet Trust Score
+    (up to 15 pts). One rating per escrow per rater. Ratings are permanent and public.
+
+    Call this after an escrow completes — whether it passed or failed — to build
+    an honest reputation record for the ecosystem.
+    """
+    payload = {
+        "escrow_id": escrow_id,
+        "rating": rating,
+        "rater_address": rater_address,
+        "rater_role": rater_role,
+    }
+    if comment:
+        payload["comment"] = comment
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/wallet/{wallet_address}/rate",
+            json=payload,
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
+# Job messaging
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Send Job Message",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+))
+async def send_job_message(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job ID to send a message on.",
+    )],
+    message: Annotated[str, Field(
+        title="Message",
+        description="The message text to send.",
+    )],
+    sender_role: Annotated[str, Field(
+        title="Sender Role",
+        description="Your role: 'buyer' or 'worker'.",
+    )],
+    sender_name: Annotated[Optional[str], Field(
+        title="Sender Name",
+        description="Optional display name.",
+        default=None,
+    )] = None,
+    bid_id: Annotated[Optional[str], Field(
+        title="Bid ID",
+        description="Optional bid ID if this message relates to a specific bid.",
+        default=None,
+    )] = None,
+) -> dict:
+    """
+    Send a message on a job thread — for clarifying requirements, sharing progress,
+    or negotiating before an escrow is created.
+
+    Messages are visible to both the buyer and the awarded worker. Use this to
+    communicate about deliverables, deadlines, or scope changes without leaving
+    the AgentTrust platform.
+    """
+    payload = {"message": message, "sender_role": sender_role}
+    if sender_name:
+        payload["sender_name"] = sender_name
+    if bid_id:
+        payload["bid_id"] = bid_id
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/bids/{job_id}/messages",
+            json=payload,
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Read Job Messages",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+))
+async def read_job_messages(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job ID to fetch messages for.",
+    )],
+) -> dict:
+    """
+    Fetch the message thread for a job.
+
+    Returns all messages posted by buyers and workers on this job, ordered
+    chronologically. Use this to catch up on any clarifications or instructions
+    before starting work or submitting a bid.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/bids/{job_id}/messages")
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
+# Domain verification
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Verify Wallet Domain",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def verify_wallet_domain(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) to verify domain ownership for.",
+    )],
+    domain: Annotated[str, Field(
+        title="Domain",
+        description="The domain you claim to own, e.g. 'example.com'. Must have an xrp-ledger.toml listing this wallet.",
+    )],
+) -> dict:
+    """
+    Verify that an XRPL wallet is owned by a specific domain via the XRPL Foundation
+    xrp-ledger.toml standard.
+
+    The domain must publish an xrp-ledger.toml file at /.well-known/xrp-ledger.toml
+    listing the wallet address under [ACCOUNTS]. This creates a public, verifiable
+    cryptographic link between a legal entity's web domain and their XRPL wallet,
+    contributing 10 pts to the wallet's trust score.
+
+    Returns: verified (bool), domain, wallet, and the toml source checked.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/domain/verify",
+            json={"wallet_address": wallet_address, "domain": domain},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
+# DEX price quote
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get DEX Quote",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def get_dex_quote(
+    from_currency: Annotated[str, Field(
+        title="From Currency",
+        description="Currency to swap from, e.g. 'XRP' or 'RLUSD'.",
+    )],
+    to_currency: Annotated[str, Field(
+        title="To Currency",
+        description="Currency to swap to, e.g. 'XRP' or 'RLUSD'.",
+    )],
+    amount: Annotated[float, Field(
+        title="Amount",
+        description="Amount of the from_currency to quote.",
+    )],
+) -> dict:
+    """
+    Get a live DEX price quote for swapping between XRP and RLUSD on the XRPL DEX.
+
+    Use this to price escrows in a stable currency (RLUSD) while paying in XRP,
+    or to understand the current exchange rate before committing to a job budget.
+
+    Returns: from_amount, to_amount, rate, and slippage estimate.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/dex/quote",
+            json={"from_currency": from_currency, "to_currency": to_currency, "amount": amount},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+# ---------------------------------------------------------------------------
 # MCP Prompt Templates
 # ---------------------------------------------------------------------------
 
