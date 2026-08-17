@@ -1023,6 +1023,74 @@ async def confirm_wallet_ownership(
         return res.json()
 
 
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get Wallet Trust Score",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def get_wallet_trust_score(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) to score.",
+    )],
+) -> dict:
+    """
+    Get the AgentTrust Wallet Trust Score (0–100) for any XRPL wallet.
+
+    Combines 12 independent signals: account age, XRP balance, on-chain activity,
+    domain verification, on-chain ownership proof, multi-jurisdiction sanctions screening
+    (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan),
+    Xaman KYC, AgentTrust KYC (Xaman-verified + registered), NFTs held, escrow completion
+    rate, and peer ratings from counterparties.
+
+    Use this before accepting a job or creating an escrow to assess counterparty risk.
+    A score below 30 is low-trust, 30–60 moderate, 60+ established.
+    KYC-verified wallets (kyc_verified: true) can create escrows up to $10,000.
+
+    Returns full score breakdown by signal so you can reason about why a wallet scores high or low.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}")
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Check Wallet KYC Status",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def check_wallet_kyc(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) to check KYC status for.",
+    )],
+) -> dict:
+    """
+    Check and register the Xaman KYC verification status for a wallet operator.
+
+    Queries Xaman (the official XRPL wallet app) to see if the wallet holder has completed
+    identity verification. If verified, the status is cached and the wallet immediately
+    unlocks escrows up to $10,000 (vs. the default $3,000 cap for unverified wallets).
+
+    Call this after completing KYC in the Xaman app (xumm.app/kyc) to register the
+    result with AgentTrust. Safe to call multiple times — returns cached result if already verified.
+
+    Returns: wallet_address, kyc_verified (bool), method, and xaman_kyc_url if not yet verified.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/kyc/verify",
+            params={"wallet_address": wallet_address},
+        )
+        res.raise_for_status()
+        return res.json()
+
+
 # ---------------------------------------------------------------------------
 # MCP Prompt Templates
 # ---------------------------------------------------------------------------
