@@ -31,7 +31,7 @@ except ImportError:
 from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
-from xrpl.models.requests import Tx
+from xrpl.models.requests import Tx, SubmitOnly
 from xrpl.models.transactions import EscrowFinish
 from xrpl.core.addresscodec import decode_seed
 from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
@@ -3942,6 +3942,10 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
                 status_code=400,
                 detail=f"amount_xrp must be ≥ {MIN_ESCROW_XRP} XRP (1 drop — XRPL minimum)."
             )
+        if amount_xrp < 1.0:
+            # Not a hard block — small amounts are valid — but warn that unfunded worker wallets
+            # won't be auto-created by the EscrowFinish if the payout is below the 1 XRP reserve.
+            logger.warning(f"escrow amount {amount_xrp} XRP < 1 XRP reserve — worker wallet may need pre-funding")
     if currency == "RLUSD" and (not amount_rlusd or amount_rlusd <= 0):
         raise HTTPException(status_code=400, detail="amount_rlusd required for RLUSD escrow.")
 
@@ -4083,6 +4087,12 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
+    if currency == "XRP" and amount_xrp and amount_xrp < 1.0:
+        response_body["worker_reserve_warning"] = (
+            f"Escrow amount ({amount_xrp} XRP) is below the 1 XRP XRPL account reserve. "
+            "If the worker wallet is unfunded, the EscrowFinish will fail to activate it. "
+            "Ensure the worker wallet is already funded, or increase the escrow amount to ≥ 1 XRP."
+        )
     return response_body
 
 
@@ -4191,6 +4201,67 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
             "Then call POST /escrow/{escrow_id}/confirm with the resulting tx hash."
         ),
         "condition": vault.condition,
+    }
+
+
+@app.post("/escrow/{escrow_id}/submit")
+async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Submit a signed EscrowCreate tx blob and auto-confirm the vault in one step.
+
+    The buyer signs the transaction dict from POST /escrow/prepare locally
+    (seed never leaves their environment), then sends the signed blob here.
+    We submit it to XRPL and activate the vault automatically — no separate
+    confirm step required.
+
+    Body: { "tx_blob": "<hex-encoded signed transaction>" }
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found.")
+
+    tx_blob = body.get("tx_blob", "").strip()
+    if not tx_blob:
+        raise HTTPException(status_code=400, detail="tx_blob is required.")
+
+    try:
+        from xrpl.models.transactions import Transaction
+        client  = AsyncJsonRpcClient(XRPL_URL)
+        result  = await client.request(SubmitOnly(tx_blob=tx_blob))
+        res     = result.result
+        engine  = res.get("engine_result", "")
+        tx_hash = res.get("tx_json", {}).get("hash") or res.get("hash", "")
+
+        if engine not in ("tesSUCCESS", "terQUEUED") and not engine.startswith("tes"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"XRPL rejected transaction: {engine} — {res.get('engine_result_message', '')}",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to submit to XRPL: {e}")
+
+    # Auto-confirm the vault
+    sequence = res.get("tx_json", {}).get("Sequence")
+    vault.escrow_tx_hash  = tx_hash
+    vault.escrow_sequence = sequence
+    if not vault.escrow_owner:
+        vault.escrow_owner = vault.buyer_address
+    db.commit()
+
+    logger.info(f"✅ Auto-confirmed via submit: escrow={escrow_id} hash={tx_hash[:16] if tx_hash else '?'}... engine={engine}")
+
+    return {
+        "status":    "submitted_and_confirmed",
+        "escrow_id": escrow_id,
+        "tx_hash":   tx_hash,
+        "sequence":  sequence,
+        "engine":    engine,
+        "next_step": (
+            "Vault is active. The worker submits proof via evaluate_escrow_work() "
+            "and payment releases automatically on PASS."
+        ),
     }
 
 

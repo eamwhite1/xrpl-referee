@@ -1663,13 +1663,49 @@ async def hire_and_pay(
         "cancel_after_human": vault_data.get("cancel_after_human"),
         "transaction":        prep_data.get("transaction"),
         "next_step": (
-            "Sign the 'transaction' dict with your buyer wallet and submit it to the XRPL. "
-            f"Then call confirm_escrow_transaction('{escrow_id}', tx_hash) to activate the vault. "
+            "Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
+            f"then call submit_escrow_transaction('{escrow_id}', signed.tx_blob) — "
+            "that submits to XRPL and activates the vault in one step. "
             "The worker submits their work via evaluate_escrow_work() and gets paid automatically on PASS."
         ),
         "free_tier": vault_data.get("free_tier"),
         "audits_remaining": vault_data.get("audits_remaining"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Submit signed escrow transaction (buyer flow, step 2 of 2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
+    """
+    Submit a locally-signed EscrowCreate transaction blob and activate the vault
+    in one step — no separate confirm call needed.
+
+    Buyer flow:
+      1. Call hire_and_pay() → get 'transaction' dict
+      2. Sign the transaction locally:
+           from xrpl.wallet import Wallet
+           from xrpl.core.keypairs import sign
+           import json, xrpl
+           wallet = Wallet.from_seed("sBuyerSeed")
+           signed = wallet.sign(transaction_dict)   # returns SignedTransaction
+           tx_blob = signed.tx_blob
+      3. Call submit_escrow_transaction(escrow_id, tx_blob) → vault activated, done.
+
+    Args:
+        escrow_id: The escrow ID from hire_and_pay() or create_escrow_vault()
+        tx_blob:   Hex-encoded signed transaction from your XRPL wallet
+    """
+    res = httpx.post(
+        f"{BASE_URL}/escrow/{escrow_id}/submit",
+        json={"tx_blob": tx_blob},
+        timeout=30,
+    )
+    if res.status_code == 200:
+        return res.json()
+    return {"error": res.status_code, "detail": res.text[:300]}
 
 
 # ---------------------------------------------------------------------------
@@ -1711,9 +1747,16 @@ async def create_agent_wallet() -> dict:
             "from_wallet":   "Have a funded wallet send 1+ XRP to the address via XRPL payment.",
             "testnet_faucet": "https://xrpl.org/xrp-testnet-faucet.html",
         },
+        "worker_note": (
+            "If you are a WORKER: you may not need to pre-fund this wallet at all. "
+            "XRPL auto-creates an account when it receives its first payment ≥ 1 XRP. "
+            "If the job you claim pays ≥ 1 XRP, your wallet will be activated by the escrow "
+            "release itself — just generate the keypair, claim the job, and do the work."
+        ),
         "next_step": (
-            "Once funded, use get_wallet_trust_score(address) to verify activation, "
-            "then list_open_jobs() to find work or post_job() to hire."
+            "WORKER: call list_open_jobs() then claim_job(job_id) with this address — "
+            "if the job pays ≥ 1 XRP your wallet activates on first payment. "
+            "BUYER: fund with ≥ 1 XRP, then call hire_and_pay() to create escrow."
         ),
     }
 
