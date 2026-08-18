@@ -419,6 +419,20 @@ class PaymentLog(Base):
     timestamp    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class FreeAuditUsage(Base):
+    """Tracks free audit credits consumed per wallet address."""
+    __tablename__ = "free_audit_usage"
+    id             = Column(Integer, primary_key=True, index=True)
+    wallet_address = Column(String, index=True, nullable=False)
+    escrow_id      = Column(String, nullable=False)
+    resource       = Column(String, nullable=True)
+    timestamp      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+FREE_AUDIT_LIMIT       = 3    # free audits per wallet
+FREE_AUDIT_MIN_SCORE   = 25   # wallet trust score must meet this threshold
+
+
 class EscrowVault(Base):
     __tablename__ = "escrow_vault"
     escrow_id         = Column(String, primary_key=True, index=True)
@@ -506,6 +520,7 @@ class JobPosting(Base):
     escrow_id          = Column(String,   nullable=True)    # set by buyer after escrow created
     buyer_email        = Column(String,   nullable=True)    # optional — notified on new bids
     buyer_callback_url = Column(String,   nullable=True)    # optional — agent webhook on new bids
+    claimable          = Column(Boolean,  default=False)    # workers can self-award without bid/award cycle
     award_token_hash   = Column(String,   nullable=True)    # SHA-256 of the one-time award token
     award_token        = Column(String,   nullable=True)    # plaintext — needed to embed in bid emails
     required_nft_issuer   = Column(String,   nullable=True)  # require NFT from this issuer wallet
@@ -1240,6 +1255,14 @@ def run_migrations():
             created_at     TIMESTAMP
         )""",
         "CREATE UNIQUE INDEX IF NOT EXISTS wallet_rating_unique ON wallet_rating (escrow_id, rater_address)",
+        """CREATE TABLE IF NOT EXISTS free_audit_usage (
+            id             SERIAL PRIMARY KEY,
+            wallet_address VARCHAR NOT NULL,
+            escrow_id      VARCHAR NOT NULL,
+            resource       VARCHAR,
+            timestamp      TIMESTAMP
+        )""",
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS claimable BOOLEAN DEFAULT FALSE",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -1897,6 +1920,39 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
         return await verify_x402_v2_payment(payment_signature, escrow_id, db, resource)
 
     if not fee_hash:
+        # ── Free tier: grant up to FREE_AUDIT_LIMIT audits for established wallets ──
+        # Extract buyer_address from escrow record if available
+        free_wallet = None
+        try:
+            vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+            if vault and vault.buyer_address:
+                free_wallet = vault.buyer_address
+        except Exception:
+            pass
+
+        if free_wallet:
+            used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
+            if used < FREE_AUDIT_LIMIT:
+                # Fetch trust score to gate on wallet quality
+                try:
+                    score_data = await compute_xrpl_trust_score(free_wallet, db)
+                    score = score_data.get("score", 0)
+                except Exception:
+                    score = 0
+
+                if score >= FREE_AUDIT_MIN_SCORE:
+                    db.add(FreeAuditUsage(wallet_address=free_wallet, escrow_id=escrow_id, resource=resource))
+                    db.commit()
+                    remaining = FREE_AUDIT_LIMIT - used - 1
+                    logger.info(f"🎁 FREE AUDIT granted: wallet={free_wallet} score={score} used={used+1}/{FREE_AUDIT_LIMIT}")
+                    return {
+                        "free_tier": True,
+                        "audits_remaining": remaining,
+                        "sender": free_wallet,
+                        "amount_xrp": 0,
+                        "message": f"Free audit applied ({used + 1}/{FREE_AUDIT_LIMIT}). {remaining} free audit{'s' if remaining != 1 else ''} remaining for this wallet.",
+                    }
+
         _raise_402(resource, "Payment required. Provide a fee_hash (x402 v1) or PAYMENT-SIGNATURE header (x402 v2).", min_xrp=required_xrp)
 
     # Route EVM transaction hashes (0x-prefixed, 66 chars) to Base USDC verification
@@ -4061,6 +4117,83 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
 
 
+class PrepareEscrowRequest(BaseModel):
+    escrow_id:        str
+    buyer_address:    str
+    worker_address:   str
+    amount_xrp:       Optional[float] = None
+    amount_rlusd:     Optional[float] = None
+    currency:         str = "XRP"
+    cancel_after_hrs: int = 168
+
+
+@app.post("/escrow/prepare")
+async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db)):
+    """
+    Build a ready-to-sign XRPL EscrowCreate transaction without requiring
+    the buyer to have any XRPL library installed.
+
+    The caller signs the returned transaction dict with their wallet (e.g. via
+    xrpl-py wallet.sign(), Xaman, or any XRPL signer) and submits the blob.
+    They then call POST /escrow/{escrow_id}/confirm with the tx hash.
+
+    This endpoint does NOT create the vault record — call POST /escrow/generate
+    first (to register the escrow and get the condition), then call this endpoint
+    to get the signable transaction.
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+    if not vault:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Escrow '{req.escrow_id}' not found. Call POST /escrow/generate first.",
+        )
+
+    try:
+        client     = AsyncJsonRpcClient(XRPL_URL)
+        acct_res   = await client.request(AccountInfo(account=req.buyer_address, ledger_index="current"))
+        acct_data  = acct_res.result["account_data"]
+        sequence   = acct_data["Sequence"]
+        ledger_res = await client.request(Fee())
+        base_fee   = int(ledger_res.result.get("drops", {}).get("base_fee", 12))
+        current_ledger = ledger_res.result.get("ledger_current_index", 0)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch XRPL account info: {e}")
+
+    currency = req.currency.upper()
+    if currency == "RLUSD" and req.amount_rlusd:
+        amount_field = {"currency": RLUSD_HEX, "issuer": RLUSD_ISSUER, "value": str(req.amount_rlusd)}
+    else:
+        amount_xrp = req.amount_xrp or (vault.amount_xrp or 0)
+        amount_field = str(int(amount_xrp * 1_000_000))
+
+    cancel_after_ripple = None
+    if vault.cancel_after_ts:
+        cancel_after_ripple = int(vault.cancel_after_ts.timestamp()) - RIPPLE_EPOCH
+
+    tx = {
+        "TransactionType":    "EscrowCreate",
+        "Account":            req.buyer_address,
+        "Destination":        req.worker_address,
+        "Amount":             amount_field,
+        "Condition":          vault.condition,
+        "Fee":                str(base_fee),
+        "Sequence":           sequence,
+        "LastLedgerSequence": current_ledger + 20,
+    }
+    if cancel_after_ripple:
+        tx["CancelAfter"] = cancel_after_ripple
+
+    return {
+        "escrow_id":   req.escrow_id,
+        "transaction": tx,
+        "instructions": (
+            "Sign this transaction with your buyer wallet and submit the signed blob to the XRPL. "
+            "Then call POST /escrow/{escrow_id}/confirm with the resulting tx hash."
+        ),
+        "condition": vault.condition,
+    }
+
+
 @app.get("/escrow/{escrow_id}")
 async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
@@ -5544,6 +5677,86 @@ async def get_bid(bid_id: str, db: Session = Depends(get_db)):
     if not bid:
         raise HTTPException(status_code=404, detail=f"Bid '{bid_id}' not found.")
     return {"bid_id": bid.id, "job_id": bid.job_id, "status": bid.status}
+
+
+@app.post("/jobs/{job_id}/claim")
+async def claim_job(job_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Worker agent claims an open job and self-awards it without a bid/award cycle.
+
+    Only works on jobs that are explicitly marked claimable (posted with
+    claimable=True). The job transitions to 'awarded', the caller's wallet
+    becomes the worker, and the buyer is notified via webhook if configured.
+
+    Returns the agreed XRP amount and escrow creation instructions so the
+    buyer (or agent acting as buyer) can immediately call /escrow/generate
+    (or the prepare_escrow endpoint) to lock funds.
+    """
+    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    if job.status != "open":
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open (status: {job.status}).")
+    if not getattr(job, "claimable", False):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Job '{job_id}' is not directly claimable. "
+                "Submit a bid via POST /jobs/{job_id}/bid instead."
+            ),
+        )
+
+    worker_address = (body.get("worker_address") or "").strip()
+    if not worker_address or not worker_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
+
+    worker_name  = (body.get("worker_name") or "").strip()
+    worker_email = (body.get("worker_email") or "").strip() or None
+
+    import uuid
+    bid_id = f"BID-{uuid.uuid4().hex[:8].upper()}"
+
+    bid = Bid(
+        id             = bid_id,
+        job_id         = job_id,
+        worker_address = worker_address,
+        worker_name    = worker_name,
+        worker_email   = worker_email,
+        proposed_xrp   = job.budget_xrp or 0,
+        proposal       = "Direct claim",
+        status         = "accepted",
+    )
+    db.add(bid)
+
+    job.status         = "awarded"
+    job.awarded_bid_id = bid_id
+    db.commit()
+
+    logger.info(f"🎯 JOB CLAIMED: {job_id} → worker={worker_address}")
+
+    import asyncio
+    if job.buyer_callback_url:
+        asyncio.create_task(fire_bid_awarded_webhook(
+            callback_url   = job.buyer_callback_url,
+            bid_id         = bid_id,
+            job_id         = job_id,
+            job_title      = job.title,
+            agreed_xrp     = bid.proposed_xrp,
+            worker_address = worker_address,
+        ))
+
+    return {
+        "status":         "claimed",
+        "job_id":         job_id,
+        "bid_id":         bid_id,
+        "worker_address": worker_address,
+        "agreed_xrp":     bid.proposed_xrp,
+        "next_step": (
+            f"Buyer must create the escrow: call prepare_escrow or create_escrow_vault() "
+            f"with worker_address='{worker_address}' and amount_xrp={bid.proposed_xrp}. "
+            f"Sign the returned EscrowCreate transaction and confirm via confirm_escrow_transaction()."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

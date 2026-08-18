@@ -1424,6 +1424,255 @@ async def get_dex_quote(
 
 
 # ---------------------------------------------------------------------------
+# High-level abstraction tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Claim Job",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def claim_job(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job ID to claim, from list_marketplace_jobs(). Job must have claimable=True.",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Your XRPL Address",
+        description="Your XRPL wallet address (r...) to receive payment when the work is approved.",
+    )],
+    worker_name: Annotated[str, Field(
+        title="Worker Name",
+        description="Your agent name or identifier, shown to the buyer.",
+    )] = "",
+    worker_email: Annotated[str, Field(
+        title="Worker Email",
+        description="Optional email for notifications. AI agents can omit this.",
+    )] = "",
+) -> dict:
+    """
+    Directly claim an open bounty job without going through the bid/award cycle.
+
+    Only works on jobs where claimable=True. The job is immediately awarded to your
+    wallet — no waiting for buyer approval. The buyer is notified via webhook.
+
+    After claiming, the buyer (or buyer agent) must create the escrow:
+      1. claim_job() — you call this
+      2. prepare_escrow() — buyer calls this to get a ready-to-sign transaction
+      3. Buyer signs and submits the EscrowCreate
+      4. Do the work, then call evaluate_escrow_work() to get paid
+
+    Returns:
+        status, job_id, bid_id, worker_address, agreed_xrp, next_step.
+    """
+    body = {"worker_address": worker_address}
+    if worker_name:
+        body["worker_name"] = worker_name
+    if worker_email:
+        body["worker_email"] = worker_email
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(f"{REFEREE_BASE}/jobs/{job_id}/claim", json=body)
+        if res.status_code == 403:
+            return {"error": "not_claimable", "message": res.json().get("detail", "Job is not directly claimable. Use submit_bid() instead.")}
+        if res.status_code == 409:
+            return {"error": "not_open", "message": res.json().get("detail", "Job is not open.")}
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"Job '{job_id}' not found."}
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Prepare Escrow Transaction",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def prepare_escrow(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code from create_escrow_vault().",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Buyer XRPL Address",
+        description="XRPL address (r...) of the buyer who will sign the EscrowCreate.",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="XRPL address (r...) of the worker who will receive payment on approval.",
+    )],
+    amount_xrp: Annotated[float | None, Field(
+        title="XRP Amount",
+        description="Amount of XRP to lock. Required for XRP escrow.",
+    )] = None,
+    currency: Annotated[str, Field(
+        title="Currency",
+        description='Currency to lock. "XRP" or "RLUSD".',
+    )] = "XRP",
+) -> dict:
+    """
+    Build a ready-to-sign XRPL EscrowCreate transaction — no XRPL library required.
+
+    Call create_escrow_vault() first to register the escrow and get the condition.
+    Then call this tool to get a complete transaction dict pre-filled with the
+    current ledger sequence, fee, and condition.
+
+    The buyer signs the returned transaction dict with their wallet and submits it
+    to the XRPL. Then call confirm_escrow_transaction() with the tx hash.
+
+    This is the low-friction path — the agent never has to construct an XRPL
+    transaction manually.
+
+    Returns:
+        transaction (ready-to-sign dict), escrow_id, condition, instructions.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/prepare",
+            json={
+                "escrow_id":      escrow_id,
+                "buyer_address":  buyer_address,
+                "worker_address": worker_address,
+                "amount_xrp":     amount_xrp,
+                "currency":       currency.upper(),
+            },
+        )
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"Escrow '{escrow_id}' not found. Call create_escrow_vault() first."}
+        if res.status_code == 502:
+            return {"error": "xrpl_unavailable", "message": res.json().get("detail", "Could not fetch XRPL account info.")}
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Hire and Pay",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def hire_and_pay(
+    task: Annotated[str, Field(
+        title="Task Description",
+        description="Detailed description of what the worker must deliver. The AI referee evaluates against this — be precise.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Your XRPL Address",
+        description="Your XRPL wallet address (r...) — you are the buyer.",
+    )],
+    amount_xrp: Annotated[float, Field(
+        title="Bounty (XRP)",
+        description="Amount of XRP to lock in escrow as the bounty.",
+        gt=0,
+    )],
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="XRPL address (r...) of the worker to hire directly. Get this from direct_hire() or award_job().",
+    )],
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="Unique receipt code for this escrow, e.g. AT-7X9K-2MQ4. Must be unique.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="Protocol Fee Hash",
+        description="64-char hex hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier (if eligible).",
+    )] = "",
+    cancel_after_hrs: Annotated[int, Field(
+        title="Deadline (hours)",
+        description="Hours until escrow auto-cancels if worker doesn't deliver. Default 168 = 7 days.",
+    )] = 168,
+    buyer_name: Annotated[str, Field(
+        title="Buyer Name",
+        description="Your name or agent identifier.",
+    )] = "",
+) -> dict:
+    """
+    One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
+
+    This combines create_escrow_vault() + prepare_escrow() into a single call.
+    The agent only needs to sign the returned transaction and confirm it —
+    no manual XRPL transaction construction required.
+
+    Typical flow:
+      1. hire_and_pay() — register vault, get ready-to-sign EscrowCreate tx
+      2. Sign transaction with your wallet and submit to XRPL
+      3. confirm_escrow_transaction(escrow_id, tx_hash) — activate the vault
+      4. Worker submits work, agent calls evaluate_escrow_work() to release payment
+
+    Returns:
+        escrow_id, transaction (ready-to-sign), condition, cancel_after_human,
+        next_step instructions.
+    """
+    # Step 1: create the vault
+    vault_body = {
+        "escrow_id":        escrow_id,
+        "fee_hash":         fee_hash or None,
+        "project_label":    task[:80],
+        "buyer_name":       buyer_name or buyer_address,
+        "buyer_address":    buyer_address,
+        "task_description": task,
+        "worker_address":   worker_address,
+        "currency":         "XRP",
+        "amount_xrp":       amount_xrp,
+        "cancel_after_hrs": cancel_after_hrs,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
+        if vault_res.status_code == 402:
+            data = vault_res.json()
+            return {
+                "error": "payment_required",
+                "message": "Protocol fee required. Pay 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_hash.",
+                "accepts": data.get("accepts", []),
+            }
+        if vault_res.status_code != 200:
+            return {"error": "vault_creation_failed", "message": vault_res.text[:300]}
+
+        vault_data = vault_res.json()
+
+        # Step 2: prepare the ready-to-sign transaction
+        prep_res = await client.post(
+            f"{REFEREE_BASE}/escrow/prepare",
+            json={
+                "escrow_id":      escrow_id,
+                "buyer_address":  buyer_address,
+                "worker_address": worker_address,
+                "amount_xrp":     amount_xrp,
+                "currency":       "XRP",
+            },
+        )
+        if prep_res.status_code != 200:
+            return {
+                "error":      "prepare_failed",
+                "message":    prep_res.text[:300],
+                "vault":      vault_data,
+                "next_step":  "Vault created. Build and sign EscrowCreate manually using the condition above.",
+            }
+
+        prep_data = prep_res.json()
+
+    return {
+        "escrow_id":          escrow_id,
+        "condition":          vault_data.get("condition"),
+        "cancel_after_human": vault_data.get("cancel_after_human"),
+        "transaction":        prep_data.get("transaction"),
+        "next_step": (
+            "Sign the 'transaction' dict with your buyer wallet and submit it to the XRPL. "
+            f"Then call confirm_escrow_transaction('{escrow_id}', tx_hash) to activate the vault. "
+            "The worker submits their work via evaluate_escrow_work() and gets paid automatically on PASS."
+        ),
+        "free_tier": vault_data.get("free_tier"),
+        "audits_remaining": vault_data.get("audits_remaining"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP Prompt Templates
 # ---------------------------------------------------------------------------
 
