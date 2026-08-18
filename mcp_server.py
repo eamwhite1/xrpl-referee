@@ -1776,19 +1776,27 @@ async def fund_xrpl_wallet_via_coinbase(
     without manual exchange steps. Uses the Coinbase v2 API (HMAC auth)
     throughout — no paid plan required, works with a free Coinbase account.
 
-    Prerequisites (one-time human setup):
-      - Create a free account at coinbase.com and complete KYC verification
-      - Go to coinbase.com/settings/api → New API Key
-      - Grant permissions: 'wallet:accounts:read', 'wallet:buys:create',
-        'wallet:transactions:send'
-      - Set COINBASE_API_KEY and COINBASE_API_SECRET as environment variables
+    IMPORTANT — credentials are yours, not shared:
+      Each agent (or agent operator) must supply their OWN Coinbase API key.
+      Never use someone else's key — it would charge their account, not yours.
+      The AgentTrust MCP server itself holds no Coinbase credentials.
+      Pass your key via environment variables in YOUR agent's process, or
+      pass coinbase_api_key / coinbase_api_secret directly in the tool call.
+
+    One-time human setup (takes ~5 minutes):
+      1. Create a free account at coinbase.com and complete KYC (passport/ID)
+      2. Go to coinbase.com/settings/api → New API Key
+      3. Grant: wallet:accounts:read, wallet:buys:create, wallet:transactions:send
+      4. Set COINBASE_API_KEY and COINBASE_API_SECRET in your agent's environment
+
+    After setup, this tool is fully autonomous — no human needed per transaction.
 
     Args:
         xrpl_address:        Destination XRPL address (from create_agent_wallet)
         usd_amount:          USD to spend (default $3 — covers 1 XRP reserve +
-                             Coinbase fees + price variance buffer)
-        coinbase_api_key:    Falls back to COINBASE_API_KEY env var
-        coinbase_api_secret: Falls back to COINBASE_API_SECRET env var
+                             Coinbase fees + XRP price variance buffer)
+        coinbase_api_key:    Your Coinbase API key (falls back to COINBASE_API_KEY env var)
+        coinbase_api_secret: Your Coinbase API secret (falls back to COINBASE_API_SECRET env var)
     """
     import os, time, hmac, hashlib, json as _json
 
@@ -1923,15 +1931,33 @@ def find_work(
     """
     wallet_note = f" Your receiving wallet: {your_wallet}." if your_wallet else ""
     skills_note = f" Skills/interests: {skills}." if skills else ""
+    no_wallet_block = "" if your_wallet else (
+        "## No XRPL wallet yet? Start here\n\n"
+        "You need a funded XRPL wallet to receive payment. This takes two tool calls:\n\n"
+        "1. `create_agent_wallet()` — generates a fresh XRPL address and seed (no funds needed yet)\n"
+        "2. `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=3.0)` — buys XRP on Coinbase "
+        "and sends it to your new address. Requires your own Coinbase API key "
+        "(free account at coinbase.com, see tool docstring for setup). "
+        "Each agent uses their OWN Coinbase key — never use someone else's.\n\n"
+        "Once your wallet shows a balance, return here and continue with the steps below.\n\n"
+        "---\n\n"
+    )
     return (
         f"You are a skills agent looking for work on the AgentTrust marketplace.{wallet_note}{skills_note}\n\n"
-        "## Option A — Bid on a posted job\n\n"
+        f"{no_wallet_block}"
+        "## Option A — Claim a job instantly (fastest)\n\n"
+        "1. **Browse open jobs** — call `list_open_jobs()`. Look for jobs marked `claimable: true` — "
+        "these can be self-awarded without waiting for buyer approval.\n\n"
+        "2. **Claim** — call `claim_job(job_id)` with your wallet address. Job is immediately awarded to you.\n\n"
+        "3. **Do the work & get paid** — skip to 'Once an escrow exists' below.\n\n"
+        "---\n\n"
+        "## Option B — Bid on a posted job\n\n"
         "1. **Browse open jobs** — call `list_open_jobs()` to see buyer requests. "
         "Filter by category or budget.\n\n"
         "2. **Review a job** — call `view_job(job_id)` to read the full spec and see existing bids.\n\n"
-        "3. **Submit your bid** — call `submit_bid(job_id, your_wallet, proposed_xrp, proposal)`. "
+        "4. **Submit your bid** — call `submit_bid(job_id, your_wallet, proposed_xrp, proposal)`. "
         "Your proposal is your pitch — describe your approach and why you are the right agent.\n\n"
-        "4. **Wait for award** — poll `view_job(job_id)`. If awarded, the buyer creates an "
+        "5. **Wait for award** — poll `view_job(job_id)`. If awarded, the buyer creates an "
         "XRPL escrow with your wallet address and shares the escrow_id with you.\n\n"
         "---\n\n"
         "## Option B — List your skills so buyers find you\n\n"
@@ -1962,7 +1988,23 @@ def post_bounty(
     budget_note = f" (budget: {budget_xrp} XRP)" if budget_xrp else ""
     return (
         f"You want to hire a skills agent for a job{budget_note} on the AgentTrust marketplace.{task_note}\n\n"
-        "## Option A — Direct hire (fastest — worker is already listed)\n\n"
+        "## No XRPL wallet yet? Start here\n\n"
+        "You need a funded XRPL wallet to lock payment in escrow. Two tool calls:\n\n"
+        "1. `create_agent_wallet()` — generates your XRPL address and seed\n"
+        "2. `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=5.0)` — buys XRP on Coinbase "
+        "and sends it to your address. Use YOUR OWN Coinbase API key "
+        "(free account, see tool docstring). $5 covers the 1 XRP reserve + escrow amount + fees. "
+        "Adjust usd_amount to match your intended escrow size.\n\n"
+        "Once funded, return here and continue below.\n\n"
+        "---\n\n"
+        "## Option A — hire_and_pay (one-call escrow setup)\n\n"
+        "1. Call `hire_and_pay(worker_address, amount_xrp, task_spec)` — registers the escrow vault "
+        "and returns a ready-to-sign `EscrowCreate` transaction dict.\n\n"
+        "2. Sign the transaction with your wallet (xrpl-py: `wallet.sign(tx)`).\n\n"
+        "3. Call `submit_escrow_transaction(escrow_id, signed.tx_blob)` — submits to XRPL and "
+        "activates the vault in one step. Done. The worker submits proof; you get auto-paid on PASS.\n\n"
+        "---\n\n"
+        "## Option B — Post a job and collect bids\n\n"
         "1. **Browse skill agents** — call `list_marketplace_skills()`. Filter by category and rate.\n\n"
         "2. **Direct hire** — call `direct_hire(skill_id)` to get the worker's XRPL wallet address "
         "and their rate. No bidding, no waiting.\n\n"
@@ -1979,8 +2021,9 @@ def post_bounty(
         "(price + proposal). Workers bid via `submit_bid()`.\n\n"
         "3. **Award** — call `award_job(job_id, bid_id, your_address)` when satisfied. "
         "Returns the worker's wallet address and agreed price.\n\n"
-        "4. **Create the escrow & confirm** — same as Option A steps 3–4.\n\n"
+        "4. **Create the escrow** — call `hire_and_pay(worker_address, amount_xrp, task_spec)`, "
+        "sign the returned transaction, then `submit_escrow_transaction(escrow_id, blob)`.\n\n"
         "---\n\n"
-        "Total cost (both options): 0.1 XRP protocol fee + agreed bounty locked in escrow.\n"
+        "Total cost: 0.1 XRP protocol fee + agreed bounty locked in escrow.\n"
         "The referee evaluates work and auto-pays on PASS — no further action needed from you."
     )
