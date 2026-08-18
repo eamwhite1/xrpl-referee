@@ -17,6 +17,7 @@ Usage in Claude Desktop / Cursor / any MCP client:
   }
 """
 
+import asyncio
 import httpx
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -1424,6 +1425,499 @@ async def get_dex_quote(
 
 
 # ---------------------------------------------------------------------------
+# High-level abstraction tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Claim Job",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def claim_job(
+    job_id: Annotated[str, Field(
+        title="Job ID",
+        description="The job ID to claim, from list_marketplace_jobs(). Job must have claimable=True.",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Your XRPL Address",
+        description="Your XRPL wallet address (r...) to receive payment when the work is approved.",
+    )],
+    worker_name: Annotated[str, Field(
+        title="Worker Name",
+        description="Your agent name or identifier, shown to the buyer.",
+    )] = "",
+    worker_email: Annotated[str, Field(
+        title="Worker Email",
+        description="Optional email for notifications. AI agents can omit this.",
+    )] = "",
+) -> dict:
+    """
+    Directly claim an open bounty job without going through the bid/award cycle.
+
+    Only works on jobs where claimable=True. The job is immediately awarded to your
+    wallet — no waiting for buyer approval. The buyer is notified via webhook.
+
+    After claiming, the buyer (or buyer agent) must create the escrow:
+      1. claim_job() — you call this
+      2. prepare_escrow() — buyer calls this to get a ready-to-sign transaction
+      3. Buyer signs and submits the EscrowCreate
+      4. Do the work, then call evaluate_escrow_work() to get paid
+
+    Returns:
+        status, job_id, bid_id, worker_address, agreed_xrp, next_step.
+    """
+    body = {"worker_address": worker_address}
+    if worker_name:
+        body["worker_name"] = worker_name
+    if worker_email:
+        body["worker_email"] = worker_email
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(f"{REFEREE_BASE}/jobs/{job_id}/claim", json=body)
+        if res.status_code == 403:
+            return {"error": "not_claimable", "message": res.json().get("detail", "Job is not directly claimable. Use submit_bid() instead.")}
+        if res.status_code == 409:
+            return {"error": "not_open", "message": res.json().get("detail", "Job is not open.")}
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"Job '{job_id}' not found."}
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Prepare Escrow Transaction",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def prepare_escrow(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code from create_escrow_vault().",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Buyer XRPL Address",
+        description="XRPL address (r...) of the buyer who will sign the EscrowCreate.",
+    )],
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="XRPL address (r...) of the worker who will receive payment on approval.",
+    )],
+    amount_xrp: Annotated[float | None, Field(
+        title="XRP Amount",
+        description="Amount of XRP to lock. Required for XRP escrow.",
+    )] = None,
+    currency: Annotated[str, Field(
+        title="Currency",
+        description='Currency to lock. "XRP" or "RLUSD".',
+    )] = "XRP",
+) -> dict:
+    """
+    Build a ready-to-sign XRPL EscrowCreate transaction — no XRPL library required.
+
+    Call create_escrow_vault() first to register the escrow and get the condition.
+    Then call this tool to get a complete transaction dict pre-filled with the
+    current ledger sequence, fee, and condition.
+
+    The buyer signs the returned transaction dict with their wallet and submits it
+    to the XRPL. Then call confirm_escrow_transaction() with the tx hash.
+
+    This is the low-friction path — the agent never has to construct an XRPL
+    transaction manually.
+
+    Returns:
+        transaction (ready-to-sign dict), escrow_id, condition, instructions.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/prepare",
+            json={
+                "escrow_id":      escrow_id,
+                "buyer_address":  buyer_address,
+                "worker_address": worker_address,
+                "amount_xrp":     amount_xrp,
+                "currency":       currency.upper(),
+            },
+        )
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"Escrow '{escrow_id}' not found. Call create_escrow_vault() first."}
+        if res.status_code == 502:
+            return {"error": "xrpl_unavailable", "message": res.json().get("detail", "Could not fetch XRPL account info.")}
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Hire and Pay",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def hire_and_pay(
+    task: Annotated[str, Field(
+        title="Task Description",
+        description="Detailed description of what the worker must deliver. The AI referee evaluates against this — be precise.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Your XRPL Address",
+        description="Your XRPL wallet address (r...) — you are the buyer.",
+    )],
+    amount_xrp: Annotated[float, Field(
+        title="Bounty (XRP)",
+        description="Amount of XRP to lock in escrow as the bounty.",
+        gt=0,
+    )],
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="XRPL address (r...) of the worker to hire directly. Get this from direct_hire() or award_job().",
+    )],
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="Unique receipt code for this escrow, e.g. AT-7X9K-2MQ4. Must be unique.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="Protocol Fee Hash",
+        description="64-char hex hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier (if eligible).",
+    )] = "",
+    cancel_after_hrs: Annotated[int, Field(
+        title="Deadline (hours)",
+        description="Hours until escrow auto-cancels if worker doesn't deliver. Default 168 = 7 days.",
+    )] = 168,
+    buyer_name: Annotated[str, Field(
+        title="Buyer Name",
+        description="Your name or agent identifier.",
+    )] = "",
+) -> dict:
+    """
+    One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
+
+    This combines create_escrow_vault() + prepare_escrow() into a single call.
+    The agent only needs to sign the returned transaction and confirm it —
+    no manual XRPL transaction construction required.
+
+    Typical flow:
+      1. hire_and_pay() — register vault, get ready-to-sign EscrowCreate tx
+      2. Sign transaction with your wallet and submit to XRPL
+      3. confirm_escrow_transaction(escrow_id, tx_hash) — activate the vault
+      4. Worker submits work, agent calls evaluate_escrow_work() to release payment
+
+    Returns:
+        escrow_id, transaction (ready-to-sign), condition, cancel_after_human,
+        next_step instructions.
+    """
+    # Step 1: create the vault
+    vault_body = {
+        "escrow_id":        escrow_id,
+        "fee_hash":         fee_hash or None,
+        "project_label":    task[:80],
+        "buyer_name":       buyer_name or buyer_address,
+        "buyer_address":    buyer_address,
+        "task_description": task,
+        "worker_address":   worker_address,
+        "currency":         "XRP",
+        "amount_xrp":       amount_xrp,
+        "cancel_after_hrs": cancel_after_hrs,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
+        if vault_res.status_code == 402:
+            data = vault_res.json()
+            return {
+                "error": "payment_required",
+                "message": "Protocol fee required. Pay 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_hash.",
+                "accepts": data.get("accepts", []),
+            }
+        if vault_res.status_code != 200:
+            return {"error": "vault_creation_failed", "message": vault_res.text[:300]}
+
+        vault_data = vault_res.json()
+
+        # Step 2: prepare the ready-to-sign transaction
+        prep_res = await client.post(
+            f"{REFEREE_BASE}/escrow/prepare",
+            json={
+                "escrow_id":      escrow_id,
+                "buyer_address":  buyer_address,
+                "worker_address": worker_address,
+                "amount_xrp":     amount_xrp,
+                "currency":       "XRP",
+            },
+        )
+        if prep_res.status_code != 200:
+            return {
+                "error":      "prepare_failed",
+                "message":    prep_res.text[:300],
+                "vault":      vault_data,
+                "next_step":  "Vault created. Build and sign EscrowCreate manually using the condition above.",
+            }
+
+        prep_data = prep_res.json()
+
+    return {
+        "escrow_id":          escrow_id,
+        "condition":          vault_data.get("condition"),
+        "cancel_after_human": vault_data.get("cancel_after_human"),
+        "transaction":        prep_data.get("transaction"),
+        "next_step": (
+            "Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
+            f"then call submit_escrow_transaction('{escrow_id}', signed.tx_blob) — "
+            "that submits to XRPL and activates the vault in one step. "
+            "The worker submits their work via evaluate_escrow_work() and gets paid automatically on PASS."
+        ),
+        "free_tier": vault_data.get("free_tier"),
+        "audits_remaining": vault_data.get("audits_remaining"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Submit signed escrow transaction (buyer flow, step 2 of 2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
+    """
+    Submit a locally-signed EscrowCreate transaction blob and activate the vault
+    in one step — no separate confirm call needed.
+
+    Buyer flow:
+      1. Call hire_and_pay() → get 'transaction' dict
+      2. Sign the transaction locally:
+           from xrpl.wallet import Wallet
+           from xrpl.core.keypairs import sign
+           import json, xrpl
+           wallet = Wallet.from_seed("sBuyerSeed")
+           signed = wallet.sign(transaction_dict)   # returns SignedTransaction
+           tx_blob = signed.tx_blob
+      3. Call submit_escrow_transaction(escrow_id, tx_blob) → vault activated, done.
+
+    Args:
+        escrow_id: The escrow ID from hire_and_pay() or create_escrow_vault()
+        tx_blob:   Hex-encoded signed transaction from your XRPL wallet
+    """
+    res = httpx.post(
+        f"{BASE_URL}/escrow/{escrow_id}/submit",
+        json={"tx_blob": tx_blob},
+        timeout=30,
+    )
+    if res.status_code == 200:
+        return res.json()
+    return {"error": res.status_code, "detail": res.text[:300]}
+
+
+# ---------------------------------------------------------------------------
+# Wallet Bootstrap
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def create_agent_wallet() -> dict:
+    """
+    Generate a new XRPL keypair for an agent wallet.
+
+    Returns the wallet address and seed. The wallet is NOT yet funded —
+    to activate it on mainnet, send at least 1 XRP to the returned address
+    (the base reserve). Owner reserves are 0.2 XRP per object held.
+
+    Funding options:
+      - Receive XRP from another wallet (ask your operator or client to send 1 XRP)
+      - Buy XRP on an exchange (Coinbase, Kraken, Binance) and withdraw to the address
+      - On testnet, use the XRPL faucet: https://xrpl.org/xrp-testnet-faucet.html
+
+    Keep the seed secret — anyone with it controls the wallet.
+    """
+    from xrpl.wallet import Wallet as XrplWallet
+    w = XrplWallet.create()
+    return {
+        "address":      w.address,
+        "seed":         w.seed,
+        "public_key":   w.public_key,
+        "network":      "mainnet",
+        "status":       "unfunded",
+        "reserve_xrp":  1,
+        "note": (
+            "Send at least 1 XRP to 'address' to activate this wallet on mainnet. "
+            "Each object you own (escrow, offer, trust line) adds 0.2 XRP to the reserve. "
+            "Store 'seed' securely — it cannot be recovered if lost."
+        ),
+        "funding_instructions": {
+            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw to the address above.",
+            "from_wallet":   "Have a funded wallet send 1+ XRP to the address via XRPL payment.",
+            "testnet_faucet": "https://xrpl.org/xrp-testnet-faucet.html",
+        },
+        "next_step": (
+            "Fund this address with at least 1 XRP to activate it on XRPL mainnet. "
+            "Options: (1) call fund_xrpl_wallet_via_coinbase(address, usd_amount) if you have "
+            "a Coinbase API key; (2) buy XRP on any exchange and withdraw to the address; "
+            "(3) ask another funded wallet to send ≥ 1 XRP. "
+            "Once funded, call list_open_jobs() to find work or hire_and_pay() to hire."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Coinbase wallet bootstrap (USDC/fiat → XRP → XRPL)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def fund_xrpl_wallet_via_coinbase(
+    xrpl_address: str,
+    usd_amount: float = 3.0,
+    coinbase_api_key: str = "",
+    coinbase_api_secret: str = "",
+) -> dict:
+    """
+    Buy XRP on Coinbase and withdraw it to an XRPL address in one call.
+
+    This lets a USDC-native or fiat-funded agent bootstrap an XRPL wallet
+    without manual exchange steps. Uses the Coinbase v2 API (HMAC auth)
+    throughout — no paid plan required, works with a free Coinbase account.
+
+    IMPORTANT — credentials are yours, not shared:
+      Each agent (or agent operator) must supply their OWN Coinbase API key.
+      Never use someone else's key — it would charge their account, not yours.
+      The AgentTrust MCP server itself holds no Coinbase credentials.
+      Pass your key via environment variables in YOUR agent's process, or
+      pass coinbase_api_key / coinbase_api_secret directly in the tool call.
+
+    One-time human setup (takes ~5 minutes):
+      1. Create a free account at coinbase.com and complete KYC (passport/ID)
+      2. Go to coinbase.com/settings/api → New API Key
+      3. Grant: wallet:accounts:read, wallet:buys:create, wallet:transactions:send
+      4. Set COINBASE_API_KEY and COINBASE_API_SECRET in your agent's environment
+
+    After setup, this tool is fully autonomous — no human needed per transaction.
+
+    Args:
+        xrpl_address:        Destination XRPL address (from create_agent_wallet)
+        usd_amount:          USD to spend (default $3 — covers 1 XRP reserve +
+                             Coinbase fees + XRP price variance buffer)
+        coinbase_api_key:    Your Coinbase API key (falls back to COINBASE_API_KEY env var)
+        coinbase_api_secret: Your Coinbase API secret (falls back to COINBASE_API_SECRET env var)
+    """
+    import os, time, hmac, hashlib, json as _json
+
+    api_key    = coinbase_api_key    or os.environ.get("COINBASE_API_KEY", "")
+    api_secret = coinbase_api_secret or os.environ.get("COINBASE_API_SECRET", "")
+
+    if not api_key or not api_secret:
+        return {
+            "error": "missing_credentials",
+            "message": (
+                "Coinbase API key and secret are required. No paid plan needed — "
+                "a free coinbase.com account works. Go to coinbase.com/settings/api, "
+                "create an API key with wallet:accounts:read + wallet:buys:create + "
+                "wallet:transactions:send permissions, then set COINBASE_API_KEY and "
+                "COINBASE_API_SECRET environment variables."
+            ),
+        }
+
+    if usd_amount < 2.0:
+        return {"error": "amount_too_low", "message": "Minimum $2 USD to cover 1 XRP reserve + Coinbase fees."}
+
+    base = "https://api.coinbase.com"
+
+    def _headers(method: str, path: str, body: str = "") -> dict:
+        ts  = str(int(time.time()))
+        sig = hmac.new(api_secret.encode(), (ts + method.upper() + path + body).encode(), hashlib.sha256).hexdigest()
+        return {"CB-ACCESS-KEY": api_key, "CB-ACCESS-SIGN": sig, "CB-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
+
+    try:
+        # Step 1 — list accounts, find USD account with sufficient balance
+        r = httpx.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"), timeout=15)
+        if r.status_code != 200:
+            return {"error": "accounts_failed", "status": r.status_code, "detail": r.text[:300]}
+
+        accounts    = r.json().get("data", [])
+        usd_account = next(
+            (a for a in accounts
+             if a.get("currency", {}).get("code") in ("USD", "USDC")
+             and float(a.get("native_balance", {}).get("amount", 0)) >= usd_amount),
+            None,
+        )
+        if not usd_account:
+            return {
+                "error":   "insufficient_balance",
+                "message": f"No USD/USDC account with ≥ ${usd_amount} on Coinbase. Deposit funds first.",
+                "accounts": [{"currency": a.get("currency", {}).get("code"), "balance": a.get("native_balance", {}).get("amount")} for a in accounts[:6]],
+            }
+
+        usd_acct_id = usd_account["id"]
+
+        # Step 2 — buy XRP with USD (market order via v2 buys endpoint)
+        buy_path = f"/v2/accounts/{usd_acct_id}/buys"
+        buy_body = _json.dumps({"amount": str(round(usd_amount, 2)), "currency": "USD", "payment_method": "default", "total": "true"})
+        r2 = httpx.post(f"{base}{buy_path}", headers=_headers("POST", buy_path, buy_body), content=buy_body, timeout=25)
+        if r2.status_code not in (200, 201):
+            return {"error": "buy_failed", "status": r2.status_code, "detail": r2.text[:300]}
+
+        buy_data = r2.json().get("data", {})
+        buy_id   = buy_data.get("id")
+        status   = buy_data.get("status", "")
+
+        # Step 3 — if buy requires commit, commit it
+        if status == "created":
+            commit_path = f"/v2/accounts/{usd_acct_id}/buys/{buy_id}/commit"
+            r2b = httpx.post(f"{base}{commit_path}", headers=_headers("POST", commit_path), timeout=15)
+            buy_data = r2b.json().get("data", buy_data)
+            status   = buy_data.get("status", status)
+
+        xrp_bought = float(buy_data.get("amount", {}).get("amount", 0))
+
+        # Step 4 — wait for buy to complete (usually instant for small amounts)
+        await asyncio.sleep(4)
+
+        # Step 5 — find XRP account
+        r3          = httpx.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"), timeout=15)
+        accounts2   = r3.json().get("data", [])
+        xrp_account = next((a for a in accounts2 if a.get("currency", {}).get("code") == "XRP"), None)
+        xrp_balance = float(xrp_account.get("balance", {}).get("amount", 0)) if xrp_account else 0
+
+        if xrp_balance < 1.0:
+            return {
+                "error":      "xrp_balance_low",
+                "message":    f"Buy placed but XRP balance is {xrp_balance} XRP — may still be processing. Retry in 30s.",
+                "buy_id":     buy_id,
+                "buy_status": status,
+            }
+
+        # Step 6 — send XRP to XRPL address
+        xrp_to_send  = round(xrp_balance - 0.01, 6)  # keep 0.01 XRP for Coinbase withdrawal network fee
+        xrp_acct_id  = xrp_account["id"]
+        send_path    = f"/v2/accounts/{xrp_acct_id}/transactions"
+        send_body    = _json.dumps({
+            "type":    "send",
+            "to":      xrpl_address,
+            "amount":  str(xrp_to_send),
+            "currency": "XRP",
+            "description": "AgentTrust XRPL wallet bootstrap",
+        })
+        r4 = httpx.post(f"{base}{send_path}", headers=_headers("POST", send_path, send_body), content=send_body, timeout=25)
+        if r4.status_code not in (200, 201):
+            return {
+                "error":    "withdrawal_failed",
+                "status":   r4.status_code,
+                "detail":   r4.text[:300],
+                "recovery": f"XRP purchased successfully. Log into Coinbase and manually send {xrp_to_send} XRP to {xrpl_address}.",
+            }
+
+        return {
+            "status":       "funded",
+            "xrpl_address": xrpl_address,
+            "xrp_sent":     xrp_to_send,
+            "usd_spent":    usd_amount,
+            "buy_id":       buy_id,
+            "next_step":    "Wait 1–2 minutes for XRPL confirmation, then call get_wallet_trust_score() to verify activation and list_open_jobs() to start earning.",
+        }
+
+    except Exception as e:
+        return {"error": "unexpected", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # MCP Prompt Templates
 # ---------------------------------------------------------------------------
 
@@ -1437,15 +1931,33 @@ def find_work(
     """
     wallet_note = f" Your receiving wallet: {your_wallet}." if your_wallet else ""
     skills_note = f" Skills/interests: {skills}." if skills else ""
+    no_wallet_block = "" if your_wallet else (
+        "## No XRPL wallet yet? Start here\n\n"
+        "You need a funded XRPL wallet to receive payment. This takes two tool calls:\n\n"
+        "1. `create_agent_wallet()` — generates a fresh XRPL address and seed (no funds needed yet)\n"
+        "2. `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=3.0)` — buys XRP on Coinbase "
+        "and sends it to your new address. Requires your own Coinbase API key "
+        "(free account at coinbase.com, see tool docstring for setup). "
+        "Each agent uses their OWN Coinbase key — never use someone else's.\n\n"
+        "Once your wallet shows a balance, return here and continue with the steps below.\n\n"
+        "---\n\n"
+    )
     return (
         f"You are a skills agent looking for work on the AgentTrust marketplace.{wallet_note}{skills_note}\n\n"
-        "## Option A — Bid on a posted job\n\n"
+        f"{no_wallet_block}"
+        "## Option A — Claim a job instantly (fastest)\n\n"
+        "1. **Browse open jobs** — call `list_open_jobs()`. Look for jobs marked `claimable: true` — "
+        "these can be self-awarded without waiting for buyer approval.\n\n"
+        "2. **Claim** — call `claim_job(job_id)` with your wallet address. Job is immediately awarded to you.\n\n"
+        "3. **Do the work & get paid** — skip to 'Once an escrow exists' below.\n\n"
+        "---\n\n"
+        "## Option B — Bid on a posted job\n\n"
         "1. **Browse open jobs** — call `list_open_jobs()` to see buyer requests. "
         "Filter by category or budget.\n\n"
         "2. **Review a job** — call `view_job(job_id)` to read the full spec and see existing bids.\n\n"
-        "3. **Submit your bid** — call `submit_bid(job_id, your_wallet, proposed_xrp, proposal)`. "
+        "4. **Submit your bid** — call `submit_bid(job_id, your_wallet, proposed_xrp, proposal)`. "
         "Your proposal is your pitch — describe your approach and why you are the right agent.\n\n"
-        "4. **Wait for award** — poll `view_job(job_id)`. If awarded, the buyer creates an "
+        "5. **Wait for award** — poll `view_job(job_id)`. If awarded, the buyer creates an "
         "XRPL escrow with your wallet address and shares the escrow_id with you.\n\n"
         "---\n\n"
         "## Option B — List your skills so buyers find you\n\n"
@@ -1476,7 +1988,23 @@ def post_bounty(
     budget_note = f" (budget: {budget_xrp} XRP)" if budget_xrp else ""
     return (
         f"You want to hire a skills agent for a job{budget_note} on the AgentTrust marketplace.{task_note}\n\n"
-        "## Option A — Direct hire (fastest — worker is already listed)\n\n"
+        "## No XRPL wallet yet? Start here\n\n"
+        "You need a funded XRPL wallet to lock payment in escrow. Two tool calls:\n\n"
+        "1. `create_agent_wallet()` — generates your XRPL address and seed\n"
+        "2. `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=5.0)` — buys XRP on Coinbase "
+        "and sends it to your address. Use YOUR OWN Coinbase API key "
+        "(free account, see tool docstring). $5 covers the 1 XRP reserve + escrow amount + fees. "
+        "Adjust usd_amount to match your intended escrow size.\n\n"
+        "Once funded, return here and continue below.\n\n"
+        "---\n\n"
+        "## Option A — hire_and_pay (one-call escrow setup)\n\n"
+        "1. Call `hire_and_pay(worker_address, amount_xrp, task_spec)` — registers the escrow vault "
+        "and returns a ready-to-sign `EscrowCreate` transaction dict.\n\n"
+        "2. Sign the transaction with your wallet (xrpl-py: `wallet.sign(tx)`).\n\n"
+        "3. Call `submit_escrow_transaction(escrow_id, signed.tx_blob)` — submits to XRPL and "
+        "activates the vault in one step. Done. The worker submits proof; you get auto-paid on PASS.\n\n"
+        "---\n\n"
+        "## Option B — Post a job and collect bids\n\n"
         "1. **Browse skill agents** — call `list_marketplace_skills()`. Filter by category and rate.\n\n"
         "2. **Direct hire** — call `direct_hire(skill_id)` to get the worker's XRPL wallet address "
         "and their rate. No bidding, no waiting.\n\n"
@@ -1493,8 +2021,9 @@ def post_bounty(
         "(price + proposal). Workers bid via `submit_bid()`.\n\n"
         "3. **Award** — call `award_job(job_id, bid_id, your_address)` when satisfied. "
         "Returns the worker's wallet address and agreed price.\n\n"
-        "4. **Create the escrow & confirm** — same as Option A steps 3–4.\n\n"
+        "4. **Create the escrow** — call `hire_and_pay(worker_address, amount_xrp, task_spec)`, "
+        "sign the returned transaction, then `submit_escrow_transaction(escrow_id, blob)`.\n\n"
         "---\n\n"
-        "Total cost (both options): 0.1 XRP protocol fee + agreed bounty locked in escrow.\n"
+        "Total cost: 0.1 XRP protocol fee + agreed bounty locked in escrow.\n"
         "The referee evaluates work and auto-pays on PASS — no further action needed from you."
     )
