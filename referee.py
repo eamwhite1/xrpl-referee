@@ -755,17 +755,23 @@ async def _get_xrpscan_account(wallet_address: str) -> dict | None:
 
 async def _get_xaman_kyc(wallet_address: str) -> bool:
     """
-    Check Xaman (XUMM) KYC status via XRPScan.
-    Returns True if the wallet holder has completed Xaman KYC, False otherwise.
+    Check Xaman KYC status via the Xaman platform API (direct, authenticated).
+    Returns True if the wallet holder has completed Xaman Global ID / KYC verification.
     Xaman KYC is a human identity verification — AI agent wallets will always return False.
     """
+    if not xumm_api_key or not xumm_api_secret:
+        logger.warning("Xaman KYC check skipped: XUMM_API_KEY/SECRET not configured")
+        return False
     try:
         async with httpx.AsyncClient(timeout=6.0) as client:
-            r = await client.get(f"{XRPSCAN_BASE}/account/{wallet_address}/xumm_kyc",
-                                 headers={"User-Agent": "AgentTrust/1.0"})
+            r = await client.get(
+                f"https://xumm.app/api/v1/platform/kyc-status/{wallet_address}",
+                headers={"X-API-Key": xumm_api_key, "X-API-Secret": xumm_api_secret},
+                params={"include_globalid": "true"},
+            )
             if r.status_code == 200:
                 data = r.json()
-                return bool(data.get("kycApproved") or data.get("kyc_approved") or data.get("approved"))
+                return bool(data.get("kycApproved") or data.get("kyc_approved"))
     except Exception as e:
         logger.warning(f"Xaman KYC check failed for {wallet_address}: {e}")
     return False
@@ -3218,7 +3224,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
       Wallet ownership proof   — 8 pts (on-chain AccountSet verification)
       Sanctions clear          — 7 pts; sanctioned wallets score 0 and are blocked from escrow
       Entity reputation        — up to 8 pts (XRPScan: verified entity +5, security flags +1 each)
-      Xaman KYC                — 5 pts (Xaman identity verification via XRPScan; human-only signal)
+      Xaman KYC                — 5 pts (Xaman Global ID verification via Xaman platform API; human-only signal)
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -3301,7 +3307,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         # AI agent wallets will never have this; it distinguishes verified humans from agents
         xaman_kyc_score = 5 if xaman_kyc else 0
 
-        # AgentTrust KYC signal — 10 pts if operator has completed Stripe Identity verification
+        # AgentTrust KYC signal — 10 pts if operator has completed AgentTrust identity verification
         agentrust_kyc_verified = False
         agentrust_kyc_score = 0
         if db:
@@ -6781,7 +6787,7 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
     return {"results": results}
 
 # ---------------------------------------------------------------------------
-# KYC — Stripe Identity + Checkout
+# KYC — Xaman Global ID verification
 # ---------------------------------------------------------------------------
 
 @app.post("/kyc/verify")
@@ -6826,8 +6832,8 @@ async def kyc_verify(wallet_address: str, db: Session = Depends(get_db)):
     return {
         "wallet_address": wallet_address,
         "kyc_verified": False,
-        "message": "Xaman KYC not detected for this wallet. Complete identity verification in the Xaman app (xumm.app) then call this endpoint again.",
-        "xaman_kyc_url": "https://xumm.app/kyc",
+        "message": "Xaman KYC not detected for this wallet. Complete identity verification via the Xaman Global ID xApp, then call this endpoint again.",
+        "xaman_kyc_url": "https://xumm.app/detect/xapp:xumm.kyc-onboarding",
     }
 
 
