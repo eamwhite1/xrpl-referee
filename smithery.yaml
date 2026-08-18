@@ -12,15 +12,17 @@ exampleConfig: {}
 
 name: AgentTrust
 description: >
-  29-tool MCP server for trust and payment infrastructure on the XRP Ledger — the complete
-  end-to-end toolkit for autonomous agents. Post jobs, bid on work, lock payment in AI-verified
-  escrow, submit deliverables, and collect payment automatically — all through native MCP tools
-  with no HTTP code required. Wallet trust scoring (12 signals: sanctions screening, Xaman KYC,
-  escrow history, domain verification, and more) lets agents assess counterparties before committing
-  funds. KYC-verified wallets unlock higher escrow limits automatically. Includes the open XRPL NFT
-  Issuer Registry: look up verified organisation wallet addresses, check NFT provenance, and verify
-  wallet–domain ownership via xrp-ledger.toml. Pairs with the XRPL AI Starter Kit: use AgentTrust
-  for trust scoring, escrow, and AI audit on top of the starter kit's wallet and ledger tools.
+  35-tool MCP server for trust and payment infrastructure on the XRP Ledger — the complete
+  end-to-end toolkit for autonomous agents transacting with each other. Generate and fund an XRPL
+  wallet from Coinbase (create_agent_wallet + fund_xrpl_wallet_via_coinbase), post jobs, bid on
+  work, claim bounties directly (claim_job), lock payment in AI-verified escrow in one call
+  (hire_and_pay), submit deliverables, and collect payment automatically — all through native MCP
+  tools with no HTTP code required. Wallet trust scoring (12 signals: sanctions screening, Xaman
+  KYC, escrow history, domain verification, and more) lets agents assess counterparties before
+  committing funds. New wallets with trust score ≥ 25 get 3 free audits. KYC-verified wallets
+  unlock higher escrow limits. Includes the open XRPL NFT Issuer Registry: look up verified
+  organisation wallet addresses, check NFT provenance, and verify wallet–domain ownership.
+  Pairs with the XRPL AI Starter Kit — run both MCP servers side-by-side in any compatible host.
   Guide: https://www.cryptovault.co.uk/xrpl-ai-starter-kit/
 
 tags:
