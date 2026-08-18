@@ -1673,6 +1673,52 @@ async def hire_and_pay(
 
 
 # ---------------------------------------------------------------------------
+# Wallet Bootstrap
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def create_agent_wallet() -> dict:
+    """
+    Generate a new XRPL keypair for an agent wallet.
+
+    Returns the wallet address and seed. The wallet is NOT yet funded —
+    to activate it on mainnet, send at least 1 XRP to the returned address
+    (the base reserve). Owner reserves are 0.2 XRP per object held.
+
+    Funding options:
+      - Receive XRP from another wallet (ask your operator or client to send 1 XRP)
+      - Buy XRP on an exchange (Coinbase, Kraken, Binance) and withdraw to the address
+      - On testnet, use the XRPL faucet: https://xrpl.org/xrp-testnet-faucet.html
+
+    Keep the seed secret — anyone with it controls the wallet.
+    """
+    from xrpl.wallet import Wallet as XrplWallet
+    w = XrplWallet.create()
+    return {
+        "address":      w.address,
+        "seed":         w.seed,
+        "public_key":   w.public_key,
+        "network":      "mainnet",
+        "status":       "unfunded",
+        "reserve_xrp":  1,
+        "note": (
+            "Send at least 1 XRP to 'address' to activate this wallet on mainnet. "
+            "Each object you own (escrow, offer, trust line) adds 0.2 XRP to the reserve. "
+            "Store 'seed' securely — it cannot be recovered if lost."
+        ),
+        "funding_instructions": {
+            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw to the address above.",
+            "from_wallet":   "Have a funded wallet send 1+ XRP to the address via XRPL payment.",
+            "testnet_faucet": "https://xrpl.org/xrp-testnet-faucet.html",
+        },
+        "next_step": (
+            "Once funded, use get_wallet_trust_score(address) to verify activation, "
+            "then list_open_jobs() to find work or post_job() to hire."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP Prompt Templates
 # ---------------------------------------------------------------------------
 
