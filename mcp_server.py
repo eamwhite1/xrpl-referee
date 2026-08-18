@@ -1773,24 +1773,22 @@ async def fund_xrpl_wallet_via_coinbase(
     Buy XRP on Coinbase and withdraw it to an XRPL address in one call.
 
     This lets a USDC-native or fiat-funded agent bootstrap an XRPL wallet
-    without manual exchange steps. It uses the Coinbase Advanced Trade API
-    to place a market buy order for XRP-USD, then initiates a withdrawal
-    to the specified XRPL address.
+    without manual exchange steps. Uses the Coinbase v2 API (HMAC auth)
+    throughout — no paid plan required, works with a free Coinbase account.
 
-    Prerequisites:
-      - A Coinbase account with KYC completed (one-time human step)
-      - A Coinbase Advanced Trade API key with 'trade' and 'transfer' permissions
-      - Set COINBASE_API_KEY and COINBASE_API_SECRET env vars, or pass them directly
+    Prerequisites (one-time human setup):
+      - Create a free account at coinbase.com and complete KYC verification
+      - Go to coinbase.com/settings/api → New API Key
+      - Grant permissions: 'wallet:accounts:read', 'wallet:buys:create',
+        'wallet:transactions:send'
+      - Set COINBASE_API_KEY and COINBASE_API_SECRET as environment variables
 
     Args:
-        xrpl_address:        The XRPL address to fund (from create_agent_wallet)
-        usd_amount:          USD worth of XRP to buy and send (default $3 — covers
-                             1 XRP reserve + buffer for fees and price variance)
-        coinbase_api_key:    Coinbase API key (falls back to COINBASE_API_KEY env var)
-        coinbase_api_secret: Coinbase API secret (falls back to COINBASE_API_SECRET env var)
-
-    Note: Coinbase charges a small spread/fee on market orders. Recommend $3+ to ensure
-    the delivered XRP covers the 1 XRP base reserve after fees and price movement.
+        xrpl_address:        Destination XRPL address (from create_agent_wallet)
+        usd_amount:          USD to spend (default $3 — covers 1 XRP reserve +
+                             Coinbase fees + price variance buffer)
+        coinbase_api_key:    Falls back to COINBASE_API_KEY env var
+        coinbase_api_secret: Falls back to COINBASE_API_SECRET env var
     """
     import os, time, hmac, hashlib, json as _json
 
@@ -1801,101 +1799,101 @@ async def fund_xrpl_wallet_via_coinbase(
         return {
             "error": "missing_credentials",
             "message": (
-                "Coinbase API key and secret are required. "
-                "Set COINBASE_API_KEY and COINBASE_API_SECRET environment variables, "
-                "or pass them directly to this tool. "
-                "Create an API key at https://www.coinbase.com/settings/api with "
-                "'trade' and 'transfer' permissions."
+                "Coinbase API key and secret are required. No paid plan needed — "
+                "a free coinbase.com account works. Go to coinbase.com/settings/api, "
+                "create an API key with wallet:accounts:read + wallet:buys:create + "
+                "wallet:transactions:send permissions, then set COINBASE_API_KEY and "
+                "COINBASE_API_SECRET environment variables."
             ),
         }
 
     if usd_amount < 2.0:
-        return {"error": "amount_too_low", "message": "Minimum $2 USD to cover 1 XRP reserve + fees."}
-
-    def _cb_headers(method: str, path: str, body: str = "") -> dict:
-        timestamp = str(int(time.time()))
-        message   = timestamp + method.upper() + path + body
-        signature = hmac.new(api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()  # noqa: S324
-        return {
-            "CB-ACCESS-KEY":       api_key,
-            "CB-ACCESS-SIGN":      signature,
-            "CB-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type":        "application/json",
-        }
+        return {"error": "amount_too_low", "message": "Minimum $2 USD to cover 1 XRP reserve + Coinbase fees."}
 
     base = "https://api.coinbase.com"
 
-    try:
-        # Step 1: Get accounts to find the USD/USDC account
-        r = httpx.get(f"{base}/api/v3/brokerage/accounts", headers=_cb_headers("GET", "/api/v3/brokerage/accounts"), timeout=15)
-        if r.status_code != 200:
-            return {"error": "coinbase_accounts_failed", "detail": r.text[:300]}
+    def _headers(method: str, path: str, body: str = "") -> dict:
+        ts  = str(int(time.time()))
+        sig = hmac.new(api_secret.encode(), (ts + method.upper() + path + body).encode(), hashlib.sha256).hexdigest()
+        return {"CB-ACCESS-KEY": api_key, "CB-ACCESS-SIGN": sig, "CB-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
 
-        accounts = r.json().get("accounts", [])
-        usd_account = next((a for a in accounts if a.get("currency") in ("USD", "USDC") and float(a.get("available_balance", {}).get("value", 0)) >= usd_amount), None)
+    try:
+        # Step 1 — list accounts, find USD account with sufficient balance
+        r = httpx.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"), timeout=15)
+        if r.status_code != 200:
+            return {"error": "accounts_failed", "status": r.status_code, "detail": r.text[:300]}
+
+        accounts    = r.json().get("data", [])
+        usd_account = next(
+            (a for a in accounts
+             if a.get("currency", {}).get("code") in ("USD", "USDC")
+             and float(a.get("native_balance", {}).get("amount", 0)) >= usd_amount),
+            None,
+        )
         if not usd_account:
             return {
-                "error": "insufficient_balance",
-                "message": f"No USD/USDC account with ≥ ${usd_amount} available on Coinbase. Deposit funds first.",
-                "accounts_found": [{"currency": a.get("currency"), "balance": a.get("available_balance", {}).get("value")} for a in accounts[:5]],
+                "error":   "insufficient_balance",
+                "message": f"No USD/USDC account with ≥ ${usd_amount} on Coinbase. Deposit funds first.",
+                "accounts": [{"currency": a.get("currency", {}).get("code"), "balance": a.get("native_balance", {}).get("amount")} for a in accounts[:6]],
             }
 
-        # Step 2: Place a market buy order for XRP-USD
-        order_body = _json.dumps({
-            "client_order_id": f"agenttrust-{int(time.time())}",
-            "product_id":      "XRP-USD",
-            "side":            "BUY",
-            "order_configuration": {
-                "market_market_ioc": {
-                    "quote_size": str(round(usd_amount, 2)),
-                }
-            },
-        })
-        r2 = httpx.post(f"{base}/api/v3/brokerage/orders", headers=_cb_headers("POST", "/api/v3/brokerage/orders", order_body), content=order_body, timeout=20)
+        usd_acct_id = usd_account["id"]
+
+        # Step 2 — buy XRP with USD (market order via v2 buys endpoint)
+        buy_path = f"/v2/accounts/{usd_acct_id}/buys"
+        buy_body = _json.dumps({"amount": str(round(usd_amount, 2)), "currency": "USD", "payment_method": "default", "total": "true"})
+        r2 = httpx.post(f"{base}{buy_path}", headers=_headers("POST", buy_path, buy_body), content=buy_body, timeout=25)
         if r2.status_code not in (200, 201):
-            return {"error": "order_failed", "detail": r2.text[:300]}
+            return {"error": "buy_failed", "status": r2.status_code, "detail": r2.text[:300]}
 
-        order_data  = r2.json()
-        order_id    = order_data.get("success_response", {}).get("order_id") or order_data.get("order_id")
-        if not order_id:
-            return {"error": "order_id_missing", "detail": order_data}
+        buy_data = r2.json().get("data", {})
+        buy_id   = buy_data.get("id")
+        status   = buy_data.get("status", "")
 
-        # Step 3: Wait briefly for fill, then get XRP account
-        await asyncio.sleep(3)
-        r3 = httpx.get(f"{base}/api/v3/brokerage/accounts", headers=_cb_headers("GET", "/api/v3/brokerage/accounts"), timeout=15)
-        accounts2   = r3.json().get("accounts", [])
-        xrp_account = next((a for a in accounts2 if a.get("currency") == "XRP"), None)
-        xrp_balance = float(xrp_account.get("available_balance", {}).get("value", 0)) if xrp_account else 0
+        # Step 3 — if buy requires commit, commit it
+        if status == "created":
+            commit_path = f"/v2/accounts/{usd_acct_id}/buys/{buy_id}/commit"
+            r2b = httpx.post(f"{base}{commit_path}", headers=_headers("POST", commit_path), timeout=15)
+            buy_data = r2b.json().get("data", buy_data)
+            status   = buy_data.get("status", status)
+
+        xrp_bought = float(buy_data.get("amount", {}).get("amount", 0))
+
+        # Step 4 — wait for buy to complete (usually instant for small amounts)
+        await asyncio.sleep(4)
+
+        # Step 5 — find XRP account
+        r3          = httpx.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"), timeout=15)
+        accounts2   = r3.json().get("data", [])
+        xrp_account = next((a for a in accounts2 if a.get("currency", {}).get("code") == "XRP"), None)
+        xrp_balance = float(xrp_account.get("balance", {}).get("amount", 0)) if xrp_account else 0
 
         if xrp_balance < 1.0:
             return {
-                "error":   "xrp_balance_low",
-                "message": f"Order placed (id={order_id}) but XRP balance is only {xrp_balance} XRP. Order may still be filling — retry in a few seconds.",
-                "order_id": order_id,
+                "error":      "xrp_balance_low",
+                "message":    f"Buy placed but XRP balance is {xrp_balance} XRP — may still be processing. Retry in 30s.",
+                "buy_id":     buy_id,
+                "buy_status": status,
             }
 
-        # Step 4: Withdraw XRP to the XRPL address
-        # Use the legacy v2 API for crypto withdrawals (still supported)
-        xrp_to_send  = round(xrp_balance * 0.95, 6)  # keep 5% buffer for Coinbase withdrawal fee
-        withdraw_body = _json.dumps({
-            "type":        "crypto",
-            "amount":      str(xrp_to_send),
-            "currency":    "XRP",
-            "crypto_address": xrpl_address,
+        # Step 6 — send XRP to XRPL address
+        xrp_to_send  = round(xrp_balance - 0.01, 6)  # keep 0.01 XRP for Coinbase withdrawal network fee
+        xrp_acct_id  = xrp_account["id"]
+        send_path    = f"/v2/accounts/{xrp_acct_id}/transactions"
+        send_body    = _json.dumps({
+            "type":    "send",
+            "to":      xrpl_address,
+            "amount":  str(xrp_to_send),
+            "currency": "XRP",
+            "description": "AgentTrust XRPL wallet bootstrap",
         })
-        acct_id = xrp_account.get("uuid") or xrp_account.get("id", "")
-        r4 = httpx.post(
-            f"{base}/v2/accounts/{acct_id}/transactions",
-            headers=_cb_headers("POST", f"/v2/accounts/{acct_id}/transactions", withdraw_body),
-            content=withdraw_body,
-            timeout=20,
-        )
+        r4 = httpx.post(f"{base}{send_path}", headers=_headers("POST", send_path, send_body), content=send_body, timeout=25)
         if r4.status_code not in (200, 201):
             return {
                 "error":    "withdrawal_failed",
+                "status":   r4.status_code,
                 "detail":   r4.text[:300],
-                "order_id": order_id,
-                "note":     f"XRP was purchased (order={order_id}) but withdrawal failed. Log into Coinbase and send {xrp_to_send} XRP to {xrpl_address} manually.",
+                "recovery": f"XRP purchased successfully. Log into Coinbase and manually send {xrp_to_send} XRP to {xrpl_address}.",
             }
 
         return {
@@ -1903,9 +1901,8 @@ async def fund_xrpl_wallet_via_coinbase(
             "xrpl_address": xrpl_address,
             "xrp_sent":     xrp_to_send,
             "usd_spent":    usd_amount,
-            "order_id":     order_id,
-            "withdrawal":   r4.json(),
-            "next_step":    "Wait 1–2 minutes for the XRPL ledger to confirm, then call get_wallet_trust_score() to verify activation.",
+            "buy_id":       buy_id,
+            "next_step":    "Wait 1–2 minutes for XRPL confirmation, then call get_wallet_trust_score() to verify activation and list_open_jobs() to start earning.",
         }
 
     except Exception as e:
