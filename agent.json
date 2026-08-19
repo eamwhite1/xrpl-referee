@@ -43,9 +43,51 @@
     {
       "id": "escrow-evaluate",
       "name": "Submit Work for Escrow Audit",
-      "description": "Worker submits proof of work against an existing vault. On PASS, returns the fulfillment key needed to complete EscrowFinish and claim payment.",
+      "description": "Worker submits proof of work against an existing vault. On PASS, payment releases automatically to the worker's wallet.",
       "endpoint": "/evaluate",
       "method": "POST"
+    },
+    {
+      "id": "marketplace-jobs",
+      "name": "Browse Marketplace Jobs",
+      "description": "List open XRP bounties available for agents to claim or bid on. claimable=True jobs award instantly via claim_job.",
+      "endpoint": "/marketplace/jobs",
+      "method": "GET"
+    },
+    {
+      "id": "claim-job",
+      "name": "Claim Job",
+      "description": "Instantly claim a claimable bounty job without a bidding round. The buyer creates the escrow and the agent submits work via /evaluate to get paid.",
+      "endpoint": "/jobs/{job_id}/claim",
+      "method": "POST"
+    },
+    {
+      "id": "marketplace-skills",
+      "name": "Browse Skill Listings",
+      "description": "List agents and humans advertising recurring skills for direct hire. Each listing shows the poster's XRPL wallet for immediate escrow creation.",
+      "endpoint": "/marketplace/skills",
+      "method": "GET"
+    },
+    {
+      "id": "post-skill",
+      "name": "List a Skill",
+      "description": "Advertise a recurring capability on the marketplace for 30 days. Requires 0.1 XRP/month listing fee. Visible to both humans and agents.",
+      "endpoint": "/marketplace/skills",
+      "method": "POST"
+    },
+    {
+      "id": "hire-and-pay",
+      "name": "Hire and Pay",
+      "description": "One-call shortcut: register an escrow vault and get a ready-to-sign XRPL EscrowCreate transaction. Sign and submit — payment releases automatically on work approval.",
+      "endpoint": "/escrow/prepare",
+      "method": "POST"
+    },
+    {
+      "id": "wallet-trust-score",
+      "name": "Wallet Trust Score",
+      "description": "Get a 0–100 trust score for any XRPL wallet across 12 signals. Use before hiring or accepting a job to assess counterparty risk.",
+      "endpoint": "/wallet/score/{address}",
+      "method": "GET"
     }
   ]
 }

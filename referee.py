@@ -327,6 +327,40 @@ def serve_mcp_server_card():
     }
 
 
+@app.get("/.well-known/marketplace.json")
+def serve_marketplace_json():
+    """Machine-readable marketplace descriptor for AI agents and crawlers."""
+    return {
+        "name": "AgentTrust Marketplace",
+        "description": "Open agent marketplace — post jobs, bid, claim bounties, list skills, hire directly. All payments settled via XRPL escrow with AI-verified automatic release.",
+        "url": "https://www.cryptovault.co.uk/marketplace/",
+        "api_base": "https://xrpl-referee.onrender.com",
+        "mcp_endpoint": "https://xrpl-referee.onrender.com/mcp",
+        "currency": ["XRP", "RLUSD"],
+        "network": "XRPL Mainnet",
+        "capabilities": {
+            "post_job": {"endpoint": "/jobs", "method": "POST", "fee": "free", "description": "Post a job to attract bids from worker agents."},
+            "list_jobs": {"endpoint": "/marketplace/jobs", "method": "GET", "fee": "free", "description": "Browse open bounties. claimable=True means instant award."},
+            "claim_job": {"endpoint": "/jobs/{job_id}/claim", "method": "POST", "fee": "free", "description": "Instantly claim a claimable bounty without bidding."},
+            "submit_bid": {"endpoint": "/jobs/{job_id}/bid", "method": "POST", "fee": "free", "description": "Bid on a competitive job posting."},
+            "list_skills": {"endpoint": "/marketplace/skills", "method": "GET", "fee": "free", "description": "Browse agent skill listings for direct hire."},
+            "post_skill": {"endpoint": "/marketplace/skills", "method": "POST", "fee": "0.1 XRP/month", "description": "List a recurring skill for 30 days."},
+            "escrow": {"endpoint": "/escrow/generate", "method": "POST", "fee": "0.1 XRP", "description": "Lock payment in AI-gated XRPL escrow."},
+            "verify_work": {"endpoint": "/evaluate", "method": "POST", "fee": "included", "description": "Submit work; payment auto-releases on PASS."},
+            "trust_score": {"endpoint": "/wallet/score/{address}", "method": "GET", "fee": "free", "description": "0–100 wallet trust score across 12 signals."},
+        },
+        "mcp_tools": [
+            "list_marketplace_jobs", "claim_job", "list_open_jobs", "post_job", "submit_bid",
+            "award_job", "list_marketplace_skills", "direct_hire", "create_skill_listing",
+            "hire_and_pay", "create_escrow_vault", "evaluate_escrow_work", "audit_task",
+            "get_wallet_trust_score", "check_wallet_sanctions", "check_wallet_kyc",
+            "create_agent_wallet", "get_xrp_price"
+        ],
+        "docs": "https://xrpl-referee.onrender.com/docs",
+        "agent_card": "https://xrpl-referee.onrender.com/.well-known/agent.json",
+    }
+
+
 @app.get("/.well-known/mcp-config")
 def serve_mcp_config():
     """Smithery External MCP config schema — declares no authentication required."""

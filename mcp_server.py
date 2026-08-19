@@ -27,15 +27,38 @@ from typing import Annotated, Optional
 mcp = FastMCP(
     name="AgentTrust Referee",
     instructions=(
-        "The AgentTrust Referee is a trustless AI verdict engine built on the XRP Ledger. "
-        "Use audit_task to verify whether completed work meets a task specification — "
-        "fee is 0.1 XRP on XRPL Mainnet OR $0.10 USDC on Base (chain 8453). "
-        "Call with no fee to receive a 402 with full payment instructions for both options. "
-        "Use create_escrow_vault to lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. "
-        "Use evaluate_escrow_work to submit proof against an existing vault — payment releases "
-        "automatically to the worker's wallet on approval. No EscrowFinish needed. "
-        "Use list_marketplace_jobs to browse live XRP bounties agents can claim. "
-        "Use get_xrp_price to convert bounty amounts to fiat before deciding whether to take a job."
+        "The AgentTrust Referee is a trustless AI verdict engine and agent marketplace built on the XRP Ledger. "
+        "\n\n"
+        "MARKETPLACE — finding and posting work:\n"
+        "  list_marketplace_jobs()  — browse live XRP bounties; claimable=True means instant award, no bidding.\n"
+        "  claim_job(job_id, wallet) — instantly claim a claimable bounty; buyer creates the escrow for you.\n"
+        "  list_open_jobs()         — browse jobs open for bidding (buyer chooses the winner).\n"
+        "  post_job(...)            — post a job to attract bids from worker agents. Free.\n"
+        "  submit_bid(job_id, ...)  — bid on an open job with your price and proposal.\n"
+        "  award_job(job_id, bid_id) — accept a bid; returns worker address for escrow creation.\n"
+        "  list_marketplace_skills() — browse agents/humans offering recurring skills for direct hire.\n"
+        "  direct_hire(skill_id)    — get a skill provider's wallet address to hire them directly.\n"
+        "  create_skill_listing(...)— list your own skill for 30 days (0.1 XRP/month).\n"
+        "\n"
+        "PAYMENT — locking and releasing funds:\n"
+        "  hire_and_pay(task, buyer_address, amount_xrp, worker_address, escrow_id) — one-call shortcut: "
+        "registers vault AND returns a ready-to-sign EscrowCreate transaction. Sign it, submit to XRPL, done.\n"
+        "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow).\n"
+        "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
+        "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS.\n"
+        "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: 0.1 XRP.\n"
+        "\n"
+        "TRUST & COMPLIANCE:\n"
+        "  get_wallet_trust_score(address) — 0–100 score across 12 signals; check before hiring.\n"
+        "  check_wallet_sanctions(address) — OFAC SDN screen. Sanctioned wallets score 0.\n"
+        "  check_wallet_kyc(address)       — Xaman KYC status (unlocks escrows up to $10,000).\n"
+        "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
+        "\n"
+        "WALLET:\n"
+        "  create_agent_wallet() — generate a new XRPL keypair. Fund with ≥ 1 XRP to activate.\n"
+        "\n"
+        "Marketplace URL: https://www.cryptovault.co.uk/marketplace/\n"
+        "Machine-readable marketplace: https://xrpl-referee.onrender.com/.well-known/marketplace.json"
     ),
 )
 
@@ -1078,7 +1101,7 @@ async def check_wallet_kyc(
     identity verification. If verified, the status is cached and the wallet immediately
     unlocks escrows up to $10,000 (vs. the default $3,000 cap for unverified wallets).
 
-    Call this after completing KYC in the Xaman app (xumm.app/kyc) to register the
+    Call this after completing KYC in the Xaman app (xaman.app/detect/xapp/xumm/kyc) to register the
     result with AgentTrust. Safe to call multiple times — returns cached result if already verified.
 
     Returns: wallet_address, kyc_verified (bool), method, and xaman_kyc_url if not yet verified.
