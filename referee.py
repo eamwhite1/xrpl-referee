@@ -756,7 +756,7 @@ async def _get_xrpscan_account(wallet_address: str) -> dict | None:
 async def _get_xaman_kyc(wallet_address: str) -> bool:
     """
     Check Xaman KYC status via the Xaman platform API (direct, authenticated).
-    Returns True if the wallet holder has completed Xaman Global ID / KYC verification.
+    Returns True if the wallet holder has completed Xaman KYC verification (powered by Veriff).
     Xaman KYC is a human identity verification — AI agent wallets will always return False.
     """
     if not xumm_api_key or not xumm_api_secret:
@@ -3224,7 +3224,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
       Wallet ownership proof   — 8 pts (on-chain AccountSet verification)
       Sanctions clear          — 7 pts; sanctioned wallets score 0 and are blocked from escrow
       Entity reputation        — up to 8 pts (XRPScan: verified entity +5, security flags +1 each)
-      Xaman KYC                — 5 pts (Xaman Global ID verification via Xaman platform API; human-only signal)
+      Xaman KYC                — 5 pts (Xaman KYC via Veriff, authenticated platform API; human-only signal)
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -6787,7 +6787,7 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
     return {"results": results}
 
 # ---------------------------------------------------------------------------
-# KYC — Xaman Global ID verification
+# KYC — Xaman KYC verification (powered by Veriff)
 # ---------------------------------------------------------------------------
 
 @app.post("/kyc/verify")
@@ -6832,8 +6832,8 @@ async def kyc_verify(wallet_address: str, db: Session = Depends(get_db)):
     return {
         "wallet_address": wallet_address,
         "kyc_verified": False,
-        "message": "Xaman KYC not detected for this wallet. Complete identity verification via the Xaman Global ID xApp, then call this endpoint again.",
-        "xaman_kyc_url": "https://xumm.app/detect/xapp:xumm.kyc-onboarding",
+        "message": "Xaman KYC not detected for this wallet. Complete identity verification via Xaman (powered by Veriff), then call this endpoint again.",
+        "xaman_kyc_url": "https://xaman.app/detect/xapp/xumm/kyc",
     }
 
 
