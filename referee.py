@@ -1425,26 +1425,23 @@ MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 _xrp_price_cache: dict = {"price": None, "fetched_at": 0.0}
 _XRP_PRICE_TTL   = 60   # seconds
 
-_price_fetch_lock = None  # initialised to asyncio.Lock() on first use
+_price_fetch_lock = None  # asyncio.Lock created lazily inside event loop
 
 async def _fetch_xrp_usd_price() -> float:
-    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s.
-    Uses a lock so concurrent cold-start requests share one outbound call."""
+    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s."""
     global _price_fetch_lock
-    if _price_fetch_lock is None:
-        import asyncio
-        _price_fetch_lock = asyncio.Lock()
+    try:
+        if _price_fetch_lock is None:
+            _price_fetch_lock = asyncio.Lock()
 
-    now = time.monotonic()
-    if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
-        return _xrp_price_cache["price"]
-
-    async with _price_fetch_lock:
-        # Re-check after acquiring lock — another coroutine may have just fetched
         now = time.monotonic()
         if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
             return _xrp_price_cache["price"]
-        try:
+
+        async with _price_fetch_lock:
+            now = time.monotonic()
+            if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
+                return _xrp_price_cache["price"]
             async with httpx.AsyncClient(timeout=3) as client:
                 r = await client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
@@ -1455,16 +1452,18 @@ async def _fetch_xrp_usd_price() -> float:
                     _xrp_price_cache["price"] = price
                     _xrp_price_cache["fetched_at"] = now
                     return price
-        except Exception as exc:
-            logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
-    return _xrp_price_cache["price"] or MIN_FEE_XRP  # last known or hardcoded fallback
+    except Exception as exc:
+        logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
+    return _xrp_price_cache["price"] or MIN_FEE_XRP
 
 async def get_required_fee_xrp() -> float:
     """Return the XRP amount equivalent to MIN_FEE_USD at the current market price."""
-    price = await _fetch_xrp_usd_price()
-    # Round up to 6 decimal places (1 drop precision), never below 1 drop
-    xrp = max(round(MIN_FEE_USD / price, 6), 0.000001)
-    return xrp
+    try:
+        price = await _fetch_xrp_usd_price()
+        xrp = max(round(MIN_FEE_USD / price, 6), 0.000001)
+        return xrp
+    except Exception:
+        return MIN_FEE_XRP
 
 # Base chain USDC payment constants
 BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
