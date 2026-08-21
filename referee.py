@@ -2117,9 +2117,62 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
         raise HTTPException(status_code=400, detail=f"Transaction is '{tx_type}', not a Payment.")
     if dest.lower() != PROTOCOL_WALLET.lower():
         _raise_402(resource, f"Wrong destination. Expected {PROTOCOL_WALLET}, got {dest}.", min_xrp=required_xrp)
+    # IOU payment — check if it's RLUSD (Ripple's stablecoin on XRPL)
     if isinstance(raw_amount, dict):
-        raise HTTPException(status_code=400, detail="Protocol fees must be paid in XRP, not issued currency.")
+        currency = str(raw_amount.get("currency", "")).upper().strip()
+        issuer   = str(raw_amount.get("issuer", "")).strip()
+        value    = raw_amount.get("value", "0")
 
+        # Accept RLUSD (native 4-char code or hex representation)
+        is_rlusd_currency = currency in ("RLUSD", RLUSD_HEX.upper())
+        is_rlusd_issuer   = issuer == RLUSD_ISSUER
+
+        if not (is_rlusd_currency and is_rlusd_issuer):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Protocol fees must be paid in XRP or RLUSD (issuer {RLUSD_ISSUER}). "
+                    f"Received {currency} from issuer {issuer}."
+                ),
+            )
+
+        try:
+            rlusd_amount = float(value)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=f"Could not parse RLUSD amount: {value!r}")
+
+        MIN_FEE_RLUSD = 0.10
+        if rlusd_amount < (MIN_FEE_RLUSD - 0.000001):
+            _raise_402(
+                resource,
+                f"Insufficient RLUSD fee. Required ≥{MIN_FEE_RLUSD} RLUSD, received {rlusd_amount} RLUSD.",
+                min_xrp=required_xrp,
+            )
+
+        db.add(PaymentLog(
+            payment_hash=fee_hash,
+            purpose="setup_fee_rlusd",
+            sender=sender,
+            amount_xrp=None,
+            escrow_id=escrow_id,
+        ))
+        db.commit()
+
+        logger.info(f"✅ RLUSD FEE VERIFIED: {rlusd_amount} RLUSD from {sender} for escrow '{escrow_id}'")
+
+        import asyncio
+        asyncio.create_task(_telegram_notify(
+            f"💵 *RLUSD protocol fee received*\n"
+            f"Amount: `{rlusd_amount} RLUSD`\n"
+            f"From: `{sender}`\n"
+            f"Escrow: `{escrow_id}`\n"
+            f"Resource: `{resource}`\n"
+            f"Hash: `{fee_hash[:16]}…`"
+        ))
+
+        return {"sender": sender, "amount_rlusd": rlusd_amount}
+
+    # Native XRP payment
     amount_xrp = round(int(raw_amount) / 1_000_000, 6)
     if amount_xrp < (required_xrp - 0.000001):
         _raise_402(
