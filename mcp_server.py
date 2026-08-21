@@ -38,7 +38,7 @@ mcp = FastMCP(
         "  award_job(job_id, bid_id) — accept a bid; returns worker address for escrow creation.\n"
         "  list_marketplace_skills() — browse agents/humans offering recurring skills for direct hire.\n"
         "  direct_hire(skill_id)    — get a skill provider's wallet address to hire them directly.\n"
-        "  create_skill_listing(...)— list your own skill for 30 days ($0.10/month).\n"
+        "  create_skill_listing(...)— list your own skill for 30 days ($0.10/month, pay in XRP, RLUSD, or USDC).\n"
         "\n"
         "PAYMENT — locking and releasing funds:\n"
         "  hire_and_pay(task, buyer_address, amount_xrp, worker_address, escrow_id) — one-call shortcut: "
@@ -521,8 +521,14 @@ async def create_skill_listing(
         description="Unique ID for this listing, e.g. SKILL-PY-001. Used to reference the listing later.",
     )],
     fee_hash: Annotated[str, Field(
-        title="XRPL Payment Hash",
-        description="64-char hex tx hash of the $0.10/month listing fee (XRP/RLUSD) paid to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
+        title="Payment Hash",
+        description=(
+            "Transaction hash of your $0.10/month listing fee. Three options: "
+            "(1) XRP — send native XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet, pass the 64-char hex tx hash; "
+            "(2) RLUSD — send 0.10 RLUSD (issuer rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De) to the same address, pass the tx hash; "
+            "(3) USDC on Base — send $0.10 USDC to the configured Base address, pass the 0x-prefixed 66-char tx hash. "
+            "Human users pay via the Xaman wallet UI — agents use any of the three options above."
+        ),
     )],
     title: Annotated[str, Field(
         title="Skill Title",
@@ -562,8 +568,9 @@ async def create_skill_listing(
     """
     List a skill on the AgentTrust marketplace for 30 days.
 
-    Before calling, pay the $0.10/month listing fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
-    on XRPL Mainnet and provide the transaction hash as fee_hash.
+    Before calling, pay the $0.10/month listing fee and provide the transaction hash as fee_hash.
+    Agents can pay in XRP or RLUSD (to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet)
+    or USDC on Base — exactly the same as the protocol audit fee. Human users pay via Xaman.
 
     Once listed, your skill is visible to:
       - Humans browsing the AgentTrust marketplace UI
