@@ -86,11 +86,6 @@ class PaymentRequired(Exception):
 async def _lifespan(app):
     # Seed public registry entries from known XRPL organisations
     _seed_public_issuers()
-    # Pre-warm XRP price cache so first fee request never waits on CoinGecko
-    try:
-        await _fetch_xrp_usd_price()
-    except Exception:
-        pass
     # XUMM connectivity check
     await _verify_xumm()
     if _mcp_http_app is not None:
@@ -1419,76 +1414,16 @@ PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 
-# ---------------------------------------------------------------------------
-# XRP/USD price oracle — cached for 60 s, falls back to MIN_FEE_XRP
-# ---------------------------------------------------------------------------
-_xrp_price_cache: dict = {"price": None, "fetched_at": 0.0}
-_XRP_PRICE_TTL   = 60   # seconds
-
-_price_fetch_lock = None  # asyncio.Lock created lazily inside event loop
-
-async def _fetch_xrp_usd_price() -> float:
-    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s."""
-    global _price_fetch_lock
-    try:
-        if _price_fetch_lock is None:
-            _price_fetch_lock = asyncio.Lock()
-
-        now = time.monotonic()
-        if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
-            return _xrp_price_cache["price"]
-
-        async with _price_fetch_lock:
-            now = time.monotonic()
-            if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
-                return _xrp_price_cache["price"]
-            price = None
-            async with httpx.AsyncClient(timeout=4) as client:
-                # Binance — most reliable, no key needed
-                try:
-                    r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
-                    price = float(r.json()["price"])
-                    if price > 0:
-                        logger.info(f"XRP price: ${price:.4f} (binance)")
-                except Exception as exc:
-                    logger.warning(f"Binance XRP price failed: {exc}")
-
-                # Kraken fallback
-                if not price:
-                    try:
-                        r = await client.get("https://api.kraken.com/0/public/Ticker?pair=XRPUSD")
-                        price = float(list(r.json()["result"].values())[0]["c"][0])
-                        if price > 0:
-                            logger.info(f"XRP price: ${price:.4f} (kraken)")
-                    except Exception as exc:
-                        logger.warning(f"Kraken XRP price failed: {exc}")
-
-                # CoinGecko last resort
-                if not price:
-                    try:
-                        r = await client.get("https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd")
-                        price = float(r.json()["ripple"]["usd"])
-                        if price > 0:
-                            logger.info(f"XRP price: ${price:.4f} (coingecko)")
-                    except Exception as exc:
-                        logger.warning(f"CoinGecko XRP price failed: {exc}")
-
-            if price and price > 0:
-                _xrp_price_cache["price"] = price
-                _xrp_price_cache["fetched_at"] = now
-                return price
-    except Exception as exc:
-        logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
-    return _xrp_price_cache["price"] or MIN_FEE_XRP
-
 async def get_required_fee_xrp() -> float:
-    """Return the XRP amount equivalent to MIN_FEE_USD at the current market price."""
+    """Return the XRP amount equivalent to MIN_FEE_USD at the current market price.
+    Delegates to the existing _get_xrp_price_usd() which is already cached and battle-tested."""
     try:
-        price = await _fetch_xrp_usd_price()
-        xrp = max(round(MIN_FEE_USD / price, 6), 0.000001)
-        return xrp
+        price = await _get_xrp_price_usd()
+        if price and price > 0:
+            return max(round(MIN_FEE_USD / price, 6), 0.000001)
     except Exception:
-        return MIN_FEE_XRP
+        pass
+    return MIN_FEE_XRP
 
 # Base chain USDC payment constants
 BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
