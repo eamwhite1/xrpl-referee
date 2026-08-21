@@ -85,6 +85,11 @@ class PaymentRequired(Exception):
 async def _lifespan(app):
     # Seed public registry entries from known XRPL organisations
     _seed_public_issuers()
+    # Pre-warm XRP price cache so first fee request never waits on CoinGecko
+    try:
+        await _fetch_xrp_usd_price()
+    except Exception:
+        pass
     # XUMM connectivity check
     await _verify_xumm()
     if _mcp_http_app is not None:
@@ -1419,25 +1424,39 @@ MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 _xrp_price_cache: dict = {"price": None, "fetched_at": 0.0}
 _XRP_PRICE_TTL   = 60   # seconds
 
+_price_fetch_lock = None  # initialised to asyncio.Lock() on first use
+
 async def _fetch_xrp_usd_price() -> float:
-    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s."""
+    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s.
+    Uses a lock so concurrent cold-start requests share one outbound call."""
+    global _price_fetch_lock
+    if _price_fetch_lock is None:
+        import asyncio
+        _price_fetch_lock = asyncio.Lock()
+
     now = time.monotonic()
     if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
         return _xrp_price_cache["price"]
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": "ripple", "vs_currencies": "usd"},
-            )
-            price = float(r.json()["ripple"]["usd"])
-            if price > 0:
-                _xrp_price_cache["price"] = price
-                _xrp_price_cache["fetched_at"] = now
-                return price
-    except Exception as exc:
-        logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
-    return _xrp_price_cache["price"] or MIN_FEE_XRP  # use last known or hardcoded fallback
+
+    async with _price_fetch_lock:
+        # Re-check after acquiring lock — another coroutine may have just fetched
+        now = time.monotonic()
+        if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
+            return _xrp_price_cache["price"]
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": "ripple", "vs_currencies": "usd"},
+                )
+                price = float(r.json()["ripple"]["usd"])
+                if price > 0:
+                    _xrp_price_cache["price"] = price
+                    _xrp_price_cache["fetched_at"] = now
+                    return price
+        except Exception as exc:
+            logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
+    return _xrp_price_cache["price"] or MIN_FEE_XRP  # last known or hardcoded fallback
 
 async def get_required_fee_xrp() -> float:
     """Return the XRP amount equivalent to MIN_FEE_USD at the current market price."""
