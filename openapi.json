@@ -2,14 +2,14 @@
   "openapi": "3.1.0",
   "info": {
     "title": "AgentTrust Referee",
-    "description": "A trustless AI verdict engine for the agent economy. POST a task spec and proof of work, pay 0.1 XRP, receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
+    "description": "A trustless AI verdict engine for the agent economy. POST a task spec and proof of work, pay $0.10 (XRP, RLUSD, or USDC), receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
     "version": "7.0.0",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
       "currency": "XRP",
       "amount": "0.1",
       "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
-      "description": "Send 0.1 XRP to this address before calling /audit. Pass the transaction hash in the x-payment-hash header."
+      "description": "Send $0.10 (XRP or RLUSD) to this address before calling /audit. Pass the transaction hash in the x-payment-hash header."
     }
   },
   "servers": [
@@ -22,13 +22,13 @@
     "/audit": {
       "post": {
         "summary": "Standalone AI verdict — no escrow required",
-        "description": "The simplest integration. Pay 0.1 XRP, get a structured AI verdict on whether work meets spec. No vault, no receipt code, no XRPL escrow needed. Use /escrow/generate if you want funds locked and released automatically.",
+        "description": "The simplest integration. Pay $0.10 (XRP, RLUSD, or USDC), get a structured AI verdict on whether work meets spec. No vault, no receipt code, no XRPL escrow needed. Use /escrow/generate if you want funds locked and released automatically.",
         "operationId": "standaloneAudit",
         "parameters": [
           {
             "name": "x-payment-hash",
             "in": "header",
-            "description": "XRPL transaction hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
+            "description": "XRPL/Base transaction hash of your $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
             "required": false,
             "schema": { "type": "string" }
           }
@@ -53,7 +53,7 @@
                   },
                   "fee_hash": {
                     "type": "string",
-                    "description": "Alternative to x-payment-hash header. XRPL tx hash of 0.1 XRP payment."
+                    "description": "Alternative to x-payment-hash header. XRPL/Base tx hash of $0.10 payment."
                   }
                 }
               }
@@ -100,7 +100,7 @@
                 "required": ["escrow_id", "fee_hash", "buyer_name", "buyer_address", "task_description", "worker_address", "amount_xrp"],
                 "properties": {
                   "escrow_id":        { "type": "string", "description": "Unique receipt code e.g. AT-7X9K-2MQ4" },
-                  "fee_hash":         { "type": "string", "description": "XRPL tx hash of 0.1 XRP protocol fee" },
+                  "fee_hash":         { "type": "string", "description": "XRPL/Base tx hash of $0.10 protocol fee" },
                   "project_label":    { "type": "string", "description": "Human-readable job label e.g. Job-01" },
                   "buyer_name":       { "type": "string" },
                   "buyer_address":    { "type": "string", "description": "Buyer's XRPL wallet address" },

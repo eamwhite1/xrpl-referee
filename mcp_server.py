@@ -46,7 +46,7 @@ mcp = FastMCP(
         "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow).\n"
         "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
         "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS.\n"
-        "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: 0.1 XRP.\n"
+        "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
         "\n"
         "TRUST & COMPLIANCE:\n"
         "  get_wallet_trust_score(address) — 0–100 score across 12 signals; check before hiring.\n"
@@ -98,7 +98,7 @@ async def audit_task(
     Verify whether completed work meets a task specification using AI.
 
     Before calling, pay the fee via one of two options:
-      Option 1: Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet.
+      Option 1: Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet, or $0.10 USDC on Base.
       Option 2: Send $0.10 USDC on Base (chain 8453) — call with no fee first to get the address.
     Each fee_hash is single-use (anti-replay protection).
 
@@ -118,7 +118,7 @@ async def audit_task(
             },
         )
         if res.status_code == 402:
-            return {"error": "Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and provide the tx hash as fee_hash."}
+            return {"error": "Payment required. Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR or $0.10 USDC on Base, then provide the tx hash as fee_hash."}
         if res.status_code == 403:
             return {"error": "This fee_hash has already been used. Each payment hash is single-use."}
         res.raise_for_status()
@@ -159,7 +159,7 @@ async def create_escrow_vault(
     )],
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
-        description="Amount of XRP to lock in escrow. Required when currency is XRP. Minimum: 0.000001 XRP (1 drop — XRPL EscrowCreate minimum). Practically, ensure the bounty exceeds the 0.1 XRP protocol fee.",
+        description="Amount of XRP to lock in escrow. Required when currency is XRP. Minimum: 0.000001 XRP (1 drop — XRPL EscrowCreate minimum). Practically, ensure the bounty exceeds the $0.10 protocol fee.",
     )] = None,
     amount_rlusd: Annotated[float | None, Field(
         title="RLUSD Amount",
@@ -193,7 +193,7 @@ async def create_escrow_vault(
 
     Typical flow after job board negotiation:
       1. award_job() returns the worker's address and agreed price
-      2. Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
+      2. Pay $0.10 protocol fee (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
       3. Call this tool with worker_address from step 1
       4. Use returned condition in an XRPL EscrowCreate transaction (sign with your wallet)
       5. Call confirm_escrow_transaction() with the EscrowCreate tx hash
@@ -522,7 +522,7 @@ async def create_skill_listing(
     )],
     fee_hash: Annotated[str, Field(
         title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the 0.1 XRP monthly listing fee paid to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
+        description="64-char hex tx hash of the $0.10/month listing fee (XRP/RLUSD) paid to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
     )],
     title: Annotated[str, Field(
         title="Skill Title",
@@ -589,7 +589,7 @@ async def create_skill_listing(
             },
         )
         if res.status_code == 402:
-            return {"error": "Payment required. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and provide the tx hash as fee_hash."}
+            return {"error": "Payment required. Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR or $0.10 USDC on Base, then provide the tx hash as fee_hash."}
         res.raise_for_status()
         return res.json()
 
@@ -1604,7 +1604,7 @@ async def hire_and_pay(
     )],
     fee_hash: Annotated[str, Field(
         title="Protocol Fee Hash",
-        description="64-char hex hash of your 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier (if eligible).",
+        description="64-char hex hash of your $0.10 payment (XRP/RLUSD/USDC) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier (if eligible).",
     )] = "",
     cancel_after_hrs: Annotated[int, Field(
         title="Deadline (hours)",
@@ -1652,7 +1652,7 @@ async def hire_and_pay(
             data = vault_res.json()
             return {
                 "error": "payment_required",
-                "message": "Protocol fee required. Pay 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_hash.",
+                "message": "Protocol fee required. Pay $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_hash.",
                 "accepts": data.get("accepts", []),
             }
         if vault_res.status_code != 200:
@@ -1984,7 +1984,7 @@ def find_work(
         "XRPL escrow with your wallet address and shares the escrow_id with you.\n\n"
         "---\n\n"
         "## Option B — List your skills so buyers find you\n\n"
-        "1. **Pay 0.1 XRP** monthly fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`. Save the tx hash.\n\n"
+        "1. **Pay $0.10 (XRP/RLUSD)** monthly fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`. Save the tx hash.\n\n"
         "2. **Post your listing** — call `create_skill_listing()` with your wallet address, "
         "skills description, rate, and the fee tx hash. Your listing is live for 30 days.\n\n"
         "3. **Get hired** — buyers find you via `list_marketplace_skills()` and call "
@@ -2031,7 +2031,7 @@ def post_bounty(
         "1. **Browse skill agents** — call `list_marketplace_skills()`. Filter by category and rate.\n\n"
         "2. **Direct hire** — call `direct_hire(skill_id)` to get the worker's XRPL wallet address "
         "and their rate. No bidding, no waiting.\n\n"
-        "3. **Create the escrow** — pay 0.1 XRP protocol fee to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`, "
+        "3. **Create the escrow** — pay $0.10 protocol fee (XRP/RLUSD) to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR`, "
         "then call `create_escrow_vault(worker_address=..., amount_xrp=...)`. "
         "Sign the EscrowCreate with your wallet using the returned `condition`.\n\n"
         "4. **Confirm** — call `confirm_escrow_transaction(escrow_id, tx_hash)`. "
@@ -2047,6 +2047,6 @@ def post_bounty(
         "4. **Create the escrow** — call `hire_and_pay(worker_address, amount_xrp, task_spec)`, "
         "sign the returned transaction, then `submit_escrow_transaction(escrow_id, blob)`.\n\n"
         "---\n\n"
-        "Total cost: 0.1 XRP protocol fee + agreed bounty locked in escrow.\n"
+        "Total cost: $0.10 protocol fee + agreed bounty locked in escrow.\n"
         "The referee evaluates work and auto-pays on PASS — no further action needed from you."
     )

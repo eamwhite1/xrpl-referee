@@ -245,7 +245,7 @@ def serve_agent_json():
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
-        "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
+        "description": "Trustless AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC) to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
@@ -255,7 +255,7 @@ def serve_agent_json():
             "schemes": ["x402", "x-payment-hash"],
             "description": (
                 "x402 protocol supported. Send a request with no payment to receive a 402 with an "
-                "X-Payment-Required header containing full payment details. Send 0.1 XRP to "
+                "X-Payment-Required header containing full payment details. Send $0.10 (XRP/RLUSD) to "
                 "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on the XRPL, then retry with the transaction "
                 "hash as the X-PAYMENT header (x402 standard) or x-payment-hash header (legacy)."
             )
@@ -295,7 +295,7 @@ def serve_mcp_server_card():
         "transport":   ["http"],
         "auth":        {"type": "none"},
         "tools": [
-            {"name": "audit_task",               "description": "Verify completed work against a task spec. Fee: 0.1 XRP on XRPL or $0.10 USDC on Base (chain 8453). Returns PASS/FAIL with score and feedback."},
+            {"name": "audit_task",               "description": "Verify completed work against a task spec. Fee: $0.10 (XRP or RLUSD on XRPL, USDC on Base) (chain 8453). Returns PASS/FAIL with score and feedback."},
             {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict. Optional trust-layer fields: nft_dvp (bool — require NFT transfer before payment releases), required_nft_issuer (wallet address), required_domain (XRPL domain verification), required_vc_issuer_did (W3C VC issuer DID), proof_policy ('ALL' or 'ANY')."},
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
             {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed. For NFT DvP jobs (nft_dvp=true), PASS sets status to PASS_AWAITING_NFT — seller must then create an NFTokenCreateOffer (Destination=buyer, Amount=0) and register it via POST /escrow/{id}/nft-offer before payment releases."},
@@ -345,7 +345,7 @@ def serve_marketplace_json():
             "submit_bid": {"endpoint": "/jobs/{job_id}/bid", "method": "POST", "fee": "free", "description": "Bid on a competitive job posting."},
             "list_skills": {"endpoint": "/marketplace/skills", "method": "GET", "fee": "free", "description": "Browse agent skill listings for direct hire."},
             "post_skill": {"endpoint": "/marketplace/skills", "method": "POST", "fee": "0.1 XRP/month", "description": "List a recurring skill for 30 days."},
-            "escrow": {"endpoint": "/escrow/generate", "method": "POST", "fee": "0.1 XRP", "description": "Lock payment in AI-gated XRPL escrow."},
+            "escrow": {"endpoint": "/escrow/generate", "method": "POST", "fee": "$0.10 (XRP, RLUSD, or USDC)", "description": "Lock payment in AI-gated XRPL escrow."},
             "verify_work": {"endpoint": "/evaluate", "method": "POST", "fee": "included", "description": "Submit work; payment auto-releases on PASS."},
             "trust_score": {"endpoint": "/wallet/score/{address}", "method": "GET", "fee": "free", "description": "0–100 wallet trust score across 12 signals."},
         },
@@ -487,7 +487,7 @@ def serve_ai_plugin():
             "Use this tool to verify whether a seller has completed a task to specification and auto-release escrowed funds. "
             "This API implements the x402 payment protocol: if you call any paid endpoint without a payment, you will receive "
             "a 402 response with an X-Payment-Required header containing base64-encoded JSON that tells you exactly how much "
-            "XRP to send, where to send it, and which header to use. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on "
+            "XRP to send, where to send it, and which header to use. Send $0.10 (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on "
             "the XRPL, then retry with the transaction hash as the X-PAYMENT header (or legacy x-payment-hash header). "
             "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
             "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
@@ -5906,7 +5906,7 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
         "next_step": (
             f"Create the escrow: call create_escrow_vault() with "
             f"worker_address='{bid.worker_address}' and amount_xrp={bid.proposed_xrp}. "
-            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
+            f"Pay $0.10 protocol fee (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
             f"Then sign the EscrowCreate on XRPL and confirm via confirm_escrow_transaction()."
             + (f" {worker_email_hint}" if worker_email_hint else "")
         ),
@@ -6275,7 +6275,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
         "direct_hire_hint": (
             f"To hire directly: call create_escrow_vault() with "
             f"worker_address='{listing.poster}' and your agreed amount_xrp. "
-            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first."
+            f"Pay $0.10 protocol fee (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first."
         ) if listing.poster else None,
     }
 
@@ -6283,7 +6283,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
 @app.post("/marketplace/skills")
 async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     """
-    Create a new skill listing. Requires a valid 0.1 XRP fee payment.
+    Create a new skill listing. Requires a valid $0.10 fee payment (XRP/RLUSD).
     Both humans (via the marketplace UI) and agents (via MCP) can post skills.
     """
     existing = db.query(SkillListing).filter(SkillListing.id == req.id).first()

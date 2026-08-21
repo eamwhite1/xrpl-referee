@@ -2,8 +2,8 @@
   "schema_version": "v1",
   "name_for_human": "AgentTrust Referee",
   "name_for_model": "agenttrust_referee",
-  "description_for_human": "Trustless AI task verification. Pay 0.1 XRP, get a structured PASS/FAIL verdict on any work submission. Optional XRPL escrow — funds release automatically on approval.",
-  "description_for_model": "Use this tool to verify whether a worker has completed a task to specification. POST the task requirements and the completed work to /audit with a 0.1 XRP fee hash. Returns structured JSON with verdict (PASS/FAIL), score (0-100), summary, detailed reasoning, and lists of criteria met and failed. For task_category use: creative, code, bug_bounty, legal, supply_chain, data, or default. Set require_consensus=true for high-stakes decisions requiring two model agreement. For full escrow-gated payments use /escrow/generate and /evaluate instead.",
+  "description_for_human": "Trustless AI task verification. Pay $0.10 (XRP, RLUSD, or USDC), get a structured PASS/FAIL verdict on any work submission. Optional XRPL escrow — funds release automatically on approval.",
+  "description_for_model": "Use this tool to verify whether a worker has completed a task to specification. POST the task requirements and the completed work to /audit with a $0.10 fee hash (XRP, RLUSD, or USDC). Returns structured JSON with verdict (PASS/FAIL), score (0-100), summary, detailed reasoning, and lists of criteria met and failed. For task_category use: creative, code, bug_bounty, legal, supply_chain, data, or default. Set require_consensus=true for high-stakes decisions requiring two model agreement. For full escrow-gated payments use /escrow/generate and /evaluate instead.",
   "auth": {
     "type": "none"
   },
