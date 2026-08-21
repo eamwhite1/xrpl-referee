@@ -362,25 +362,26 @@ def serve_marketplace_json():
 
 
 @app.get("/.well-known/payment-required")
-def serve_payment_required():
+async def serve_payment_required():
     """
     x402 payment discovery descriptor.
     Agents can GET this before calling any paid endpoint to learn what payment
     schemes are accepted, amounts, and network details — without triggering a 402.
     Follows the x402 'accepts' envelope format (x402Version 1 + x402Version 2 entries).
     """
+    fee_xrp = await get_required_fee_xrp()
     accepts = [
         {
             "scheme":   "exact",
             "network":  "xrpl:0",
             "asset":    "XRP",
             "payTo":    PROTOCOL_WALLET,
-            "amount":   str(int(MIN_FEE_XRP * 1_000_000)),  # drops
+            "amount":   str(int(round(fee_xrp * 1_000_000))),  # drops, live price
             "resource": "/*",
             "maxTimeoutSeconds": 300,
             "extra": {
                 "instruction": (
-                    f"Send {MIN_FEE_XRP} XRP (native) to {PROTOCOL_WALLET} on XRPL Mainnet. "
+                    f"Send {fee_xrp:.6g} XRP (≈$0.10) to {PROTOCOL_WALLET} on XRPL Mainnet. "
                     "Include the transaction hash as the X-PAYMENT header or fee_hash body field. "
                     "x402 v2 presigned flow: include signed tx blob as PAYMENT-SIGNATURE header."
                 ),
@@ -1409,7 +1410,41 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
 PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
-MIN_FEE_XRP        = 0.1
+MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
+MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
+
+# ---------------------------------------------------------------------------
+# XRP/USD price oracle — cached for 60 s, falls back to MIN_FEE_XRP
+# ---------------------------------------------------------------------------
+_xrp_price_cache: dict = {"price": None, "fetched_at": 0.0}
+_XRP_PRICE_TTL   = 60   # seconds
+
+async def _fetch_xrp_usd_price() -> float:
+    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s."""
+    now = time.monotonic()
+    if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
+        return _xrp_price_cache["price"]
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "ripple", "vs_currencies": "usd"},
+            )
+            price = float(r.json()["ripple"]["usd"])
+            if price > 0:
+                _xrp_price_cache["price"] = price
+                _xrp_price_cache["fetched_at"] = now
+                return price
+    except Exception as exc:
+        logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
+    return _xrp_price_cache["price"] or MIN_FEE_XRP  # use last known or hardcoded fallback
+
+async def get_required_fee_xrp() -> float:
+    """Return the XRP amount equivalent to MIN_FEE_USD at the current market price."""
+    price = await _fetch_xrp_usd_price()
+    # Round up to 6 decimal places (1 drop precision), never below 1 drop
+    xrp = max(round(MIN_FEE_USD / price, 6), 0.000001)
+    return xrp
 
 # Base chain USDC payment constants
 BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
@@ -1603,6 +1638,8 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
 
     Spec: https://x402.org, https://xrpl-x402.t54.ai/docs
     """
+    # min_xrp should always be pre-resolved by the async caller via get_required_fee_xrp();
+    # MIN_FEE_XRP here is a static safety net only.
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
 
     v2_entry, invoice_id = _x402_v2_envelope(resource, required_xrp)
@@ -2029,7 +2066,7 @@ class QuoteRequest(BaseModel):
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
 async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None) -> dict:
-    required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
+    required_xrp = min_xrp if min_xrp is not None else await get_required_fee_xrp()
 
     if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
         logger.warning(f"⚠️ REVIEWER BYPASS used for {resource} (escrow_id={escrow_id}) — fee check skipped.")
@@ -3985,12 +4022,14 @@ async def standalone_audit(
 ):
     fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
     if not fee_hash and not x_reviewer_token and not payment_signature:
+        fee_xrp = await get_required_fee_xrp()
         _raise_402(
             "/audit",
-            f"Payment required. Option 1: Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL. "
+            f"Payment required. Option 1: Send {fee_xrp:.6g} XRP (≈$0.10) to {PROTOCOL_WALLET} on the XRPL. "
             f"Option 2: Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS or '(not configured)'} on Base (chain 8453). "
             "Include the transaction hash as the X-PAYMENT header (or fee_hash body field). "
             "Or provide a PAYMENT-SIGNATURE header (x402 v2 XRPL presigned flow).",
+            min_xrp=fee_xrp,
         )
 
     audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
@@ -4026,17 +4065,20 @@ async def standalone_audit(
 # 14. XUMM ENDPOINTS
 # ---------------------------------------------------------------------------
 class FeePayloadRequest(BaseModel):
-    amount_xrp: Optional[float] = None  # override fee amount; defaults to MIN_FEE_XRP
+    amount_xrp: Optional[float] = None  # override fee amount; defaults to live $0.10 equivalent
 
 @app.post("/xumm/fee-payload")
 async def create_fee_payload(req: FeePayloadRequest = FeePayloadRequest()):
-    xrp = req.amount_xrp if req.amount_xrp and req.amount_xrp > 0 else MIN_FEE_XRP
+    xrp = req.amount_xrp if req.amount_xrp and req.amount_xrp > 0 else await get_required_fee_xrp()
     tx = {
         "TransactionType": "Payment",
         "Destination":     PROTOCOL_WALLET,
-        "Amount":          str(int(xrp * 1_000_000)),
+        "Amount":          str(int(round(xrp * 1_000_000))),
     }
-    return await xumm_create_payload(tx)
+    result = await xumm_create_payload(tx)
+    result["amount_xrp"] = round(xrp, 6)
+    result["amount_usd"] = round(MIN_FEE_USD, 2)
+    return result
 
 
 @app.get("/xumm/payload/{uuid}")
