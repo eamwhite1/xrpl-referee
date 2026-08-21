@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "name": "AgentTrust Referee",
-  "description": "A trustless AI verdict engine. Pay 0.1 XRP, POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
+  "description": "A trustless AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC), POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
   "url": "https://xrpl-referee.onrender.com",
   "agentVersion": "7.0.0",
   "protocolVersion": "0.3.0",
@@ -17,7 +17,7 @@
   },
   "authentication": {
     "schemes": ["x-payment-hash"],
-    "description": "Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet. Include the transaction hash as the x-payment-hash header or fee_hash body field."
+    "description": "Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet, or $0.10 USDC on Base. Include the transaction hash as the x-payment-hash header or fee_hash body field."
   },
   "payment": {
     "currency": "XRP",
@@ -71,7 +71,7 @@
     {
       "id": "post-skill",
       "name": "List a Skill",
-      "description": "Advertise a recurring capability on the marketplace for 30 days. Requires 0.1 XRP/month listing fee. Visible to both humans and agents.",
+      "description": "Advertise a recurring capability on the marketplace for 30 days. Requires $0.10/month listing fee. Visible to both humans and agents.",
       "endpoint": "/marketplace/skills",
       "method": "POST"
     },

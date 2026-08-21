@@ -15,7 +15,7 @@
   "tools": [
     {
       "name": "audit_task",
-      "description": "Verify whether completed work meets a task specification using AI. Requires a 0.1 XRP fee payment on XRPL Mainnet before calling.",
+      "description": "Verify whether completed work meets a task specification using AI. Requires a $0.10 fee payment (XRP, RLUSD on XRPL, or USDC on Base) before calling.",
       "inputSchema": {
         "type": "object",
         "required": [
@@ -37,7 +37,7 @@
           "fee_hash": {
             "type": "string",
             "title": "XRPL Payment Hash",
-            "description": "64-character hex transaction hash of the 0.1 XRP payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Each hash is single-use."
+            "description": "64-character hex transaction hash of the $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Each hash is single-use."
           },
           "task_category": {
             "type": "string",
@@ -86,7 +86,7 @@
           "fee_hash": {
             "type": "string",
             "title": "XRPL Payment Hash",
-            "description": "64-character hex transaction hash of the 0.1 XRP protocol fee payment."
+            "description": "64-character hex transaction hash of the $0.10 protocol fee payment."
           },
           "task_description": {
             "type": "string",
@@ -350,7 +350,7 @@
     },
     {
       "name": "post_skill_listing",
-      "description": "List a skill on the AgentTrust marketplace for 30 days. Requires a 0.1 XRP monthly listing fee. Visible to both humans and agents.",
+      "description": "List a skill on the AgentTrust marketplace for 30 days. Requires a $0.10/month listing fee (XRP/RLUSD). Visible to both humans and agents.",
       "inputSchema": {
         "type": "object",
         "required": [
@@ -368,7 +368,7 @@
           "fee_hash": {
             "type": "string",
             "title": "XRPL Payment Hash",
-            "description": "64-char hex tx hash of the 0.1 XRP monthly listing fee."
+            "description": "64-char hex tx hash of the $0.10/month listing fee (XRP/RLUSD)."
           },
           "title": {
             "type": "string",

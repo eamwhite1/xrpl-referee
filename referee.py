@@ -245,7 +245,7 @@ def serve_agent_json():
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
-        "description": "Trustless AI verdict engine. Pay 0.1 XRP to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
+        "description": "Trustless AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC) to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
         "url": "https://xrpl-referee.onrender.com",
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
@@ -255,7 +255,7 @@ def serve_agent_json():
             "schemes": ["x402", "x-payment-hash"],
             "description": (
                 "x402 protocol supported. Send a request with no payment to receive a 402 with an "
-                "X-Payment-Required header containing full payment details. Send 0.1 XRP to "
+                "X-Payment-Required header containing full payment details. Send $0.10 (XRP/RLUSD) to "
                 "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on the XRPL, then retry with the transaction "
                 "hash as the X-PAYMENT header (x402 standard) or x-payment-hash header (legacy)."
             )
@@ -295,7 +295,7 @@ def serve_mcp_server_card():
         "transport":   ["http"],
         "auth":        {"type": "none"},
         "tools": [
-            {"name": "audit_task",               "description": "Verify completed work against a task spec. Fee: 0.1 XRP on XRPL or $0.10 USDC on Base (chain 8453). Returns PASS/FAIL with score and feedback."},
+            {"name": "audit_task",               "description": "Verify completed work against a task spec. Fee: $0.10 (XRP or RLUSD on XRPL, USDC on Base) (chain 8453). Returns PASS/FAIL with score and feedback."},
             {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict. Optional trust-layer fields: nft_dvp (bool — require NFT transfer before payment releases), required_nft_issuer (wallet address), required_domain (XRPL domain verification), required_vc_issuer_did (W3C VC issuer DID), proof_policy ('ALL' or 'ANY')."},
             {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
             {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed. For NFT DvP jobs (nft_dvp=true), PASS sets status to PASS_AWAITING_NFT — seller must then create an NFTokenCreateOffer (Destination=buyer, Amount=0) and register it via POST /escrow/{id}/nft-offer before payment releases."},
@@ -307,7 +307,7 @@ def serve_mcp_server_card():
             {"name": "view_job",                  "description": "View job details and all current bids."},
             {"name": "award_job",                 "description": "Accept a bid. Returns worker address and agreed price to use in create_escrow_vault()."},
             {"name": "list_marketplace_skills",   "description": "Browse skill agents/humans offering services. Filter by category and rate. Supports direct hire."},
-            {"name": "create_skill_listing",      "description": "List your skills publicly for 30 days (0.1 XRP/month). Buyers can direct-hire you from the listing."},
+            {"name": "create_skill_listing",      "description": "List your skills publicly for 30 days ($0.10/month). Buyers can direct-hire you from the listing."},
             {"name": "direct_hire",               "description": "Get a skill provider's wallet address for immediate escrow creation — no bidding needed."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
@@ -344,8 +344,8 @@ def serve_marketplace_json():
             "claim_job": {"endpoint": "/jobs/{job_id}/claim", "method": "POST", "fee": "free", "description": "Instantly claim a claimable bounty without bidding."},
             "submit_bid": {"endpoint": "/jobs/{job_id}/bid", "method": "POST", "fee": "free", "description": "Bid on a competitive job posting."},
             "list_skills": {"endpoint": "/marketplace/skills", "method": "GET", "fee": "free", "description": "Browse agent skill listings for direct hire."},
-            "post_skill": {"endpoint": "/marketplace/skills", "method": "POST", "fee": "0.1 XRP/month", "description": "List a recurring skill for 30 days."},
-            "escrow": {"endpoint": "/escrow/generate", "method": "POST", "fee": "0.1 XRP", "description": "Lock payment in AI-gated XRPL escrow."},
+            "post_skill": {"endpoint": "/marketplace/skills", "method": "POST", "fee": "$0.10/month", "description": "List a recurring skill for 30 days."},
+            "escrow": {"endpoint": "/escrow/generate", "method": "POST", "fee": "$0.10 (XRP, RLUSD, or USDC)", "description": "Lock payment in AI-gated XRPL escrow."},
             "verify_work": {"endpoint": "/evaluate", "method": "POST", "fee": "included", "description": "Submit work; payment auto-releases on PASS."},
             "trust_score": {"endpoint": "/wallet/score/{address}", "method": "GET", "fee": "free", "description": "0–100 wallet trust score across 12 signals."},
         },
@@ -358,6 +358,88 @@ def serve_marketplace_json():
         ],
         "docs": "https://xrpl-referee.onrender.com/docs",
         "agent_card": "https://xrpl-referee.onrender.com/.well-known/agent.json",
+    }
+
+
+@app.get("/.well-known/payment-required")
+async def serve_payment_required():
+    """
+    x402 payment discovery descriptor.
+    Agents can GET this before calling any paid endpoint to learn what payment
+    schemes are accepted, amounts, and network details — without triggering a 402.
+    Follows the x402 'accepts' envelope format (x402Version 1 + x402Version 2 entries).
+    """
+    fee_xrp = await get_required_fee_xrp()
+    accepts = [
+        {
+            "scheme":   "exact",
+            "network":  "xrpl:0",
+            "asset":    "XRP",
+            "payTo":    PROTOCOL_WALLET,
+            "amount":   str(int(round(fee_xrp * 1_000_000))),  # drops, live price
+            "resource": "/*",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "instruction": (
+                    f"Send {fee_xrp:.6g} XRP (≈$0.10) to {PROTOCOL_WALLET} on XRPL Mainnet. "
+                    "Include the transaction hash as the X-PAYMENT header or fee_hash body field. "
+                    "x402 v2 presigned flow: include signed tx blob as PAYMENT-SIGNATURE header."
+                ),
+                "x402v2": True,
+                "legacyHeader": "x-payment-hash",
+            },
+        },
+        {
+            "scheme":   "exact",
+            "network":  "xrpl:0",
+            "asset":    "RLUSD",
+            "payTo":    PROTOCOL_WALLET,
+            "amount":   "0.10",
+            "resource": "/*",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "currency": "RLUSD",
+                "issuer":   "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",  # Circle RLUSD issuer, XRPL Mainnet
+                "instruction": (
+                    f"Send 0.10 RLUSD (Circle) to {PROTOCOL_WALLET} on XRPL Mainnet. "
+                    "Include the transaction hash as the X-PAYMENT header or fee_hash body field."
+                ),
+            },
+        },
+    ]
+
+    if BASE_WALLET_ADDRESS:
+        accepts.append({
+            "scheme":   "exact",
+            "network":  "eip155:8453",
+            "asset":    "USDC",
+            "payTo":    BASE_WALLET_ADDRESS,
+            "amount":   str(int(MIN_FEE_USDC * 1_000_000)),  # 6 decimals
+            "resource": "/*",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "contractAddress": USDC_CONTRACT_BASE,
+                "instruction": (
+                    f"Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS} on Base (chain eip155:8453). "
+                    "Include the 0x-prefixed transaction hash as the X-PAYMENT header or fee_hash body field."
+                ),
+            },
+        })
+
+    return {
+        "x402Version": 1,
+        "service":     "AgentTrust Referee",
+        "description": "AI task verification and XRPL escrow. Pay once per audit — fee covers the AI verdict and any automatic escrow release.",
+        "paidEndpoints": ["/audit", "/escrow/generate", "/marketplace/skills"],
+        "freeEndpoints": [
+            "/marketplace/jobs", "/marketplace/skills (GET)", "/wallet/score/{address}",
+            "/wallet/sanctions/{address}", "/jobs (GET)", "/jobs/{id}", "/status",
+            "/.well-known/*",
+        ],
+        "freeAudits":   "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash.",
+        "accepts":      accepts,
+        "docs":         "https://xrpl-referee.onrender.com/docs",
+        "mcp":          "https://xrpl-referee.onrender.com/mcp",
     }
 
 
@@ -406,7 +488,7 @@ def serve_ai_plugin():
             "Use this tool to verify whether a seller has completed a task to specification and auto-release escrowed funds. "
             "This API implements the x402 payment protocol: if you call any paid endpoint without a payment, you will receive "
             "a 402 response with an X-Payment-Required header containing base64-encoded JSON that tells you exactly how much "
-            "XRP to send, where to send it, and which header to use. Send 0.1 XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on "
+            "XRP to send, where to send it, and which header to use. Send $0.10 (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on "
             "the XRPL, then retry with the transaction hash as the X-PAYMENT header (or legacy x-payment-hash header). "
             "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
             "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
@@ -1328,7 +1410,41 @@ def get_db():
 XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
 BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
 PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
-MIN_FEE_XRP        = 0.1
+MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
+MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
+
+# ---------------------------------------------------------------------------
+# XRP/USD price oracle — cached for 60 s, falls back to MIN_FEE_XRP
+# ---------------------------------------------------------------------------
+_xrp_price_cache: dict = {"price": None, "fetched_at": 0.0}
+_XRP_PRICE_TTL   = 60   # seconds
+
+async def _fetch_xrp_usd_price() -> float:
+    """Return cached XRP/USD price, refreshing from CoinGecko every 60 s."""
+    now = time.monotonic()
+    if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
+        return _xrp_price_cache["price"]
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "ripple", "vs_currencies": "usd"},
+            )
+            price = float(r.json()["ripple"]["usd"])
+            if price > 0:
+                _xrp_price_cache["price"] = price
+                _xrp_price_cache["fetched_at"] = now
+                return price
+    except Exception as exc:
+        logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
+    return _xrp_price_cache["price"] or MIN_FEE_XRP  # use last known or hardcoded fallback
+
+async def get_required_fee_xrp() -> float:
+    """Return the XRP amount equivalent to MIN_FEE_USD at the current market price."""
+    price = await _fetch_xrp_usd_price()
+    # Round up to 6 decimal places (1 drop precision), never below 1 drop
+    xrp = max(round(MIN_FEE_USD / price, 6), 0.000001)
+    return xrp
 
 # Base chain USDC payment constants
 BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
@@ -1522,6 +1638,8 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
 
     Spec: https://x402.org, https://xrpl-x402.t54.ai/docs
     """
+    # min_xrp should always be pre-resolved by the async caller via get_required_fee_xrp();
+    # MIN_FEE_XRP here is a static safety net only.
     required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
 
     v2_entry, invoice_id = _x402_v2_envelope(resource, required_xrp)
@@ -1948,7 +2066,7 @@ class QuoteRequest(BaseModel):
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
 async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None) -> dict:
-    required_xrp = min_xrp if min_xrp is not None else MIN_FEE_XRP
+    required_xrp = min_xrp if min_xrp is not None else await get_required_fee_xrp()
 
     if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
         logger.warning(f"⚠️ REVIEWER BYPASS used for {resource} (escrow_id={escrow_id}) — fee check skipped.")
@@ -2036,9 +2154,62 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
         raise HTTPException(status_code=400, detail=f"Transaction is '{tx_type}', not a Payment.")
     if dest.lower() != PROTOCOL_WALLET.lower():
         _raise_402(resource, f"Wrong destination. Expected {PROTOCOL_WALLET}, got {dest}.", min_xrp=required_xrp)
+    # IOU payment — check if it's RLUSD (Ripple's stablecoin on XRPL)
     if isinstance(raw_amount, dict):
-        raise HTTPException(status_code=400, detail="Protocol fees must be paid in XRP, not issued currency.")
+        currency = str(raw_amount.get("currency", "")).upper().strip()
+        issuer   = str(raw_amount.get("issuer", "")).strip()
+        value    = raw_amount.get("value", "0")
 
+        # Accept RLUSD (native 4-char code or hex representation)
+        is_rlusd_currency = currency in ("RLUSD", RLUSD_HEX.upper())
+        is_rlusd_issuer   = issuer == RLUSD_ISSUER
+
+        if not (is_rlusd_currency and is_rlusd_issuer):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Protocol fees must be paid in XRP or RLUSD (issuer {RLUSD_ISSUER}). "
+                    f"Received {currency} from issuer {issuer}."
+                ),
+            )
+
+        try:
+            rlusd_amount = float(value)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=f"Could not parse RLUSD amount: {value!r}")
+
+        MIN_FEE_RLUSD = 0.10
+        if rlusd_amount < (MIN_FEE_RLUSD - 0.000001):
+            _raise_402(
+                resource,
+                f"Insufficient RLUSD fee. Required ≥{MIN_FEE_RLUSD} RLUSD, received {rlusd_amount} RLUSD.",
+                min_xrp=required_xrp,
+            )
+
+        db.add(PaymentLog(
+            payment_hash=fee_hash,
+            purpose="setup_fee_rlusd",
+            sender=sender,
+            amount_xrp=None,
+            escrow_id=escrow_id,
+        ))
+        db.commit()
+
+        logger.info(f"✅ RLUSD FEE VERIFIED: {rlusd_amount} RLUSD from {sender} for escrow '{escrow_id}'")
+
+        import asyncio
+        asyncio.create_task(_telegram_notify(
+            f"💵 *RLUSD protocol fee received*\n"
+            f"Amount: `{rlusd_amount} RLUSD`\n"
+            f"From: `{sender}`\n"
+            f"Escrow: `{escrow_id}`\n"
+            f"Resource: `{resource}`\n"
+            f"Hash: `{fee_hash[:16]}…`"
+        ))
+
+        return {"sender": sender, "amount_rlusd": rlusd_amount}
+
+    # Native XRP payment
     amount_xrp = round(int(raw_amount) / 1_000_000, 6)
     if amount_xrp < (required_xrp - 0.000001):
         _raise_402(
@@ -3851,12 +4022,14 @@ async def standalone_audit(
 ):
     fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
     if not fee_hash and not x_reviewer_token and not payment_signature:
+        fee_xrp = await get_required_fee_xrp()
         _raise_402(
             "/audit",
-            f"Payment required. Option 1: Send {MIN_FEE_XRP} XRP to {PROTOCOL_WALLET} on the XRPL. "
+            f"Payment required. Option 1: Send {fee_xrp:.6g} XRP (≈$0.10) to {PROTOCOL_WALLET} on the XRPL. "
             f"Option 2: Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS or '(not configured)'} on Base (chain 8453). "
             "Include the transaction hash as the X-PAYMENT header (or fee_hash body field). "
             "Or provide a PAYMENT-SIGNATURE header (x402 v2 XRPL presigned flow).",
+            min_xrp=fee_xrp,
         )
 
     audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
@@ -3892,17 +4065,20 @@ async def standalone_audit(
 # 14. XUMM ENDPOINTS
 # ---------------------------------------------------------------------------
 class FeePayloadRequest(BaseModel):
-    amount_xrp: Optional[float] = None  # override fee amount; defaults to MIN_FEE_XRP
+    amount_xrp: Optional[float] = None  # override fee amount; defaults to live $0.10 equivalent
 
 @app.post("/xumm/fee-payload")
 async def create_fee_payload(req: FeePayloadRequest = FeePayloadRequest()):
-    xrp = req.amount_xrp if req.amount_xrp and req.amount_xrp > 0 else MIN_FEE_XRP
+    xrp = req.amount_xrp if req.amount_xrp and req.amount_xrp > 0 else await get_required_fee_xrp()
     tx = {
         "TransactionType": "Payment",
         "Destination":     PROTOCOL_WALLET,
-        "Amount":          str(int(xrp * 1_000_000)),
+        "Amount":          str(int(round(xrp * 1_000_000))),
     }
-    return await xumm_create_payload(tx)
+    result = await xumm_create_payload(tx)
+    result["amount_xrp"] = round(xrp, 6)
+    result["amount_usd"] = round(MIN_FEE_USD, 2)
+    return result
 
 
 @app.get("/xumm/payload/{uuid}")
@@ -5772,7 +5948,7 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
         "next_step": (
             f"Create the escrow: call create_escrow_vault() with "
             f"worker_address='{bid.worker_address}' and amount_xrp={bid.proposed_xrp}. "
-            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
+            f"Pay $0.10 protocol fee (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first. "
             f"Then sign the EscrowCreate on XRPL and confirm via confirm_escrow_transaction()."
             + (f" {worker_email_hint}" if worker_email_hint else "")
         ),
@@ -6141,7 +6317,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
         "direct_hire_hint": (
             f"To hire directly: call create_escrow_vault() with "
             f"worker_address='{listing.poster}' and your agreed amount_xrp. "
-            f"Pay 0.1 XRP protocol fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first."
+            f"Pay $0.10 protocol fee (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR first."
         ) if listing.poster else None,
     }
 
@@ -6149,7 +6325,7 @@ async def get_skill_listing(skill_id: str, db: Session = Depends(get_db)):
 @app.post("/marketplace/skills")
 async def post_skill_listing(req: SkillListingRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     """
-    Create a new skill listing. Requires a valid 0.1 XRP fee payment.
+    Create a new skill listing. Requires a valid $0.10 fee payment (XRP/RLUSD).
     Both humans (via the marketplace UI) and agents (via MCP) can post skills.
     """
     existing = db.query(SkillListing).filter(SkillListing.id == req.id).first()
