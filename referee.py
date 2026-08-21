@@ -361,6 +361,87 @@ def serve_marketplace_json():
     }
 
 
+@app.get("/.well-known/payment-required")
+def serve_payment_required():
+    """
+    x402 payment discovery descriptor.
+    Agents can GET this before calling any paid endpoint to learn what payment
+    schemes are accepted, amounts, and network details — without triggering a 402.
+    Follows the x402 'accepts' envelope format (x402Version 1 + x402Version 2 entries).
+    """
+    accepts = [
+        {
+            "scheme":   "exact",
+            "network":  "xrpl:0",
+            "asset":    "XRP",
+            "payTo":    PROTOCOL_WALLET,
+            "amount":   str(int(MIN_FEE_XRP * 1_000_000)),  # drops
+            "resource": "/*",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "instruction": (
+                    f"Send {MIN_FEE_XRP} XRP (native) to {PROTOCOL_WALLET} on XRPL Mainnet. "
+                    "Include the transaction hash as the X-PAYMENT header or fee_hash body field. "
+                    "x402 v2 presigned flow: include signed tx blob as PAYMENT-SIGNATURE header."
+                ),
+                "x402v2": True,
+                "legacyHeader": "x-payment-hash",
+            },
+        },
+        {
+            "scheme":   "exact",
+            "network":  "xrpl:0",
+            "asset":    "RLUSD",
+            "payTo":    PROTOCOL_WALLET,
+            "amount":   "0.10",
+            "resource": "/*",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "currency": "RLUSD",
+                "issuer":   "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",  # Circle RLUSD issuer, XRPL Mainnet
+                "instruction": (
+                    f"Send 0.10 RLUSD (Circle) to {PROTOCOL_WALLET} on XRPL Mainnet. "
+                    "Include the transaction hash as the X-PAYMENT header or fee_hash body field."
+                ),
+            },
+        },
+    ]
+
+    if BASE_WALLET_ADDRESS:
+        accepts.append({
+            "scheme":   "exact",
+            "network":  "eip155:8453",
+            "asset":    "USDC",
+            "payTo":    BASE_WALLET_ADDRESS,
+            "amount":   str(int(MIN_FEE_USDC * 1_000_000)),  # 6 decimals
+            "resource": "/*",
+            "maxTimeoutSeconds": 300,
+            "extra": {
+                "contractAddress": USDC_CONTRACT_BASE,
+                "instruction": (
+                    f"Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS} on Base (chain eip155:8453). "
+                    "Include the 0x-prefixed transaction hash as the X-PAYMENT header or fee_hash body field."
+                ),
+            },
+        })
+
+    return {
+        "x402Version": 1,
+        "service":     "AgentTrust Referee",
+        "description": "AI task verification and XRPL escrow. Pay once per audit — fee covers the AI verdict and any automatic escrow release.",
+        "paidEndpoints": ["/audit", "/escrow/generate", "/marketplace/skills"],
+        "freeEndpoints": [
+            "/marketplace/jobs", "/marketplace/skills (GET)", "/wallet/score/{address}",
+            "/wallet/sanctions/{address}", "/jobs (GET)", "/jobs/{id}", "/status",
+            "/.well-known/*",
+        ],
+        "freeAudits":   "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash.",
+        "accepts":      accepts,
+        "docs":         "https://xrpl-referee.onrender.com/docs",
+        "mcp":          "https://xrpl-referee.onrender.com/mcp",
+    }
+
+
 @app.get("/.well-known/mcp-config")
 def serve_mcp_config():
     """Smithery External MCP config schema — declares no authentication required."""
