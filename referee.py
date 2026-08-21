@@ -219,7 +219,9 @@ def serve_playground():
 </div></body></html>""", status_code=200)
 
 @app.get("/status")
+@app.get("/health")
 @app.head("/status")
+@app.head("/health")
 def health_check():
     return {"status": "online", "version": "7.0", "timestamp": datetime.now(timezone.utc)}
 
