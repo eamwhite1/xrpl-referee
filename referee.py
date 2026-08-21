@@ -1,6 +1,5 @@
 import os
 import time
-import asyncio
 import httpx
 from decimal import Decimal, InvalidOperation
 import logging
@@ -1425,20 +1424,21 @@ MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 _xrp_price_cache: dict = {"price": None, "fetched_at": 0.0}
 _XRP_PRICE_TTL   = 60   # seconds
 
-_price_fetch_lock: asyncio.Lock | None = None  # created lazily inside async context
+_price_fetch_lock = None  # initialised to asyncio.Lock() on first use
 
 async def _fetch_xrp_usd_price() -> float:
     """Return cached XRP/USD price, refreshing from CoinGecko every 60 s.
     Uses a lock so concurrent cold-start requests share one outbound call."""
     global _price_fetch_lock
     if _price_fetch_lock is None:
+        import asyncio
         _price_fetch_lock = asyncio.Lock()
 
     now = time.monotonic()
     if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
         return _xrp_price_cache["price"]
 
-    async with _price_fetch_lock:  # type: ignore[union-attr]
+    async with _price_fetch_lock:
         # Re-check after acquiring lock — another coroutine may have just fetched
         now = time.monotonic()
         if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
