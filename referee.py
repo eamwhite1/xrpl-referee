@@ -1442,16 +1442,41 @@ async def _fetch_xrp_usd_price() -> float:
             now = time.monotonic()
             if _xrp_price_cache["price"] and now - _xrp_price_cache["fetched_at"] < _XRP_PRICE_TTL:
                 return _xrp_price_cache["price"]
-            async with httpx.AsyncClient(timeout=3) as client:
-                r = await client.get(
-                    "https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": "ripple", "vs_currencies": "usd"},
-                )
-                price = float(r.json()["ripple"]["usd"])
-                if price > 0:
-                    _xrp_price_cache["price"] = price
-                    _xrp_price_cache["fetched_at"] = now
-                    return price
+            price = None
+            async with httpx.AsyncClient(timeout=4) as client:
+                # Binance — most reliable, no key needed
+                try:
+                    r = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
+                    price = float(r.json()["price"])
+                    if price > 0:
+                        logger.info(f"XRP price: ${price:.4f} (binance)")
+                except Exception as exc:
+                    logger.warning(f"Binance XRP price failed: {exc}")
+
+                # Kraken fallback
+                if not price:
+                    try:
+                        r = await client.get("https://api.kraken.com/0/public/Ticker?pair=XRPUSD")
+                        price = float(list(r.json()["result"].values())[0]["c"][0])
+                        if price > 0:
+                            logger.info(f"XRP price: ${price:.4f} (kraken)")
+                    except Exception as exc:
+                        logger.warning(f"Kraken XRP price failed: {exc}")
+
+                # CoinGecko last resort
+                if not price:
+                    try:
+                        r = await client.get("https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd")
+                        price = float(r.json()["ripple"]["usd"])
+                        if price > 0:
+                            logger.info(f"XRP price: ${price:.4f} (coingecko)")
+                    except Exception as exc:
+                        logger.warning(f"CoinGecko XRP price failed: {exc}")
+
+            if price and price > 0:
+                _xrp_price_cache["price"] = price
+                _xrp_price_cache["fetched_at"] = now
+                return price
     except Exception as exc:
         logger.warning(f"XRP price oracle failed: {exc} — using fallback {MIN_FEE_XRP} XRP")
     return _xrp_price_cache["price"] or MIN_FEE_XRP
