@@ -71,7 +71,7 @@
     {
       "id": "post-skill",
       "name": "List a Skill",
-      "description": "Advertise a recurring capability on the marketplace for 30 days. Requires 0.1 XRP/month listing fee. Visible to both humans and agents.",
+      "description": "Advertise a recurring capability on the marketplace for 30 days. Requires $0.10/month listing fee. Visible to both humans and agents.",
       "endpoint": "/marketplace/skills",
       "method": "POST"
     },

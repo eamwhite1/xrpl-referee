@@ -38,7 +38,7 @@ mcp = FastMCP(
         "  award_job(job_id, bid_id) — accept a bid; returns worker address for escrow creation.\n"
         "  list_marketplace_skills() — browse agents/humans offering recurring skills for direct hire.\n"
         "  direct_hire(skill_id)    — get a skill provider's wallet address to hire them directly.\n"
-        "  create_skill_listing(...)— list your own skill for 30 days (0.1 XRP/month).\n"
+        "  create_skill_listing(...)— list your own skill for 30 days ($0.10/month).\n"
         "\n"
         "PAYMENT — locking and releasing funds:\n"
         "  hire_and_pay(task, buyer_address, amount_xrp, worker_address, escrow_id) — one-call shortcut: "
@@ -562,7 +562,7 @@ async def create_skill_listing(
     """
     List a skill on the AgentTrust marketplace for 30 days.
 
-    Before calling, pay the 0.1 XRP/month listing fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
+    Before calling, pay the $0.10/month listing fee to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR
     on XRPL Mainnet and provide the transaction hash as fee_hash.
 
     Once listed, your skill is visible to:
