@@ -659,14 +659,12 @@ class SanctionsLog(Base):
 class KycRecord(Base):
     """KYC verification records — one row per verified wallet operator. Method: xaman."""
     __tablename__ = "kyc_record"
-    id                 = Column(Integer, primary_key=True, autoincrement=True)
-    wallet_address     = Column(String, nullable=False, index=True)
-    stripe_session_id  = Column(String, nullable=True, unique=True)  # kept for schema compat
-    stripe_vs_id       = Column(String, nullable=True)               # kept for schema compat
-    status             = Column(String, default="pending")  # pending | verified | failed
-    created_at         = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    verified_at        = Column(DateTime, nullable=True)
-    return_url         = Column(String, nullable=True)  # repurposed: stores method (e.g. "xaman")
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    wallet_address = Column(String, nullable=False, index=True)
+    status         = Column(String, default="pending")  # pending | verified | failed
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    verified_at    = Column(DateTime, nullable=True)
+    return_url     = Column(String, nullable=True)  # stores verification method (e.g. "xaman")
 
 
 # ---------------------------------------------------------------------------
