@@ -1635,7 +1635,6 @@ async def hire_and_pay(
     # Step 1: create the vault
     vault_body = {
         "escrow_id":        escrow_id,
-        "fee_hash":         fee_hash or None,
         "project_label":    task[:80],
         "buyer_name":       buyer_name or buyer_address,
         "buyer_address":    buyer_address,
@@ -1645,6 +1644,8 @@ async def hire_and_pay(
         "amount_xrp":       amount_xrp,
         "cancel_after_hrs": cancel_after_hrs,
     }
+    if fee_hash:
+        vault_body["fee_hash"] = fee_hash
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
