@@ -142,8 +142,8 @@ async def create_escrow_vault(
     )],
     fee_hash: Annotated[str, Field(
         title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the payment to the protocol wallet.",
-    )],
+        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit if eligible for free tier (wallet created via create_agent_wallet gets 3 free escrows).",
+    )] = "",
     task_description: Annotated[str, Field(
         title="Task Description",
         description="Detailed specification the worker must fulfil to be paid. Be precise — the AI referee evaluates against this.",
@@ -206,7 +206,6 @@ async def create_escrow_vault(
     """
     body = {
         "escrow_id":        escrow_id,
-        "fee_hash":         fee_hash,
         "project_label":    project_label,
         "buyer_name":       buyer_name,
         "buyer_address":    buyer_address,
@@ -217,6 +216,8 @@ async def create_escrow_vault(
         "cancel_after_hrs": cancel_after_hrs,
         "max_submissions":  max_submissions,
     }
+    if fee_hash:
+        body["fee_hash"] = fee_hash
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
