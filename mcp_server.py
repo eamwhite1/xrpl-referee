@@ -54,8 +54,11 @@ mcp = FastMCP(
         "  check_wallet_kyc(address)       — Xaman KYC status (unlocks escrows up to $10,000).\n"
         "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
         "\n"
-        "WALLET:\n"
-        "  create_agent_wallet() — generate a new XRPL keypair. Fund with ≥ 1 XRP to activate.\n"
+        "WALLET BOOTSTRAP (do this first if you have no XRPL wallet):\n"
+        "  1. create_agent_wallet()                    — generate a new XRPL keypair (free tier: 3 free escrows included).\n"
+        "  2. fund_xrpl_wallet_via_coinbase(address)   — buy XRP with USD/USDC via Coinbase and send to your new wallet.\n"
+        "     Requires a free Coinbase account + API key (wallet:accounts:read, wallet:buys:create, wallet:transactions:send).\n"
+        "     Alternatively: buy XRP on any exchange and withdraw to the address, or ask another agent to send ≥ 1 XRP.\n"
         "\n"
         "Marketplace URL: https://www.cryptovault.co.uk/marketplace/\n"
         "Machine-readable marketplace: https://xrpl-referee.onrender.com/.well-known/marketplace.json"
@@ -1635,7 +1638,6 @@ async def hire_and_pay(
     # Step 1: create the vault
     vault_body = {
         "escrow_id":        escrow_id,
-        "fee_hash":         fee_hash or None,
         "project_label":    task[:80],
         "buyer_name":       buyer_name or buyer_address,
         "buyer_address":    buyer_address,
@@ -1645,6 +1647,8 @@ async def hire_and_pay(
         "amount_xrp":       amount_xrp,
         "cancel_after_hrs": cancel_after_hrs,
     }
+    if fee_hash:
+        vault_body["fee_hash"] = fee_hash
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
@@ -1754,6 +1758,12 @@ async def create_agent_wallet() -> dict:
     """
     from xrpl.wallet import Wallet as XrplWallet
     w = XrplWallet.create()
+    # Register as bootstrapped so free tier applies regardless of trust score
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(f"{REFEREE_BASE}/wallet/{w.address}/bootstrap")
+    except Exception:
+        pass  # non-fatal — free tier just falls back to trust score check
     return {
         "address":      w.address,
         "seed":         w.seed,

@@ -550,6 +550,15 @@ class FreeAuditUsage(Base):
 
 FREE_AUDIT_LIMIT       = 3    # free audits per wallet
 FREE_AUDIT_MIN_SCORE   = 25   # wallet trust score must meet this threshold
+FREE_AUDIT_MIN_SCORE_BOOTSTRAPPED = 0  # wallets created via create_agent_wallet get free tier regardless of score
+
+
+class BootstrappedWallet(Base):
+    """Wallets created via create_agent_wallet — eligible for free tier regardless of trust score."""
+    __tablename__ = "bootstrapped_wallet"
+    id             = Column(Integer, primary_key=True, index=True)
+    wallet_address = Column(String, unique=True, index=True, nullable=False)
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class EscrowVault(Base):
@@ -1386,6 +1395,11 @@ def run_migrations():
             timestamp      TIMESTAMP
         )""",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS claimable BOOLEAN DEFAULT FALSE",
+        """CREATE TABLE IF NOT EXISTS bootstrapped_wallet (
+            id             SERIAL PRIMARY KEY,
+            wallet_address VARCHAR UNIQUE NOT NULL,
+            created_at     TIMESTAMP
+        )""",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2046,7 +2060,7 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None) -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None, buyer_address: str = None) -> dict:
     required_xrp = min_xrp if min_xrp is not None else await get_required_fee_xrp()
 
     if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
@@ -2058,26 +2072,29 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
 
     if not fee_hash:
         # ── Free tier: grant up to FREE_AUDIT_LIMIT audits for established wallets ──
-        # Extract buyer_address from escrow record if available
-        free_wallet = None
-        try:
-            vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-            if vault and vault.buyer_address:
-                free_wallet = vault.buyer_address
-        except Exception:
-            pass
+        # Use passed buyer_address directly, or fall back to escrow record lookup
+        free_wallet = buyer_address or None
+        if not free_wallet:
+            try:
+                vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+                if vault and vault.buyer_address:
+                    free_wallet = vault.buyer_address
+            except Exception:
+                pass
 
         if free_wallet:
             used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
             if used < FREE_AUDIT_LIMIT:
-                # Fetch trust score to gate on wallet quality
+                # Wallets created via create_agent_wallet bypass the trust score requirement
+                is_bootstrapped = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == free_wallet).first() is not None
+                min_score = FREE_AUDIT_MIN_SCORE_BOOTSTRAPPED if is_bootstrapped else FREE_AUDIT_MIN_SCORE
                 try:
                     score_data = await compute_xrpl_trust_score(free_wallet, db)
                     score = score_data.get("score", 0)
                 except Exception:
                     score = 0
 
-                if score >= FREE_AUDIT_MIN_SCORE:
+                if score >= min_score:
                     db.add(FreeAuditUsage(wallet_address=free_wallet, escrow_id=escrow_id, resource=resource))
                     db.commit()
                     remaining = FREE_AUDIT_LIMIT - used - 1
@@ -3724,6 +3741,16 @@ class WalletRatingRequest(BaseModel):
     comment:       Optional[str] = None
 
 
+@app.post("/wallet/{address}/bootstrap")
+async def bootstrap_wallet(address: str, db: Session = Depends(get_db)):
+    """Register a wallet as bootstrapped (created via create_agent_wallet) for free tier eligibility."""
+    existing = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == address).first()
+    if not existing:
+        db.add(BootstrappedWallet(wallet_address=address))
+        db.commit()
+    return {"address": address, "bootstrapped": True, "free_tier_credits": FREE_AUDIT_LIMIT}
+
+
 @app.post("/wallet/{address}/rate")
 async def rate_wallet(address: str, req: WalletRatingRequest, db: Session = Depends(get_db)):
     """
@@ -4119,7 +4146,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             detail=threshold["message"],
         )
 
-    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature, buyer_address=req.buyer_address)
     if response is not None and fee_result.get("payment_response_header"):
         response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
