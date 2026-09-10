@@ -5189,7 +5189,7 @@ async def nft_dvp_status(escrow_id: str, db: Session = Depends(get_db)):
 # 17. DELIVERY RETRIEVAL
 # ---------------------------------------------------------------------------
 @app.get("/escrow/{escrow_id}/delivery")
-async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
+async def get_delivery(escrow_id: str, worker_address: Optional[str] = None, db: Session = Depends(get_db)):
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
@@ -5207,6 +5207,8 @@ async def get_delivery(escrow_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail=f"Delivery expired. Receipt: {escrow_id}")
     if vault.status != "RELEASED":
         raise HTTPException(status_code=403, detail="Delivery only available after PASS verdict.")
+    if worker_address and vault.worker_address and worker_address != vault.worker_address:
+        raise HTTPException(status_code=403, detail="worker_address does not match this escrow.")
     if not vault.worker_submission:
         raise HTTPException(status_code=404, detail="Delivery data not found.")
 
@@ -5601,7 +5603,6 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         buyer_email        = body.get("buyer_email") or None,
         buyer_callback_url = body.get("buyer_callback_url") or None,
         award_token_hash   = award_token_hash,
-        award_token        = award_token,
         required_nft_issuer   = body.get("required_nft_issuer") or None,
         required_nft_metadata = json.dumps(body.get("required_nft_metadata")) if body.get("required_nft_metadata") else None,
         required_domain        = body.get("required_domain") or None,
@@ -5777,15 +5778,12 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
 
     if not worker_address or not worker_address.startswith("r"):
         raise HTTPException(status_code=400, detail="worker_address must be a valid XRPL r-address.")
-    if not proposed_xrp or float(proposed_xrp) <= 0:
-        raise HTTPException(status_code=400, detail="proposed_xrp must be > 0.")
+    if proposed_xrp is None:
+        raise HTTPException(status_code=400, detail="proposed_xrp is required (use 0 for inquiry/open-price bids).")
+    if float(proposed_xrp) < 0:
+        raise HTTPException(status_code=400, detail="proposed_xrp must be >= 0.")
     if not proposal:
         raise HTTPException(status_code=400, detail="proposal is required — describe your approach.")
-    if not worker_email and not callback_url:
-        raise HTTPException(
-            status_code=400,
-            detail="worker_email is required for human bidders. AI agents may provide callback_url instead."
-        )
 
     # Prevent duplicate bids from the same wallet on the same job
     existing_bid = db.query(Bid).filter(Bid.job_id == job_id, Bid.worker_address == worker_address).first()
@@ -5808,7 +5806,6 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         worker_name     = body.get("worker_name") or "",
         worker_email    = worker_email,
         callback_url    = callback_url,
-        chat_token      = raw_chat_token,
         chat_token_hash = chat_token_hash,
         proposed_xrp    = float(proposed_xrp),
         proposal        = proposal,
@@ -5834,7 +5831,7 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
             job_id       = job_id,
             job_title    = job.title,
             proposed_xrp = bid.proposed_xrp,
-            chat_token   = bid.chat_token or "",
+            chat_token   = "",  # not re-sent after creation
         ))
     # Notify the job poster (buyer) — works for both humans (email) and agents (webhook)
     if job.buyer_email:
@@ -5849,7 +5846,7 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
             proposed_xrp   = bid.proposed_xrp,
             proposal       = bid.proposal,
             total_bids     = total_bids,
-            award_token    = job.award_token or "",
+            award_token    = "",  # not re-sent after job creation
         ))
     if job.buyer_callback_url:
         asyncio.create_task(fire_new_bid_buyer_webhook(
