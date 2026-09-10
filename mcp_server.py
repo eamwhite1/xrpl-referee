@@ -1875,83 +1875,84 @@ async def fund_xrpl_wallet_via_coinbase(
         return {"CB-ACCESS-KEY": api_key, "CB-ACCESS-SIGN": sig, "CB-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
 
     try:
-        # Step 1 — list accounts, find USD account with sufficient balance
-        r = httpx.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"), timeout=15)
-        if r.status_code != 200:
-            return {"error": "accounts_failed", "status": r.status_code, "detail": r.text[:300]}
+        async with httpx.AsyncClient(timeout=25.0) as cb:
+            # Step 1 — list accounts, find USD account with sufficient balance
+            r = await cb.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"))
+            if r.status_code != 200:
+                return {"error": "accounts_failed", "status": r.status_code, "detail": r.text[:300]}
 
-        accounts    = r.json().get("data", [])
-        usd_account = next(
-            (a for a in accounts
-             if a.get("currency", {}).get("code") in ("USD", "USDC")
-             and float(a.get("native_balance", {}).get("amount", 0)) >= usd_amount),
-            None,
-        )
-        if not usd_account:
-            return {
-                "error":   "insufficient_balance",
-                "message": f"No USD/USDC account with ≥ ${usd_amount} on Coinbase. Deposit funds first.",
-                "accounts": [{"currency": a.get("currency", {}).get("code"), "balance": a.get("native_balance", {}).get("amount")} for a in accounts[:6]],
-            }
+            accounts    = r.json().get("data", [])
+            usd_account = next(
+                (a for a in accounts
+                 if a.get("currency", {}).get("code") in ("USD", "USDC")
+                 and float(a.get("native_balance", {}).get("amount", 0)) >= usd_amount),
+                None,
+            )
+            if not usd_account:
+                return {
+                    "error":   "insufficient_balance",
+                    "message": f"No USD/USDC account with ≥ ${usd_amount} on Coinbase. Deposit funds first.",
+                    "accounts": [{"currency": a.get("currency", {}).get("code"), "balance": a.get("native_balance", {}).get("amount")} for a in accounts[:6]],
+                }
 
-        usd_acct_id = usd_account["id"]
+            usd_acct_id = usd_account["id"]
 
-        # Step 2 — buy XRP with USD (market order via v2 buys endpoint)
-        buy_path = f"/v2/accounts/{usd_acct_id}/buys"
-        buy_body = _json.dumps({"amount": str(round(usd_amount, 2)), "currency": "USD", "payment_method": "default", "total": "true"})
-        r2 = httpx.post(f"{base}{buy_path}", headers=_headers("POST", buy_path, buy_body), content=buy_body, timeout=25)
-        if r2.status_code not in (200, 201):
-            return {"error": "buy_failed", "status": r2.status_code, "detail": r2.text[:300]}
+            # Step 2 — buy XRP with USD (market order via v2 buys endpoint)
+            buy_path = f"/v2/accounts/{usd_acct_id}/buys"
+            buy_body = _json.dumps({"amount": str(round(usd_amount, 2)), "currency": "USD", "payment_method": "default", "total": "true"})
+            r2 = await cb.post(f"{base}{buy_path}", headers=_headers("POST", buy_path, buy_body), content=buy_body)
+            if r2.status_code not in (200, 201):
+                return {"error": "buy_failed", "status": r2.status_code, "detail": r2.text[:300]}
 
-        buy_data = r2.json().get("data", {})
-        buy_id   = buy_data.get("id")
-        status   = buy_data.get("status", "")
+            buy_data = r2.json().get("data", {})
+            buy_id   = buy_data.get("id")
+            status   = buy_data.get("status", "")
 
-        # Step 3 — if buy requires commit, commit it
-        if status == "created":
-            commit_path = f"/v2/accounts/{usd_acct_id}/buys/{buy_id}/commit"
-            r2b = httpx.post(f"{base}{commit_path}", headers=_headers("POST", commit_path), timeout=15)
-            buy_data = r2b.json().get("data", buy_data)
-            status   = buy_data.get("status", status)
+            # Step 3 — if buy requires commit, commit it
+            if status == "created":
+                commit_path = f"/v2/accounts/{usd_acct_id}/buys/{buy_id}/commit"
+                r2b = await cb.post(f"{base}{commit_path}", headers=_headers("POST", commit_path))
+                buy_data = r2b.json().get("data", buy_data)
+                status   = buy_data.get("status", status)
 
-        xrp_bought = float(buy_data.get("amount", {}).get("amount", 0))
+            xrp_bought = float(buy_data.get("amount", {}).get("amount", 0))
 
-        # Step 4 — wait for buy to complete (usually instant for small amounts)
-        await asyncio.sleep(4)
+            # Step 4 — wait for buy to complete (usually instant for small amounts)
+            await asyncio.sleep(4)
 
-        # Step 5 — find XRP account
-        r3          = httpx.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"), timeout=15)
-        accounts2   = r3.json().get("data", [])
-        xrp_account = next((a for a in accounts2 if a.get("currency", {}).get("code") == "XRP"), None)
-        xrp_balance = float(xrp_account.get("balance", {}).get("amount", 0)) if xrp_account else 0
+            # Step 5 — find XRP account
+            r3          = await cb.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"))
+            accounts2   = r3.json().get("data", [])
+            xrp_account = next((a for a in accounts2 if a.get("currency", {}).get("code") == "XRP"), None)
+            xrp_balance = float(xrp_account.get("balance", {}).get("amount", 0)) if xrp_account else 0
 
-        if xrp_balance < 1.0:
-            return {
-                "error":      "xrp_balance_low",
-                "message":    f"Buy placed but XRP balance is {xrp_balance} XRP — may still be processing. Retry in 30s.",
-                "buy_id":     buy_id,
-                "buy_status": status,
-            }
+            if xrp_balance < 1.0:
+                return {
+                    "error":      "xrp_balance_low",
+                    "message":    f"Buy placed but XRP balance is {xrp_balance} XRP — may still be processing. Retry in 30s.",
+                    "buy_id":     buy_id,
+                    "buy_status": status,
+                }
 
-        # Step 6 — send XRP to XRPL address
-        xrp_to_send  = round(xrp_balance - 0.01, 6)  # keep 0.01 XRP for Coinbase withdrawal network fee
-        xrp_acct_id  = xrp_account["id"]
-        send_path    = f"/v2/accounts/{xrp_acct_id}/transactions"
-        send_body    = _json.dumps({
-            "type":    "send",
-            "to":      xrpl_address,
-            "amount":  str(xrp_to_send),
-            "currency": "XRP",
-            "description": "AgentTrust XRPL wallet bootstrap",
-        })
-        r4 = httpx.post(f"{base}{send_path}", headers=_headers("POST", send_path, send_body), content=send_body, timeout=25)
-        if r4.status_code not in (200, 201):
-            return {
-                "error":    "withdrawal_failed",
-                "status":   r4.status_code,
-                "detail":   r4.text[:300],
-                "recovery": f"XRP purchased successfully. Log into Coinbase and manually send {xrp_to_send} XRP to {xrpl_address}.",
-            }
+            # Step 6 — send XRP to XRPL address
+            xrp_to_send  = round(xrp_balance - 0.01, 6)  # keep 0.01 XRP for Coinbase withdrawal network fee
+            xrp_acct_id  = xrp_account["id"]
+            send_path    = f"/v2/accounts/{xrp_acct_id}/transactions"
+            send_body    = _json.dumps({
+                "type":    "send",
+                "to":      xrpl_address,
+                "amount":  str(xrp_to_send),
+                "currency": "XRP",
+                "description": "AgentTrust XRPL wallet bootstrap",
+            })
+            r4 = await cb.post(f"{base}{send_path}", headers=_headers("POST", send_path, send_body), content=send_body)
+            if r4.status_code not in (200, 201):
+                return {
+                    "error":    "withdrawal_failed",
+                    "status":   r4.status_code,
+                    "detail":   r4.text[:300],
+                    "recovery": f"XRP purchased successfully. Log into Coinbase and manually send {xrp_to_send} XRP to {xrpl_address}.",
+                }
 
         return {
             "status":       "funded",
