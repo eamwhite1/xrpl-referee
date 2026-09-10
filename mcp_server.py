@@ -1727,11 +1727,11 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
         escrow_id: The escrow ID from hire_and_pay() or create_escrow_vault()
         tx_blob:   Hex-encoded signed transaction from your XRPL wallet
     """
-    res = httpx.post(
-        f"{BASE_URL}/escrow/{escrow_id}/submit",
-        json={"tx_blob": tx_blob},
-        timeout=30,
-    )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/{escrow_id}/submit",
+            json={"tx_blob": tx_blob},
+        )
     if res.status_code == 200:
         return res.json()
     return {"error": res.status_code, "detail": res.text[:300]}
