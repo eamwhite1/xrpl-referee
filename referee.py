@@ -2048,7 +2048,7 @@ class StandaloneAuditRequest(BaseModel):
     task_category:       str            = "default"
     require_consensus:   bool           = False
 
-_XUMM_ALLOWED_TX_TYPES = {"EscrowCreate", "EscrowFinish", "Payment"}
+_XUMM_ALLOWED_TX_TYPES = {"EscrowCreate", "EscrowFinish"}
 
 class XummPayloadRequest(BaseModel):
     txjson:    dict
@@ -4962,7 +4962,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "amount_rlusd":         vault.amount_rlusd,
         "currency":             vault.currency,
         "auto_finish_queued":   auto_finish_queued,
-        "finish_tx_hash":       vault.auto_finish_hash,
+        "auto_finish_hash":     vault.auto_finish_hash,
         # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
         "dex_quote_rlusd":      dex_quote,
         "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
@@ -5249,7 +5249,7 @@ async def nft_dvp_status(escrow_id: str, db: Session = Depends(get_db)):
 # 17. DELIVERY RETRIEVAL
 # ---------------------------------------------------------------------------
 @app.get("/escrow/{escrow_id}/delivery")
-async def get_delivery(escrow_id: str, worker_address: Optional[str] = None, db: Session = Depends(get_db)):
+async def get_delivery(escrow_id: str, worker_address: str, db: Session = Depends(get_db)):
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
@@ -5267,7 +5267,7 @@ async def get_delivery(escrow_id: str, worker_address: Optional[str] = None, db:
         raise HTTPException(status_code=410, detail=f"Delivery expired. Receipt: {escrow_id}")
     if vault.status != "RELEASED":
         raise HTTPException(status_code=403, detail="Delivery only available after PASS verdict.")
-    if worker_address and vault.worker_address and worker_address != vault.worker_address:
+    if vault.worker_address and worker_address != vault.worker_address:
         raise HTTPException(status_code=403, detail="worker_address does not match this escrow.")
     if not vault.worker_submission:
         raise HTTPException(status_code=404, detail="Delivery data not found.")
@@ -5669,7 +5669,7 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         required_vc_issuer_did = body.get("required_vc_issuer_did") or None,
         required_vc_type       = body.get("required_vc_type") or None,
         proof_policy           = body.get("proof_policy") or "ALL",
-        claimable              = bool(body.get("claimable", False)),
+        claimable              = bool(body.get("claimable", body.get("is_claimable", False))),
     )
     db.add(job)
     db.commit()
@@ -5818,6 +5818,7 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
         "expires_at":    job.expires_at.strftime("%Y-%m-%d %H:%M UTC") if job.expires_at else None,
         "required_nft_issuer": job.required_nft_issuer or None,
         "proof_policy":  job.proof_policy or "ALL",
+        "claimable":     bool(job.claimable) if hasattr(job, "claimable") else False,
         "bids":          bids_out,
     }
 
