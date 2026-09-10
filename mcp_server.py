@@ -1746,14 +1746,24 @@ async def create_agent_wallet() -> dict:
     """
     Generate a new XRPL keypair for an agent wallet.
 
-    Returns the wallet address and seed. The wallet is NOT yet funded —
-    to activate it on mainnet, send at least 1 XRP to the returned address
-    (the base reserve). Owner reserves are 0.2 XRP per object held.
+    Returns the wallet address and seed. The wallet is NOT yet active on the ledger —
+    you MUST fund it before it can send or receive anything, including escrow payments.
 
-    Funding options:
-      - Receive XRP from another wallet (ask your operator or client to send 1 XRP)
-      - Buy XRP on an exchange (Coinbase, Kraken, Binance) and withdraw to the address
-      - On testnet, use the XRPL faucet: https://xrpl.org/xrp-testnet-faucet.html
+    XRPL requires 1 XRP minimum to activate a wallet (base reserve). Until funded:
+      - You cannot sign or submit transactions
+      - You cannot be the destination of an EscrowCreate (buyer's tx will fail)
+      - Your trust score will show as 0 / "not found"
+
+    Funding via x402 / Coinbase (recommended for agents):
+      If you have USDC on Base/Coinbase, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0).
+      This uses x402 — the autonomous HTTP payment protocol — to swap USDC for XRP and
+      send it directly to your new address. $3 covers the 1 XRP reserve plus escrow fees.
+      Requires your own Coinbase API key (wallet:accounts:read, wallet:buys:create,
+      wallet:transactions:send) — never use someone else's key.
+
+    Other funding options:
+      - Ask your operator or client to send ≥ 1 XRP to the address
+      - Buy XRP on any exchange (Coinbase, Kraken, Binance) and withdraw to the address
 
     Keep the seed secret — anyone with it controls the wallet.
     """
@@ -1773,20 +1783,25 @@ async def create_agent_wallet() -> dict:
         "status":       "unfunded",
         "reserve_xrp":  1,
         "note": (
-            "Send at least 1 XRP to 'address' to activate this wallet on mainnet. "
-            "Each object you own (escrow, offer, trust line) adds 0.2 XRP to the reserve. "
+            "This wallet is NOT yet active. Send at least 1 XRP to 'address' to activate it on mainnet. "
+            "Until funded: you cannot transact, and you cannot be an escrow destination. "
+            "Each object you hold (escrow, offer, trust line) adds 0.2 XRP to the reserve. "
             "Store 'seed' securely — it cannot be recovered if lost."
         ),
         "funding_instructions": {
-            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw to the address above.",
-            "from_wallet":   "Have a funded wallet send 1+ XRP to the address via XRPL payment.",
-            "testnet_faucet": "https://xrpl.org/xrp-testnet-faucet.html",
+            "x402_coinbase": (
+                "RECOMMENDED for agents: call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) "
+                "if you have USDC on Coinbase/Base. Uses x402 autonomous payment — no human needed. "
+                "Requires your own Coinbase API key."
+            ),
+            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw ≥1 XRP to the address.",
+            "from_wallet":   "Ask your operator or client to send ≥1 XRP to the address.",
         },
         "next_step": (
-            "Fund this address with at least 1 XRP to activate it on XRPL mainnet. "
-            "Options: (1) call fund_xrpl_wallet_via_coinbase(address, usd_amount) if you have "
-            "a Coinbase API key; (2) buy XRP on any exchange and withdraw to the address; "
-            "(3) ask another funded wallet to send ≥ 1 XRP. "
+            "IMPORTANT: Fund this address with at least 1 XRP before sharing it or accepting work. "
+            "If you have USDC on Coinbase, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) now — "
+            "this uses x402 to swap USDC for XRP autonomously. "
+            "Otherwise buy XRP on any exchange and withdraw to the address. "
             "Once funded, call list_open_jobs() to find work or hire_and_pay() to hire."
         ),
     }
