@@ -4383,11 +4383,21 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
     try:
         client     = AsyncJsonRpcClient(XRPL_URL)
         acct_res   = await client.request(AccountInfo(account=req.buyer_address, ledger_index="current"))
+        if "account_data" not in acct_res.result:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Buyer address {req.buyer_address} is not activated on the XRPL ledger. "
+                    "Send at least 2 XRP to this address to activate it, then retry."
+                ),
+            )
         acct_data  = acct_res.result["account_data"]
         sequence   = acct_data["Sequence"]
         ledger_res = await client.request(Fee())
         base_fee   = int(ledger_res.result.get("drops", {}).get("base_fee", 12))
         current_ledger = ledger_res.result.get("ledger_current_index", 0)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not fetch XRPL account info: {e}")
 
