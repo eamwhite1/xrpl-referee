@@ -1570,7 +1570,15 @@ else:
 # SUBMISSION LIMITS
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_SUBMISSIONS = int(os.getenv("DEFAULT_MAX_SUBMISSIONS", "3"))
-EXTRA_ATTEMPT_FEE_XRP   = 0.05  # charged per extra submission beyond the limit
+EXTRA_ATTEMPT_FEE_USD   = 0.05  # target USD price per extra submission attempt
+
+
+def extra_attempt_fee_xrp() -> float:
+    """Return the extra-attempt fee in XRP at the current cached price (falls back to 0.025 XRP)."""
+    price = _xrp_price_cache.get("usd") if _xrp_price_cache else None
+    if price and price > 0:
+        return round(EXTRA_ATTEMPT_FEE_USD / price, 6)
+    return 0.025  # fallback if price not cached yet
 
 
 # ---------------------------------------------------------------------------
@@ -4628,7 +4636,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             detail=(
                 f"Submission limit reached ({max_allowed} attempt{'s' if max_allowed != 1 else ''} allowed). "
                 f"Contact the buyer to request additional attempts, or purchase an extra attempt for "
-                f"{EXTRA_ATTEMPT_FEE_XRP} XRP via POST /evaluate/purchase-attempt."
+                f"${EXTRA_ATTEMPT_FEE_USD} (≈ {extra_attempt_fee_xrp()} XRP) via POST /evaluate/purchase-attempt."
             ),
         )
 
@@ -4981,7 +4989,7 @@ class PurchaseAttemptRequest(BaseModel):
 @app.post("/evaluate/purchase-attempt")
 async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     """
-    Seller pays EXTRA_ATTEMPT_FEE_XRP (0.05 XRP) to unlock one more submission.
+    Seller pays $0.05 (≈ EXTRA_ATTEMPT_FEE_USD in XRP at current price) to unlock one more submission.
     Returns updated attempts_remaining.
     """
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
@@ -4997,7 +5005,7 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
         fee_hash  = req.fee_hash,
         escrow_id = f"{req.escrow_id}-attempt",
         db        = db,
-        min_xrp   = EXTRA_ATTEMPT_FEE_XRP,
+        min_xrp   = extra_attempt_fee_xrp(),
         resource  = "/evaluate/purchase-attempt",
         reviewer_token = x_reviewer_token,
         payment_signature = payment_signature,
