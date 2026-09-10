@@ -1755,6 +1755,12 @@ async def create_agent_wallet() -> dict:
     """
     from xrpl.wallet import Wallet as XrplWallet
     w = XrplWallet.create()
+    # Register as bootstrapped so free tier applies regardless of trust score
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(f"{REFEREE_BASE}/wallet/{w.address}/bootstrap")
+    except Exception:
+        pass  # non-fatal — free tier just falls back to trust score check
     return {
         "address":      w.address,
         "seed":         w.seed,
