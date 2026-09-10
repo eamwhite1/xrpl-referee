@@ -140,10 +140,6 @@ async def create_escrow_vault(
         title="Escrow ID",
         description="Unique receipt code for this vault, e.g. AT-7X9K-2MQ4. Used to reference the vault in subsequent calls.",
     )],
-    fee_hash: Annotated[str, Field(
-        title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit if eligible for free tier (wallet created via create_agent_wallet gets 3 free escrows).",
-    )] = "",
     task_description: Annotated[str, Field(
         title="Task Description",
         description="Detailed specification the worker must fulfil to be paid. Be precise — the AI referee evaluates against this.",
@@ -160,6 +156,10 @@ async def create_escrow_vault(
         title="Worker XRPL Address",
         description="XRPL wallet address (r...) of the worker who will receive payment on approval. Use the address returned by award_job().",
     )],
+    fee_hash: Annotated[str, Field(
+        title="XRPL Payment Hash",
+        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit if eligible for free tier (wallet created via create_agent_wallet gets 3 free escrows).",
+    )] = "",
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
         description="Amount of XRP to lock in escrow. Required when currency is XRP. Minimum: 0.000001 XRP (1 drop — XRPL EscrowCreate minimum). Practically, ensure the bounty exceeds the $0.10 protocol fee.",
