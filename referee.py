@@ -32,7 +32,7 @@ except ImportError:
 from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
-from xrpl.models.requests import Tx, SubmitOnly, AccountInfo
+from xrpl.models.requests import Tx, SubmitOnly, AccountInfo, Fee
 from xrpl.models.transactions import EscrowFinish
 from xrpl.core.addresscodec import decode_seed
 from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
