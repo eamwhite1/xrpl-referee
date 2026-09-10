@@ -2048,8 +2048,21 @@ class StandaloneAuditRequest(BaseModel):
     task_category:       str            = "default"
     require_consensus:   bool           = False
 
+_XUMM_ALLOWED_TX_TYPES = {"EscrowCreate", "EscrowFinish", "Payment"}
+
 class XummPayloadRequest(BaseModel):
-    txjson: dict
+    txjson:    dict
+    escrow_id: Optional[str] = None  # required for EscrowFinish to bind to a vault
+
+    @validator("txjson")
+    def validate_txjson(cls, v):
+        tx_type = v.get("TransactionType", "")
+        if tx_type not in _XUMM_ALLOWED_TX_TYPES:
+            raise ValueError(
+                f"TransactionType '{tx_type}' is not permitted. "
+                f"Allowed: {sorted(_XUMM_ALLOWED_TX_TYPES)}"
+            )
+        return v
 
 class QuoteRequest(BaseModel):
     worker_address:  str
@@ -4095,8 +4108,22 @@ async def get_xumm_payload_status(uuid: str):
 
 
 @app.post("/xumm/create-payload")
-async def create_xumm_payload(req: XummPayloadRequest):
-    result = await xumm_create_payload(req.txjson)
+async def create_xumm_payload(req: XummPayloadRequest, db: Session = Depends(get_db)):
+    # For EscrowFinish, bind fulfillment from the vault — never trust caller-supplied fulfillment
+    txjson = dict(req.txjson)
+    if txjson.get("TransactionType") == "EscrowFinish":
+        if not req.escrow_id:
+            raise HTTPException(status_code=400, detail="escrow_id is required for EscrowFinish payloads.")
+        vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+        if not vault or not vault.fulfillment:
+            raise HTTPException(status_code=404, detail="Vault not found or fulfillment not yet available.")
+        if vault.status not in ("PASS", "RELEASED"):
+            raise HTTPException(status_code=409, detail="Escrow has not been approved yet.")
+        txjson["Fulfillment"] = vault.fulfillment
+        txjson["Condition"]   = vault.condition
+        txjson["Owner"]       = vault.buyer_address
+        txjson["OfferSequence"] = vault.escrow_sequence
+    result = await xumm_create_payload(txjson)
     return {"nextUrl": result["nextUrl"], "uuid": result["uuid"]}
 
 
@@ -4332,16 +4359,27 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     try:
         client  = AsyncJsonRpcClient(XRPL_URL)
         tx_res  = await client.request(Tx(transaction=tx_hash))
-        if tx_res.is_successful():
-            tx_data  = tx_res.result.get("tx_json") or tx_res.result.get("tx") or tx_res.result
-            sequence = tx_data.get("Sequence")
-            logger.info(f"✅ EscrowCreate confirmed: hash={tx_hash[:16]}... seq={sequence}")
+        if not tx_res.is_successful():
+            raise HTTPException(status_code=400, detail=f"Transaction {tx_hash} not found on the XRPL ledger.")
+        tx_data   = tx_res.result.get("tx_json") or tx_res.result.get("tx") or tx_res.result
+        tx_type   = tx_data.get("TransactionType", "")
+        if tx_type != "EscrowCreate":
+            raise HTTPException(status_code=400, detail=f"Transaction is a {tx_type}, not an EscrowCreate.")
+        on_chain_condition = tx_data.get("Condition", "")
+        if on_chain_condition and vault.condition and on_chain_condition.upper() != vault.condition.upper():
+            raise HTTPException(status_code=400, detail="Transaction condition does not match this vault.")
+        destination = tx_data.get("Destination", "")
+        if destination and vault.worker_address and destination != vault.worker_address:
+            raise HTTPException(status_code=400, detail="Transaction destination does not match the worker address.")
+        sequence = tx_data.get("Sequence")
+        logger.info(f"✅ EscrowCreate confirmed: hash={tx_hash[:16]}... seq={sequence}")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"Could not look up sequence for {tx_hash}: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not verify transaction on XRPL: {e}")
 
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
-    # Record who created the EscrowCreate (buyer in the bilateral flow)
     if not vault.escrow_owner:
         vault.escrow_owner = vault.buyer_address
     db.commit()
@@ -4907,13 +4945,15 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         except Exception as e:
             logger.warning(f"⚠️ Webhook failed: {e}")
 
+    auto_finish_queued = is_approved and bool(vault.escrow_sequence)
+    # Only expose fulfillment when auto-finish did NOT run (manual EscrowFinish needed)
+    expose_fulfillment = is_approved and not auto_finish_queued
     return {
         "escrow_id":            req.escrow_id,
         "status":               "approved" if is_approved else "rejected",
         "verdict":              verdict_dict,
         "model_used":           model_used,
-        # fulfillment key still returned for agent fallback / manual claim
-        "fulfillment":          revealed_fulfillment,
+        "fulfillment":          revealed_fulfillment if expose_fulfillment else None,
         "condition":            vault.condition if is_approved else None,
         "worker_address":       vault.worker_address,
         "buyer_address":        vault.buyer_address,
@@ -4921,7 +4961,8 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "amount_xrp":           vault.amount_xrp,
         "amount_rlusd":         vault.amount_rlusd,
         "currency":             vault.currency,
-        "auto_finish_queued":   is_approved and bool(vault.escrow_sequence),
+        "auto_finish_queued":   auto_finish_queued,
+        "finish_tx_hash":       vault.auto_finish_hash,
         # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
         "dex_quote_rlusd":      dex_quote,
         "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
@@ -5627,6 +5668,7 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         required_vc_issuer_did = body.get("required_vc_issuer_did") or None,
         required_vc_type       = body.get("required_vc_type") or None,
         proof_policy           = body.get("proof_policy") or "ALL",
+        claimable              = bool(body.get("claimable", False)),
     )
     db.add(job)
     db.commit()
