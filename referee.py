@@ -2046,7 +2046,7 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None) -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None, buyer_address: str = None) -> dict:
     required_xrp = min_xrp if min_xrp is not None else await get_required_fee_xrp()
 
     if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
@@ -2058,14 +2058,15 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
 
     if not fee_hash:
         # ── Free tier: grant up to FREE_AUDIT_LIMIT audits for established wallets ──
-        # Extract buyer_address from escrow record if available
-        free_wallet = None
-        try:
-            vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-            if vault and vault.buyer_address:
-                free_wallet = vault.buyer_address
-        except Exception:
-            pass
+        # Use passed buyer_address directly, or fall back to escrow record lookup
+        free_wallet = buyer_address or None
+        if not free_wallet:
+            try:
+                vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+                if vault and vault.buyer_address:
+                    free_wallet = vault.buyer_address
+            except Exception:
+                pass
 
         if free_wallet:
             used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
@@ -4119,7 +4120,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             detail=threshold["message"],
         )
 
-    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature, buyer_address=req.buyer_address)
     if response is not None and fee_result.get("payment_response_header"):
         response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
