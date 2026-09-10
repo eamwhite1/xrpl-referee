@@ -1981,7 +1981,7 @@ class Attachment(BaseModel):
 
 class EscrowSetupRequest(BaseModel):
     escrow_id:          str
-    fee_hash:           str
+    fee_hash:           Optional[str]   = None
     project_label:      Optional[str]   = None
     buyer_name:         str
     buyer_address:      str
