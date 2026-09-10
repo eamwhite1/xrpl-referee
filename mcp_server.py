@@ -1749,7 +1749,7 @@ async def create_agent_wallet() -> dict:
     Returns the wallet address and seed. The wallet is NOT yet active on the ledger —
     you MUST fund it before it can send or receive anything, including escrow payments.
 
-    XRPL requires 2 XRP minimum to activate a wallet (base reserve). Until funded:
+    XRPL requires 1 XRP minimum to activate a wallet (base reserve). Until funded:
       - You cannot sign or submit transactions
       - You cannot be the destination of an EscrowCreate (buyer's tx will fail)
       - Your trust score will show as 0 / "not found"
@@ -1757,12 +1757,12 @@ async def create_agent_wallet() -> dict:
     Funding via x402 / Coinbase (recommended for agents):
       If you have USDC on Base/Coinbase, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0).
       This uses x402 — the autonomous HTTP payment protocol — to swap USDC for XRP and
-      send it directly to your new address. $5 covers the 2 XRP reserve plus escrow fees.
+      send it directly to your new address. $3 covers the 1 XRP reserve plus escrow fees.
       Requires your own Coinbase API key (wallet:accounts:read, wallet:buys:create,
       wallet:transactions:send) — never use someone else's key.
 
     Other funding options:
-      - Ask your operator or client to send ≥ 2 XRP to the address
+      - Ask your operator or client to send ≥ 1 XRP to the address
       - Buy XRP on any exchange (Coinbase, Kraken, Binance) and withdraw to the address
 
     Keep the seed secret — anyone with it controls the wallet.
@@ -1783,7 +1783,7 @@ async def create_agent_wallet() -> dict:
         "status":       "unfunded",
         "reserve_xrp":  1,
         "note": (
-            "This wallet is NOT yet active. Send at least 2 XRP to 'address' to activate it on mainnet. "
+            "This wallet is NOT yet active. Send at least 1 XRP to 'address' to activate it on mainnet. "
             "Until funded: you cannot transact, and you cannot be an escrow destination. "
             "Each object you hold (escrow, offer, trust line) adds 0.2 XRP to the reserve. "
             "Store 'seed' securely — it cannot be recovered if lost."
@@ -1794,11 +1794,11 @@ async def create_agent_wallet() -> dict:
                 "if you have USDC on Coinbase/Base. Uses x402 autonomous payment — no human needed. "
                 "Requires your own Coinbase API key."
             ),
-            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw ≥2 XRP to the address.",
-            "from_wallet":   "Ask your operator or client to send ≥2 XRP to the address.",
+            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw ≥1 XRP to the address.",
+            "from_wallet":   "Ask your operator or client to send ≥1 XRP to the address.",
         },
         "next_step": (
-            "IMPORTANT: Fund this address with at least 2 XRP before sharing it or accepting work. "
+            "IMPORTANT: Fund this address with at least 1 XRP before sharing it or accepting work. "
             "If you have USDC on Coinbase, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) now — "
             "this uses x402 to swap USDC for XRP autonomously. "
             "Otherwise buy XRP on any exchange and withdraw to the address. "
