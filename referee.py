@@ -4560,6 +4560,15 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="This escrow has already been released.")
     if vault.status == "CANCELLED":
         raise HTTPException(status_code=409, detail="This escrow has been cancelled.")
+    if not vault.escrow_sequence:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Escrow '{req.escrow_id}' has not been confirmed on the XRPL ledger yet. "
+                "Sign and submit the EscrowCreate transaction first, then call "
+                "confirm_escrow_transaction() with the tx hash before submitting work."
+            ),
+        )
 
     # ── SUBMISSION LIMIT CHECK ──
     current_count = vault.submission_count or 0
