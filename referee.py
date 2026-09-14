@@ -237,7 +237,7 @@ def robots_txt():
         "Allow: /audit",
         "Allow: /status",
         "",
-        "Sitemap: https://xrpl-referee.onrender.com/openapi.json",
+        "Sitemap: https://mcp.cryptovault.co.uk/openapi.json",
     ])
 
 @app.get("/.well-known/agent.json")
@@ -249,10 +249,10 @@ def serve_agent_json():
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
         "description": "Trustless AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC) to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
-        "url": "https://xrpl-referee.onrender.com",
+        "url": "https://mcp.cryptovault.co.uk",
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
-        "provider": {"organization": "AgentTrust Protocol", "url": "https://xrpl-referee.onrender.com"},
+        "provider": {"organization": "AgentTrust Protocol", "url": "https://mcp.cryptovault.co.uk"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
@@ -291,7 +291,7 @@ def serve_mcp_server_card():
             "Implements the x402 payment protocol: call any paid endpoint without payment to receive "
             "a 402 with an X-Payment-Required header describing exactly how to pay in XRP."
         ),
-        "url":         "https://xrpl-referee.onrender.com/mcp",
+        "url":         "https://mcp.cryptovault.co.uk/mcp",
         "homepage":    "https://www.cryptovault.co.uk",
         "contact":     "hello@cryptovault.co.uk",
         "license":     "MIT",
@@ -337,8 +337,8 @@ def serve_marketplace_json():
         "name": "AgentTrust Marketplace",
         "description": "Open agent marketplace — post jobs, bid, claim bounties, list skills, hire directly. All payments settled via XRPL escrow with AI-verified automatic release.",
         "url": "https://www.cryptovault.co.uk/marketplace/",
-        "api_base": "https://xrpl-referee.onrender.com",
-        "mcp_endpoint": "https://xrpl-referee.onrender.com/mcp",
+        "api_base": "https://mcp.cryptovault.co.uk",
+        "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "currency": ["XRP", "RLUSD"],
         "network": "XRPL Mainnet",
         "capabilities": {
@@ -359,8 +359,8 @@ def serve_marketplace_json():
             "get_wallet_trust_score", "check_wallet_sanctions", "check_wallet_kyc",
             "create_agent_wallet", "get_xrp_price"
         ],
-        "docs": "https://xrpl-referee.onrender.com/docs",
-        "agent_card": "https://xrpl-referee.onrender.com/.well-known/agent.json",
+        "docs": "https://mcp.cryptovault.co.uk/docs",
+        "agent_card": "https://mcp.cryptovault.co.uk/.well-known/agent.json",
     }
 
 
@@ -441,8 +441,8 @@ async def serve_payment_required():
         ],
         "freeAudits":   "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash.",
         "accepts":      accepts,
-        "docs":         "https://xrpl-referee.onrender.com/docs",
-        "mcp":          "https://xrpl-referee.onrender.com/mcp",
+        "docs":         "https://mcp.cryptovault.co.uk/docs",
+        "mcp":          "https://mcp.cryptovault.co.uk/mcp",
     }
 
 
@@ -451,7 +451,7 @@ def serve_mcp_config():
     """Smithery External MCP config schema — declares no authentication required."""
     return {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "https://xrpl-referee.onrender.com/.well-known/mcp-config",
+        "$id": "https://mcp.cryptovault.co.uk/.well-known/mcp-config",
         "type": "object",
         "title": "AgentTrust Referee",
         "description": "No authentication required. Connect directly to the MCP endpoint at /mcp.",
@@ -464,10 +464,10 @@ def serve_mcp_config():
 @app.get("/.well-known/xrpl-issuer-registry")
 def serve_issuer_registry_discovery():
     return {
-        "registry_api": "https://xrpl-referee.onrender.com/nft/issuers",
+        "registry_api": "https://mcp.cryptovault.co.uk/nft/issuers",
         "spec": "https://www.cryptovault.co.uk/docs/issuer-registry-spec.md",
         "version": "1.0.0",
-        "mcp_endpoint": "https://xrpl-referee.onrender.com/mcp",
+        "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "contact": "admin@cryptovault.co.uk",
         "published": "2026-06-06",
     }
@@ -500,7 +500,7 @@ def serve_ai_plugin():
             "Supports XRP and RLUSD. Sellers may include XRPL transaction hashes as proof of on-chain delivery — the referee will verify them on the ledger."
         ),
         "auth": {"type": "none"},
-        "api": {"type": "openapi", "url": "https://xrpl-referee.onrender.com/openapi.json"},
+        "api": {"type": "openapi", "url": "https://mcp.cryptovault.co.uk/openapi.json"},
         "logo_url": "https://www.cryptovault.co.uk/logo.png",
         "contact_email": "hello@cryptovault.co.uk",
         "legal_info_url": "https://www.cryptovault.co.uk",
@@ -6538,7 +6538,7 @@ async def list_nft_issuers(category: str = None, include_pending: bool = False, 
         params["category"] = category
     sql += " ORDER BY name"
     rows = db.execute(text(sql), params).fetchall()
-    base_url = "https://xrpl-referee.onrender.com"
+    base_url = "https://mcp.cryptovault.co.uk"
     keys = list(rows[0]._fields) if rows else []
     def row_val(r, k): return getattr(r, k, None)
     return {
@@ -6693,7 +6693,7 @@ async def issuer_registry_feed(
             "per_page": per_page,
             "total": total,
             "total_pages": max(1, -(-total // per_page)),
-            "next": f"https://xrpl-referee.onrender.com/nft/issuers/feed?page={page+1}&per_page={per_page}" if (page * per_page) < total else None,
+            "next": f"https://mcp.cryptovault.co.uk/nft/issuers/feed?page={page+1}&per_page={per_page}" if (page * per_page) < total else None,
         },
         "filters": {"category": category, "verified": verified, "since": since},
         "issuers": [

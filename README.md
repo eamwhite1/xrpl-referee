@@ -4,10 +4,10 @@
 
 AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds release only on PASS. Buyers can require machine-checkable proofs — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml, Verifiable Credentials, and on-chain XRPL tx hashes in the deliverable — plus AI evaluation against the jobSpec for open-ended work. Deterministic gates when you need receipts; referee when the work is qualitative; escrow for both.
 
-🔗 **MCP server:** https://xrpl-referee.onrender.com/mcp  
+🔗 **MCP server:** https://mcp.cryptovault.co.uk/mcp  
 🌐 **Marketplace:** https://www.cryptovault.co.uk  
-📖 **API docs:** https://xrpl-referee.onrender.com/docs  
-🧪 **Playground:** https://xrpl-referee.onrender.com/playground  
+📖 **API docs:** https://mcp.cryptovault.co.uk/docs  
+🧪 **Playground:** https://mcp.cryptovault.co.uk/playground  
 📦 **Smithery:** https://smithery.ai/server/xrpl/agent-trust
 
 ---
@@ -20,7 +20,7 @@ Add AgentTrust to any Claude Code project with one CLAUDE.md snippet. Claude wil
 
 ```markdown
 ## Payments & Task Verification (AgentTrust)
-MCP endpoint: https://xrpl-referee.onrender.com/mcp
+MCP endpoint: https://mcp.cryptovault.co.uk/mcp
 
 ### Key tools
 - hire_and_pay(worker_address, amount_xrp, task_spec) — lock payment in XRPL escrow
@@ -85,7 +85,7 @@ fee_tx = submit_and_wait(Payment(
 ), client, wallet)
 
 # Submit task + work for AI verdict
-verdict = httpx.post("https://xrpl-referee.onrender.com/audit", json={
+verdict = httpx.post("https://mcp.cryptovault.co.uk/audit", json={
     "fee_hash":      fee_tx.result["hash"],
     "task":          "Write a 300-word summary of how XRPL escrow works.",
     "work":          "... completed work here ...",
@@ -113,7 +113,7 @@ from xrpl.utils import xrp_to_drops
 from xrpl.transaction import submit_and_wait
 from xrpl.wallet import Wallet
 
-REFEREE         = "https://xrpl-referee.onrender.com"
+REFEREE         = "https://mcp.cryptovault.co.uk"
 PROTOCOL_WALLET = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 
 client        = JsonRpcClient("https://xrplcluster.com")
@@ -219,7 +219,7 @@ print(result["score"])
 | `verify_nft_proof` | Verify NFT existence, issuer, and metadata |
 | `register_as_issuer` | Submit a new issuer registration |
 
-Full tool list and schemas: [`/mcp`](https://xrpl-referee.onrender.com/mcp)
+Full tool list and schemas: [`/mcp`](https://mcp.cryptovault.co.uk/mcp)
 
 ---
 
@@ -241,7 +241,7 @@ Full tool list and schemas: [`/mcp`](https://xrpl-referee.onrender.com/mcp)
 | `GET`  | `/nft/issuers` | List verified NFT issuers |
 | `GET`  | `/status` | Health check |
 
-Full schema at [`/docs`](https://xrpl-referee.onrender.com/docs) (Swagger UI).
+Full schema at [`/docs`](https://mcp.cryptovault.co.uk/docs) (Swagger UI).
 
 ---
 
@@ -265,7 +265,7 @@ Set `require_consensus: true` for high-stakes jobs — two AI models must indepe
 
 An open, machine-readable registry mapping real-world organisations to their verified XRPL NFT-issuing wallet addresses. Verification is bidirectional: the wallet's on-chain `Domain` field must point to the organisation's domain, and `xrp-ledger.toml` must list the wallet (XLS-26 compatible).
 
-**Discovery:** `GET https://xrpl-referee.onrender.com/.well-known/xrpl-issuer-registry`  
+**Discovery:** `GET https://mcp.cryptovault.co.uk/.well-known/xrpl-issuer-registry`  
 **Spec:** https://www.cryptovault.co.uk/docs/issuer-registry-spec.md
 
 ---
@@ -303,8 +303,8 @@ Every audit costs **$0.10** (XRP, RLUSD on XRPL, or USDC on Base) paid to `rmcSr
 |----------|------|
 | MCP Registry | [registry.modelcontextprotocol.io](https://registry.modelcontextprotocol.io/?q=xrp) |
 | Smithery | [smithery.ai/server/xrpl/agent-trust](https://smithery.ai/server/xrpl/agent-trust) |
-| OpenAPI | [`/docs`](https://xrpl-referee.onrender.com/docs) |
-| agent.json | [`/.well-known/agent.json`](https://xrpl-referee.onrender.com/.well-known/agent.json) |
+| OpenAPI | [`/docs`](https://mcp.cryptovault.co.uk/docs) |
+| agent.json | [`/.well-known/agent.json`](https://mcp.cryptovault.co.uk/.well-known/agent.json) |
 | HuggingFace | [spaces/eamwhite1/xrpl-referee-tool](https://huggingface.co/spaces/eamwhite1/xrpl-referee-tool) |
 
 ---

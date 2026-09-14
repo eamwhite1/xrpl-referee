@@ -11,7 +11,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://xrpl-referee.onrender.com/mcp"
+      "url": "https://mcp.cryptovault.co.uk/mcp"
     }
   ]
 }
