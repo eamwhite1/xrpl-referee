@@ -9,7 +9,7 @@
   },
   "api": {
     "type": "openapi",
-    "url": "https://xrpl-referee.onrender.com/openapi.json"
+    "url": "https://mcp.cryptovault.co.uk/openapi.json"
   },
   "logo_url": "https://agenttrust.io/logo.png",
   "contact_email": "hello@agenttrust.io",

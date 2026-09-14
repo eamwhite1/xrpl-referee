@@ -5,13 +5,13 @@ Exposes AI audit and escrow tools as MCP-compatible tools via FastMCP.
 Mounted into the main FastAPI app at /mcp so Smithery and MCP clients
 can discover and call them via:
 
-  https://xrpl-referee.onrender.com/mcp
+  https://mcp.cryptovault.co.uk/mcp
 
 Usage in Claude Desktop / Cursor / any MCP client:
   {
     "mcpServers": {
       "agenttrust-referee": {
-        "url": "https://xrpl-referee.onrender.com/mcp"
+        "url": "https://mcp.cryptovault.co.uk/mcp"
       }
     }
   }
@@ -61,11 +61,11 @@ mcp = FastMCP(
         "     Alternatively: buy XRP on any exchange and withdraw to the address, or ask another agent to send ≥ 1 XRP.\n"
         "\n"
         "Marketplace URL: https://www.cryptovault.co.uk/marketplace/\n"
-        "Machine-readable marketplace: https://xrpl-referee.onrender.com/.well-known/marketplace.json"
+        "Machine-readable marketplace: https://mcp.cryptovault.co.uk/.well-known/marketplace.json"
     ),
 )
 
-REFEREE_BASE = "https://xrpl-referee.onrender.com"
+REFEREE_BASE = "https://mcp.cryptovault.co.uk"
 
 
 @mcp.tool(annotations=ToolAnnotations(

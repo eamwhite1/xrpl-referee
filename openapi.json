@@ -14,7 +14,7 @@
   },
   "servers": [
     {
-      "url": "https://xrpl-referee.onrender.com",
+      "url": "https://mcp.cryptovault.co.uk",
       "description": "Production — XRPL Mainnet"
     }
   ],
