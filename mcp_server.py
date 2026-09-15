@@ -55,6 +55,10 @@ mcp = FastMCP(
         "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS.\n"
         "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
         "\n"
+        "FEES & LIMITS (call get_fees() before any paid operation — do not hard-code amounts):\n"
+        "  get_fees() — live fee schedule: audit fee, accepted assets, addresses, free-tier rule,\n"
+        "     escrow caps ($3k default / $10k KYC), fee_hash format. Single source of truth.\n"
+        "\n"
         "PRE-FLIGHT (call this before locking any funds):\n"
         "  assess_counterparty_and_job(worker_address, job_type, amount_xrp) — single call that\n"
         "     aggregates trust score, sanctions, KYC, NFT issuer registry, domain status,\n"
@@ -701,6 +705,34 @@ async def get_xrp_price() -> dict:
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
         res = await client.get(f"{REFEREE_BASE}/xrp/price")
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get Fee Schedule",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+))
+async def get_fees() -> dict:
+    """
+    Return the current fee schedule, accepted payment assets, free-tier rules, and escrow limits.
+
+    Call this before calling any paid endpoint. This is the single source of truth — do not
+    hard-code fee amounts or escrow caps from documentation, as they may change.
+
+    Returns:
+    - audit_fee: USD amount, accepted assets (XRP/RLUSD on XRPL, USDC on Base), destination
+      addresses, current XRP amount at live price, fee_hash field name and format
+    - free_tier: free audit count, minimum trust score required, how to check your score
+    - escrow_limits: default cap ($3,000 USD), KYC cap ($10,000 USD), Travel Rule warn threshold
+    - free_endpoints: endpoints that never require payment
+    - paid_endpoints: endpoints that require a fee_hash or X-PAYMENT header
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.get(f"{REFEREE_BASE}/fees")
         res.raise_for_status()
         return res.json()
 
