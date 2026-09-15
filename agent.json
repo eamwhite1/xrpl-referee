@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "name": "AgentTrust Referee",
-  "description": "A trustless AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC), POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
+  "description": "A trust-minimized AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC), POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
   "url": "https://mcp.cryptovault.co.uk",
   "agentVersion": "7.0.0",
   "protocolVersion": "0.3.0",
@@ -36,7 +36,7 @@
     {
       "id": "escrow-create",
       "name": "Create Escrow Vault",
-      "description": "Lock XRPL funds in a crypto-condition escrow vault gated by AI verdict. Returns a condition for use in EscrowCreate. For the full trustless payment flow.",
+      "description": "Lock XRPL funds in a crypto-condition escrow vault gated by AI verdict. Returns a condition for use in EscrowCreate. For the full trust-minimized payment flow.",
       "endpoint": "/escrow/generate",
       "method": "POST"
     },

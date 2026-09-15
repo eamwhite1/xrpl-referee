@@ -1,7 +1,7 @@
 {
   "name": "AgentTrust Referee",
   "version": "7.0.0",
-  "description": "Trustless AI task verification with automatic XRP payment release. Post a task spec and work submission \u2014 get PASS/FAIL from an AI referee. Escrowed XRP releases automatically to the worker on approval. Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents.",
+  "description": "Trust-minimized AI task verification with automatic XRP payment release. Post a task spec and work submission \u2014 get PASS/FAIL from an AI referee. Escrowed XRP releases automatically to the worker on approval. Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents.",
   "url": "https://mcp.cryptovault.co.uk/mcp",
   "homepage": "https://www.cryptovault.co.uk",
   "iconUrl": "https://mcp.cryptovault.co.uk/favicon.svg",
