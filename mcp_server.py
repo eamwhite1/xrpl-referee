@@ -48,8 +48,14 @@ mcp = FastMCP(
         "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS.\n"
         "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
         "\n"
-        "TRUST & COMPLIANCE:\n"
-        "  get_wallet_trust_score(address) — 0–100 score across 12 signals; check before hiring.\n"
+        "PRE-FLIGHT (call this before locking any funds):\n"
+        "  assess_counterparty_and_job(worker_address, job_type, amount_xrp) — single call that\n"
+        "     aggregates trust score, sanctions, KYC, NFT issuer registry, domain status,\n"
+        "     recommended release conditions, escrow cap, and go/no-go rules. Returns proceed=True/False.\n"
+        "     If proceed is False, do not call create_escrow_vault or hire_and_pay.\n"
+        "\n"
+        "TRUST & COMPLIANCE (individual checks — use assess_counterparty_and_job for the full picture):\n"
+        "  get_wallet_trust_score(address) — 0–100 score across 12 signals.\n"
         "  check_wallet_sanctions(address) — OFAC SDN screen. Sanctioned wallets score 0.\n"
         "  check_wallet_kyc(address)       — Xaman KYC status (unlocks escrows up to $10,000).\n"
         "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
@@ -2104,6 +2110,173 @@ def find_work(
         "On FAIL you receive a score, feedback, and remaining attempt count.\n\n"
         "Important: only submit polished, complete work — attempts are limited (usually 3)."
     )
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Assess Counterparty and Job",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+async def assess_counterparty_and_job(
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Wallet Address",
+        description="The XRPL wallet address of the counterparty you are considering hiring or paying.",
+    )],
+    job_type: Annotated[str, Field(
+        title="Job Type",
+        description="Natural-language description of the work — e.g. 'software development', 'gig tickets', 'W3C credential', 'invoice payment'. Used to recommend release conditions.",
+    )] = "general",
+    amount_xrp: Annotated[float, Field(
+        title="Intended Escrow Amount (XRP)",
+        description="How much XRP you plan to lock in escrow. Used to check whether the counterparty's KYC level allows it.",
+    )] = 0.0,
+    nft_issuer_query: Annotated[str, Field(
+        title="NFT Issuer Name or Wallet (optional)",
+        description="If the job involves an NFT proof, pass the issuer name or wallet address to check the registry.",
+    )] = "",
+) -> dict:
+    """
+    Single pre-flight check before locking funds in escrow.
+
+    Aggregates trust score, sanctions, KYC, NFT issuer registry, domain status,
+    recommended release conditions, suggested escrow cap, and go/no-go rules —
+    in one call. Run this before create_escrow_vault or hire_and_pay.
+
+    Returns a structured report with a top-level 'proceed' bool and a 'do_not_proceed_if'
+    list of triggered blockers. If proceed is False, do not lock funds.
+    """
+    import asyncio
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # Fan out all read-only checks in parallel
+        tasks = {
+            "trust":     client.get(f"{REFEREE_BASE}/wallet/score/{worker_address}"),
+            "sanctions": client.get(f"{REFEREE_BASE}/wallet/sanctions/{worker_address}"),
+        }
+        if nft_issuer_query:
+            tasks["issuer"] = client.get(f"{REFEREE_BASE}/nft/issuers", params={"q": nft_issuer_query})
+
+        responses = {}
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for key, result in zip(tasks.keys(), results):
+            if isinstance(result, Exception):
+                responses[key] = {"error": str(result)}
+            else:
+                try:
+                    responses[key] = result.json()
+                except Exception:
+                    responses[key] = {"error": "parse error", "status": result.status_code}
+
+    # --- Parse trust score ---
+    trust_data = responses.get("trust", {})
+    trust_score = trust_data.get("score", 0)
+    trust_breakdown = trust_data.get("breakdown", {})
+    kyc_verified = trust_data.get("kyc_verified", False)
+    domain_verified = trust_data.get("domain_verified", False)
+
+    # --- Parse sanctions ---
+    sanctions_data = responses.get("sanctions", {})
+    sanctioned = sanctions_data.get("sanctioned", False)
+
+    # --- Escrow cap logic ---
+    if sanctioned:
+        escrow_cap_xrp = 0
+    elif kyc_verified:
+        escrow_cap_xrp = 10000 / max(trust_data.get("xrp_price_usd", 0.5), 0.01)
+    else:
+        escrow_cap_xrp = 3000 / max(trust_data.get("xrp_price_usd", 0.5), 0.01)
+
+    # --- NFT issuer check ---
+    issuer_data = responses.get("issuer")
+    issuer_verified = None
+    if issuer_data and not issuer_data.get("error"):
+        results_list = issuer_data.get("results", [])
+        issuer_verified = len(results_list) > 0 and results_list[0].get("verified", False)
+
+    # --- Recommended release conditions ---
+    jt = job_type.lower()
+    if any(k in jt for k in ["ticket", "nft", "concert", "collectible", "art", "dvp"]):
+        recommended_mode = "proof_gates"
+        recommended_config = {"require_nft_proof": True, "nft_dvp": True, "require_ai_audit": False}
+    elif any(k in jt for k in ["domain", "org", "company", "corporate"]):
+        recommended_mode = "proof_gates"
+        recommended_config = {"required_domain": "ANY", "require_ai_audit": False}
+    elif any(k in jt for k in ["credential", "vc", "kyc", "certificate", "licence"]):
+        recommended_mode = "proof_gates"
+        recommended_config = {"required_vc_issuer_did": "<issuer DID>", "require_ai_audit": False}
+    elif any(k in jt for k in ["code", "software", "dev", "writing", "research", "content", "invoice"]):
+        recommended_mode = "ai_audit"
+        recommended_config = {"require_ai_audit": True}
+    elif trust_score >= 60 and (domain_verified or kyc_verified):
+        recommended_mode = "ai_audit"
+        recommended_config = {"require_ai_audit": True}
+    else:
+        recommended_mode = "both"
+        recommended_config = {"required_domain": "ANY", "require_ai_audit": True}
+
+    # --- Go / no-go rules ---
+    blockers = []
+    warnings = []
+
+    if sanctioned:
+        blockers.append("SANCTIONED — wallet appears on OFAC SDN list. Do not proceed under any circumstances.")
+    if trust_score == 0 and not trust_data.get("error"):
+        blockers.append("Trust score is 0 — wallet has no on-chain history. Do not lock significant funds.")
+    if amount_xrp > 0 and amount_xrp > escrow_cap_xrp:
+        blockers.append(f"Intended amount ({amount_xrp} XRP) exceeds escrow cap ({escrow_cap_xrp:.0f} XRP) for this wallet's KYC level.")
+    if issuer_verified is False and nft_issuer_query:
+        blockers.append(f"NFT issuer '{nft_issuer_query}' not found in the verified registry. Do not accept their NFTs as proof without manual verification.")
+
+    if trust_score < 30:
+        warnings.append(f"Low trust score ({trust_score}/100). Consider requiring domain or KYC verification.")
+    if not kyc_verified:
+        warnings.append("Wallet is not KYC-verified. Escrow cap applies ($3,000 equivalent).")
+    if not domain_verified:
+        warnings.append("Wallet domain not verified. Consider requiring domain proof gate.")
+    if issuer_verified is None and any(k in jt for k in ["nft", "ticket", "dvp"]):
+        warnings.append("Job appears NFT-related but no issuer was checked. Pass nft_issuer_query to verify.")
+
+    proceed = len(blockers) == 0
+
+    return {
+        "proceed": proceed,
+        "worker_address": worker_address,
+        "trust": {
+            "score": trust_score,
+            "band": "high" if trust_score >= 60 else "moderate" if trust_score >= 30 else "low",
+            "kyc_verified": kyc_verified,
+            "domain_verified": domain_verified,
+            "breakdown": trust_breakdown,
+        },
+        "sanctions": {
+            "sanctioned": sanctioned,
+            "source": sanctions_data.get("source"),
+            "list": sanctions_data.get("list"),
+        },
+        "nft_issuer": {
+            "queried": nft_issuer_query or None,
+            "verified": issuer_verified,
+            "registry_result": responses.get("issuer", {}).get("results", [None])[0] if responses.get("issuer") else None,
+        } if nft_issuer_query else None,
+        "escrow": {
+            "intended_xrp": amount_xrp or None,
+            "cap_xrp": round(escrow_cap_xrp, 2),
+            "within_cap": (amount_xrp <= escrow_cap_xrp) if amount_xrp else True,
+        },
+        "recommended_release": {
+            "mode": recommended_mode,
+            "config": recommended_config,
+            "call_recommend_release_conditions": f"recommend_release_conditions('{job_type}') for full parameter set",
+        },
+        "do_not_proceed_if": blockers,
+        "warnings": warnings,
+        "next_step": (
+            "Do NOT proceed — resolve blockers above before locking funds." if not proceed
+            else "All checks passed. Configure release conditions and call create_escrow_vault or hire_and_pay."
+        ),
+    }
 
 
 @mcp.tool()
