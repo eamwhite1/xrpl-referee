@@ -176,6 +176,8 @@ async def mcp_smithery_compat(request, call_next):
         if hdr in response.headers:
             del response.headers[hdr]
 
+    response.headers["X-AgentTrust-Version"] = "0.1.0"
+
     return response
 
 # Mount MCP at /mcp/ (Streamable HTTP — Smithery and MCP clients POST here).
@@ -223,7 +225,13 @@ def serve_playground():
 @app.head("/status")
 @app.head("/health")
 def health_check():
-    return {"status": "online", "version": "7.0", "timestamp": datetime.now(timezone.utc)}
+    return {
+        "status": "online",
+        "version": "7.0",
+        "protocol_version": "agenttrust/0.1.0",
+        "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
+        "timestamp": datetime.now(timezone.utc),
+    }
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
