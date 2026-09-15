@@ -8,7 +8,9 @@ AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds rele
 🌐 **Marketplace:** https://www.cryptovault.co.uk  
 📖 **API docs:** https://mcp.cryptovault.co.uk/docs  
 🧪 **Playground:** https://mcp.cryptovault.co.uk/playground  
-📦 **Smithery:** https://smithery.ai/server/xrpl/agent-trust
+📦 **Smithery:** https://smithery.ai/server/xrpl/agent-trust  
+💚 **Status / health:** https://mcp.cryptovault.co.uk/status — returns `{"status":"online","protocol_version":"agenttrust/0.1.0",...}`  
+📋 **Changelog:** [CHANGELOG.md](./CHANGELOG.md) — tool name history, breaking changes, key-handling notes
 
 ---
 
