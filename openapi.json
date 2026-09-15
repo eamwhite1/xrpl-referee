@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "AgentTrust Referee",
-    "description": "A trustless AI verdict engine for the agent economy. POST a task spec and proof of work, pay $0.10 (XRP, RLUSD, or USDC), receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
+    "description": "A trust-minimized AI verdict engine for the agent economy. POST a task spec and proof of work, pay $0.10 (XRP, RLUSD, or USDC), receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
     "version": "7.0.0",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
@@ -89,7 +89,7 @@
     "/escrow/generate": {
       "post": {
         "summary": "Create an AI-gated XRPL escrow vault",
-        "description": "Locks funds in XRPL crypto-condition escrow. The fulfillment key is only released when /evaluate approves the submitted work. Use this for the full trustless payment flow.",
+        "description": "Locks funds in XRPL crypto-condition escrow. The fulfillment key is only released when /evaluate approves the submitted work. Use this for the full trust-minimized payment flow.",
         "operationId": "generateEscrow",
         "requestBody": {
           "required": true,
