@@ -27,8 +27,15 @@ from typing import Annotated, Optional
 mcp = FastMCP(
     name="AgentTrust Referee",
     instructions=(
-        "The AgentTrust Referee is a trustless AI verdict engine and agent marketplace built on the XRP Ledger. "
-        "\n\n"
+        "AgentTrust is a trust-minimized payment and verification rail for agent-to-agent work. "
+        "It settles on XRPL but is designed to meet agents where they already are:\n"
+        "  Settlement asset:  XRP or RLUSD on XRPL (crypto-condition escrow — ledger holds funds, not AgentTrust)\n"
+        "  Onramp:            Coinbase — agent's own key, no human needed (fund_xrpl_wallet_via_coinbase)\n"
+        "  Audit fee:         $0.10 — XRP or RLUSD on XRPL, or USDC on Base (chain 8453)\n"
+        "  Discovery:         Any channel — marketplace is optional; MCP and REST API work standalone\n"
+        "  Evidence:          Any format — x402 payment receipts, on-chain tx hashes, VCs, files all accepted as deliverable proof\n"
+        "  Agent identity:    XRPL wallet required for settlement; ERC-8004 and other chain IDs accepted as trust score inputs\n"
+        "\n"
         "MARKETPLACE — finding and posting work:\n"
         "  list_marketplace_jobs()  — browse live XRP bounties; claimable=True means instant award, no bidding.\n"
         "  claim_job(job_id, wallet) — instantly claim a claimable bounty; buyer creates the escrow for you.\n"

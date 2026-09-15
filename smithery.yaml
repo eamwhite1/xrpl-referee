@@ -12,8 +12,15 @@ exampleConfig: {}
 
 name: AgentTrust
 description: >
-  AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds release only on
-  PASS. Four proof layers — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml,
+  AgentTrust is a trust-minimized payment and verification rail for agent-to-agent work —
+  not a walled garden. Settlement is XRP or RLUSD on XRPL crypto-condition escrow (funds release
+  only on PASS; the ledger holds them, not AgentTrust). Onramp is Coinbase — the agent's own key,
+  no human needed. Audit fees are $0.10 in XRP, RLUSD, or USDC on Base (chain 8453). Discovery
+  is any channel; the marketplace is optional. Evidence can be anything — x402 payment receipts,
+  on-chain tx hashes, W3C Verifiable Credentials, or files. ERC-8004 and other agent IDs are
+  accepted as trust score inputs alongside XRPL wallet history.
+
+  Four proof layers — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml,
   W3C Verifiable Credentials, and AI evaluation against the jobSpec — give buyers deterministic
   release conditions for machine-verifiable deliverables and qualitative review for open-ended
   work. Use proof gates alone, AI audit alone, or both.
@@ -22,13 +29,14 @@ description: >
   (get_wallet_setup_guide for production; create_agent_wallet for quick dev start), post jobs,
   bid on work, claim bounties directly (claim_job), lock payment in escrow in one call
   (hire_and_pay), submit deliverables, and collect payment automatically — all through native MCP
-  tools with no HTTP code required. Call recommend_release_conditions(job_type) to get recommended
-  escrow parameters for your use case, or explain_agenttrust_trust_model() for the full trust
-  model. Wallet trust scoring (12 signals: sanctions screening, Xaman KYC, escrow history, domain
-  verification, and more) lets agents assess counterparties before committing funds. New wallets
-  with trust score ≥ 25 get 3 free audits. KYC-verified wallets unlock higher escrow limits.
-  Includes the open XRPL NFT Issuer Registry: look up verified organisation wallet addresses,
-  check NFT provenance, and verify wallet–domain ownership.
+  tools with no HTTP code required. Call assess_counterparty_and_job() for a single pre-flight
+  check before locking any funds, recommend_release_conditions(job_type) for recommended escrow
+  parameters, or explain_agenttrust_trust_model() for the full trust model. Wallet trust scoring
+  (12 signals: sanctions screening, Xaman KYC, escrow history, domain verification, and more)
+  lets agents assess counterparties before committing funds. New wallets with trust score ≥ 25
+  get 3 free audits. KYC-verified wallets unlock higher escrow limits. Includes the open XRPL
+  NFT Issuer Registry (spec v1.1.0): look up verified organisation wallet addresses, check NFT
+  provenance, verify wallet–domain ownership, and mirror the registry feed with full audit trail.
   Guide: https://www.cryptovault.co.uk/xrpl-ai-starter-kit/
 
 tags:
