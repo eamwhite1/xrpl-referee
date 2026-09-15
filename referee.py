@@ -625,6 +625,8 @@ class EscrowVault(Base):
     nft_dvp_status       = Column(String,   nullable=True)   # "pending_offer" | "offer_created" | "accepted" | "expired"
     # Invoice requirements — v13
     invoice_requirements = Column(Text,    nullable=True)   # JSON: {po_number, supplier_name, services_description, require_date, require_line_items}
+    # AI audit opt-out — v14
+    require_ai_audit     = Column(Boolean, default=True)    # False = skip AI; proof gates alone release payment
 
 
 class JobPosting(Base):
@@ -1359,6 +1361,8 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS nft_dvp_status       VARCHAR",
         # v13 — invoice requirements
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS invoice_requirements  TEXT",
+        # v14 — AI audit opt-out
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS require_ai_audit      BOOLEAN DEFAULT TRUE",
         # v14 — KYC verification
         """CREATE TABLE IF NOT EXISTS kyc_record (
             id                SERIAL PRIMARY KEY,
@@ -2027,6 +2031,8 @@ class EscrowSetupRequest(BaseModel):
     nft_dvp: bool = False  # enable NFT delivery-vs-payment mode
     # Invoice requirements — buyer can require seller to submit a matching invoice
     invoice_requirements: Optional[dict] = None
+    # AI audit — set False to release on proof gates alone (requires at least one proof gate)
+    require_ai_audit: bool = True
     # Expected fields: po_number, supplier_name, services_description,
     # require_date (bool), require_line_items (bool)
     # Amount/currency are always required when this is set (mirrored from escrow amount)
@@ -4144,6 +4150,18 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
+    # Validate: require_ai_audit=False only makes sense with at least one proof gate
+    if not req.require_ai_audit:
+        has_proof_gate = any([
+            req.require_nft_proof, req.required_nft_issuer,
+            req.required_domain, req.required_vc_issuer_did,
+        ])
+        if not has_proof_gate:
+            raise HTTPException(
+                status_code=400,
+                detail="require_ai_audit=False requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did)."
+            )
+
     # OFAC sanctions check — block sanctioned wallets before accepting any funds
     for addr_to_check in [req.buyer_address, req.worker_address]:
         if addr_to_check:
@@ -4294,6 +4312,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         proof_policy           = req.proof_policy or "ALL",
         nft_dvp                = req.nft_dvp or False,
         invoice_requirements   = json.dumps(req.invoice_requirements) if req.invoice_requirements else None,
+        require_ai_audit       = req.require_ai_audit,
     )
     db.add(vault)
     db.commit()
@@ -4801,16 +4820,34 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     if extra_notes:
         work_with_nft = req.work + "\n\n" + "\n".join(extra_notes)
 
-    verdict_dict, model_used = await run_ai_audit(
-        task                    = vault.task_description,
-        work                    = work_with_nft,
-        buyer_attachments       = stored_buyer_attachments,
-        worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
-        task_category           = req.task_category,
-        require_consensus       = req.require_consensus,
-        spec_link_snapshots     = stored_spec_snapshots,
-        evidence_link_snapshots = evidence_snapshots,
-    )
+    # ── AI AUDIT OPT-OUT ──
+    # When require_ai_audit=False AND at least one proof gate was configured and passed,
+    # skip the AI step entirely and treat it as an automatic PASS.
+    skip_ai = (not vault.require_ai_audit) and bool(proof_results) and all(r[1] for r in proof_results)
+    if skip_ai:
+        proof_summary = "; ".join(r[2] for r in proof_results if r[1])
+        verdict_dict = {
+            "verdict":       "PASS",
+            "score":         100,
+            "summary":       f"All proof gates passed — AI audit not required. {proof_summary}",
+            "details":       proof_summary,
+            "criteria_met":  [r[0] for r in proof_results if r[1]],
+            "criteria_failed": [],
+            "ai_skipped":    True,
+        }
+        model_used = "none (proof-gate release)"
+        logger.info(f"✅ AI SKIPPED (proof-gate release) for {req.escrow_id}: {proof_summary}")
+    else:
+        verdict_dict, model_used = await run_ai_audit(
+            task                    = vault.task_description,
+            work                    = work_with_nft,
+            buyer_attachments       = stored_buyer_attachments,
+            worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
+            task_category           = req.task_category,
+            require_consensus       = req.require_consensus,
+            spec_link_snapshots     = stored_spec_snapshots,
+            evidence_link_snapshots = evidence_snapshots,
+        )
 
     is_approved          = verdict_dict.get("verdict") == "PASS"
     revealed_fulfillment = None

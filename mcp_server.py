@@ -189,10 +189,19 @@ async def create_escrow_vault(
         title="Max Submissions",
         description="Number of work submission attempts the worker is allowed before the vault is locked. Default 3.",
     )] = 3,
+    require_ai_audit: Annotated[bool, Field(
+        title="Require AI Audit",
+        description="Default True. Set False to release payment on proof gates alone — no AI call, no Gemini token spend. Requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did). Use for machine-verifiable deliverables: NFT delivery, domain verification, W3C credentials.",
+    )] = True,
 ) -> dict:
     """
-    Create an AI-gated XRPL escrow vault. Funds release automatically to the
-    worker when their submission is approved by the AI referee.
+    Create an XRPL escrow vault. Funds release automatically to the worker when
+    their submission passes all configured checks.
+
+    Two release modes:
+    - AI audit (default): worker submits text/files; AI referee scores against task_description.
+    - Proof-gate only (require_ai_audit=False): payment releases when all configured proof
+      gates pass (NFT issuer, domain, VC). No AI call. Requires at least one proof gate.
 
     Typical flow after job board negotiation:
       1. award_job() returns the worker's address and agreed price
@@ -215,6 +224,7 @@ async def create_escrow_vault(
         "category":         category,
         "cancel_after_hrs": cancel_after_hrs,
         "max_submissions":  max_submissions,
+        "require_ai_audit": require_ai_audit,
     }
     if fee_hash:
         body["fee_hash"] = fee_hash
