@@ -120,14 +120,26 @@ async def audit_task(
     """
     Verify whether completed work meets a task specification using AI.
 
-    Before calling, pay the fee via one of two options:
-      Option 1: Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet, or $0.10 USDC on Base.
-      Option 2: Send $0.10 USDC on Base (chain 8453) — call with no fee first to get the address.
+    Call get_fees() first to get the current fee amount and accepted assets.
     Each fee_hash is single-use (anti-replay protection).
 
-    Returns:
-        status (approved/rejected), verdict (PASS/FAIL), score (0-100),
-        summary, details, criteria_met, criteria_failed, model_used.
+    Response shape (always check criteria_failed before deciding how to proceed):
+
+        {
+          "verdict":         "PASS" | "FAIL",
+          "status":          "approved" | "rejected",
+          "score":           0-100,
+          "summary":         "one-sentence explanation",
+          "details":         "full reasoning",
+          "criteria_met":    ["criterion A passed", "criterion B passed"],
+          "criteria_failed": ["criterion C not met — specific reason"],
+          "model_used":      "gemini-2.5-flash"
+        }
+
+    On PASS: proceed to payment or accept the deliverable.
+    On FAIL: read criteria_failed to understand exactly what was missing.
+      Each entry is a specific, actionable failure — not a generic rejection.
+      Use them to tell the worker precisely what to fix before resubmitting.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
         res = await client.post(
@@ -327,16 +339,40 @@ async def evaluate_escrow_work(
     """
     Submit proof of completed work against an existing escrow vault.
 
-    On approval, payment releases automatically — no EscrowFinish needed.
+    On PASS, payment releases automatically — no EscrowFinish needed.
     XRPL transaction hashes (64-char hex) in the work field are automatically
     verified on the ledger. Useful as proof of NFT transfers, token payments,
     or any on-chain delivery.
 
-    Returns on PASS:
-        status: "approved", auto_finish_queued: True.
+    Response shape on PASS:
 
-    Returns on FAIL:
-        status: "rejected", score, summary, criteria_failed, attempts_remaining.
+        {
+          "verdict":          "PASS",
+          "status":           "approved",
+          "score":            0-100,
+          "summary":          "explanation",
+          "criteria_met":     ["all criteria that passed"],
+          "criteria_failed":  [],
+          "auto_finish_queued": True,
+          "model_used":       "gemini-2.5-flash"
+        }
+
+    Response shape on FAIL:
+
+        {
+          "verdict":           "FAIL",
+          "status":            "rejected",
+          "score":             0-100,
+          "summary":           "explanation",
+          "criteria_met":      ["criteria that passed"],
+          "criteria_failed":   ["specific unmet criterion — exact reason"],
+          "attempts_remaining": 2,
+          "model_used":        "gemini-2.5-flash"
+        }
+
+    On FAIL: read criteria_failed for specific, actionable feedback. Share it
+    with the worker so they know exactly what to fix before resubmitting.
+    Resubmit by calling evaluate_escrow_work again with the same escrow_id.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
         res = await client.post(

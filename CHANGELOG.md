@@ -6,6 +6,17 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.2.0 — 2026-09-15
+
+### Added
+- `criteria_met` and `criteria_failed` arrays now first-class fields in every `audit_task` and `evaluate_escrow_work` response. Each `criteria_failed` entry is specific and actionable — share with the worker before resubmitting.
+- `05_mcp_tools.py` example: end-to-end MCP client flow with `get_fees()`, `assess_counterparty_and_job()`, and `audit_task()` verdict handling
+
+### Planned (premium tier)
+- `require_consensus`: cross-architecture multi-model agreement before releasing escrow. Currently two Gemini calls on the same provider; true consensus requires independent architectures (GPT-4o + Gemini + Claude). Tracked as a premium feature — not yet available.
+
+---
+
 ## v2.1.0 — 2026-09-15
 
 ### Added
