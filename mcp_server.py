@@ -55,8 +55,11 @@ mcp = FastMCP(
         "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
         "\n"
         "WALLET BOOTSTRAP (do this first if you have no XRPL wallet):\n"
-        "  1. create_agent_wallet()                    — generate a new XRPL keypair (free tier: 3 free escrows included).\n"
-        "  2. fund_xrpl_wallet_via_coinbase(address)   — buy XRP with USD/USDC via Coinbase and send to your new wallet.\n"
+        "  PRODUCTION (recommended): call get_wallet_setup_guide() — generate locally with Wallet.create(),\n"
+        "     store seed in .env, pass only your public address to AgentTrust. Seed never leaves your environment.\n"
+        "  DEVELOPMENT / QUICK START: create_agent_wallet() — generates a keypair and returns the seed.\n"
+        "     ⚠ Seed is returned in plaintext. Do not use in production. Free tier: 3 free escrows included.\n"
+        "  FUNDING: fund_xrpl_wallet_via_coinbase(address) — buy XRP with USD/USDC via Coinbase and send to your wallet.\n"
         "     Requires a free Coinbase account + API key (wallet:accounts:read, wallet:buys:create, wallet:transactions:send).\n"
         "     Alternatively: buy XRP on any exchange and withdraw to the address, or ask another agent to send ≥ 1 XRP.\n"
         "\n"
@@ -1754,28 +1757,26 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
 @mcp.tool()
 async def create_agent_wallet() -> dict:
     """
-    Generate a new XRPL keypair for an agent wallet.
+    Convenience tool: generate a new XRPL keypair and return the seed.
 
-    Returns the wallet address and seed. The wallet is NOT yet active on the ledger —
-    you MUST fund it before it can send or receive anything, including escrow payments.
+    ⚠ NOT RECOMMENDED FOR PRODUCTION. The seed (private key) is returned in plaintext
+    and will appear in your conversation transcript and any logs. For production agents,
+    call get_wallet_setup_guide() instead — it documents the secure local approach
+    (Wallet.generate() + seed in .env) where the seed never leaves your environment.
 
+    Use this tool only for throwaway wallets, local development, or quick demos.
+    NEVER paste the returned seed into a chat, commit it to version control, or share it.
+
+    The wallet is NOT yet active on the ledger — fund it before use.
     XRPL requires 1 XRP minimum to activate a wallet (base reserve). Until funded:
       - You cannot sign or submit transactions
       - You cannot be the destination of an EscrowCreate (buyer's tx will fail)
       - Your trust score will show as 0 / "not found"
 
-    Funding via x402 / Coinbase (recommended for agents):
-      If you have USDC on Base/Coinbase, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0).
-      This uses x402 — the autonomous HTTP payment protocol — to swap USDC for XRP and
-      send it directly to your new address. $3 covers the 1 XRP reserve plus escrow fees.
-      Requires your own Coinbase API key (wallet:accounts:read, wallet:buys:create,
-      wallet:transactions:send) — never use someone else's key.
-
-    Other funding options:
+    Funding options:
+      - Call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) if you have USDC on Coinbase
       - Ask your operator or client to send ≥ 1 XRP to the address
       - Buy XRP on any exchange (Coinbase, Kraken, Binance) and withdraw to the address
-
-    Keep the seed secret — anyone with it controls the wallet.
     """
     from xrpl.wallet import Wallet as XrplWallet
     w = XrplWallet.create()
@@ -1814,6 +1815,75 @@ async def create_agent_wallet() -> dict:
             "Otherwise buy XRP on any exchange and withdraw to the address. "
             "Once funded, call list_open_jobs() to find work or hire_and_pay() to hire."
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Wallet setup guide (recommended production approach)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_wallet_setup_guide() -> dict:
+    """
+    Returns the recommended production wallet setup for XRPL agents.
+
+    Call this instead of create_agent_wallet() when building a production agent.
+    The secure approach keeps the seed entirely in your own environment — AgentTrust
+    only ever sees your public address and signed transactions.
+
+    create_agent_wallet() returns a seed in plaintext (conversation transcript, logs).
+    This guide shows how to generate locally so the seed never leaves your environment.
+    """
+    return {
+        "recommended_approach": "Generate locally with xrpl-py — seed stays in your environment",
+        "why": (
+            "AgentTrust only needs your public address and signed transactions. "
+            "The seed (private key) should never be passed to any external service, "
+            "including this MCP server. create_agent_wallet() is a convenience tool "
+            "for development only — it returns the seed in plaintext."
+        ),
+        "step_1_generate": {
+            "description": "Generate a wallet locally — run this once, offline if possible",
+            "code": (
+                "from xrpl.wallet import Wallet\n"
+                "w = Wallet.create()\n"
+                "print('Address:', w.address)   # share this freely\n"
+                "print('Seed:   ', w.seed)       # store this in .env — never share\n"
+            ),
+        },
+        "step_2_store": {
+            "description": "Store the seed in your environment, not in code",
+            "env_file": "XRPL_SEED=sYourSeedHere",
+            "load_in_code": (
+                "import os\n"
+                "from xrpl.wallet import Wallet\n"
+                "wallet = Wallet.from_seed(os.environ['XRPL_SEED'])\n"
+            ),
+            "warning": "Never commit .env to version control. Add it to .gitignore.",
+        },
+        "step_3_use_with_agenttrust": {
+            "description": "Pass only your public address to AgentTrust",
+            "example": (
+                "# Buyer: lock funds\n"
+                "create_escrow_vault(buyer_address=wallet.address, worker_address='rSeller...', ...)\n\n"
+                "# AgentTrust signs the EscrowFinish with its own key — you sign EscrowCreate locally\n"
+            ),
+        },
+        "ripple_official_skill": {
+            "description": "Ripple's official XRPL Agent Wallet Skill (recommended for Claude/LLM agents)",
+            "install_command": "claude mcp add xrpl-agent-wallet",
+            "note": (
+                "Ripple's skill handles key management, transaction signing, and wallet "
+                "lifecycle. It keeps the seed in a local secure store and exposes only "
+                "signing operations — the seed is never returned to the model."
+            ),
+        },
+        "production_checklist": [
+            "Seed stored in .env or a secrets manager (Vault, AWS Secrets Manager, etc.)",
+            "Seed never appears in conversation transcripts or logs",
+            "Wallet address verified on XRPL mainnet before accepting work",
+            "Only public address shared with AgentTrust and counterparties",
+        ],
     }
 
 
