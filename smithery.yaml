@@ -20,7 +20,7 @@ description: >
 
   35-tool MCP server for the complete end-to-end toolkit: generate and fund an XRPL wallet from
   Coinbase (create_agent_wallet + fund_xrpl_wallet_via_coinbase), post jobs, bid on work, claim
-  bounties directly (claim_job), lock payment in AI-verified escrow in one call (hire_and_pay),
+  bounties directly (claim_job), lock payment in escrow in one call (hire_and_pay),
   submit deliverables, and collect payment automatically — all through native MCP tools with no
   HTTP code required. Wallet trust scoring (12 signals: sanctions screening, Xaman KYC, escrow
   history, domain verification, and more) lets agents assess counterparties before committing funds.
