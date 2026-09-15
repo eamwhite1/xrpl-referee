@@ -2106,6 +2106,173 @@ def find_work(
     )
 
 
+@mcp.tool()
+async def explain_agenttrust_trust_model() -> dict:
+    """
+    Returns the AgentTrust trust model: what is guaranteed, where trust remains,
+    and when to use proof gates vs AI audit. Read this before designing an escrow flow.
+    """
+    return {
+        "summary": "AgentTrust is trust-minimized, not trustless. Here is the full picture.",
+        "guaranteed": [
+            "Funds never touch AgentTrust's wallet — XRP/RLUSD sit in native XRPL crypto-condition escrow. We cannot move them.",
+            "Worker wallet address is locked at vault creation — payment cannot be rerouted.",
+            "The fulfillment key is derived from your job spec — only a valid submission unlocks it.",
+            "Every wallet is screened against the OFAC SDN sanctions list at vault creation.",
+            "Fulfillment keys are encrypted AES-256-GCM at rest; raw key reconstructed in-memory only at release.",
+        ],
+        "remaining_trust": [
+            "AI verdict (Gemini) can be wrong and is final — no human appeals process.",
+            "The XRPL NFT Issuer Registry is operated by AgentTrust — a public mirror spec is open for anyone to run.",
+            "API availability depends on AgentTrust infrastructure — use proof gates for zero-dependency release.",
+        ],
+        "proof_vs_audit": {
+            "use_proof_gates_when": [
+                "Delivery is machine-verifiable: NFT transfer, domain ownership, VC signature",
+                "You need a deterministic, auditable release condition with no AI in the loop",
+                "The deliverable IS the on-chain event (DvP, token transfer, credential presentation)",
+                "You want payment to release even if AgentTrust's AI endpoint is down",
+            ],
+            "use_ai_audit_when": [
+                "Work is qualitative or open-ended: code review, writing, research, design",
+                "You have a natural-language job spec to evaluate against",
+                "You want a structured PASS/FAIL verdict with a scored summary",
+            ],
+            "use_both_when": [
+                "High-value jobs where proof gates verify delivery mechanism AND AI verifies quality",
+                "Example: NFT proof confirms the seller has the asset; AI confirms it matches the spec",
+            ],
+        },
+        "proof_gate_types": {
+            "nft_proof": "Seller must hold (or transfer) a specific XRPL NFT — optionally restricted to a verified issuer. Set require_nft_proof=true, optional required_nft_issuer=<wallet>.",
+            "domain_verification": "Seller's XRPL wallet must be cryptographically linked to a domain via on-chain Domain field + xrp-ledger.toml. Set required_domain='example.com' or 'ANY'.",
+            "verifiable_credential": "Seller presents a W3C VC JWT. AgentTrust verifies the issuer's signature. Set required_vc_issuer_did and/or required_vc_type.",
+            "nft_dvp": "Atomic Delivery-vs-Payment — NFT transfers to buyer's wallet atomically when escrow releases. Set nft_dvp=true with require_nft_proof=true.",
+        },
+        "proof_policy": "Set proof_policy='ALL' (all selected gates must pass) or 'ANY' (any one suffices).",
+        "skip_ai_audit": "Set require_ai_audit=false with at least one proof gate to release on proof alone. Returns HTTP 400 if no proof gate is configured.",
+        "code": "MIT. Backend: https://github.com/eamwhite1/xrpl-referee",
+    }
+
+
+@mcp.tool()
+async def recommend_release_conditions(job_type: str) -> dict:
+    """
+    Given a job or deliverable type, returns recommended escrow release conditions —
+    which proof gates to configure, whether to enable AI audit, and example parameters.
+
+    Examples: "gig tickets", "software development", "domain verification", "NFT art",
+    "invoice payment", "W3C credential", "code review", "data labelling", "writing"
+    """
+    jt = job_type.lower().strip()
+
+    # --- NFT / ticket / physical asset delivery ---
+    if any(k in jt for k in ["ticket", "nft", "concert", "event", "collectible", "art", "token"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_nft_proof": True,
+                "nft_dvp": True,
+                "require_ai_audit": False,
+                "proof_policy": "ALL",
+            },
+            "rationale": "NFT transfer IS the delivery. DvP releases payment atomically when the NFT arrives in your wallet. No AI needed — the on-chain event is its own receipt.",
+            "optional": {"required_nft_issuer": "<issuer wallet — look up via lookup_nft_issuer()>"},
+            "example_call": "create_escrow_vault(..., require_nft_proof=True, nft_dvp=True, require_ai_audit=False)",
+        }
+
+    # --- Domain / org verification ---
+    if any(k in jt for k in ["domain", "website", "org", "company", "business registration", "corporate"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "required_domain": "example.com",
+                "require_ai_audit": False,
+                "proof_policy": "ALL",
+            },
+            "rationale": "Domain ownership is machine-verifiable via on-chain Domain field + xrp-ledger.toml. No AI needed.",
+            "example_call": "create_escrow_vault(..., required_domain='example.com', require_ai_audit=False)",
+        }
+
+    # --- W3C Verifiable Credential ---
+    if any(k in jt for k in ["credential", "vc", "kyc", "qualification", "certificate", "degree", "licence", "license"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "required_vc_issuer_did": "did:web:issuer.example.com",
+                "required_vc_type": "ProfessionalQualificationCredential",
+                "require_ai_audit": False,
+                "proof_policy": "ALL",
+            },
+            "rationale": "Cryptographic VC verification is deterministic. AgentTrust verifies the issuer's signature — no AI needed for the credential check. Add AI audit if you also want qualitative work assessed.",
+            "example_call": "create_escrow_vault(..., required_vc_issuer_did='did:web:...', require_ai_audit=False)",
+        }
+
+    # --- Invoice / AP automation ---
+    if any(k in jt for k in ["invoice", "purchase order", "po ", "accounts payable", "billing", "payment term"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_ai_audit": True,
+                "invoice_requirements": {
+                    "require_date": True,
+                    "require_line_items": True,
+                },
+            },
+            "rationale": "AI audit verifies the invoice matches your PO fields (supplier name, amount, services, line items). Pass invoice_requirements on vault creation.",
+            "example_call": "create_escrow_vault(..., require_ai_audit=True, invoice_requirements={require_date: true, require_line_items: true})",
+        }
+
+    # --- Software / code / technical work ---
+    if any(k in jt for k in ["code", "software", "dev", "bug", "feature", "pr", "pull request", "script", "api", "engineer"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_ai_audit": True,
+                "require_nft_proof": False,
+            },
+            "rationale": "Code quality and spec compliance are qualitative — AI audit is the right tool. Include a detailed task_description / job spec for best results.",
+            "tip": "For high-trust work, also require required_domain to verify the worker's organisation.",
+            "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='<detailed spec>')",
+        }
+
+    # --- Writing / research / content ---
+    if any(k in jt for k in ["writing", "content", "research", "report", "essay", "copy", "blog", "article", "data label", "annotation"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_ai_audit": True,
+            },
+            "rationale": "Open-ended qualitative work. AI audit evaluates submission against your task spec. Write a detailed spec for best results.",
+            "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='<detailed spec>')",
+        }
+
+    # --- High-value / hybrid ---
+    if any(k in jt for k in ["high value", "high-value", "large", "enterprise", "audit", "compliance"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_ai_audit": True,
+                "required_domain": "ANY",
+                "proof_policy": "ALL",
+            },
+            "rationale": "Belt-and-suspenders: domain proof verifies the worker's organisation; AI audit verifies quality. Both must pass.",
+            "example_call": "create_escrow_vault(..., require_ai_audit=True, required_domain='ANY')",
+        }
+
+    # --- Fallback ---
+    return {
+        "job_type": job_type,
+        "recommended": {
+            "require_ai_audit": True,
+        },
+        "rationale": "No specific proof gate identified for this job type. AI audit is the safe default for open-ended work.",
+        "alternatives": "Call explain_agenttrust_trust_model() for full proof gate options, or specify a more precise job type.",
+        "proof_gate_options": ["require_nft_proof", "required_domain", "required_vc_issuer_did", "nft_dvp"],
+        "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='<your spec>')",
+    }
+
+
 @mcp.prompt()
 def post_bounty(
     task: Annotated[str, Field(description="Description of the work you need done.")] = "",
