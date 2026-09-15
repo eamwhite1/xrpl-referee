@@ -701,11 +701,16 @@ class NftIssuer(Base):
     category       = Column(String, nullable=True)   # e.g. "logistics", "freelance", "iot"
     description    = Column(String, nullable=True)
     website        = Column(String, nullable=True)
-    verified       = Column(String, default="pending")  # "pending", "verified", "revoked"
+    verified       = Column(String, default="pending")  # "pending", "verified", "public", "disputed", "revoked"
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     contact_email  = Column(String, nullable=True)
     lei            = Column(String, nullable=True)
     nft_types      = Column(String, nullable=True)
+    # Verification audit trail
+    verified_at    = Column(DateTime, nullable=True)    # when status last changed to verified/disputed/revoked
+    verified_by    = Column(String, nullable=True)      # operator or automated system that performed the check
+    toml_url       = Column(String, nullable=True)      # exact xrp-ledger.toml URL that was checked
+    accountset_tx_hash = Column(String, nullable=True)  # on-chain AccountSet tx proving Domain field ownership
 
     def all_wallets(self) -> list:
         """Return all registered wallets for this issuer."""
@@ -1399,6 +1404,10 @@ def run_migrations():
             timestamp      TIMESTAMP
         )""",
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS claimable BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS verified_at        TIMESTAMP",
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS verified_by        VARCHAR",
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS toml_url           VARCHAR",
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS accountset_tx_hash VARCHAR",
         """CREATE TABLE IF NOT EXISTS bootstrapped_wallet (
             id             SERIAL PRIMARY KEY,
             wallet_address VARCHAR UNIQUE NOT NULL,
@@ -6683,7 +6692,10 @@ async def issuer_registry_feed(
     - page / per_page: standard pagination (max 200 per page)
     - since: ISO 8601 timestamp — return only records created or updated after this time
     - category: filter by category slug
-    - verified: filter by status ('verified', 'public', or omit for both)
+    - verified: filter by status ('verified', 'public', 'pending', 'disputed', or omit for verified+public)
+
+    Verification proof fields (verified_at, verified_by, toml_url, accountset_tx_hash) are included
+    in each record so third-party mirrors can independently check the evidence chain.
     """
     per_page = min(per_page, 200)
     offset = (page - 1) * per_page
@@ -6691,7 +6703,7 @@ async def issuer_registry_feed(
     where_clauses = ["verified IN ('verified','public')"]
     params: dict = {}
 
-    if verified in ("verified", "public", "pending"):
+    if verified in ("verified", "public", "pending", "disputed", "revoked"):
         where_clauses = [f"verified = :verified"]
         params["verified"] = verified
     if category:
@@ -6707,24 +6719,30 @@ async def issuer_registry_feed(
         "SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer'"
     )).fetchall()}
 
-    opt_wa  = ", wallet_addresses" if "wallet_addresses" in existing_cols else ", NULL as wallet_addresses"
-    opt_lei = ", lei"              if "lei"              in existing_cols else ", NULL as lei"
-    opt_nft = ", nft_types"        if "nft_types"        in existing_cols else ", NULL as nft_types"
-    opt_cat = ", created_at"       if "created_at"       in existing_cols else ", NULL as created_at"
+    opt_wa   = ", wallet_addresses"    if "wallet_addresses"    in existing_cols else ", NULL as wallet_addresses"
+    opt_lei  = ", lei"                 if "lei"                 in existing_cols else ", NULL as lei"
+    opt_nft  = ", nft_types"           if "nft_types"           in existing_cols else ", NULL as nft_types"
+    opt_cat  = ", created_at"          if "created_at"          in existing_cols else ", NULL as created_at"
+    opt_vat  = ", verified_at"         if "verified_at"         in existing_cols else ", NULL as verified_at"
+    opt_vby  = ", verified_by"         if "verified_by"         in existing_cols else ", NULL as verified_by"
+    opt_tom  = ", toml_url"            if "toml_url"            in existing_cols else ", NULL as toml_url"
+    opt_accs = ", accountset_tx_hash"  if "accountset_tx_hash"  in existing_cols else ", NULL as accountset_tx_hash"
 
     total = db.execute(text(f"SELECT COUNT(*) FROM nft_issuer WHERE {where_sql}"), params).scalar()
 
     rows = db.execute(text(
-        f"SELECT id, wallet_address{opt_wa}, name, category, description, website, verified{opt_lei}{opt_nft}{opt_cat}"
+        f"SELECT id, wallet_address{opt_wa}, name, category, description, website, verified"
+        f"{opt_lei}{opt_nft}{opt_cat}{opt_vat}{opt_vby}{opt_tom}{opt_accs}"
         f" FROM nft_issuer WHERE {where_sql} ORDER BY id LIMIT :limit OFFSET :offset"
     ), {**params, "limit": per_page, "offset": offset}).fetchall()
 
     def rv(r, k): return getattr(r, k, None)
 
-    return {
-        "spec_version": "1.0.0",
+    generated_at = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "spec_version": "1.1.0",
         "spec": "https://www.cryptovault.co.uk/docs/issuer-registry-spec.md",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
         "pagination": {
             "page": page,
             "per_page": per_page,
@@ -6735,21 +6753,34 @@ async def issuer_registry_feed(
         "filters": {"category": category, "verified": verified, "since": since},
         "issuers": [
             {
-                "id":               rv(r, "id"),
-                "wallet_address":   rv(r, "wallet_address"),
-                "wallet_addresses": json.loads(rv(r, "wallet_addresses") or "[]") or [rv(r, "wallet_address")],
-                "name":             rv(r, "name"),
-                "category":         rv(r, "category"),
-                "description":      rv(r, "description"),
-                "website":          rv(r, "website"),
-                "verified":         rv(r, "verified"),
-                "lei":              rv(r, "lei"),
-                "nft_types":        rv(r, "nft_types"),
-                "created_at":       rv(r, "created_at").isoformat() if rv(r, "created_at") else None,
+                "id":                  rv(r, "id"),
+                "wallet_address":      rv(r, "wallet_address"),
+                "wallet_addresses":    json.loads(rv(r, "wallet_addresses") or "[]") or [rv(r, "wallet_address")],
+                "name":                rv(r, "name"),
+                "category":            rv(r, "category"),
+                "description":         rv(r, "description"),
+                "website":             rv(r, "website"),
+                "verified":            rv(r, "verified"),
+                "lei":                 rv(r, "lei"),
+                "nft_types":           rv(r, "nft_types"),
+                "created_at":          rv(r, "created_at").isoformat() if rv(r, "created_at") else None,
+                # Verification audit trail — mirrors can independently check these proofs
+                "verified_at":         rv(r, "verified_at").isoformat() if rv(r, "verified_at") else None,
+                "verified_by":         rv(r, "verified_by"),
+                "toml_url":            rv(r, "toml_url"),
+                "accountset_tx_hash":  rv(r, "accountset_tx_hash"),
             }
             for r in rows
         ],
     }
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Cache-Control": "public, max-age=300, stale-while-revalidate=60",
+            "ETag": f'"{hash(generated_at)}"',
+        },
+    )
 
 
 class NftIssuerClaimRequest(BaseModel):

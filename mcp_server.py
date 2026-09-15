@@ -1159,16 +1159,53 @@ async def lookup_nft_issuer(
     Look up an organisation in the AgentTrust XRPL NFT Issuer Registry.
 
     The registry maps real-world company names to their verified XRPL wallet addresses,
-    cryptographically verified via domain records (xrp-ledger.toml). Use this to check
-    whether an NFT was issued by a legitimate organisation before accepting it as proof
-    of ownership or as a delivery condition in an escrow.
+    cryptographically verified via domain records (xrp-ledger.toml) and on-chain AccountSet
+    transactions. Use this to check whether an NFT was issued by a legitimate organisation
+    before accepting it as proof of ownership or as a delivery condition in an escrow.
 
-    Returns: name, xrpl_wallet, verified status, domain, and a register_url if not found.
+    Results are exact-match or close-match only. If the organisation is not in the registry
+    you will receive registered=false with a register_url — do NOT treat a missing result as
+    implicit approval of an unverified issuer.
+
+    Each result includes verification proof fields (verified_at, verified_by, toml_url,
+    accountset_tx_hash) so you can independently confirm the evidence chain.
+
+    Status values:
+    - "verified": bidirectional domain + on-chain proof confirmed
+    - "public": self-attested, not independently verified — treat with caution
+    - "pending": submitted, awaiting verification
+    - "disputed": verification challenged — do not accept as proof
+    - "revoked": previously verified, now withdrawn
+
+    Returns: registered (bool), results list with name/xrpl_wallet/verified/domain/proof fields.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/nft/issuers", params={"q": query})
         res.raise_for_status()
-        return res.json()
+        data = res.json()
+
+    results = data if isinstance(data, list) else data.get("results", [])
+    # Filter out "not found" sentinel entries that have no wallet
+    real_results = [r for r in results if r.get("xrpl_wallet") or r.get("wallet_address")]
+
+    if not real_results:
+        return {
+            "registered": False,
+            "query": query,
+            "message": (
+                f"No registered issuer found for '{query}' in the AgentTrust registry. "
+                "This does not mean the organisation does not exist on XRPL — it means "
+                "they have not been verified in this registry. Do not infer trust from absence."
+            ),
+            "register_url": "https://mcp.cryptovault.co.uk/docs#tag/nft/POST/nft/issuers",
+            "feed_url": "https://mcp.cryptovault.co.uk/nft/issuers/feed",
+        }
+
+    return {
+        "registered": True,
+        "query": query,
+        "results": real_results,
+    }
 
 
 @mcp.tool(annotations=ToolAnnotations(
