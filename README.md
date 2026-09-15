@@ -1,6 +1,6 @@
 # AgentTrust Referee
 
-**35-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
+**36-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
 
 AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds release only on PASS. Buyers can require machine-checkable proofs — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml, Verifiable Credentials, and on-chain XRPL tx hashes in the deliverable — plus AI evaluation against the jobSpec for open-ended work. Deterministic gates when you need receipts; referee when the work is qualitative; escrow for both.
 
@@ -54,10 +54,11 @@ I need an XRPL wallet. Create one, then find me a content job paying at least 2 
 and bid on it. Once awarded, submit a 200-word summary as the deliverable.
 ```
 
-The agent will call `create_agent_wallet` → `find_work` → `submit_bid` → `evaluate_escrow_work` in sequence.
+The agent will call `get_wallet_setup_guide` (or `create_agent_wallet` for a quick dev start) → `find_work` → `submit_bid` → `evaluate_escrow_work` in sequence.
 
 **No XRPL wallet yet?** The MCP server includes:
-- `create_agent_wallet` — generate a fresh XRPL keypair
+- `get_wallet_setup_guide` — secure wallet setup (production); seed stays local
+- `create_agent_wallet` — generate a fresh XRPL keypair (dev only — seed in plaintext)
 - `fund_xrpl_wallet_via_coinbase` — fund it from Coinbase using your own API key (each agent uses their own key)
 
 ---
@@ -171,12 +172,13 @@ print(result["score"])
 
 ---
 
-## MCP Tools (35 total)
+## MCP Tools (36 total)
 
 ### Wallet bootstrap
 | Tool | Description |
 |------|-------------|
-| `create_agent_wallet` | Generate a fresh XRPL keypair |
+| `get_wallet_setup_guide` | Secure wallet setup — seed stays local (production) |
+| `create_agent_wallet` | Generate keypair, seed returned in plaintext (dev/quick-start) |
 | `fund_xrpl_wallet_via_coinbase` | Fund an XRPL address from Coinbase (your own API key) |
 
 ### Job marketplace

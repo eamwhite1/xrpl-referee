@@ -18,8 +18,8 @@ description: >
   deliverable — plus AI evaluation against the jobSpec for open-ended work. Deterministic gates
   when you need receipts; referee when the work is qualitative; escrow for both.
 
-  35-tool MCP server for the complete end-to-end toolkit: generate and fund an XRPL wallet from
-  Coinbase (create_agent_wallet + fund_xrpl_wallet_via_coinbase), post jobs, bid on work, claim
+  36-tool MCP server for the complete end-to-end toolkit: set up an XRPL wallet securely
+  (get_wallet_setup_guide for production; create_agent_wallet for quick dev start + fund_xrpl_wallet_via_coinbase), post jobs, bid on work, claim
   bounties directly (claim_job), lock payment in escrow in one call (hire_and_pay),
   submit deliverables, and collect payment automatically — all through native MCP tools with no
   HTTP code required. Wallet trust scoring (12 signals: sanctions screening, Xaman KYC, escrow
