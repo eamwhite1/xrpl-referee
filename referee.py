@@ -244,6 +244,7 @@ def robots_txt():
         "Allow: /playground",
         "Allow: /audit",
         "Allow: /status",
+        "Allow: /fees",
         "",
         "Sitemap: https://mcp.cryptovault.co.uk/openapi.json",
     ])
@@ -369,6 +370,77 @@ def serve_marketplace_json():
         ],
         "docs": "https://mcp.cryptovault.co.uk/docs",
         "agent_card": "https://mcp.cryptovault.co.uk/.well-known/agent.json",
+    }
+
+
+@app.get("/fees")
+async def get_fees():
+    """
+    Machine-readable fee schedule, escrow limits, and free-tier rules.
+    This is the single source of truth — agents should read this before calling any paid endpoint.
+    """
+    fee_xrp = await get_required_fee_xrp()
+    return {
+        "protocol_version": "agenttrust/0.1.0",
+        "audit_fee": {
+            "usd": MIN_FEE_USD,
+            "assets_accepted": [
+                {
+                    "asset": "XRP",
+                    "network": "xrpl:0",
+                    "destination": PROTOCOL_WALLET,
+                    "amount_xrp": fee_xrp,
+                    "note": "Amount varies with XRP/USD price. Call /fees for the current value.",
+                },
+                {
+                    "asset": "RLUSD",
+                    "network": "xrpl:0",
+                    "destination": PROTOCOL_WALLET,
+                    "amount_rlusd": MIN_FEE_USD,
+                },
+                {
+                    "asset": "USDC",
+                    "network": "eip155:8453",
+                    "destination": BASE_WALLET_ADDRESS or "contact hello@cryptovault.co.uk",
+                    "amount_usdc": MIN_FEE_USDC,
+                    "decimals": 6,
+                    "amount_units": int(MIN_FEE_USDC * 1_000_000),
+                },
+            ],
+            "fee_hash_field": "fee_hash",
+            "fee_hash_format": {
+                "xrpl": "64-char hex of an XRPL Payment tx — single use",
+                "base": "0x-prefixed 66-char EVM tx hash — single use",
+            },
+            "x402_header": "X-PAYMENT or x-payment-hash (legacy)",
+        },
+        "free_tier": {
+            "rule": "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash",
+            "free_audits": FREE_AUDIT_LIMIT,
+            "min_trust_score": FREE_AUDIT_MIN_SCORE,
+            "check_score": "GET /wallet/score/{address}",
+        },
+        "escrow_limits": {
+            "default_cap_usd": THRESHOLD_BLOCK_USD,
+            "kyc_cap_usd": THRESHOLD_BLOCK_KYC_USD,
+            "travel_rule_warn_usd": THRESHOLD_WARN_USD,
+            "note": (
+                f"Escrows over ${THRESHOLD_BLOCK_USD:,} require KYC (Xaman). "
+                f"Hard ceiling ${THRESHOLD_BLOCK_KYC_USD:,} even for KYC-verified wallets. "
+                f"Travel Rule compliance warning issued above ${THRESHOLD_WARN_USD:,}."
+            ),
+            "kyc_guide": "https://www.cryptovault.co.uk/kyc/",
+        },
+        "free_endpoints": [
+            "/fees", "/status", "/health",
+            "/marketplace/jobs", "/jobs (GET)", "/jobs/{id}",
+            "/wallet/score/{address}", "/wallet/sanctions/{address}",
+            "/nft/issuers", "/nft/issuers/feed", "/nft/issuers/by-wallet/{address}",
+            "/.well-known/*",
+        ],
+        "paid_endpoints": ["/audit", "/escrow/generate", "/marketplace/skills (POST)"],
+        "docs": "https://mcp.cryptovault.co.uk/docs",
+        "changelog": "https://github.com/eamwhite1/xrpl-referee/blob/main/CHANGELOG.md",
     }
 
 

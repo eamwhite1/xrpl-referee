@@ -6,6 +6,15 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.1.0 — 2026-09-15
+
+### Added
+- `GET /fees` — machine-readable fee schedule, accepted assets, addresses, free-tier rules, and escrow caps. Single source of truth; agents should call this before any paid endpoint.
+- `get_fees()` MCP tool — wraps `GET /fees`; listed first in system prompt
+- `/fees` added to robots.txt Allow list
+
+---
+
 ## v2.0.0 — 2026-09-15
 
 ### Added
