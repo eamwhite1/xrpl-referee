@@ -359,7 +359,7 @@ def serve_marketplace_json():
             "post_skill": {"endpoint": "/marketplace/skills", "method": "POST", "fee": "$0.10/month", "description": "List a recurring skill for 30 days."},
             "escrow": {"endpoint": "/escrow/generate", "method": "POST", "fee": "$0.10 (XRP, RLUSD, or USDC)", "description": "Lock payment in AI-gated XRPL escrow."},
             "verify_work": {"endpoint": "/evaluate", "method": "POST", "fee": "included", "description": "Submit work; payment auto-releases on PASS."},
-            "trust_score": {"endpoint": "/wallet/score/{address}", "method": "GET", "fee": "free", "description": "0–100 wallet trust score across 12 signals."},
+            "trust_score": {"endpoint": "/wallet/score/{address}", "method": "GET", "fee": "free", "description": "0–100 wallet trust score across 11 signals."},
         },
         "mcp_tools": [
             "list_marketplace_jobs", "claim_job", "list_open_jobs", "post_job", "submit_bid",
@@ -839,14 +839,14 @@ class SanctionsLog(Base):
 
 
 class KycRecord(Base):
-    """KYC verification records — one row per verified wallet operator. Method: xaman."""
+    """KYC verification records — one row per verified wallet operator. Method: didit."""
     __tablename__ = "kyc_record"
     id             = Column(Integer, primary_key=True, autoincrement=True)
     wallet_address = Column(String, nullable=False, index=True)
     status         = Column(String, default="pending")  # pending | verified | failed
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     verified_at    = Column(DateTime, nullable=True)
-    return_url     = Column(String, nullable=True)  # stores verification method (e.g. "xaman")
+    return_url     = Column(String, nullable=True)  # stores verification method (e.g. "didit")
 
 
 # ---------------------------------------------------------------------------
