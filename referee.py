@@ -1172,8 +1172,6 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
         if not kyc_verified:
             # No live fallback — KYC status is set by the Didit webhook at /kyc/webhook
             pass
-            except Exception:
-                pass
 
     effective_limit = THRESHOLD_BLOCK_KYC_USD if kyc_verified else THRESHOLD_BLOCK_USD
 
