@@ -106,7 +106,7 @@ app = FastAPI(
         "**Trust layer stack:** four independent proof mechanisms buyers can require from sellers — "
         "(1) NFT from a trusted issuer, (2) XRPL domain verification, "
         "(3) W3C Verifiable Credential, (4) XRPL wallet trust score "
-        "(11 signals including on-chain ownership proof, Xaman KYC, XRPScan entity reputation, and OFAC sanctions screening).\n\n"
+        "(11 signals including on-chain ownership proof, identity KYC, XRPScan entity reputation, and OFAC sanctions screening).\n\n"
         "**Compliance:** all wallet addresses are automatically screened against the US OFAC SDN "
         "sanctions list at escrow creation and trust score computation. Sanctioned wallets "
         "cannot participate in escrow and receive a score of 0.\n\n"
@@ -323,7 +323,7 @@ def serve_mcp_server_card():
             {"name": "direct_hire",               "description": "Get a skill provider's wallet address for immediate escrow creation — no bidding needed."},
             {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
             {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
-            {"name": "get_wallet_trust_score",    "description": "GET /wallet/score/{address} — AgentTrust Wallet Trust Score (0–100). The first open trust-scoring system built natively for XRPL wallets. Combines 11 independent signals: account age, XRP balance, on-chain activity, domain verification, on-chain ownership proof, sanctions screening (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan verified entity + security flags), Xaman KYC (human identity verification), NFTs held, AgentTrust escrow completion rate, and peer ratings from counterparties. Returns a full score breakdown by signal so agents can reason about why a wallet scores high or low. A score below 30 is low-trust, 30–60 is moderate, 60+ is established. Free to query for any XRPL address."},
+            {"name": "get_wallet_trust_score",    "description": "GET /wallet/score/{address} — AgentTrust Wallet Trust Score (0–100). The first open trust-scoring system built natively for XRPL wallets. Combines 11 independent signals: account age, XRP balance, on-chain activity, domain verification, on-chain ownership proof, sanctions screening (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan verified entity + security flags), identity KYC (Didit verification; human-only signal), NFTs held, AgentTrust escrow completion rate, and peer ratings from counterparties. Returns a full score breakdown by signal so agents can reason about why a wallet scores high or low. A score below 30 is low-trust, 30–60 is moderate, 60+ is established. Free to query for any XRPL address."},
             {"name": "verify_nft_proof",          "description": "POST /nft/verify — verify that an XRPL NFT exists in a wallet, was minted by a required issuer, and contains required metadata fields. Used to confirm event-based proof (ticket purchased, cargo shipped, etc)."},
             {"name": "verify_domain_ownership",   "description": "POST /domain/verify — verify that an XRPL wallet is cryptographically linked to a domain via the account Domain field and xrp-ledger.toml. Proves the wallet owner controls the specified organisation's domain."},
             {"name": "verify_vc",                 "description": "POST /vc/verify — verify a W3C Verifiable Credential JWT. Checks expiry, issuer DID, credential type, and optionally resolves the DID via the Universal Resolver. Accepts credentials from any W3C-compliant issuer."},
@@ -425,11 +425,12 @@ async def get_fees():
             "kyc_cap_usd": THRESHOLD_BLOCK_KYC_USD,
             "travel_rule_warn_usd": THRESHOLD_WARN_USD,
             "note": (
-                f"Escrows over ${THRESHOLD_BLOCK_USD:,} require KYC (Xaman). "
-                f"Hard ceiling ${THRESHOLD_BLOCK_KYC_USD:,} even for KYC-verified wallets. "
+                f"Escrows over ${THRESHOLD_BLOCK_USD:,} require identity verification (Didit). "
+                f"Hard ceiling ${THRESHOLD_BLOCK_KYC_USD:,} even for verified wallets. "
                 f"Travel Rule compliance warning issued above ${THRESHOLD_WARN_USD:,}."
             ),
             "kyc_guide": "https://www.cryptovault.co.uk/kyc/",
+            "kyc_fee_usd": 0.50,
         },
         "free_endpoints": [
             "/fees", "/status", "/health",
@@ -966,28 +967,66 @@ async def _get_xrpscan_account(wallet_address: str) -> dict | None:
         return None
 
 
-async def _get_xaman_kyc(wallet_address: str) -> bool:
+# Didit KYC — identity verification powered by Didit (didit.me)
+DIDIT_API_KEY      = os.getenv("DIDIT_API_KEY", "")
+DIDIT_WORKFLOW_ID  = os.getenv("DIDIT_WORKFLOW_ID", "")
+DIDIT_WEBHOOK_SECRET = os.getenv("DIDIT_WEBHOOK_SECRET", "")
+DIDIT_BASE         = "https://verification.didit.me"
+
+async def _create_didit_session(wallet_address: str) -> Optional[str]:
     """
-    Check Xaman KYC status via the Xaman platform API (direct, authenticated).
-    Returns True if the wallet holder has completed Xaman KYC verification (powered by Veriff).
-    Xaman KYC is a human identity verification — AI agent wallets will always return False.
+    Create a Didit KYC verification session for the given wallet address.
+    Returns the verification URL to redirect the user to, or None on failure.
+    vendor_data stores the wallet address so the webhook can look it up.
     """
-    if not xumm_api_key or not xumm_api_secret:
-        logger.warning("Xaman KYC check skipped: XUMM_API_KEY/SECRET not configured")
-        return False
+    if not DIDIT_API_KEY or not DIDIT_WORKFLOW_ID:
+        logger.warning("Didit KYC skipped: DIDIT_API_KEY/DIDIT_WORKFLOW_ID not configured")
+        return None
     try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            r = await client.get(
-                f"https://xumm.app/api/v1/platform/kyc-status/{wallet_address}",
-                headers={"X-API-Key": xumm_api_key, "X-API-Secret": xumm_api_secret},
-                params={"include_globalid": "true"},
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{DIDIT_BASE}/v3/session/",
+                headers={"Authorization": f"Bearer {DIDIT_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "workflow_id": DIDIT_WORKFLOW_ID,
+                    "vendor_data": wallet_address,
+                    "callback": f"{os.getenv('REFEREE_BASE_URL', 'https://mcp.cryptovault.co.uk')}/kyc/complete",
+                },
             )
-            if r.status_code == 200:
+            if r.status_code in (200, 201):
                 data = r.json()
-                return bool(data.get("kycApproved") or data.get("kyc_approved"))
+                return data.get("url") or data.get("verification_url") or data.get("session_url")
+            logger.warning(f"Didit session creation failed: {r.status_code} {r.text[:200]}")
     except Exception as e:
-        logger.warning(f"Xaman KYC check failed for {wallet_address}: {e}")
-    return False
+        logger.warning(f"Didit session creation error: {e}")
+    return None
+
+
+def _verify_didit_webhook_signature(payload: bytes, headers: dict) -> bool:
+    """
+    Verify Didit webhook HMAC-SHA256 signature.
+    Tries simple canonical format first, then raw body fallback.
+    """
+    if not DIDIT_WEBHOOK_SECRET:
+        return False
+    import hmac as _hmac
+    secret = DIDIT_WEBHOOK_SECRET.encode()
+    try:
+        body = json.loads(payload)
+        session_id = body.get("session_id", "")
+        status     = body.get("status", "")
+        created_at = body.get("created_at", "")
+        # Simple canonical format
+        canonical = f"{created_at}:{session_id}:{status}:verification"
+        sig_simple = _hmac.new(secret, canonical.encode("utf-8"), "sha256").hexdigest()
+        received = headers.get("x-signature") or headers.get("x-didit-signature") or ""
+        if _hmac.compare_digest(sig_simple, received):
+            return True
+        # Fallback: raw body HMAC
+        sig_raw = _hmac.new(secret, payload, "sha256").hexdigest()
+        return _hmac.compare_digest(sig_raw, received)
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 ANCHAIN_API_KEY = os.getenv("ANCHAIN_API_KEY", "")
@@ -1119,7 +1158,7 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
     if usd_value is None:
         return {"ok": True}  # can't determine value — don't block
 
-    # Check KYC status for the buyer wallet — AgentTrust cache first, then live Xaman query
+    # Check KYC status for the buyer wallet — AgentTrust DB only (Didit webhooks keep this current)
     kyc_verified = False
     if buyer_address and db:
         try:
@@ -1131,21 +1170,8 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
         except Exception:
             pass
         if not kyc_verified:
-            try:
-                xaman_ok = await _get_xaman_kyc(buyer_address)
-                if xaman_ok:
-                    kyc_verified = True
-                    # Cache the Xaman result so future calls skip the HTTP round-trip
-                    try:
-                        db.add(KycRecord(
-                            wallet_address=buyer_address,
-                            status="verified",
-                            verified_at=datetime.now(timezone.utc),
-                            return_url=None,
-                        ))
-                        db.commit()
-                    except Exception:
-                        db.rollback()
+            # No live fallback — KYC status is set by the Didit webhook at /kyc/webhook
+            pass
             except Exception:
                 pass
 
@@ -3541,7 +3567,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
       Wallet ownership proof   — 8 pts (on-chain AccountSet verification)
       Sanctions clear          — 7 pts; sanctioned wallets score 0 and are blocked from escrow
       Entity reputation        — up to 8 pts (XRPScan: verified entity +5, security flags +1 each)
-      Xaman KYC                — 5 pts (Xaman KYC via Veriff, authenticated platform API; human-only signal)
+      Identity KYC             — 10 pts (Didit identity verification; human-only signal, unlocks $10k escrow cap)
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -3591,12 +3617,11 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         except Exception:
             pass
 
-        # Fetch NFTs, XRPScan entity data, and Xaman KYC concurrently
+        # Fetch NFTs and XRPScan entity data concurrently
         import asyncio as _asyncio
         nft_task      = _asyncio.create_task(_fetch_nft_count(wallet_address))
         xrpscan_task  = _asyncio.create_task(_get_xrpscan_account(wallet_address))
-        xaman_task    = _asyncio.create_task(_get_xaman_kyc(wallet_address))
-        nft_count, xrpscan, xaman_kyc = await _asyncio.gather(nft_task, xrpscan_task, xaman_task)
+        nft_count, xrpscan = await _asyncio.gather(nft_task, xrpscan_task)
 
         # XRPScan entity + security flags signal
         xrpscan_score   = 0
@@ -3620,11 +3645,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "deposit_auth":        xrpscan.get("deposit_auth", False),
             }
 
-        # Xaman KYC signal — 5 pts if wallet holder has completed Xaman identity verification
-        # AI agent wallets will never have this; it distinguishes verified humans from agents
-        xaman_kyc_score = 5 if xaman_kyc else 0
-
-        # AgentTrust KYC signal — 10 pts if operator has completed AgentTrust identity verification
+        # Identity KYC signal — 10 pts if operator has completed Didit identity verification
         agentrust_kyc_verified = False
         agentrust_kyc_score = 0
         if db:
@@ -3731,7 +3752,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                     "source": "bithomp",
                 }
 
-        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score + xrpscan_score + xaman_kyc_score + agentrust_kyc_score
+        total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score + xrpscan_score + agentrust_kyc_score
 
         signals = {
             "age_days":              age_days,
@@ -3746,7 +3767,6 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             "known_entity":          xrpscan_entity or (sanctions_detail.get("entity") if sanctions_detail else None),
             "xrpscan_entity":        xrpscan_entity,
             "xrpscan_flags":         xrpscan_flags,
-            "xaman_kyc":             xaman_kyc,
             "kyc_verified":          agentrust_kyc_verified,
             "score_breakdown": {
                 "account_age":            age_score,
@@ -3759,8 +3779,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "wallet_sig_verified":    wallet_sig_score,
                 "sanctions_clear":        sanctions_score,
                 "entity_reputation":      xrpscan_score,
-                "xaman_kyc":              xaman_kyc_score,
-                "agentrust_kyc":          agentrust_kyc_score,
+                "identity_kyc":           agentrust_kyc_score,
             },
             **completion_stats,
             **peer_stats,
@@ -3794,7 +3813,7 @@ async def get_wallet_score(address: str, db: Session = Depends(get_db)):
     AgentTrust Wallet Trust Score — 11 on-chain + platform signals, scored 0–100.
     Combines account age, balance, activity, domain verification, on-chain wallet
     ownership proof, multi-jurisdiction sanctions screening (AnChain.ai BEI),
-    entity reputation (XRPScan), Xaman KYC, NFTs held, AgentTrust escrow
+    entity reputation (XRPScan), identity KYC, NFTs held, AgentTrust escrow
     completion history, and peer ratings.
     A sanctioned wallet receives a hard score of 0 regardless of other signals.
     """
@@ -7218,21 +7237,20 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
     return {"results": results}
 
 # ---------------------------------------------------------------------------
-# KYC — Xaman KYC verification (powered by Veriff)
+# KYC — Identity verification powered by Didit (didit.me)
+# Fee: $0.50 in XRP or RLUSD (charged via fee_hash, same mechanism as audit fees)
 # ---------------------------------------------------------------------------
 
-@app.post("/kyc/verify")
-async def kyc_verify(wallet_address: str, db: Session = Depends(get_db)):
+@app.post("/kyc/start")
+async def kyc_start(wallet_address: str, fee_hash: Optional[str] = None, db: Session = Depends(get_db)):
     """
-    Check whether a wallet has Xaman KYC and cache the result.
-    Agents call this after the operator completes Xaman KYC to refresh
-    their verified status without waiting for the next trust score query.
-
-    Returns {"kyc_verified": true} if Xaman reports the wallet as KYC-approved.
-    The result is cached in kyc_record so future escrow requests bypass the
-    live Xaman query.
+    Start a KYC identity verification session for a wallet operator.
+    Charges $0.50 via fee_hash (XRP/RLUSD on XRPL or USDC on Base).
+    Returns a verification_url — redirect the user there to complete ID verification.
+    Didit webhooks back to /kyc/webhook on completion; the wallet is then marked
+    as kyc_verified and unlocks escrows up to $10,000.
     """
-    # Return cached result if already verified
+    # Return immediately if already verified
     existing = db.query(KycRecord).filter(
         KycRecord.wallet_address == wallet_address,
         KycRecord.status == "verified",
@@ -7241,38 +7259,83 @@ async def kyc_verify(wallet_address: str, db: Session = Depends(get_db)):
         return {
             "wallet_address": wallet_address,
             "kyc_verified": True,
-            "method": existing.return_url or "xaman",
+            "method": existing.return_url or "didit",
             "verified_at": existing.verified_at.isoformat() if existing.verified_at else None,
         }
 
-    xaman_ok = await _get_xaman_kyc(wallet_address)
-    if xaman_ok:
-        try:
-            row = KycRecord(
-                wallet_address=wallet_address,
-                status="verified",
-                verified_at=datetime.now(timezone.utc),
-                return_url="xaman",
-            )
-            db.add(row)
-            db.commit()
-        except Exception:
-            db.rollback()
-        return {"wallet_address": wallet_address, "kyc_verified": True, "method": "xaman"}
+    # Validate fee payment ($0.50)
+    KYC_FEE_USD = 0.50
+    if fee_hash:
+        fee_ok = await _validate_fee_hash(fee_hash, KYC_FEE_USD, wallet_address, db)
+        if not fee_ok:
+            raise HTTPException(status_code=402, detail="Invalid or already-used fee_hash. Pay $0.50 in XRP, RLUSD, or USDC to start KYC verification.")
+    else:
+        raise HTTPException(status_code=402, detail={
+            "error": "payment_required",
+            "message": "KYC verification costs $0.50. Pay in XRP, RLUSD (XRPL), or USDC (Base chain 8453) and include the tx hash as fee_hash.",
+            "fee_usd": KYC_FEE_USD,
+        })
+
+    verification_url = await _create_didit_session(wallet_address)
+    if not verification_url:
+        raise HTTPException(status_code=503, detail="KYC service temporarily unavailable. Please try again shortly.")
 
     return {
         "wallet_address": wallet_address,
         "kyc_verified": False,
-        "message": "Xaman KYC not detected for this wallet. Complete identity verification via Xaman (powered by Veriff), then call this endpoint again.",
-        "xaman_kyc_url": "https://xaman.app/detect/xapp/xumm/kyc",
+        "status": "pending",
+        "verification_url": verification_url,
+        "message": "Complete identity verification at the URL above. Your wallet will be upgraded to the $10,000 escrow cap automatically once approved.",
     }
+
+
+@app.post("/kyc/webhook")
+async def kyc_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Didit webhook receiver — called by Didit when a KYC session completes.
+    Marks the wallet as verified on Approved status.
+    """
+    payload = await request.body()
+    if not _verify_didit_webhook_signature(payload, dict(request.headers)):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        body = json.loads(payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    status       = body.get("status", "")
+    wallet_address = body.get("vendor_data", "")
+    session_id   = body.get("session_id", "")
+
+    logger.info(f"Didit KYC webhook: session={session_id} status={status} wallet={wallet_address}")
+
+    if status == "Approved" and wallet_address:
+        try:
+            existing = db.query(KycRecord).filter(
+                KycRecord.wallet_address == wallet_address,
+                KycRecord.status == "verified",
+            ).first()
+            if not existing:
+                db.add(KycRecord(
+                    wallet_address=wallet_address,
+                    status="verified",
+                    verified_at=datetime.now(timezone.utc),
+                    return_url="didit",
+                ))
+                db.commit()
+                logger.info(f"Wallet {wallet_address} marked KYC verified via Didit (session {session_id})")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to store KYC record for {wallet_address}: {e}")
+
+    return {"received": True}
 
 
 @app.get("/kyc/status/{wallet_address}")
 async def kyc_status(wallet_address: str, db: Session = Depends(get_db)):
     """
     Check KYC verification status for a wallet address.
-    Checks the local cache first, then queries Xaman live if no cached record exists.
     """
     row = db.query(KycRecord).filter(
         KycRecord.wallet_address == wallet_address,
@@ -7282,16 +7345,14 @@ async def kyc_status(wallet_address: str, db: Session = Depends(get_db)):
         return {
             "wallet_address": wallet_address,
             "kyc_verified": True,
-            "method": row.return_url or "xaman",
+            "method": row.return_url or "didit",
             "verified_at": row.verified_at.isoformat() if row.verified_at else None,
         }
-
-    # Live Xaman check
-    xaman_ok = await _get_xaman_kyc(wallet_address)
     return {
         "wallet_address": wallet_address,
-        "kyc_verified": xaman_ok,
-        "method": "xaman" if xaman_ok else None,
+        "kyc_verified": False,
+        "message": "Not KYC verified. Call POST /kyc/start with a fee_hash to begin identity verification ($0.50).",
+        "kyc_url": "https://www.cryptovault.co.uk/kyc/",
     }
 
 

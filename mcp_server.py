@@ -66,9 +66,10 @@ mcp = FastMCP(
         "     If proceed is False, do not call create_escrow_vault or hire_and_pay.\n"
         "\n"
         "TRUST & COMPLIANCE (individual checks — use assess_counterparty_and_job for the full picture):\n"
-        "  get_wallet_trust_score(address) — 0–100 score across 12 signals.\n"
+        "  get_wallet_trust_score(address) — 0–100 score across 11 signals.\n"
         "  check_wallet_sanctions(address) — OFAC SDN screen. Sanctioned wallets score 0.\n"
-        "  check_wallet_kyc(address)       — Xaman KYC status (unlocks escrows up to $10,000).\n"
+        "  check_wallet_kyc(address)       — identity KYC status (unlocks escrows up to $10,000).\n"
+        "  start_wallet_kyc(address, fee_hash) — start Didit identity verification ($0.50 fee); returns verification_url.\n"
         "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
         "\n"
         "WALLET BOOTSTRAP (do this first if you have no XRPL wallet):\n"
@@ -1164,12 +1165,12 @@ async def get_wallet_trust_score(
     Combines 12 independent signals: account age, XRP balance, on-chain activity,
     domain verification, on-chain ownership proof, multi-jurisdiction sanctions screening
     (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan),
-    Xaman KYC, AgentTrust KYC (Xaman-verified + registered), NFTs held, escrow completion
+    Identity KYC (Didit-verified), NFTs held, escrow completion
     rate, and peer ratings from counterparties.
 
     Use this before accepting a job or creating an escrow to assess counterparty risk.
     A score below 30 is low-trust, 30–60 moderate, 60+ established.
-    KYC-verified wallets (kyc_verified: true) can create escrows up to $10,000.
+    Identity-verified wallets (kyc_verified: true) can create escrows up to $10,000.
 
     Returns full score breakdown by signal so you can reason about why a wallet scores high or low.
     """
@@ -1193,21 +1194,57 @@ async def check_wallet_kyc(
     )],
 ) -> dict:
     """
-    Check and register the Xaman KYC verification status for a wallet operator.
+    Check identity verification status for a wallet operator.
 
-    Queries Xaman (the official XRPL wallet app) to see if the wallet holder has completed
-    identity verification. If verified, the status is cached and the wallet immediately
-    unlocks escrows up to $10,000 (vs. the default $3,000 cap for unverified wallets).
+    Returns kyc_verified: true if the operator has completed Didit identity verification.
+    Verified wallets unlock escrows up to $10,000 (vs. the default $3,000 cap).
 
-    Call this after completing KYC in the Xaman app (xaman.app/detect/xapp/xumm/kyc) to register the
-    result with AgentTrust. Safe to call multiple times — returns cached result if already verified.
+    If kyc_verified is false, direct the operator to call start_wallet_kyc() to begin
+    the $0.50 identity verification flow.
 
-    Returns: wallet_address, kyc_verified (bool), method, and xaman_kyc_url if not yet verified.
+    Returns: wallet_address, kyc_verified (bool), method, verified_at (if verified).
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(
+            f"{REFEREE_BASE}/kyc/status/{wallet_address}",
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Start Wallet KYC Verification",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def start_wallet_kyc(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="The XRPL wallet address (r...) to verify.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="Fee Transaction Hash",
+        description="TX hash of a $0.50 payment in XRP, RLUSD (XRPL), or USDC (Base chain 8453). Call get_fees() to get current amounts and destination addresses.",
+    )],
+) -> dict:
+    """
+    Start a Didit identity verification session for a wallet operator ($0.50 fee).
+
+    Call get_fees() first to get the current fee amount and accepted assets.
+    Pay $0.50 in XRP, RLUSD, or USDC and pass the tx hash as fee_hash.
+
+    Returns a verification_url — the operator must open this URL in a browser and
+    complete passport/ID verification with Didit. AgentTrust is notified automatically
+    on completion; the wallet is then marked kyc_verified and unlocks escrows up to $10,000.
+
+    Safe to call check_wallet_kyc() afterwards to confirm status.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
-            f"{REFEREE_BASE}/kyc/verify",
-            params={"wallet_address": wallet_address},
+            f"{REFEREE_BASE}/kyc/start",
+            params={"wallet_address": wallet_address, "fee_hash": fee_hash},
         )
         res.raise_for_status()
         return res.json()
