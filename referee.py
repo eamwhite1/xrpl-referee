@@ -538,17 +538,34 @@ async def serve_payment_required():
             },
         })
 
+    extra_attempt_xrp = extra_attempt_fee_xrp()
+    premium_xrp = await get_required_fee_xrp(premium=True)
+    kyc_xrp = kyc_fee_xrp()
+
     return {
         "x402Version": 1,
         "service":     "AgentTrust Referee",
-        "description": "AI task verification and XRPL escrow. Pay once per audit — fee covers the AI verdict and any automatic escrow release.",
-        "paidEndpoints": ["/audit", "/escrow/generate", "/marketplace/skills"],
+        "description": "AI task verification and XRPL escrow. Pay per API call — fees are metered, non-custodial, x402-compatible.",
+        "paidEndpoints": [
+            {"path": "/audit",                          "fee_usd": MIN_FEE_USD,       "description": "Standard AI audit (Gemini Flash). Returns PASS/FAIL with score and feedback."},
+            {"path": "/audit?require_consensus=true",   "fee_usd": PREMIUM_FEE_USD,   "description": "Premium consensus audit (Gemini Flash + Pro). Both models must agree on PASS."},
+            {"path": "/escrow/generate",                "fee_usd": MIN_FEE_USD,       "description": "Create an XRPL crypto-condition escrow vault. Funds release automatically on PASS."},
+            {"path": "/evaluate/purchase-attempt",      "fee_usd": EXTRA_ATTEMPT_FEE_USD, "description": "Unlock one additional work submission attempt for an escrow that has hit its limit."},
+            {"path": "/kyc/start",                      "fee_usd": KYC_FEE_USD,       "description": "Start Didit identity verification ($0.50 one-time). Raises escrow cap to $10,000."},
+            {"path": "/marketplace/skills (POST)",      "fee_usd": MIN_FEE_USD,       "description": "List a recurring skill on the marketplace for 30 days."},
+        ],
         "freeEndpoints": [
             "/marketplace/jobs", "/marketplace/skills (GET)", "/wallet/score/{address}",
             "/wallet/sanctions/{address}", "/jobs (GET)", "/jobs/{id}", "/status",
             "/.well-known/*",
         ],
         "freeAudits":   "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash.",
+        "liveAmounts": {
+            "audit_xrp":           fee_xrp,
+            "premium_audit_xrp":   premium_xrp,
+            "extra_attempt_xrp":   extra_attempt_xrp,
+            "kyc_xrp":             kyc_xrp,
+        },
         "accepts":      accepts,
         "docs":         "https://mcp.cryptovault.co.uk/docs",
         "mcp":          "https://mcp.cryptovault.co.uk/mcp",
@@ -1719,6 +1736,8 @@ else:
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_SUBMISSIONS = int(os.getenv("DEFAULT_MAX_SUBMISSIONS", "3"))
 EXTRA_ATTEMPT_FEE_USD   = 0.05  # target USD price per extra submission attempt
+KYC_FEE_USD             = 0.50  # one-time identity verification fee
+KYC_FEE_XRP_FALLBACK    = 0.50  # static fallback; live price used when available
 
 
 def extra_attempt_fee_xrp() -> float:
@@ -1727,6 +1746,14 @@ def extra_attempt_fee_xrp() -> float:
     if price and price > 0:
         return round(EXTRA_ATTEMPT_FEE_USD / price, 6)
     return 0.025  # fallback if price not cached yet
+
+
+def kyc_fee_xrp() -> float:
+    """Return the KYC fee in XRP at current price (falls back to 0.50 XRP)."""
+    price = _xrp_price_cache.get("usd") if _xrp_price_cache else None
+    if price and price > 0:
+        return round(KYC_FEE_USD / price, 6)
+    return KYC_FEE_XRP_FALLBACK
 
 
 # ---------------------------------------------------------------------------
@@ -5171,13 +5198,17 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 class PurchaseAttemptRequest(BaseModel):
     escrow_id: str
-    fee_hash:  str   # 0.05 XRP payment hash
+    fee_hash:  Optional[str] = None   # 0.05 XRP/RLUSD/USDC payment hash; omit to receive a 402
 
 @app.post("/evaluate/purchase-attempt")
 async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     """
     Seller pays $0.05 (≈ EXTRA_ATTEMPT_FEE_USD in XRP at current price) to unlock one more submission.
     Returns updated attempts_remaining.
+
+    x402 compatible: call with no fee_hash and no payment headers to receive a proper 402
+    with X-Payment-Required (x402 v1) and PAYMENT-REQUIRED (x402 v2) headers describing
+    how to pay in XRP, RLUSD, or USDC on Base.
     """
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if not vault:
@@ -5187,7 +5218,17 @@ async def purchase_extra_attempt(req: PurchaseAttemptRequest, db: Session = Depe
     if vault.status == "CANCELLED":
         raise HTTPException(status_code=409, detail="Escrow is cancelled.")
 
-    # Verify the 0.05 XRP payment
+    # Emit proper x402 402 when no payment provided
+    if not req.fee_hash and not x_reviewer_token and not payment_signature:
+        _raise_402(
+            "/evaluate/purchase-attempt",
+            f"Extra submission attempt — payment required. Send {extra_attempt_fee_xrp():.6g} XRP "
+            f"(≈${EXTRA_ATTEMPT_FEE_USD:.2f}) to {PROTOCOL_WALLET} on the XRPL, or ${EXTRA_ATTEMPT_FEE_USD:.2f} USDC on Base (chain 8453). "
+            "Include the transaction hash as the X-PAYMENT header or fee_hash body field.",
+            min_xrp=extra_attempt_fee_xrp(),
+        )
+
+    # Verify the 0.05 XRP/RLUSD/USDC payment
     fee_result = await verify_fee_payment(
         fee_hash  = req.fee_hash,
         escrow_id = f"{req.escrow_id}-attempt",
@@ -7284,13 +7325,16 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @app.post("/kyc/start")
-async def kyc_start(wallet_address: str, fee_hash: Optional[str] = None, db: Session = Depends(get_db)):
+async def kyc_start(wallet_address: str, fee_hash: Optional[str] = None, payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), x_reviewer_token: Optional[str] = Header(None), db: Session = Depends(get_db)):
     """
     Start a KYC identity verification session for a wallet operator.
     Charges $0.50 via fee_hash (XRP/RLUSD on XRPL or USDC on Base).
     Returns a verification_url — redirect the user there to complete ID verification.
     Didit webhooks back to /kyc/webhook on completion; the wallet is then marked
     as kyc_verified and unlocks escrows up to $10,000.
+
+    x402 compatible: call with no fee_hash and no payment headers to receive a proper 402
+    with X-Payment-Required and PAYMENT-REQUIRED headers describing how to pay.
     """
     # Return immediately if already verified
     existing = db.query(KycRecord).filter(
@@ -7305,18 +7349,28 @@ async def kyc_start(wallet_address: str, fee_hash: Optional[str] = None, db: Ses
             "verified_at": existing.verified_at.isoformat() if existing.verified_at else None,
         }
 
-    # Validate fee payment ($0.50)
-    KYC_FEE_USD = 0.50
-    if fee_hash:
-        fee_ok = await _validate_fee_hash(fee_hash, KYC_FEE_USD, wallet_address, db)
-        if not fee_ok:
-            raise HTTPException(status_code=402, detail="Invalid or already-used fee_hash. Pay $0.50 in XRP, RLUSD, or USDC to start KYC verification.")
-    else:
-        raise HTTPException(status_code=402, detail={
-            "error": "payment_required",
-            "message": "KYC verification costs $0.50. Pay in XRP, RLUSD (XRPL), or USDC (Base chain 8453) and include the tx hash as fee_hash.",
-            "fee_usd": KYC_FEE_USD,
-        })
+    # Emit proper x402 402 when no payment provided
+    if not fee_hash and not x_reviewer_token and not payment_signature:
+        fee_xrp = kyc_fee_xrp()
+        _raise_402(
+            "/kyc/start",
+            f"Identity KYC verification — payment required. Send {fee_xrp:.6g} XRP "
+            f"(≈${KYC_FEE_USD:.2f}) to {PROTOCOL_WALLET} on the XRPL, or ${KYC_FEE_USD:.2f} USDC on Base (chain 8453). "
+            "Include the transaction hash as the X-PAYMENT header or fee_hash query parameter.",
+            min_xrp=fee_xrp,
+        )
+
+    # Validate fee payment ($0.50) via unified verify_fee_payment
+    fee_result = await verify_fee_payment(
+        fee_hash          = fee_hash,
+        escrow_id         = f"kyc-{wallet_address[:20]}",
+        db                = db,
+        min_xrp           = kyc_fee_xrp(),
+        resource          = "/kyc/start",
+        reviewer_token    = x_reviewer_token,
+        payment_signature = payment_signature,
+    )
+    _ = fee_result  # payment response header not needed for KYC
 
     verification_url = await _create_didit_session(wallet_address)
     if not verification_url:
