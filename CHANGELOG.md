@@ -6,6 +6,27 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.5.0 — 2026-09-19
+
+### Added
+- **`purchase_extra_attempt()` MCP tool** — unlocks one additional work submission when the vault limit is reached ($0.05 fee). Previously only accessible as a bare REST endpoint; agents can now call it directly from `tools/list`.
+- **Proof-gate params in `create_escrow_vault` and `hire_and_pay` MCP schemas** — `require_nft_proof`, `required_nft_issuer`, `nft_dvp`, `required_domain`, `required_vc_issuer_did`, `required_vc_type`, `proof_policy`, and `require_consensus` are now first-class tool parameters. Agents can discover and configure release conditions without reading the REST API docs.
+- **`KYC_FEE_USD` / `kyc_fee_xrp()` constants** — KYC fee tracked at module level with live XRP pricing.
+
+### Changed
+- **x402 consistency across all paid endpoints:**
+  - `/evaluate/purchase-attempt` (`$0.05`): `fee_hash` is now optional; omitting payment returns a proper `_raise_402` with `X-Payment-Required` (x402 v1) + `PAYMENT-REQUIRED` (x402 v2) headers and USDC/Base option. Previously returned 422 Unprocessable Entity.
+  - `/kyc/start` (`$0.50`): replaced plain `HTTPException(402)` dict with `_raise_402` for full x402 v1+v2 envelope. Also wired up `verify_fee_payment` (supports x402 v2 presigned transactions) instead of the simpler internal `_validate_fee_hash`.
+- **`/.well-known/x402` catalog expanded**: `paidEndpoints` now lists all six paid endpoints with per-entry `fee_usd` and description (was three entries, no descriptions). New `liveAmounts` block exposes current XRP equivalents for all fee tiers. Agents searching the x402 catalog now see the full AgentTrust paid surface including the premium consensus tier and extra-attempt path.
+- **MCP system prompt**: `evaluate_escrow_work` description now states the 3-attempt default, `max_submissions` range (1–10), and the `purchase_extra_attempt` fallback. Onboarding guides (worker and buyer) now lead with `get_wallet_setup_guide()` as the recommended production path; `create_agent_wallet()` is clearly labelled dev/throwaway-only.
+- **Coinbase framing**: system prompt, `fund_xrpl_wallet_via_coinbase` docstring, and `get_wallet_setup_guide` return value all now explicitly state Coinbase is an onramp only — all escrow settlement happens on XRPL. Removed a misleading "x402 autonomous payment" label from the wallet setup guide (the tool uses Coinbase HMAC API v2, not x402).
+
+### Fixed
+- `evaluate_escrow_work` docstring now documents the attempt limit and directs agents to `purchase_extra_attempt` on `submission_limit_reached` error.
+- `fee_hash` description on `create_escrow_vault` no longer implies `create_agent_wallet` is the only path to the free tier.
+
+---
+
 ## v2.4.0 — 2026-09-19
 
 ### Added
