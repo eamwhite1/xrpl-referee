@@ -55,7 +55,10 @@ mcp = FastMCP(
         "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow). "
         "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25).\n"
         "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
-        "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS.\n"
+        "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS. "
+        "Workers get 3 attempts by default (buyer sets max_submissions 1–10). "
+        "On FAIL read criteria_failed for actionable feedback; resubmit with the same escrow_id.\n"
+        "  purchase_extra_attempt(escrow_id, fee_hash) — unlock one more submission when the limit is reached. Fee: $0.05 (XRP/RLUSD).\n"
         "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
         "\n"
         "FEES & LIMITS (call get_fees() before any paid operation — do not hard-code amounts):\n"
@@ -430,6 +433,12 @@ async def evaluate_escrow_work(
           "model_used":        "gemini-2.5-flash"
         }
 
+    Attempt limits: workers get 3 attempts by default (buyer can set 1–10 via
+    max_submissions on create_escrow_vault / hire_and_pay). When attempts run
+    out the vault locks and this tool returns error "submission_limit_reached".
+    To unlock one more attempt, call purchase_extra_attempt(escrow_id, fee_hash)
+    with a $0.05 fee payment — then resubmit.
+
     On FAIL: read criteria_failed for specific, actionable feedback. Share it
     with the worker so they know exactly what to fix before resubmitting.
     Resubmit by calling evaluate_escrow_work again with the same escrow_id.
@@ -452,6 +461,43 @@ async def evaluate_escrow_work(
                 "message": data.get("detail", "Submission limit reached."),
                 "hint":    "Purchase an extra attempt for 0.05 XRP via POST /evaluate/purchase-attempt",
             }
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Purchase Extra Submission Attempt",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def purchase_extra_attempt(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code for the vault whose submission limit has been reached.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="Fee Payment Hash",
+        description="64-char hex XRPL transaction hash of the $0.05 payment (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.",
+    )],
+) -> dict:
+    """
+    Purchase one additional submission attempt for a vault that has hit its limit.
+
+    Workers get 3 attempts by default (buyer sets this via max_submissions).
+    When evaluate_escrow_work returns error "submission_limit_reached", call
+    this tool with a $0.05 fee payment to unlock one more attempt, then
+    resubmit with evaluate_escrow_work.
+
+    Fee: $0.05 paid in XRP or RLUSD to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR.
+    Returns: updated attempts_remaining count on success.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/evaluate/purchase-attempt",
+            json={"escrow_id": escrow_id, "fee_hash": fee_hash},
+        )
         res.raise_for_status()
         return res.json()
 
