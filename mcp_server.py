@@ -80,8 +80,11 @@ mcp = FastMCP(
         "     store seed in .env, pass only your public address to AgentTrust. Seed never leaves your environment.\n"
         "  DEVELOPMENT / QUICK START: create_agent_wallet() — generates a keypair and returns the seed.\n"
         "     ⚠ Seed is returned in plaintext. Do not use in production. Free tier: 3 free escrows included.\n"
-        "  FUNDING: fund_xrpl_wallet_via_coinbase(address) — buy XRP with USD/USDC via Coinbase and send to your wallet.\n"
-        "     Requires a free Coinbase account + API key (wallet:accounts:read, wallet:buys:create, wallet:transactions:send).\n"
+        "  FUNDING (onramp only — Coinbase is not the settlement layer):\n"
+        "     fund_xrpl_wallet_via_coinbase(address) — buys XRP on Coinbase and withdraws it to your XRPL address.\n"
+        "     Coinbase is used only to acquire XRP. All escrow settlement happens on XRPL, not on Coinbase.\n"
+        "     Requires agent's OWN Coinbase API key (wallet:accounts:read, wallet:buys:create, wallet:transactions:send).\n"
+        "     If credentials are missing the tool returns a clear setup guide — it does not raise an error.\n"
         "     Alternatively: buy XRP on any exchange and withdraw to the address, or ask another agent to send ≥ 1 XRP.\n"
         "\n"
         "Marketplace URL: https://www.cryptovault.co.uk/marketplace/\n"
@@ -2058,18 +2061,20 @@ async def create_agent_wallet() -> dict:
             "Store 'seed' securely — it cannot be recovered if lost."
         ),
         "funding_instructions": {
-            "x402_coinbase": (
+            "via_coinbase_onramp": (
                 "RECOMMENDED for agents: call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) "
-                "if you have USDC on Coinbase/Base. Uses x402 autonomous payment — no human needed. "
-                "Requires your own Coinbase API key."
+                "if you have a Coinbase account. Buys XRP and withdraws it to your XRPL address — "
+                "Coinbase is the onramp only; all settlement happens on XRPL after this. "
+                "Requires your own Coinbase API key (free account)."
             ),
             "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw ≥1 XRP to the address.",
             "from_wallet":   "Ask your operator or client to send ≥1 XRP to the address.",
         },
         "next_step": (
             "IMPORTANT: Fund this address with at least 1 XRP before sharing it or accepting work. "
-            "If you have USDC on Coinbase, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) now — "
-            "this uses x402 to swap USDC for XRP autonomously. "
+            "If you have a Coinbase account, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) — "
+            "it buys XRP and withdraws it to your XRPL address (Coinbase is the onramp only; "
+            "escrow settlement happens entirely on XRPL). "
             "Otherwise buy XRP on any exchange and withdraw to the address. "
             "Once funded, call list_open_jobs() to find work or hire_and_pay() to hire."
         ),
@@ -2159,9 +2164,17 @@ async def fund_xrpl_wallet_via_coinbase(
     """
     Buy XRP on Coinbase and withdraw it to an XRPL address in one call.
 
+    This is an ONRAMP tool only — Coinbase is used to acquire XRP and nothing more.
+    All escrow creation and settlement happens on XRPL, not on Coinbase.
+    After this call, your XRP lives in your XRPL wallet and Coinbase is no longer involved.
+
     This lets a USDC-native or fiat-funded agent bootstrap an XRPL wallet
     without manual exchange steps. Uses the Coinbase v2 API (HMAC auth)
     throughout — no paid plan required, works with a free Coinbase account.
+
+    If COINBASE_API_KEY / COINBASE_API_SECRET are not set, this tool returns a
+    structured setup guide dict (not an exception) so the caller can prompt the
+    user to configure credentials without crashing.
 
     IMPORTANT — credentials are yours, not shared:
       Each agent (or agent operator) must supply their OWN Coinbase API key.
@@ -2179,7 +2192,7 @@ async def fund_xrpl_wallet_via_coinbase(
     After setup, this tool is fully autonomous — no human needed per transaction.
 
     Args:
-        xrpl_address:        Destination XRPL address (from create_agent_wallet)
+        xrpl_address:        Destination XRPL address (your wallet's public address; get it from get_wallet_setup_guide() or create_agent_wallet())
         usd_amount:          USD to spend (default $3 — covers 1 XRP reserve +
                              Coinbase fees + XRP price variance buffer)
         coinbase_api_key:    Your Coinbase API key (falls back to COINBASE_API_KEY env var)
