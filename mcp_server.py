@@ -48,9 +48,12 @@ mcp = FastMCP(
         "  create_skill_listing(...)— list your own skill for 30 days ($0.10/month).\n"
         "\n"
         "PAYMENT — locking and releasing funds:\n"
-        "  hire_and_pay(task, buyer_address, amount_xrp, worker_address, escrow_id) — one-call shortcut: "
-        "registers vault AND returns a ready-to-sign EscrowCreate transaction. Sign it, submit to XRPL, done.\n"
-        "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow).\n"
+        "  hire_and_pay(task, buyer_address, amount_xrp, worker_address, escrow_id, ...) — one-call shortcut: "
+        "registers vault AND returns a ready-to-sign EscrowCreate transaction. Sign it, submit to XRPL, done. "
+        "Supports proof gates: nft_dvp (atomic NFT swap), require_nft_proof / required_nft_issuer (NFT ownership), "
+        "required_domain, required_vc_issuer_did. Buyers can require any of these before PASS releases escrow.\n"
+        "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow). "
+        "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25).\n"
         "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
         "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS.\n"
         "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
@@ -226,15 +229,53 @@ async def create_escrow_vault(
         title="Require AI Audit",
         description="Default True. Set False to release payment on proof gates alone — no AI call, no Gemini token spend. Requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did). Use for machine-verifiable deliverables: NFT delivery, domain verification, W3C credentials.",
     )] = True,
+    require_consensus: Annotated[bool, Field(
+        title="Premium Consensus Audit",
+        description="Require consensus between Gemini Flash AND Gemini Pro before a PASS is issued. Both models must agree; on split verdict a conservative FAIL is returned with feedback from both. Fee: $0.25 (vs $0.10 standard). Ignored when require_ai_audit=False.",
+    )] = False,
+    require_nft_proof: Annotated[bool, Field(
+        title="Require NFT Proof",
+        description="Worker must own an NFT from any verified issuer (or from required_nft_issuer if set) to receive payment. Set required_nft_issuer to restrict to a specific issuer wallet.",
+    )] = False,
+    required_nft_issuer: Annotated[str, Field(
+        title="Required NFT Issuer",
+        description="Restrict NFT proof to NFTs minted by this XRPL wallet address. Also implicitly sets require_nft_proof=True. Leave blank to accept NFTs from any trusted issuer.",
+    )] = "",
+    nft_dvp: Annotated[bool, Field(
+        title="NFT Delivery-vs-Payment",
+        description="Atomic NFT swap: worker must transfer a specific NFT to the buyer before payment releases. On PASS the vault enters PASS_AWAITING_NFT; worker then registers their NFTokenCreateOffer via POST /escrow/{id}/nft-offer and payment auto-releases when buyer accepts. Mutually exclusive with require_nft_proof.",
+    )] = False,
+    required_domain: Annotated[str, Field(
+        title="Required Domain",
+        description="Worker must have their XRPL wallet domain field pointing to this domain (verified via xrp-ledger.toml). Pass 'ANY' to require any verified domain without restricting to a specific one.",
+    )] = "",
+    required_vc_issuer_did: Annotated[str, Field(
+        title="Required VC Issuer DID",
+        description="Worker must present a W3C Verifiable Credential JWT issued by this DID (e.g. did:web:issuer.example.com). Used for accreditation, certifications, or KYB checks.",
+    )] = "",
+    required_vc_type: Annotated[str, Field(
+        title="Required VC Type",
+        description="If set alongside required_vc_issuer_did, the VC must also have this credential type (e.g. 'CertifiedDeveloper'). Leave blank to accept any credential type from the issuer.",
+    )] = "",
+    proof_policy: Annotated[str, Field(
+        title="Proof Policy",
+        description="When multiple proof gates are set: 'ALL' (default) requires every gate to pass; 'ANY' requires at least one gate to pass.",
+        enum=["ALL", "ANY"],
+    )] = "ALL",
 ) -> dict:
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
     their submission passes all configured checks.
 
+    Buyers can require NFT ownership, an atomic NFT Delivery-vs-Payment swap, domain
+    verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
+    relevant proof-gate params below.
+
     Two release modes:
     - AI audit (default): worker submits text/files; AI referee scores against task_description.
     - Proof-gate only (require_ai_audit=False): payment releases when all configured proof
-      gates pass (NFT issuer, domain, VC). No AI call. Requires at least one proof gate.
+      gates pass (require_nft_proof / required_nft_issuer / nft_dvp / required_domain /
+      required_vc_issuer_did). No AI call. Requires at least one proof gate.
 
     Typical flow after job board negotiation:
       1. award_job() returns the worker's address and agreed price
@@ -258,9 +299,24 @@ async def create_escrow_vault(
         "cancel_after_hrs": cancel_after_hrs,
         "max_submissions":  max_submissions,
         "require_ai_audit": require_ai_audit,
+        "proof_policy":     proof_policy,
     }
     if fee_hash:
         body["fee_hash"] = fee_hash
+    if require_consensus:
+        body["require_consensus"] = True
+    if require_nft_proof:
+        body["require_nft_proof"] = True
+    if required_nft_issuer:
+        body["required_nft_issuer"] = required_nft_issuer
+    if nft_dvp:
+        body["nft_dvp"] = True
+    if required_domain:
+        body["required_domain"] = required_domain
+    if required_vc_issuer_did:
+        body["required_vc_issuer_did"] = required_vc_issuer_did
+    if required_vc_type:
+        body["required_vc_type"] = required_vc_type
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
@@ -1786,6 +1842,35 @@ async def hire_and_pay(
         title="Buyer Name",
         description="Your name or agent identifier.",
     )] = "",
+    require_consensus: Annotated[bool, Field(
+        title="Premium Consensus Audit",
+        description="Require consensus between Gemini Flash AND Gemini Pro. Both must agree on PASS; split verdict returns conservative FAIL. Fee: $0.25 (vs $0.10 standard).",
+    )] = False,
+    require_nft_proof: Annotated[bool, Field(
+        title="Require NFT Proof",
+        description="Worker must own an NFT from any trusted issuer (or from required_nft_issuer if set) to receive payment.",
+    )] = False,
+    required_nft_issuer: Annotated[str, Field(
+        title="Required NFT Issuer",
+        description="Restrict NFT proof to NFTs minted by this XRPL wallet address.",
+    )] = "",
+    nft_dvp: Annotated[bool, Field(
+        title="NFT Delivery-vs-Payment",
+        description="Atomic NFT swap: worker must transfer a specific NFT to the buyer before payment releases. On PASS the vault enters PASS_AWAITING_NFT; worker registers their NFTokenCreateOffer and payment auto-releases when buyer accepts.",
+    )] = False,
+    required_domain: Annotated[str, Field(
+        title="Required Domain",
+        description="Worker must have their XRPL wallet domain field pointing to this domain. Pass 'ANY' to require any verified domain.",
+    )] = "",
+    required_vc_issuer_did: Annotated[str, Field(
+        title="Required VC Issuer DID",
+        description="Worker must present a W3C Verifiable Credential JWT issued by this DID.",
+    )] = "",
+    proof_policy: Annotated[str, Field(
+        title="Proof Policy",
+        description="When multiple proof gates are set: 'ALL' (default) requires every gate to pass; 'ANY' requires at least one.",
+        enum=["ALL", "ANY"],
+    )] = "ALL",
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -1793,6 +1878,11 @@ async def hire_and_pay(
     This combines create_escrow_vault() + prepare_escrow() into a single call.
     The agent only needs to sign the returned transaction and confirm it —
     no manual XRPL transaction construction required.
+
+    Buyers can require NFT ownership, an atomic NFT Delivery-vs-Payment swap, domain
+    verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
+    relevant proof-gate params (require_nft_proof, required_nft_issuer, nft_dvp,
+    required_domain, required_vc_issuer_did).
 
     Typical flow:
       1. hire_and_pay() — register vault, get ready-to-sign EscrowCreate tx
@@ -1815,9 +1905,22 @@ async def hire_and_pay(
         "currency":         "XRP",
         "amount_xrp":       amount_xrp,
         "cancel_after_hrs": cancel_after_hrs,
+        "proof_policy":     proof_policy,
     }
     if fee_hash:
         vault_body["fee_hash"] = fee_hash
+    if require_consensus:
+        vault_body["require_consensus"] = True
+    if require_nft_proof:
+        vault_body["require_nft_proof"] = True
+    if required_nft_issuer:
+        vault_body["required_nft_issuer"] = required_nft_issuer
+    if nft_dvp:
+        vault_body["nft_dvp"] = True
+    if required_domain:
+        vault_body["required_domain"] = required_domain
+    if required_vc_issuer_did:
+        vault_body["required_vc_issuer_did"] = required_vc_issuer_did
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
