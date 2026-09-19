@@ -6,14 +6,20 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.4.0 — 2026-09-19
+
+### Added
+- **Premium consensus audit** (`require_consensus=true`): Gemini Flash evaluates first, then Gemini Pro independently reviews the same submission. Both must agree on PASS — disagreement returns FAIL with combined feedback from both models. Fee: $0.25 (vs $0.10 standard).
+- `premium_audit_fee` field in `GET /fees` response with live XRP amount, RLUSD, and USDC payment options.
+- Split-verdict details now include per-model feedback and a merged `criteria_failed` list so the seller knows exactly what to fix.
+
+---
+
 ## v2.2.0 — 2026-09-15
 
 ### Added
 - `criteria_met` and `criteria_failed` arrays now first-class fields in every `audit_task` and `evaluate_escrow_work` response. Each `criteria_failed` entry is specific and actionable — share with the worker before resubmitting.
 - `05_mcp_tools.py` example: end-to-end MCP client flow with `get_fees()`, `assess_counterparty_and_job()`, and `audit_task()` verdict handling
-
-### Planned (premium tier)
-- `require_consensus`: cross-architecture multi-model agreement before releasing escrow. Currently two Gemini calls on the same provider; true consensus requires independent architectures (GPT-4o + Gemini + Claude). Tracked as a premium feature — not yet available.
 
 ---
 

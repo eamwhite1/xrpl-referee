@@ -380,6 +380,7 @@ async def get_fees():
     This is the single source of truth — agents should read this before calling any paid endpoint.
     """
     fee_xrp = await get_required_fee_xrp()
+    premium_fee_xrp = await get_required_fee_xrp(premium=True)
     return {
         "protocol_version": "agenttrust/0.1.0",
         "audit_fee": {
@@ -413,6 +414,33 @@ async def get_fees():
                 "base": "0x-prefixed 66-char EVM tx hash — single use",
             },
             "x402_header": "X-PAYMENT or x-payment-hash (legacy)",
+        },
+        "premium_audit_fee": {
+            "usd": PREMIUM_FEE_USD,
+            "description": "Dual-model consensus audit (Gemini Flash + Gemini Pro). Both models must agree on PASS; disagreement returns FAIL with combined feedback. Set require_consensus=true on /audit or /evaluate.",
+            "assets_accepted": [
+                {
+                    "asset": "XRP",
+                    "network": "xrpl:0",
+                    "destination": PROTOCOL_WALLET,
+                    "amount_xrp": premium_fee_xrp,
+                    "note": "Amount varies with XRP/USD price. Call /fees for the current value.",
+                },
+                {
+                    "asset": "RLUSD",
+                    "network": "xrpl:0",
+                    "destination": PROTOCOL_WALLET,
+                    "amount_rlusd": PREMIUM_FEE_USD,
+                },
+                {
+                    "asset": "USDC",
+                    "network": "eip155:8453",
+                    "destination": BASE_WALLET_ADDRESS or "contact hello@cryptovault.co.uk",
+                    "amount_usdc": PREMIUM_FEE_USD,
+                    "decimals": 6,
+                    "amount_units": int(PREMIUM_FEE_USD * 1_000_000),
+                },
+            ],
         },
         "free_tier": {
             "rule": "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash",
@@ -576,7 +604,7 @@ def serve_ai_plugin():
             "the XRPL, then retry with the transaction hash as the X-PAYMENT header (or legacy x-payment-hash header). "
             "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
             "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
-            "Set require_consensus=true for high-stakes decisions requiring two-model agreement. "
+            "Set require_consensus=true for a premium dual-model consensus audit ($0.25 fee): Gemini Flash evaluates first, then Gemini Pro independently reviews — both must agree on PASS or the result is FAIL with combined feedback from both models. "
             "For full escrow-gated payments: POST to /escrow/generate to lock funds, then POST to /evaluate to audit and auto-release. "
             "Supports XRP and RLUSD. Sellers may include XRPL transaction hashes as proof of on-chain delivery — the referee will verify them on the ledger."
         ),
@@ -1546,17 +1574,20 @@ BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp d
 PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
+PREMIUM_FEE_USD    = 0.25   # consensus (dual-model) audit fee
+PREMIUM_FEE_XRP    = 0.25   # fallback if price oracle is unavailable
 
-async def get_required_fee_xrp() -> float:
-    """Return the XRP amount equivalent to MIN_FEE_USD at the current market price.
-    Delegates to the existing _get_xrp_price_usd() which is already cached and battle-tested."""
+async def get_required_fee_xrp(premium: bool = False) -> float:
+    """Return the XRP amount equivalent to the required fee at the current market price."""
+    target = PREMIUM_FEE_USD if premium else MIN_FEE_USD
+    fallback = PREMIUM_FEE_XRP if premium else MIN_FEE_XRP
     try:
         price = await _get_xrp_price_usd()
         if price and price > 0:
-            return max(round(MIN_FEE_USD / price, 6), 0.000001)
+            return max(round(target / price, 6), 0.000001)
     except Exception:
         pass
-    return MIN_FEE_XRP
+    return fallback
 
 # Base chain USDC payment constants
 BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
@@ -3997,12 +4028,14 @@ async def run_ai_audit(
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
     candidates = [
-        "gemini-2.5-flash",   # fast — try first to beat Render's 30s request timeout
+        "gemini-2.5-flash",   # fast — primary model for all audits
         "gemini-2.0-flash",
-        "gemini-2.5-pro",     # slower — fallback only
         "gemini-1.5-flash",
+        "gemini-2.5-pro",     # slower — fallback only (also used as consensus model)
         "gemini-1.5-pro",
     ]
+    # Premium consensus: Flash for speed, Pro for depth
+    CONSENSUS_MODEL = "gemini-2.5-pro"
 
     domain_context = DOMAIN_PROMPTS.get(task_category, DOMAIN_PROMPTS["default"])
 
@@ -4112,31 +4145,38 @@ async def run_ai_audit(
                     logger.info(f"✅ AI VERDICT: {verdict_dict['verdict']} | score={verdict_dict.get('score')} | model={model_id}")
 
                     if require_consensus:
-                        second_candidates = [m for m in candidates if m != model_id]
-                        for model_2 in second_candidates:
-                            try:
-                                url2 = (
-                                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                                    f"{model_2}:generateContent?key={api_key}"
-                                )
-                                res2 = await client.post(url2, json=payload, timeout=60.0)
-                                if res2.status_code == 200:
-                                    raw2  = res2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                                    clean2 = raw2.replace("```json", "").replace("```", "").strip()
-                                    v2     = json.loads(clean2)
-                                    v2["verdict"] = str(v2.get("verdict", "FAIL")).strip().upper()
-                                    if v2["verdict"] != verdict_dict["verdict"]:
-                                        logger.warning(f"⚖️ CONSENSUS SPLIT — defaulting FAIL")
-                                        verdict_dict["verdict"]   = "FAIL"
-                                        verdict_dict["summary"]   = f"Models disagreed. Conservative FAIL applied."
-                                        verdict_dict["consensus"] = False
-                                        verdict_dict["models"]    = [model_id, model_2]
-                                    else:
-                                        verdict_dict["consensus"] = True
-                                        verdict_dict["models"]    = [model_id, model_2]
-                                    break
-                            except Exception as e2:
-                                logger.warning(f"Consensus model {model_2} failed: {e2}")
+                        # Premium consensus: Flash as primary, Pro as independent second opinion
+                        model_2 = CONSENSUS_MODEL if CONSENSUS_MODEL != model_id else "gemini-1.5-pro"
+                        try:
+                            url2 = (
+                                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                                f"{model_2}:generateContent?key={api_key}"
+                            )
+                            res2 = await client.post(url2, json=payload, timeout=60.0)
+                            if res2.status_code == 200:
+                                raw2   = res2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                                clean2 = raw2.replace("```json", "").replace("```", "").strip()
+                                v2     = json.loads(clean2)
+                                v2["verdict"] = str(v2.get("verdict", "FAIL")).strip().upper()
+                                if v2["verdict"] != verdict_dict["verdict"]:
+                                    logger.warning(f"⚖️ CONSENSUS SPLIT ({model_id}={verdict_dict['verdict']} vs {model_2}={v2['verdict']}) — defaulting FAIL")
+                                    primary_details = verdict_dict.get("details", "")
+                                    pro_details     = v2.get("details", "")
+                                    verdict_dict["verdict"]         = "FAIL"
+                                    verdict_dict["summary"]         = "The two models reached different verdicts. A conservative FAIL has been applied — please review the feedback below and resubmit."
+                                    verdict_dict["details"]         = f"Fast model: {primary_details} | Pro model: {pro_details}"
+                                    verdict_dict["criteria_failed"] = list(set(
+                                        verdict_dict.get("criteria_failed", []) + v2.get("criteria_failed", [])
+                                    ))
+                                    verdict_dict["consensus"] = False
+                                    verdict_dict["models"]    = [model_id, model_2]
+                                else:
+                                    verdict_dict["consensus"] = True
+                                    verdict_dict["models"]    = [model_id, model_2]
+                            else:
+                                logger.warning(f"Consensus model {model_2} HTTP {res2.status_code} — skipping consensus check")
+                        except Exception as e2:
+                            logger.warning(f"Consensus model {model_2} failed: {e2} — skipping consensus check")
 
                     return verdict_dict, model_id
                 else:
@@ -4162,12 +4202,16 @@ async def standalone_audit(
     response: Response = None,
 ):
     fee_hash = (req.fee_hash or x_payment_hash or x_payment or "").strip()
+    is_premium = bool(req.require_consensus)
     if not fee_hash and not x_reviewer_token and not payment_signature:
-        fee_xrp = await get_required_fee_xrp()
+        fee_xrp = await get_required_fee_xrp(premium=is_premium)
+        fee_usd = PREMIUM_FEE_USD if is_premium else MIN_FEE_USD
+        fee_usdc = PREMIUM_FEE_USD if is_premium else MIN_FEE_USDC
+        tier_label = "Premium consensus audit (Gemini Flash + Pro)" if is_premium else "Standard audit"
         _raise_402(
             "/audit",
-            f"Payment required. Option 1: Send {fee_xrp:.6g} XRP (≈$0.10) to {PROTOCOL_WALLET} on the XRPL. "
-            f"Option 2: Send ${MIN_FEE_USDC:.2f} USDC to {BASE_WALLET_ADDRESS or '(not configured)'} on Base (chain 8453). "
+            f"{tier_label} — payment required. Option 1: Send {fee_xrp:.6g} XRP (≈${fee_usd:.2f}) to {PROTOCOL_WALLET} on the XRPL. "
+            f"Option 2: Send ${fee_usdc:.2f} USDC to {BASE_WALLET_ADDRESS or '(not configured)'} on Base (chain 8453). "
             "Include the transaction hash as the X-PAYMENT header (or fee_hash body field). "
             "Or provide a PAYMENT-SIGNATURE header (x402 v2 XRPL presigned flow).",
             min_xrp=fee_xrp,
