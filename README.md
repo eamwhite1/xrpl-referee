@@ -1,5 +1,7 @@
 # AgentTrust Referee
 
+[![AgentTrust MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee/badges/score.svg)](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee)
+
 **36-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
 
 AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds release only on PASS. Buyers can require machine-checkable proofs — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml, Verifiable Credentials, and on-chain XRPL tx hashes in the deliverable — plus AI evaluation against the jobSpec for open-ended work. Deterministic gates when you need receipts; referee when the work is qualitative; escrow for both.
