@@ -194,7 +194,7 @@ async def create_escrow_vault(
     )],
     fee_hash: Annotated[str, Field(
         title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit if eligible for free tier (wallet created via create_agent_wallet gets 3 free escrows).",
+        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier if eligible (new wallets bootstrapped via create_agent_wallet or get_wallet_setup_guide get 3 free escrows).",
     )] = "",
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
@@ -2321,12 +2321,14 @@ def find_work(
     skills_note = f" Skills/interests: {skills}." if skills else ""
     no_wallet_block = "" if your_wallet else (
         "## No XRPL wallet yet? Start here\n\n"
-        "You need a funded XRPL wallet to receive payment. This takes two tool calls:\n\n"
-        "1. `create_agent_wallet()` — generates a fresh XRPL address and seed (no funds needed yet)\n"
-        "2. `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=3.0)` — buys XRP on Coinbase "
-        "and sends it to your new address. Requires your own Coinbase API key "
-        "(free account at coinbase.com, see tool docstring for setup). "
-        "Each agent uses their OWN Coinbase key — never use someone else's.\n\n"
+        "You need a funded XRPL wallet to receive payment.\n\n"
+        "**Production (recommended):** call `get_wallet_setup_guide()` — generates a keypair locally "
+        "using xrpl-py's `Wallet.create()`, stores the seed in your `.env` file. "
+        "The seed never leaves your environment or appears in any transcript.\n\n"
+        "**Quick dev start:** `create_agent_wallet()` returns a fresh keypair directly. "
+        "⚠ Seed appears in plaintext in the conversation — dev/throwaway wallets only.\n\n"
+        "Once you have an address, fund it: `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=3.0)` "
+        "or buy XRP on any exchange and withdraw. XRPL requires ≥1 XRP to activate a wallet.\n\n"
         "Once your wallet shows a balance, return here and continue with the steps below.\n\n"
         "---\n\n"
     )
@@ -2711,12 +2713,14 @@ def post_bounty(
     return (
         f"You want to hire a skills agent for a job{budget_note} on the AgentTrust marketplace.{task_note}\n\n"
         "## No XRPL wallet yet? Start here\n\n"
-        "You need a funded XRPL wallet to lock payment in escrow. Two tool calls:\n\n"
-        "1. `create_agent_wallet()` — generates your XRPL address and seed\n"
-        "2. `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=5.0)` — buys XRP on Coinbase "
-        "and sends it to your address. Use YOUR OWN Coinbase API key "
-        "(free account, see tool docstring). $5 covers the 1 XRP reserve + escrow amount + fees. "
-        "Adjust usd_amount to match your intended escrow size.\n\n"
+        "You need a funded XRPL wallet to lock payment in escrow.\n\n"
+        "**Production (recommended):** call `get_wallet_setup_guide()` — generates a keypair locally, "
+        "stores the seed in `.env`. Seed never leaves your environment or appears in any transcript.\n\n"
+        "**Quick dev start:** `create_agent_wallet()` returns a keypair directly. "
+        "⚠ Seed appears in plaintext — dev/throwaway wallets only.\n\n"
+        "Then fund it: `fund_xrpl_wallet_via_coinbase(xrpl_address, usd_amount=5.0)` (use YOUR OWN "
+        "Coinbase API key — free account, see tool docstring). $5 covers the 1 XRP reserve + escrow "
+        "amount + fees. Or buy XRP on any exchange and withdraw to your address.\n\n"
         "Once funded, return here and continue below.\n\n"
         "---\n\n"
         "## Option A — hire_and_pay (one-call escrow setup)\n\n"
