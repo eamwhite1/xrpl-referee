@@ -6,6 +6,27 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.6.0 — 2026-09-20
+
+### Added
+- **`POST /wallet/scores` — batch trust scoring endpoint**: score up to 50 XRPL addresses in one call. Queries run in parallel; results returned ranked by score descending with a `rank` field on each entry. Fee: $0.10 (XRP or RLUSD on XRPL). Added to `/.well-known/x402` paid catalog. Use cases: candidate ranking, counterparty screening, agent directories, leaderboards.
+- **`batch_wallet_trust_scores()` MCP tool**: exposes the batch endpoint as a first-class tool with full docstring and use-case guidance.
+- **`callback_url` and `metadata` params on `create_escrow_vault` and `hire_and_pay`**: enables headless/white-label integrations where the integrator handles all user-facing surfaces. `callback_url` receives webhook POSTs on state changes (funded/PASS/FAIL/expired); `metadata` (JSON string) round-trips caller reference IDs (invoice_id, po_number, tenant_id) in every webhook payload.
+- **`skill.md`**: distributable Claude Code `.claude/agents/` skill file covering the full AgentTrust workflow — wallet bootstrap, hiring flow, work submission, all four release condition modes, marketplace, trust/compliance, and key rules.
+- **`/.well-known/agent.json` fully updated**: all 16 skills, proof gate capabilities, `callback_url`/`metadata` white-label params, fees table, x402 flag, correct provider org (Boxclever Media Ltd), and discovery links to MCP config, x402, marketplace, and OpenAPI.
+
+### Changed
+- **`GET /wallet/score/{address}` rate-limited**: 20 free requests per hour per IP (in-memory token bucket, 1-hour window). Requests exceeding the limit receive HTTP 429 with a message pointing at the batch endpoint.
+- **Trust score reframed as open discovery infrastructure**: endpoint docstring, MCP tool description, and `wallet-score` page now position the API as "the open reputation layer for XRPL agents" rather than a pre-escrow tool. Aligns with Circle's call for open reputation indexes.
+- **`get_wallet_trust_score()` MCP tool description updated**: notes rate limit, score bands, and pointer to `batch_wallet_trust_scores()` for multi-wallet queries.
+- **`/.well-known/agent.json` inline fallback in `referee.py`**: fixed description "Trustless" → "Trust-minimized"; updated provider org and URL.
+- **`serve_mcp_server_card` description**: "Trustless AI task verification" → "Trust-minimized AI task verification".
+
+### Fixed
+- `agent.json` root file was on schema v1.0/agentVersion 7.0 with only 3 skills — updated to v9.0/0.6 schema with all 16 skills and full capability flags.
+
+---
+
 ## v2.5.0 — 2026-09-19
 
 ### Added

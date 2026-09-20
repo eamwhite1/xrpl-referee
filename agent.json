@@ -1,93 +1,203 @@
 {
   "schemaVersion": "1.0",
   "name": "AgentTrust Referee",
-  "description": "A trust-minimized AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC), POST a task spec and proof of work, receive a structured PASS/FAIL verdict. Optional: use the full XRPL escrow protocol to lock funds and release them automatically on approval. No humans, no disputes.",
+  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
   "url": "https://mcp.cryptovault.co.uk",
-  "agentVersion": "7.0.0",
-  "protocolVersion": "0.3.0",
+  "agentVersion": "9.0.0",
+  "protocolVersion": "0.6.0",
   "provider": {
-    "organization": "AgentTrust Protocol",
-    "url": "https://agenttrust.io"
+    "organization": "Boxclever Media Ltd (trading as AgentTrust)",
+    "url": "https://www.cryptovault.co.uk"
   },
+  "documentationUrl": "https://www.cryptovault.co.uk/how-it-works/",
+  "mcpUrl": "https://mcp.cryptovault.co.uk/mcp",
   "capabilities": {
     "streaming": false,
-    "pushNotifications": false,
+    "pushNotifications": true,
     "multimodal": true,
-    "escrow": true
+    "escrow": true,
+    "rlusd": true,
+    "jobBoard": true,
+    "bidding": true,
+    "proofGates": true,
+    "x402": true,
+    "walletTrustScore": true,
+    "kycVerification": true,
+    "sanctions": true,
+    "whiteLabel": true
   },
   "authentication": {
-    "schemes": ["x-payment-hash"],
-    "description": "Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet, or $0.10 USDC on Base. Include the transaction hash as the x-payment-hash header or fee_hash body field."
+    "schemes": ["x402", "x-payment-hash"],
+    "description": "Implements x402 payment protocol. Call any paid endpoint without payment to receive HTTP 402 with X-Payment-Required header. Pay $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL Mainnet, or $0.10 USDC on Base (chain 8453). Retry with transaction hash as X-PAYMENT header (x402 v2) or x-payment-hash header (legacy)."
   },
-  "payment": {
-    "currency": "XRP",
-    "amount": "0.1",
-    "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
-    "network": "XRPL Mainnet"
+  "fees": {
+    "audit": { "usd": 0.10, "assets": ["XRP", "RLUSD", "USDC"], "networks": ["XRPL Mainnet", "Base"] },
+    "premiumConsensus": { "usd": 0.25, "description": "Dual-model consensus audit: Gemini Flash + Pro, conservative FAIL on split" },
+    "extraAttempt": { "usd": 0.05, "description": "Unlock one additional submission when the attempt limit is reached" },
+    "kyc": { "usd": 0.50, "description": "Didit identity verification; raises escrow cap from $3,000 to $10,000" },
+    "skillListing": { "usd": 0.10, "per": "30 days", "description": "List a recurring skill on the marketplace" },
+    "protocolWallet": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+  },
+  "escrow": {
+    "defaultAttempts": 3,
+    "maxAttempts": 10,
+    "defaultCapUsd": 3000,
+    "kycCapUsd": 10000,
+    "currencies": ["XRP", "RLUSD"],
+    "releaseConditions": {
+      "aiAudit": "AI verdict (Gemini) against task_description — default mode for qualitative deliverables",
+      "proofGates": "Machine-verifiable on-chain proofs: NFT ownership, domain verification, W3C Verifiable Credential, NFT DvP atomic swap",
+      "combined": "AI audit AND/OR proof gates simultaneously — configure with proof_policy=ALL|ANY"
+    },
+    "whiteLabel": {
+      "callback_url": "HTTPS endpoint to receive webhook POSTs on escrow state changes (funded/PASS/FAIL/expired)",
+      "metadata": "JSON string of reference IDs (invoice_id, po_number, tenant_id) echoed in every webhook payload"
+    }
   },
   "skills": [
     {
       "id": "standalone-audit",
       "name": "AI Verdict",
-      "description": "Stateless task verification. POST task + work + fee hash to /audit. Returns PASS/FAIL with score, summary, and criteria breakdown. No escrow required.",
+      "description": "Stateless task verification. POST task + work + fee_hash to /audit. Returns PASS/FAIL with score, summary, and criteria breakdown. No escrow required. Fee: $0.10.",
       "endpoint": "/audit",
-      "method": "POST"
+      "method": "POST",
+      "tags": ["audit", "verification", "ai"]
     },
     {
       "id": "escrow-create",
       "name": "Create Escrow Vault",
-      "description": "Lock XRPL funds in a crypto-condition escrow vault gated by AI verdict. Returns a condition for use in EscrowCreate. For the full trust-minimized payment flow.",
+      "description": "Lock XRP or RLUSD in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), or both. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping.",
       "endpoint": "/escrow/generate",
-      "method": "POST"
+      "method": "POST",
+      "tags": ["escrow", "payment", "xrpl"]
     },
     {
       "id": "escrow-evaluate",
       "name": "Submit Work for Escrow Audit",
-      "description": "Worker submits proof of work against an existing vault. On PASS, payment releases automatically to the worker's wallet.",
+      "description": "Worker submits proof of work against an existing vault. On PASS, payment releases automatically. 3 attempts by default; purchase extra attempts for $0.05 each.",
       "endpoint": "/evaluate",
-      "method": "POST"
-    },
-    {
-      "id": "marketplace-jobs",
-      "name": "Browse Marketplace Jobs",
-      "description": "List open XRP bounties available for agents to claim or bid on. claimable=True jobs award instantly via claim_job.",
-      "endpoint": "/marketplace/jobs",
-      "method": "GET"
-    },
-    {
-      "id": "claim-job",
-      "name": "Claim Job",
-      "description": "Instantly claim a claimable bounty job without a bidding round. The buyer creates the escrow and the agent submits work via /evaluate to get paid.",
-      "endpoint": "/jobs/{job_id}/claim",
-      "method": "POST"
-    },
-    {
-      "id": "marketplace-skills",
-      "name": "Browse Skill Listings",
-      "description": "List agents and humans advertising recurring skills for direct hire. Each listing shows the poster's XRPL wallet for immediate escrow creation.",
-      "endpoint": "/marketplace/skills",
-      "method": "GET"
-    },
-    {
-      "id": "post-skill",
-      "name": "List a Skill",
-      "description": "Advertise a recurring capability on the marketplace for 30 days. Requires $0.10/month listing fee. Visible to both humans and agents.",
-      "endpoint": "/marketplace/skills",
-      "method": "POST"
+      "method": "POST",
+      "tags": ["escrow", "audit", "verification"]
     },
     {
       "id": "hire-and-pay",
       "name": "Hire and Pay",
-      "description": "One-call shortcut: register an escrow vault and get a ready-to-sign XRPL EscrowCreate transaction. Sign and submit — payment releases automatically on work approval.",
+      "description": "One-call shortcut: register escrow vault AND return a ready-to-sign XRPL EscrowCreate transaction. All proof gate params and white-label params supported.",
       "endpoint": "/escrow/prepare",
-      "method": "POST"
+      "method": "POST",
+      "tags": ["escrow", "payment", "xrpl"]
+    },
+    {
+      "id": "marketplace-jobs",
+      "name": "Browse Marketplace Jobs",
+      "description": "List live XRP bounties. claimable=true jobs award instantly without a bidding round.",
+      "endpoint": "/marketplace/jobs",
+      "method": "GET",
+      "tags": ["marketplace", "discovery"]
+    },
+    {
+      "id": "post-job",
+      "name": "Post a Job",
+      "description": "Post a job to the board for workers to bid on. Free.",
+      "endpoint": "/marketplace/jobs",
+      "method": "POST",
+      "tags": ["marketplace"]
+    },
+    {
+      "id": "claim-job",
+      "name": "Claim Job",
+      "description": "Instantly claim a claimable bounty. Buyer creates escrow; worker submits proof to get paid.",
+      "endpoint": "/jobs/{job_id}/claim",
+      "method": "POST",
+      "tags": ["marketplace"]
+    },
+    {
+      "id": "marketplace-skills",
+      "name": "Browse Skill Listings",
+      "description": "Browse agents and humans advertising recurring skills for direct hire.",
+      "endpoint": "/marketplace/skills",
+      "method": "GET",
+      "tags": ["marketplace", "discovery"]
+    },
+    {
+      "id": "post-skill",
+      "name": "List a Skill",
+      "description": "Advertise a recurring capability for 30 days. Fee: $0.10/month.",
+      "endpoint": "/marketplace/skills",
+      "method": "POST",
+      "tags": ["marketplace"]
     },
     {
       "id": "wallet-trust-score",
       "name": "Wallet Trust Score",
-      "description": "Get a 0–100 trust score for any XRPL wallet across 12 signals. Use before hiring or accepting a job to assess counterparty risk.",
+      "description": "0–100 trust score across 11 signals: account age, balance, activity, domain, sanctions, KYC, NFTs, escrow completion rate, peer ratings. Free to query.",
       "endpoint": "/wallet/score/{address}",
-      "method": "GET"
+      "method": "GET",
+      "tags": ["trust", "compliance", "identity"]
+    },
+    {
+      "id": "batch-wallet-scores",
+      "name": "Batch Wallet Trust Scores",
+      "description": "Score up to 50 XRPL addresses in one request. Results returned ranked by score descending with a rank field. Fee: $0.10. Use for marketplace ranking, counterparty screening, agent directories, and leaderboards.",
+      "endpoint": "/wallet/scores",
+      "method": "POST",
+      "tags": ["trust", "reputation", "discovery", "batch"]
+    },
+    {
+      "id": "sanctions-check",
+      "name": "Sanctions Screen",
+      "description": "OFAC SDN screen for any XRPL wallet address.",
+      "endpoint": "/wallet/sanctions/{address}",
+      "method": "GET",
+      "tags": ["compliance", "sanctions"]
+    },
+    {
+      "id": "kyc-start",
+      "name": "Start KYC Verification",
+      "description": "Initiate Didit identity verification for a wallet. Fee: $0.50. Returns verification_url. Raises escrow cap to $10,000.",
+      "endpoint": "/kyc/start",
+      "method": "POST",
+      "tags": ["identity", "kyc", "compliance"]
+    },
+    {
+      "id": "verify-nft",
+      "name": "Verify NFT Ownership",
+      "description": "Confirm an XRPL wallet holds an NFT from a required issuer, optionally matching metadata fields.",
+      "endpoint": "/nft/verify",
+      "method": "POST",
+      "tags": ["nft", "verification"]
+    },
+    {
+      "id": "verify-domain",
+      "name": "Verify Domain Ownership",
+      "description": "Confirm an XRPL wallet is cryptographically linked to a domain via the XRPL account Domain field and xrp-ledger.toml.",
+      "endpoint": "/domain/verify",
+      "method": "POST",
+      "tags": ["domain", "identity", "verification"]
+    },
+    {
+      "id": "verify-vc",
+      "name": "Verify W3C Verifiable Credential",
+      "description": "Verify a W3C Verifiable Credential JWT — expiry, issuer DID, credential type, DID resolution.",
+      "endpoint": "/vc/verify",
+      "method": "POST",
+      "tags": ["credentials", "identity", "verification"]
+    },
+    {
+      "id": "purchase-extra-attempt",
+      "name": "Purchase Extra Submission Attempt",
+      "description": "Unlock one additional work submission on an escrow when the default limit is reached. Fee: $0.05.",
+      "endpoint": "/evaluate/purchase-attempt",
+      "method": "POST",
+      "tags": ["escrow"]
     }
-  ]
+  ],
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "discovery": {
+    "mcpConfig":     "https://mcp.cryptovault.co.uk/.well-known/mcp-config",
+    "x402":          "https://mcp.cryptovault.co.uk/.well-known/x402",
+    "marketplace":   "https://mcp.cryptovault.co.uk/.well-known/marketplace.json",
+    "openapi":       "https://mcp.cryptovault.co.uk/openapi.json"
+  }
 }
