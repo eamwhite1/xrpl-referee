@@ -553,9 +553,10 @@ async def serve_payment_required():
             {"path": "/evaluate/purchase-attempt",      "fee_usd": EXTRA_ATTEMPT_FEE_USD, "description": "Unlock one additional work submission attempt for an escrow that has hit its limit."},
             {"path": "/kyc/start",                      "fee_usd": KYC_FEE_USD,       "description": "Start Didit identity verification ($0.50 one-time). Raises escrow cap to $10,000."},
             {"path": "/marketplace/skills (POST)",      "fee_usd": MIN_FEE_USD,       "description": "List a recurring skill on the marketplace for 30 days."},
+            {"path": "/wallet/scores (POST)",           "fee_usd": MIN_FEE_USD,       "description": "Batch wallet trust scores — up to 50 addresses, ranked by score. Open reputation layer for XRPL agents."},
         ],
         "freeEndpoints": [
-            "/marketplace/jobs", "/marketplace/skills (GET)", "/wallet/score/{address}",
+            "/marketplace/jobs", "/marketplace/skills (GET)", "/wallet/score/{address} (rate-limited: 20/hr)",
             "/wallet/sanctions/{address}", "/jobs (GET)", "/jobs/{id}", "/status",
             "/.well-known/*",
         ],
@@ -677,6 +678,24 @@ class FreeAuditUsage(Base):
 FREE_AUDIT_LIMIT       = 3    # free audits per wallet
 FREE_AUDIT_MIN_SCORE   = 25   # wallet trust score must meet this threshold
 FREE_AUDIT_MIN_SCORE_BOOTSTRAPPED = 0  # wallets created via create_agent_wallet get free tier regardless of score
+
+# ── Trust score rate limiting (in-memory, per-IP) ──────────────────────────
+from collections import deque
+_score_rate_buckets: dict[str, deque] = {}
+SCORE_RATE_LIMIT   = 20   # free single-lookup requests per window
+SCORE_RATE_WINDOW  = 3600  # seconds (1 hour)
+SCORE_BATCH_MAX    = 50   # max addresses per paid batch request
+
+def _check_score_rate_limit(ip: str) -> bool:
+    """Return True if the IP is within the free-tier rate limit, False if exceeded."""
+    now = time.time()
+    bucket = _score_rate_buckets.setdefault(ip, deque())
+    while bucket and now - bucket[0] > SCORE_RATE_WINDOW:
+        bucket.popleft()
+    if len(bucket) >= SCORE_RATE_LIMIT:
+        return False
+    bucket.append(now)
+    return True
 
 
 class BootstrappedWallet(Base):
@@ -3864,17 +3883,106 @@ async def _score_bid_wallet(bid_id: str, wallet_address: str, session_factory):
 
 
 @app.get("/wallet/score/{address}")
-async def get_wallet_score(address: str, db: Session = Depends(get_db)):
+async def get_wallet_score(address: str, request: Request, db: Session = Depends(get_db)):
     """
-    AgentTrust Wallet Trust Score — 11 on-chain + platform signals, scored 0–100.
-    Combines account age, balance, activity, domain verification, on-chain wallet
-    ownership proof, multi-jurisdiction sanctions screening (AnChain.ai BEI),
-    entity reputation (XRPScan), identity KYC, NFTs held, AgentTrust escrow
-    completion history, and peer ratings.
-    A sanctioned wallet receives a hard score of 0 regardless of other signals.
+    Open reputation layer for XRPL agents and wallets.
+
+    Returns a 0–100 trust score across 11 independent signals: account age,
+    XRP balance, on-chain activity, domain verification, on-chain ownership proof,
+    multi-jurisdiction sanctions screening (AnChain.ai BEI — OFAC/UN/UK/EU/CA/AU),
+    entity reputation (XRPScan), identity KYC (Didit), NFTs held, AgentTrust escrow
+    completion rate, and peer ratings from counterparties.
+
+    Free to query. Rate limit: 20 requests per hour per IP.
+    For bulk / programmatic use, POST /wallet/scores (fee: $0.10 per batch of up to 50).
     """
+    ip = request.client.host if request.client else "unknown"
+    if not _check_score_rate_limit(ip):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "Rate limit exceeded",
+                "message": f"Free tier allows {SCORE_RATE_LIMIT} lookups per hour. For bulk queries use POST /wallet/scores ($0.10 per batch of up to {SCORE_BATCH_MAX} addresses).",
+                "bulk_endpoint": "POST /wallet/scores",
+                "bulk_docs": "https://mcp.cryptovault.co.uk/docs#/wallet/batch_wallet_scores",
+            }
+        )
     result = await compute_xrpl_trust_score(address, db=db)
     return result
+
+
+class BatchScoreRequest(BaseModel):
+    addresses: list[str]
+    fee_hash: Optional[str] = None
+    payment_signature: Optional[str] = None
+
+
+@app.post("/wallet/scores")
+async def batch_wallet_scores(
+    req: BatchScoreRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"),
+):
+    """
+    Batch wallet trust scores — the open reputation layer for XRPL agents.
+
+    Score up to 50 XRPL addresses in a single request. Queries run in parallel.
+    Returns a ranked list of results ordered by score descending.
+
+    Fee: $0.10 (XRP or RLUSD on XRPL, or USDC on Base). Pay to
+    rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and include the tx hash as fee_hash
+    in the request body (x402 v1) or as PAYMENT-SIGNATURE header (x402 v2).
+
+    Use cases: marketplace ranking, counterparty screening, agent directories,
+    leaderboards, pre-hire due diligence on multiple candidates.
+    """
+    if not req.addresses:
+        raise HTTPException(status_code=400, detail="addresses must be a non-empty list.")
+    if len(req.addresses) > SCORE_BATCH_MAX:
+        raise HTTPException(status_code=400, detail=f"Maximum {SCORE_BATCH_MAX} addresses per request.")
+
+    # Deduplicate while preserving order
+    seen = set()
+    addresses = [a for a in req.addresses if not (a in seen or seen.add(a))]
+
+    ps = payment_signature or req.payment_signature
+    if not req.fee_hash and not ps:
+        _raise_402(
+            "/wallet/scores",
+            "Batch scoring requires payment. Pay $0.10 (XRP/RLUSD) to the protocol wallet.",
+        )
+
+    await verify_fee_payment(
+        fee_hash=req.fee_hash or "",
+        escrow_id=f"batch-scores-{int(time.time())}",
+        db=db,
+        resource="/wallet/scores",
+        payment_signature=ps,
+    )
+
+    results = await asyncio.gather(
+        *[compute_xrpl_trust_score(addr, db=db) for addr in addresses],
+        return_exceptions=True,
+    )
+
+    scored = []
+    for addr, result in zip(addresses, results):
+        if isinstance(result, Exception):
+            scored.append({"address": addr, "error": str(result), "score": None})
+        else:
+            scored.append(result)
+
+    # Rank by score descending (None scores sort last)
+    scored.sort(key=lambda r: r.get("score") or -1, reverse=True)
+    for i, r in enumerate(scored):
+        r["rank"] = i + 1
+
+    return {
+        "count": len(scored),
+        "batch_size": len(addresses),
+        "results": scored,
+    }
 
 
 @app.get("/wallet/debug-age/{address}")

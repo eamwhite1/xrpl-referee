@@ -136,6 +136,14 @@
       "tags": ["trust", "compliance", "identity"]
     },
     {
+      "id": "batch-wallet-scores",
+      "name": "Batch Wallet Trust Scores",
+      "description": "Score up to 50 XRPL addresses in one request. Results returned ranked by score descending with a rank field. Fee: $0.10. Use for marketplace ranking, counterparty screening, agent directories, and leaderboards.",
+      "endpoint": "/wallet/scores",
+      "method": "POST",
+      "tags": ["trust", "reputation", "discovery", "batch"]
+    },
+    {
       "id": "sanctions-check",
       "name": "Sanctions Screen",
       "description": "OFAC SDN screen for any XRPL wallet address.",
