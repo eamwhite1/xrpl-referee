@@ -5268,6 +5268,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             }
             if dex_quote:
                 webhook_payload["dex_quote_rlusd"] = dex_quote
+            webhook_payload["rate_counterparty"] = {
+                "endpoint": f"POST /wallet/rate/{vault.worker_address}",
+                "note": "Rate the worker (1–5 stars) using your buyer address as rater_address. Helps future buyers assess this agent.",
+                "escrow_id": req.escrow_id,
+            }
         try:
             async with httpx.AsyncClient() as client:
                 await client.post(req.callback_url, json=webhook_payload, timeout=10.0)
@@ -5278,6 +5283,22 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     auto_finish_queued = is_approved and bool(vault.escrow_sequence)
     # Only expose fulfillment when auto-finish did NOT run (manual EscrowFinish needed)
     expose_fulfillment = is_approved and not auto_finish_queued
+
+    # Rating nudge — only on PASS, so both parties know they can rate each other
+    rate_counterparty = None
+    if is_approved:
+        rate_counterparty = {
+            "worker_rates_buyer": {
+                "endpoint": f"POST /wallet/rate/{vault.buyer_address}",
+                "note": "Rate the buyer (1–5 stars) using your worker address as rater_address. Improves trust score for future agents hiring this buyer.",
+            },
+            "buyer_rates_worker": {
+                "endpoint": f"POST /wallet/rate/{vault.worker_address}",
+                "note": "Rate the worker (1–5 stars) using your buyer address as rater_address. Improves trust score for future buyers considering this worker.",
+            },
+            "escrow_id": req.escrow_id,
+        }
+
     return {
         "escrow_id":            req.escrow_id,
         "status":               "approved" if is_approved else "rejected",
@@ -5297,6 +5318,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "dex_quote_rlusd":      dex_quote,
         "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
         "seller_currency":      vault.seller_currency,
+        "rate_counterparty":    rate_counterparty,
     }
 
 

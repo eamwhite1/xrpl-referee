@@ -460,6 +460,12 @@ async def evaluate_escrow_work(
     On FAIL: read criteria_failed for specific, actionable feedback. Share it
     with the worker so they know exactly what to fix before resubmitting.
     Resubmit by calling evaluate_escrow_work again with the same escrow_id.
+
+    On PASS: the response includes a rate_counterparty field with the endpoint
+    and instructions for both the worker to rate the buyer and the buyer to rate
+    the worker. Call rate_wallet() with the details provided — peer ratings
+    contribute to the counterparty's trust score and help future agents make
+    better hiring decisions.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
         res = await client.post(
