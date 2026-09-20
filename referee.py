@@ -257,11 +257,11 @@ def serve_agent_json():
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
-        "description": "Trustless AI verdict engine. Pay $0.10 (XRP, RLUSD, or USDC) to /audit — get PASS/FAIL on any task. Optional XRPL escrow protocol available.",
+        "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT, domain, W3C VC, NFT DvP), marketplace job board, wallet trust scoring, and x402 payment protocol.",
         "url": "https://mcp.cryptovault.co.uk",
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
-        "provider": {"organization": "AgentTrust Protocol", "url": "https://mcp.cryptovault.co.uk"},
+        "provider": {"organization": "Boxclever Media Ltd (trading as AgentTrust)", "url": "https://www.cryptovault.co.uk"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
@@ -289,7 +289,7 @@ def serve_mcp_server_card():
         "name":        "AgentTrust Referee",
         "version":     "7.0.0",
         "description": (
-            "Trustless AI task verification with automatic XRP payment release. "
+            "Trust-minimized AI task verification with automatic XRP payment release. "
             "Post a task spec and work submission — get PASS/FAIL from an AI referee. "
             "Escrowed XRP releases automatically to the worker on approval. "
             "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents. "
