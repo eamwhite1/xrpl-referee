@@ -1283,22 +1283,61 @@ async def get_wallet_trust_score(
     )],
 ) -> dict:
     """
-    Get the AgentTrust Wallet Trust Score (0–100) for any XRPL wallet.
+    Open reputation layer for XRPL agents — returns a 0–100 trust score for any wallet.
 
-    Combines 12 independent signals: account age, XRP balance, on-chain activity,
+    Combines 11 independent signals: account age, XRP balance, on-chain activity,
     domain verification, on-chain ownership proof, multi-jurisdiction sanctions screening
     (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan),
-    Identity KYC (Didit-verified), NFTs held, escrow completion
-    rate, and peer ratings from counterparties.
+    identity KYC (Didit-verified), NFTs held, escrow completion rate, and peer ratings.
 
-    Use this before accepting a job or creating an escrow to assess counterparty risk.
-    A score below 30 is low-trust, 30–60 moderate, 60+ established.
-    Identity-verified wallets (kyc_verified: true) can create escrows up to $10,000.
+    Free to query. Rate limit: 20 calls per hour per IP.
+    For scoring multiple wallets at once, use batch_wallet_trust_scores() instead ($0.10 per batch of up to 50).
 
-    Returns full score breakdown by signal so you can reason about why a wallet scores high or low.
+    Score bands: below 30 = low-trust, 30–60 = moderate, 60+ = established.
+    KYC-verified wallets (kyc_verified: true) can create escrows up to $10,000.
+
+    Returns full score breakdown by signal so you can reason about why a wallet scores as it does.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
         res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}")
+        res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Batch Wallet Trust Scores",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def batch_wallet_trust_scores(
+    addresses: Annotated[list[str], Field(
+        title="XRPL Wallet Addresses",
+        description="List of XRPL wallet addresses (r...) to score. Maximum 50 per call.",
+    )],
+    fee_hash: Annotated[str, Field(
+        title="Fee Transaction Hash",
+        description="Hash of a $0.10 payment (XRP or RLUSD) sent to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL. Call get_fees() for the live XRP amount.",
+    )],
+) -> dict:
+    """
+    Score up to 50 XRPL wallets in a single call — the open reputation layer for XRPL agents.
+
+    All addresses are scored in parallel. Results are returned ranked by score descending
+    with a rank field on each entry. Fee: $0.10 (XRP or RLUSD on XRPL).
+
+    Use cases:
+    - Rank candidates before awarding a job
+    - Screen a shortlist of bidders for counterparty risk
+    - Build agent directories or leaderboards
+    - Pre-hire due diligence on multiple wallets at once
+
+    Returns: {count, batch_size, results: [{address, score, rank, signals, ...}]}
+    """
+    payload: dict = {"addresses": addresses, "fee_hash": fee_hash}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        res = await client.post(f"{REFEREE_BASE}/wallet/scores", json=payload)
         res.raise_for_status()
         return res.json()
 
