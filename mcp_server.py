@@ -268,6 +268,14 @@ async def create_escrow_vault(
         description="When multiple proof gates are set: 'ALL' (default) requires every gate to pass; 'ANY' requires at least one gate to pass.",
         enum=["ALL", "ANY"],
     )] = "ALL",
+    callback_url: Annotated[Optional[str], Field(
+        title="Callback URL",
+        description="HTTPS endpoint on your server to receive webhook POST notifications on escrow state changes (funded, PASS, FAIL, expired). Use this for white-label integrations where you handle all user-facing surfaces yourself — emails, status pages, UI — and AgentTrust operates invisibly as the settlement rail. Payload: {escrow_id, event, verdict, timestamp, metadata}.",
+    )] = None,
+    metadata: Annotated[Optional[str], Field(
+        title="Metadata (JSON string)",
+        description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.) without storing them on AgentTrust's side. Example: '{\"invoice_id\": \"INV-2026-0042\", \"po_number\": \"PO-9981\"}'.",
+    )] = None,
 ) -> dict:
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
@@ -282,6 +290,12 @@ async def create_escrow_vault(
     - Proof-gate only (require_ai_audit=False): payment releases when all configured proof
       gates pass (require_nft_proof / required_nft_issuer / nft_dvp / required_domain /
       required_vc_issuer_did). No AI call. Requires at least one proof gate.
+
+    White-label / headless integration:
+    - Pass callback_url to receive webhook POSTs on all state changes. AgentTrust operates
+      as a silent settlement rail; your platform handles all user-facing surfaces.
+    - Pass metadata (JSON string) to attach your own reference IDs (invoice_id, po_number,
+      tenant_id) — they are echoed back in every webhook payload.
 
     Typical flow after job board negotiation:
       1. award_job() returns the worker's address and agreed price
@@ -323,6 +337,10 @@ async def create_escrow_vault(
         body["required_vc_issuer_did"] = required_vc_issuer_did
     if required_vc_type:
         body["required_vc_type"] = required_vc_type
+    if callback_url:
+        body["buyer_callback_url"] = callback_url
+    if metadata:
+        body["metadata"] = metadata
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
@@ -1920,6 +1938,14 @@ async def hire_and_pay(
         description="When multiple proof gates are set: 'ALL' (default) requires every gate to pass; 'ANY' requires at least one.",
         enum=["ALL", "ANY"],
     )] = "ALL",
+    callback_url: Annotated[Optional[str], Field(
+        title="Callback URL",
+        description="HTTPS endpoint on your server to receive webhook POST notifications on escrow state changes (funded, PASS, FAIL, expired). Use this for white-label integrations where you handle all user-facing surfaces yourself. Payload: {escrow_id, event, verdict, timestamp, metadata}.",
+    )] = None,
+    metadata: Annotated[Optional[str], Field(
+        title="Metadata (JSON string)",
+        description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.). Example: '{\"invoice_id\": \"INV-2026-0042\"}'.",
+    )] = None,
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -1932,6 +1958,10 @@ async def hire_and_pay(
     verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
     relevant proof-gate params (require_nft_proof, required_nft_issuer, nft_dvp,
     required_domain, required_vc_issuer_did).
+
+    White-label / headless integration:
+    - Pass callback_url to receive webhook POSTs on all state changes.
+    - Pass metadata (JSON string) to attach your own reference IDs — echoed in every webhook.
 
     Typical flow:
       1. hire_and_pay() — register vault, get ready-to-sign EscrowCreate tx
@@ -1970,6 +2000,10 @@ async def hire_and_pay(
         vault_body["required_domain"] = required_domain
     if required_vc_issuer_did:
         vault_body["required_vc_issuer_did"] = required_vc_issuer_did
+    if callback_url:
+        vault_body["buyer_callback_url"] = callback_url
+    if metadata:
+        vault_body["metadata"] = metadata
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
