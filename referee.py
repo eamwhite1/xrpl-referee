@@ -549,7 +549,7 @@ async def serve_payment_required():
         "paidEndpoints": [
             {"path": "/audit",                          "fee_usd": MIN_FEE_USD,       "description": "Standard AI audit (Gemini Flash). Returns PASS/FAIL with score and feedback."},
             {"path": "/audit?require_consensus=true",   "fee_usd": PREMIUM_FEE_USD,   "description": "Premium consensus audit (Gemini Flash + Pro). Both models must agree on PASS."},
-            {"path": "/escrow/generate",                "fee_usd": MIN_FEE_USD,       "description": "Create an XRPL crypto-condition escrow vault. Funds release automatically on PASS."},
+            {"path": "/escrow/generate",                "fee_usd": MIN_FEE_USD,       "description": "Create an XRPL crypto-condition escrow vault. Funds release automatically on PASS. Includes 3 evaluation attempts. Each additional slot set via max_submissions costs $0.05 extra at creation time."},
             {"path": "/evaluate/purchase-attempt",      "fee_usd": EXTRA_ATTEMPT_FEE_USD, "description": "Unlock one additional work submission attempt for an escrow that has hit its limit."},
             {"path": "/kyc/start",                      "fee_usd": KYC_FEE_USD,       "description": "Start Didit identity verification ($0.50 one-time). Raises escrow cap to $10,000."},
             {"path": "/marketplace/skills (POST)",      "fee_usd": MIN_FEE_USD,       "description": "List a recurring skill on the marketplace for 30 days."},
@@ -4484,7 +4484,16 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             detail=threshold["message"],
         )
 
-    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature, buyer_address=req.buyer_address)
+    # Tiered creation fee: $0.10 covers 3 attempts; each slot above 3 costs $0.05 extra.
+    requested_subs = max(1, min(req.max_submissions, 10))
+    extra_slots    = max(0, requested_subs - DEFAULT_MAX_SUBMISSIONS)
+    creation_fee_usd = MIN_FEE_USD + extra_slots * EXTRA_ATTEMPT_FEE_USD
+    creation_fee_xrp = await get_required_fee_xrp()
+    if extra_slots > 0:
+        price = _xrp_price_cache.get("usd") if _xrp_price_cache else None
+        creation_fee_xrp = round(creation_fee_usd / price, 6) if price and price > 0 else creation_fee_xrp + extra_slots * extra_attempt_fee_xrp()
+
+    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, min_xrp=creation_fee_xrp, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature, buyer_address=req.buyer_address)
     if response is not None and fee_result.get("payment_response_header"):
         response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 

@@ -56,7 +56,8 @@ mcp = FastMCP(
         "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25).\n"
         "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
         "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS. "
-        "Workers get 3 attempts by default (buyer sets max_submissions 1–10). "
+        "Workers get 3 attempts by default. Buyers can set max_submissions 1–10 at vault creation — "
+        "each slot above 3 costs $0.05 extra at creation time. "
         "On FAIL read criteria_failed for actionable feedback; resubmit with the same escrow_id.\n"
         "  purchase_extra_attempt(escrow_id, fee_hash) — unlock one more submission when the limit is reached. Fee: $0.05 (XRP/RLUSD).\n"
         "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
@@ -229,7 +230,7 @@ async def create_escrow_vault(
     )] = "default",
     max_submissions: Annotated[int, Field(
         title="Max Submissions",
-        description="Number of work submission attempts the worker is allowed before the vault is locked. Default 3.",
+        description="Number of work submission attempts the worker is allowed before the vault is locked. Default 3 (included in the $0.10 creation fee). Each slot above 3 costs an extra $0.05 at creation time (e.g. max_submissions=5 → $0.10 + 2×$0.05 = $0.20). Range 1–10.",
     )] = 3,
     require_ai_audit: Annotated[bool, Field(
         title="Require AI Audit",
@@ -451,11 +452,11 @@ async def evaluate_escrow_work(
           "model_used":        "gemini-2.5-flash"
         }
 
-    Attempt limits: workers get 3 attempts by default (buyer can set 1–10 via
-    max_submissions on create_escrow_vault / hire_and_pay). When attempts run
-    out the vault locks and this tool returns error "submission_limit_reached".
-    To unlock one more attempt, call purchase_extra_attempt(escrow_id, fee_hash)
-    with a $0.05 fee payment — then resubmit.
+    Attempt limits: workers get 3 attempts by default. Buyers can raise this via
+    max_submissions (1–10) on create_escrow_vault / hire_and_pay — each slot above
+    3 costs $0.05 extra at creation time. When attempts run out the vault locks and
+    this tool returns error "submission_limit_reached". Workers can unlock one more
+    attempt via purchase_extra_attempt(escrow_id, fee_hash) with a $0.05 fee.
 
     On FAIL: read criteria_failed for specific, actionable feedback. Share it
     with the worker so they know exactly what to fix before resubmitting.
@@ -509,7 +510,8 @@ async def purchase_extra_attempt(
     """
     Purchase one additional submission attempt for a vault that has hit its limit.
 
-    Workers get 3 attempts by default (buyer sets this via max_submissions).
+    Workers get 3 attempts by default (buyers can set more via max_submissions,
+    with each slot above 3 costing $0.05 extra at creation time).
     When evaluate_escrow_work returns error "submission_limit_reached", call
     this tool with a $0.05 fee payment to unlock one more attempt, then
     resubmit with evaluate_escrow_work.
