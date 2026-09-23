@@ -2737,6 +2737,59 @@ async def send_worker_receipt_email(
         logger.error(f"❌ Seller email failed for {escrow_id}: {e}")
 
 
+async def send_buyer_escrow_confirmation_email(
+    buyer_email:   str,
+    buyer_name:    str,
+    escrow_id:     str,
+    worker_email:  str,
+    amount:        float,
+    currency:      str,
+    task_preview:  str,
+    deadline:      str,
+):
+    if not RESEND_API_KEY or not buyer_email:
+        return
+    amount_str   = f"{amount} {currency}"
+    preview_safe = task_preview[:300] + ("…" if len(task_preview) > 300 else "")
+    worker_label = worker_email if worker_email else "your worker"
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      buyer_email,
+            "subject": f"✅ Escrow confirmed — {escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}
+.task-box{{background:#f8f9fc;border-left:3px solid #0066FF;border-radius:0 8px 8px 0;
+           padding:12px 16px;font-size:.88rem;color:#333;line-height:1.65;margin-bottom:20px;}}
+.green{{color:#00B97A;font-weight:700;}}
+</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Payment locked in escrow</h1>
+  <p>Hi{' ' + buyer_name if buyer_name else ''}, your payment of <strong>{amount_str}</strong>
+     has been locked on the XRP Ledger for <strong>{worker_label}</strong>.
+     It releases automatically when the work passes AI verification — you don't need to do anything else.</p>
+  <div class="detail"><span>Escrow ID</span><br><strong>{escrow_id}</strong></div>
+  <div class="detail"><span>Amount locked</span><br><strong>{amount_str}</strong></div>
+  <div class="detail"><span>Worker</span><br><strong>{worker_label}</strong></div>
+  <div class="detail"><span>Deadline</span><br><strong>{deadline}</strong></div>
+  <p style="font-size:.85rem;font-weight:700;margin-bottom:.4rem;color:#0d0d12;">Task brief:</p>
+  <div class="task-box">{preview_safe}</div>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+    <span class="green">Your funds are protected.</span> Payment only releases when the AI referee
+    approves the submitted work. If no work is submitted by the deadline, funds return to your wallet automatically.
+  </p>
+  <div class="footer">
+    Escrow ID: {escrow_id} · {amount_str} · {deadline}<br>
+    Forward this email to your accounting software to create a draft bill.<br><br>
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Buyer escrow confirmation email sent to {buyer_email} for {escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Buyer escrow confirmation email failed for {escrow_id}: {e}")
+
+
 async def send_job_posted_email(
     buyer_email:  str,
     buyer_name:   str,
@@ -4613,11 +4666,11 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
 
     logger.info(f"🔒 VAULT CREATED: {req.escrow_id} | currency={currency} | seller_wants={req.seller_currency}")
 
-    # Send worker receipt email
+    # Send worker receipt email + buyer escrow confirmation
+    import asyncio
+    deadline_str = cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC") if cancel_after_ts else "Not specified"
+    amount_val   = amount_rlusd if currency == "RLUSD" else amount_xrp
     if req.worker_email:
-        import asyncio
-        deadline_str = cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC") if cancel_after_ts else "Not specified"
-        amount_val   = amount_rlusd if currency == "RLUSD" else amount_xrp
         asyncio.create_task(send_worker_receipt_email(
             worker_email         = req.worker_email,
             worker_name          = "",
@@ -4628,6 +4681,17 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             task_preview         = req.task_description,
             deadline             = deadline_str,
             invoice_requirements = req.invoice_requirements or None,
+        ))
+    if req.buyer_email:
+        asyncio.create_task(send_buyer_escrow_confirmation_email(
+            buyer_email  = req.buyer_email,
+            buyer_name   = req.buyer_name or "",
+            escrow_id    = req.escrow_id,
+            worker_email = req.worker_email or "",
+            amount       = amount_val,
+            currency     = currency,
+            task_preview = req.task_description,
+            deadline     = deadline_str,
         ))
 
     cancel_after_ripple = (
