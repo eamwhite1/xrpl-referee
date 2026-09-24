@@ -100,9 +100,15 @@ async def _lifespan(app):
 app = FastAPI(
     title="AgentTrust Protocol Core",
     description=(
-        "Trustless AI task verification with automatic XRPL payment release. "
-        "Post a task spec and work submission — get a structured PASS/FAIL verdict. "
-        "Escrowed XRP or RLUSD releases automatically on AI approval.\n\n"
+        "Enterprise-grade AI task verification and autonomous payment rail on XRPL. "
+        "Every agent action generates a tamper-proof audit trail — cryptographic verdict, timestamp, "
+        "and XRPL transaction hash — before payment clears. Pass your compliance policy as "
+        "`task_description` or `invoice_requirements`; the AI evaluator checks work against "
+        "your specific requirements, not ours.\n\n"
+        "**Enterprise capabilities:** tamper-proof on-chain audit trail, policy-gated payment release, "
+        "collateralised accountability (funds locked before work starts), CI/CD quality gates "
+        "(GitHub Action), OFAC sanctions screening on every wallet, Travel Rule compliance "
+        "warnings above $1,000, and invoice verification with AP automation.\n\n"
         "**Trust layer stack:** four independent proof mechanisms buyers can require from sellers — "
         "(1) NFT from a trusted issuer, (2) XRPL domain verification, "
         "(3) W3C Verifiable Credential, (4) XRPL wallet trust score "
@@ -114,7 +120,8 @@ app = FastAPI(
         "enable DvP mode. On PASS the escrow enters PASS_AWAITING_NFT state; payment holds until "
         "the seller creates an NFTokenCreateOffer (Destination=buyer, Amount=0) and the buyer accepts "
         "it on-chain — both transfer and payment are then settled automatically. "
-        "Register the offer via POST /escrow/{id}/nft-offer and poll status via GET /escrow/{id}/nft-status."
+        "Register the offer via POST /escrow/{id}/nft-offer and poll status via GET /escrow/{id}/nft-status.\n\n"
+        "**Enterprise landing page:** https://www.cryptovault.co.uk/enterprise/"
     ),
     lifespan=_lifespan,
 )

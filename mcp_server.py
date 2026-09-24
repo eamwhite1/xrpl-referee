@@ -2718,6 +2718,15 @@ async def explain_agenttrust_trust_model() -> dict:
         },
         "proof_policy": "Set proof_policy='ALL' (all selected gates must pass) or 'ANY' (any one suffices).",
         "skip_ai_audit": "Set require_ai_audit=false with at least one proof gate to release on proof alone. Returns HTTP 400 if no proof gate is configured.",
+        "enterprise": {
+            "summary": "AgentTrust is designed for enterprise deployment from the ground up.",
+            "audit_trail": "Every escrow verdict, timestamp, and transaction hash is permanently recorded on the XRPL — tamper-proof, independently verifiable, no AgentTrust involvement needed to read it.",
+            "your_policy": "Pass task_description or invoice_requirements with your compliance rulebook or corporate policy — the AI evaluator checks work against your requirements before payment releases.",
+            "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no disputes, no chargebacks, no manual intervention.",
+            "ci_quality_gates": "GitHub Action gates every pull request with dual-model AI audit (Gemini Flash + Gemini Pro consensus). Fails pipeline if diff scores below your threshold. $0.10/audit.",
+            "compliance": "OFAC SDN screening on every wallet. Travel Rule compliance warnings above $1,000. Invoice verification with AP automation via accounts_email.",
+            "enterprise_page": "https://www.cryptovault.co.uk/enterprise/",
+        },
         "code": "MIT. Backend: https://github.com/eamwhite1/xrpl-referee",
     }
 
