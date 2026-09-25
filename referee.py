@@ -4967,31 +4967,6 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     }
 
 
-@app.post("/enterprise/audit/{escrow_id}/abandon")
-async def enterprise_abandon_escrow(
-    escrow_id: str,
-    account: EnterpriseAccount = Depends(_get_current_account),
-    db: Session = Depends(get_db),
-):
-    """Abandon a LOCKED vault that has no on-chain escrow (no tx hash)."""
-    if not _subscription_active(account):
-        raise HTTPException(status_code=402, detail="Subscription required")
-    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
-    addresses = {w.xrpl_address for w in wallets}
-    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
-    if not vault or vault.buyer_address not in addresses:
-        raise HTTPException(status_code=404, detail="Escrow not found")
-    if vault.status not in ("LOCKED", "PENDING"):
-        raise HTTPException(status_code=400, detail=f"Vault is {vault.status} and cannot be abandoned")
-    if vault.status == "LOCKED" and vault.escrow_tx_hash:
-        raise HTTPException(status_code=400, detail="Vault has a live on-chain escrow — use the cancel flow instead")
-    old_status = vault.status
-    vault.status = "ABANDONED"
-    db.commit()
-    logger.info(f"🗑 User-abandoned vault {escrow_id} (account={account.id}, was={old_status}, tx_hash={vault.escrow_tx_hash!r})")
-    return {"ok": True}
-
-
 @app.get("/escrow/{escrow_id}")
 async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
@@ -8141,6 +8116,31 @@ async def enterprise_email_receipt(
             <p style="font-family:sans-serif;font-size:12px;color:#999;margin-top:2rem">AgentTrust · Boxclever Media Ltd · Registered in England &amp; Wales no. 09394447</p>
         """,
     })
+    return {"ok": True}
+
+
+@app.post("/enterprise/audit/{escrow_id}/abandon")
+async def enterprise_abandon_escrow(
+    escrow_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Abandon a LOCKED vault that has no on-chain escrow (no tx hash)."""
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+    addresses = {w.xrpl_address for w in wallets}
+    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not vault or vault.buyer_address not in addresses:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if vault.status not in ("LOCKED", "PENDING"):
+        raise HTTPException(status_code=400, detail=f"Vault is {vault.status} and cannot be abandoned")
+    if vault.status == "LOCKED" and vault.escrow_tx_hash:
+        raise HTTPException(status_code=400, detail="Vault has a live on-chain escrow — use the cancel flow instead")
+    old_status = vault.status
+    vault.status = "ABANDONED"
+    db.commit()
+    logger.info(f"🗑 User-abandoned vault {escrow_id} (account={account.id}, was={old_status}, tx_hash={vault.escrow_tx_hash!r})")
     return {"ok": True}
 
 
