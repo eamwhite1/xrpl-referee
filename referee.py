@@ -8048,8 +8048,74 @@ async def enterprise_audit_detail(
         "auto_finish_hash": escrow.auto_finish_hash,
         "project_label": escrow.project_label,
         "created_at": escrow.created_at.isoformat() if escrow.created_at else None,
+        "cancel_after_ts": escrow.cancel_after_ts.isoformat() if escrow.cancel_after_ts else None,
         "xrpl_explorer": f"https://livenet.xrpl.org/transactions/{escrow.auto_finish_hash}" if escrow.auto_finish_hash else None,
+        # Proof gates
+        "proof_policy": escrow.proof_policy,
+        "required_nft_issuer": escrow.required_nft_issuer,
+        "required_nft_metadata": escrow.required_nft_metadata,
+        "required_domain": escrow.required_domain,
+        "required_vc_issuer_did": escrow.required_vc_issuer_did,
+        "required_vc_type": escrow.required_vc_type,
+        "nft_dvp": escrow.nft_dvp,
+        "nft_dvp_status": escrow.nft_dvp_status,
+        "nft_dvp_token_id": escrow.nft_dvp_token_id,
     }
+
+
+@app.post("/enterprise/audit/{escrow_id}/email-receipt")
+async def enterprise_email_receipt(
+    escrow_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Email a formatted receipt for a single escrow to the account holder."""
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+    addresses = {w.xrpl_address for w in wallets}
+    escrow = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not escrow or escrow.buyer_address not in addresses:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if not RESEND_API_KEY:
+        raise HTTPException(status_code=503, detail="Email not configured")
+
+    label = escrow.project_label or f"Escrow {escrow.escrow_id[:8]}"
+    amount = escrow.amount_rlusd or escrow.amount_xrp
+    explorer_url = f"https://livenet.xrpl.org/transactions/{escrow.auto_finish_hash}" if escrow.auto_finish_hash else None
+    explorer_link = f'<a href="{explorer_url}">View on XRPL Explorer</a>' if explorer_url else "—"
+
+    verdict_json = ""
+    if escrow.ai_verdict:
+        try:
+            import json as _json
+            v = _json.loads(escrow.ai_verdict)
+            verdict_json = f"<p><strong>Verdict:</strong> {v.get('verdict','—')} (score {v.get('score','—')})<br><strong>Summary:</strong> {v.get('summary','')}</p>"
+        except Exception:
+            verdict_json = f"<pre style='font-size:12px'>{escrow.ai_verdict}</pre>"
+
+    resend.Emails.send({
+        "from": RESEND_FROM,
+        "to": account.email,
+        "subject": f"AgentTrust Receipt — {label}",
+        "html": f"""
+            <h2 style="font-family:sans-serif">AgentTrust Escrow Receipt</h2>
+            <table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;width:100%;max-width:600px">
+                <tr><td style="padding:6px 0;color:#666;width:160px">Project</td><td><strong>{label}</strong></td></tr>
+                <tr><td style="padding:6px 0;color:#666">Status</td><td><strong>{escrow.status}</strong></td></tr>
+                <tr><td style="padding:6px 0;color:#666">Amount</td><td>{amount:.4f} {escrow.currency}</td></tr>
+                <tr><td style="padding:6px 0;color:#666">Buyer</td><td style="font-family:monospace;font-size:12px">{escrow.buyer_address or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#666">Worker</td><td style="font-family:monospace;font-size:12px">{escrow.worker_address or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#666">Escrow Tx</td><td style="font-family:monospace;font-size:12px">{escrow.escrow_tx_hash or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#666">Release Tx</td><td style="font-family:monospace;font-size:12px">{escrow.auto_finish_hash or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#666">Date</td><td>{escrow.created_at.strftime('%d %B %Y, %H:%M UTC') if escrow.created_at else '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#666">XRPL</td><td>{explorer_link}</td></tr>
+            </table>
+            {verdict_json}
+            <p style="font-family:sans-serif;font-size:12px;color:#999;margin-top:2rem">AgentTrust · Boxclever Media Ltd · Registered in England &amp; Wales no. 09394447</p>
+        """,
+    })
+    return {"ok": True}
 
 
 # --- Subscription payment detection (background poller) ---
