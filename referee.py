@@ -8256,7 +8256,7 @@ async def _poll_expired_escrows():
                     # on pre-migration vaults). Abandon if deadline passed or created >24h ago.
                     orphaned = db.query(EscrowVault).filter(
                         EscrowVault.status == "LOCKED",
-                        EscrowVault.escrow_tx_hash == None,
+                        or_(EscrowVault.escrow_tx_hash == None, EscrowVault.escrow_tx_hash == ""),
                     ).filter(
                         (EscrowVault.cancel_after_ts != None) & (EscrowVault.cancel_after_ts < now)
                         | (EscrowVault.cancel_after_ts == None) & (EscrowVault.created_at < stale_cutoff)
