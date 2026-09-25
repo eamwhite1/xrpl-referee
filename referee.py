@@ -4983,9 +4983,12 @@ async def enterprise_abandon_escrow(
         raise HTTPException(status_code=404, detail="Escrow not found")
     if vault.status not in ("LOCKED", "PENDING"):
         raise HTTPException(status_code=400, detail=f"Vault is {vault.status} and cannot be abandoned")
+    if vault.status == "LOCKED" and vault.escrow_tx_hash:
+        raise HTTPException(status_code=400, detail="Vault has a live on-chain escrow — use the cancel flow instead")
+    old_status = vault.status
     vault.status = "ABANDONED"
     db.commit()
-    logger.info(f"🗑 User-abandoned vault {escrow_id} (account={account.id}, was={vault.status}, tx_hash={vault.escrow_tx_hash!r})")
+    logger.info(f"🗑 User-abandoned vault {escrow_id} (account={account.id}, was={old_status}, tx_hash={vault.escrow_tx_hash!r})")
     return {"ok": True}
 
 
