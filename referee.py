@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response, Cookie
+from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response, Cookie, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 import jwt as pyjwt
@@ -785,6 +785,8 @@ class EscrowVault(Base):
     invoice_requirements = Column(Text,    nullable=True)   # JSON: {po_number, supplier_name, services_description, require_date, require_line_items}
     # AI audit opt-out — v14
     require_ai_audit     = Column(Boolean, default=True)    # False = skip AI; proof gates alone release payment
+    # Template reference
+    template_id          = Column(String,  nullable=True)   # optional: EscrowTemplate.id
 
 
 class JobPosting(Base):
@@ -1429,6 +1431,38 @@ class LinkedWallet(Base):
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class EnterpriseApiKey(Base):
+    __tablename__ = "enterprise_api_key"
+    id          = Column(String, primary_key=True)   # uuid
+    account_id  = Column(String, index=True, nullable=False)
+    key_hash    = Column(String, unique=True, nullable=False)  # sha256 of the raw key
+    label       = Column(String, nullable=True)
+    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_used_at= Column(DateTime, nullable=True)
+    revoked     = Column(Boolean, default=False)
+
+
+class EscrowTemplate(Base):
+    __tablename__ = "escrow_template"
+    id                   = Column(String, primary_key=True)
+    account_id           = Column(String, index=True, nullable=False)
+    name                 = Column(String, nullable=False)
+    description          = Column(String, nullable=True)
+    # Policy fields — all optional; None means "not enforced"
+    category             = Column(String, nullable=True)
+    rubric               = Column(Text,   nullable=True)   # custom AI evaluation prompt
+    min_amount_xrp       = Column(Float,  nullable=True)
+    max_amount_xrp       = Column(Float,  nullable=True)
+    deadline_hours       = Column(Integer,nullable=True)   # enforced cancel_after window
+    require_nft_proof    = Column(Boolean, default=False)
+    required_nft_issuer  = Column(String, nullable=True)
+    required_domain      = Column(String, nullable=True)
+    required_vc_issuer_did = Column(String, nullable=True)
+    require_ai_audit     = Column(Boolean, default=True)
+    proof_policy         = Column(String, default="ALL")
+    created_at           = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -1619,6 +1653,34 @@ def run_migrations():
             wallet_address VARCHAR UNIQUE NOT NULL,
             created_at     TIMESTAMP
         )""",
+        """CREATE TABLE IF NOT EXISTS enterprise_api_key (
+            id           VARCHAR PRIMARY KEY,
+            account_id   VARCHAR NOT NULL,
+            key_hash     VARCHAR UNIQUE NOT NULL,
+            label        VARCHAR,
+            created_at   TIMESTAMP,
+            last_used_at TIMESTAMP,
+            revoked      BOOLEAN DEFAULT FALSE
+        )""",
+        """CREATE TABLE IF NOT EXISTS escrow_template (
+            id                     VARCHAR PRIMARY KEY,
+            account_id             VARCHAR NOT NULL,
+            name                   VARCHAR NOT NULL,
+            description            VARCHAR,
+            category               VARCHAR,
+            rubric                 TEXT,
+            min_amount_xrp         FLOAT,
+            max_amount_xrp         FLOAT,
+            deadline_hours         INTEGER,
+            require_nft_proof      BOOLEAN DEFAULT FALSE,
+            required_nft_issuer    VARCHAR,
+            required_domain        VARCHAR,
+            required_vc_issuer_did VARCHAR,
+            require_ai_audit       BOOLEAN DEFAULT TRUE,
+            proof_policy           VARCHAR DEFAULT 'ALL',
+            created_at             TIMESTAMP
+        )""",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS template_id VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2269,6 +2331,8 @@ class EscrowSetupRequest(BaseModel):
     invoice_requirements: Optional[dict] = None
     # AI audit — set False to release on proof gates alone (requires at least one proof gate)
     require_ai_audit: bool = True
+    # Template reference — enterprise agents can pass a template_id to apply policy
+    template_id: Optional[str] = None
     # Expected fields: po_number, supplier_name, services_description,
     # require_date (bool), require_line_items (bool)
     # Amount/currency are always required when this is set (mirrored from escrow amount)
@@ -4672,6 +4736,32 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         failed = sum(1 for s in snapshots if s.get("error"))
         logger.info(f"🔗 Spec links: {ok} fetched, {failed} failed for {req.escrow_id}")
 
+    # Resolve template if provided (enterprise agents pass template_id)
+    template = None
+    if req.template_id:
+        template = db.query(EscrowTemplate).filter_by(id=req.template_id).first()
+        if not template:
+            raise HTTPException(status_code=404, detail=f"Template '{req.template_id}' not found")
+        # Enforce template policy constraints
+        amount = req.amount_xrp or req.amount_rlusd or 0
+        if template.min_amount_xrp and amount < template.min_amount_xrp:
+            raise HTTPException(status_code=400, detail=f"Template requires minimum {template.min_amount_xrp} XRP")
+        if template.max_amount_xrp and amount > template.max_amount_xrp:
+            raise HTTPException(status_code=400, detail=f"Template caps escrow at {template.max_amount_xrp} XRP")
+        # Apply template defaults where caller hasn't set them
+        if template.require_nft_proof and not req.require_nft_proof:
+            req.require_nft_proof = True
+        if template.required_nft_issuer and not req.required_nft_issuer:
+            req.required_nft_issuer = template.required_nft_issuer
+        if template.required_domain and not req.required_domain:
+            req.required_domain = template.required_domain
+        if template.required_vc_issuer_did and not req.required_vc_issuer_did:
+            req.required_vc_issuer_did = template.required_vc_issuer_did
+        if not template.require_ai_audit:
+            req.require_ai_audit = False
+        if template.proof_policy:
+            req.proof_policy = template.proof_policy
+
     vault = EscrowVault(
         escrow_id             = req.escrow_id,
         condition             = final_condition,
@@ -4706,6 +4796,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         nft_dvp                = req.nft_dvp or False,
         invoice_requirements   = json.dumps(req.invoice_requirements) if req.invoice_requirements else None,
         require_ai_audit       = req.require_ai_audit,
+        template_id            = req.template_id,
     )
     db.add(vault)
     db.commit()
@@ -7727,6 +7818,23 @@ def _get_current_account(request: Request, db: Session = Depends(get_db)) -> Ent
         raise HTTPException(status_code=401, detail="Invalid session")
 
 
+def _get_account_from_api_key(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+) -> Optional[EnterpriseAccount]:
+    if not x_api_key:
+        return None
+    key_hash = hashlib.sha256(x_api_key.encode()).hexdigest()
+    api_key = db.query(EnterpriseApiKey).filter_by(key_hash=key_hash, revoked=False).first()
+    if not api_key:
+        return None
+    account = db.query(EnterpriseAccount).filter_by(id=api_key.account_id).first()
+    if account:
+        api_key.last_used_at = datetime.now(timezone.utc)
+        db.commit()
+    return account
+
+
 def _subscription_active(account: EnterpriseAccount, db=None) -> bool:
     now = datetime.now(timezone.utc)
     if account.status == "trial":
@@ -8141,6 +8249,158 @@ async def enterprise_abandon_escrow(
     vault.status = "ABANDONED"
     db.commit()
     logger.info(f"🗑 User-abandoned vault {escrow_id} (account={account.id}, was={old_status}, tx_hash={vault.escrow_tx_hash!r})")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Enterprise API Keys
+# ---------------------------------------------------------------------------
+
+@app.post("/enterprise/api-keys")
+async def create_api_key(
+    body: dict = Body(...),
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    raw_key = "at_" + secrets.token_hex(32)
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    api_key = EnterpriseApiKey(
+        id=str(uuid.uuid4()),
+        account_id=account.id,
+        key_hash=key_hash,
+        label=body.get("label"),
+    )
+    db.add(api_key)
+    db.commit()
+    return {"id": api_key.id, "key": raw_key, "label": api_key.label, "note": "Store this key — it will not be shown again."}
+
+
+@app.get("/enterprise/api-keys")
+async def list_api_keys(
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    keys = db.query(EnterpriseApiKey).filter_by(account_id=account.id, revoked=False).all()
+    return {"keys": [{"id": k.id, "label": k.label, "created_at": k.created_at.isoformat() if k.created_at else None, "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None} for k in keys]}
+
+
+@app.delete("/enterprise/api-keys/{key_id}")
+async def revoke_api_key(
+    key_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    key = db.query(EnterpriseApiKey).filter_by(id=key_id, account_id=account.id).first()
+    if not key:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.revoked = True
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Escrow Templates
+# ---------------------------------------------------------------------------
+
+def _template_dict(t: EscrowTemplate) -> dict:
+    return {
+        "id": t.id, "name": t.name, "description": t.description,
+        "category": t.category, "rubric": t.rubric,
+        "min_amount_xrp": t.min_amount_xrp, "max_amount_xrp": t.max_amount_xrp,
+        "deadline_hours": t.deadline_hours,
+        "require_nft_proof": t.require_nft_proof,
+        "required_nft_issuer": t.required_nft_issuer,
+        "required_domain": t.required_domain,
+        "required_vc_issuer_did": t.required_vc_issuer_did,
+        "require_ai_audit": t.require_ai_audit,
+        "proof_policy": t.proof_policy,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+    }
+
+
+@app.post("/enterprise/templates")
+async def create_template(
+    body: dict = Body(...),
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    tmpl = EscrowTemplate(
+        id=str(uuid.uuid4()),
+        account_id=account.id,
+        name=body.get("name", "Untitled"),
+        description=body.get("description"),
+        category=body.get("category"),
+        rubric=body.get("rubric"),
+        min_amount_xrp=body.get("min_amount_xrp"),
+        max_amount_xrp=body.get("max_amount_xrp"),
+        deadline_hours=body.get("deadline_hours"),
+        require_nft_proof=body.get("require_nft_proof", False),
+        required_nft_issuer=body.get("required_nft_issuer"),
+        required_domain=body.get("required_domain"),
+        required_vc_issuer_did=body.get("required_vc_issuer_did"),
+        require_ai_audit=body.get("require_ai_audit", True),
+        proof_policy=body.get("proof_policy", "ALL"),
+    )
+    db.add(tmpl)
+    db.commit()
+    return _template_dict(tmpl)
+
+
+@app.get("/enterprise/templates")
+async def list_templates(
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    tmpls = db.query(EscrowTemplate).filter_by(account_id=account.id).all()
+    return {"templates": [_template_dict(t) for t in tmpls]}
+
+
+@app.get("/enterprise/templates/{template_id}")
+async def get_template(
+    template_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    tmpl = db.query(EscrowTemplate).filter_by(id=template_id, account_id=account.id).first()
+    if not tmpl:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return _template_dict(tmpl)
+
+
+@app.put("/enterprise/templates/{template_id}")
+async def update_template(
+    template_id: str,
+    body: dict = Body(...),
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    tmpl = db.query(EscrowTemplate).filter_by(id=template_id, account_id=account.id).first()
+    if not tmpl:
+        raise HTTPException(status_code=404, detail="Template not found")
+    for field in ("name","description","category","rubric","min_amount_xrp","max_amount_xrp",
+                  "deadline_hours","require_nft_proof","required_nft_issuer","required_domain",
+                  "required_vc_issuer_did","require_ai_audit","proof_policy"):
+        if field in body:
+            setattr(tmpl, field, body[field])
+    db.commit()
+    return _template_dict(tmpl)
+
+
+@app.delete("/enterprise/templates/{template_id}")
+async def delete_template(
+    template_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    tmpl = db.query(EscrowTemplate).filter_by(id=template_id, account_id=account.id).first()
+    if not tmpl:
+        raise HTTPException(status_code=404, detail="Template not found")
+    db.delete(tmpl)
+    db.commit()
     return {"ok": True}
 
 
