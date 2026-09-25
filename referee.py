@@ -4967,21 +4967,28 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     }
 
 
-@app.post("/admin/abandon/{escrow_id}")
-async def admin_abandon_escrow(escrow_id: str, key: str = "", db: Session = Depends(get_db)):
-    """Force-abandon a stuck LOCKED vault. Guarded by ADMIN_KEY env var."""
-    admin_key = os.getenv("ADMIN_KEY") or (os.getenv("XRPL_SEED", "")[-8:] if os.getenv("XRPL_SEED") else "")
-    if not admin_key or key != admin_key:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-    if not vault:
-        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found")
-    old_status = vault.status
+@app.post("/enterprise/audit/{escrow_id}/abandon")
+async def enterprise_abandon_escrow(
+    escrow_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Abandon a LOCKED vault that has no on-chain escrow (no tx hash)."""
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+    addresses = {w.xrpl_address for w in wallets}
+    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not vault or vault.buyer_address not in addresses:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if vault.status != "LOCKED":
+        raise HTTPException(status_code=400, detail=f"Vault is {vault.status}, not LOCKED")
+    if vault.escrow_tx_hash:
+        raise HTTPException(status_code=400, detail="Vault has an on-chain tx — use the normal cancel flow")
     vault.status = "ABANDONED"
     db.commit()
-    logger.info(f"🗑 Admin force-abandoned vault {escrow_id} (was {old_status}, tx_hash={vault.escrow_tx_hash!r})")
-    return {"escrow_id": escrow_id, "old_status": old_status, "new_status": "ABANDONED",
-            "escrow_tx_hash": vault.escrow_tx_hash}
+    logger.info(f"🗑 User-abandoned orphaned vault {escrow_id} (account={account.id}, tx_hash={vault.escrow_tx_hash!r})")
+    return {"ok": True}
 
 
 @app.get("/escrow/{escrow_id}")
