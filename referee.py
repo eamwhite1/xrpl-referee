@@ -14,9 +14,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse, HTMLResponse
+import jwt as pyjwt
+import uuid
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 import resend
@@ -1398,6 +1400,31 @@ class SkillListing(Base):
     status       = Column(String,   default="ACTIVE")
 
 
+class EnterpriseAccount(Base):
+    __tablename__ = "enterprise_account"
+    id            = Column(String,   primary_key=True, index=True)   # uuid
+    email         = Column(String,   unique=True, index=True, nullable=False)
+    name          = Column(String,   nullable=True)
+    google_sub    = Column(String,   unique=True, nullable=True)     # Google subject ID
+    org_name      = Column(String,   nullable=True)
+    status        = Column(String,   default="trial")                # trial | active | expired
+    trial_ends_at = Column(DateTime, nullable=True)
+    sub_expires_at= Column(DateTime, nullable=True)
+    last_payment_hash = Column(String, nullable=True)
+    created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class LinkedWallet(Base):
+    __tablename__ = "linked_wallet"
+    id             = Column(Integer, primary_key=True, index=True)
+    account_id     = Column(String,  index=True, nullable=False)     # → EnterpriseAccount.id
+    xrpl_address   = Column(String,  index=True, nullable=False)
+    label          = Column(String,  nullable=True)
+    verified       = Column(Boolean, default=False)
+    verify_challenge = Column(String, nullable=True)
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -1664,6 +1691,14 @@ RESEND_API_KEY       = os.getenv("RESEND_API_KEY")
 RESEND_FROM          = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
 DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
+
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://mcp.cryptovault.co.uk/auth/google/callback")
+JWT_SECRET           = os.getenv("JWT_SECRET", secrets.token_hex(32))
+DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
+ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
+SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
@@ -7660,6 +7695,428 @@ async def kyc_status(wallet_address: str, db: Session = Depends(get_db)):
         "message": "Not KYC verified. Call POST /kyc/start with a fee_hash to begin identity verification ($0.50).",
         "kyc_url": "https://www.cryptovault.co.uk/kyc/",
     }
+
+
+# ---------------------------------------------------------------------------
+# ENTERPRISE DASHBOARD — Auth, Wallet Linking, Dashboard API
+# ---------------------------------------------------------------------------
+
+def _make_session_token(account_id: str) -> str:
+    payload = {"sub": account_id, "exp": datetime.now(timezone.utc) + timedelta(days=30)}
+    return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def _get_current_account(request: Request, db: Session = Depends(get_db)) -> EnterpriseAccount:
+    token = request.cookies.get("at_session")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        account = db.query(EnterpriseAccount).filter_by(id=payload["sub"]).first()
+        if not account:
+            raise HTTPException(status_code=401, detail="Account not found")
+        return account
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Session expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+
+def _subscription_active(account: EnterpriseAccount) -> bool:
+    now = datetime.now(timezone.utc)
+    if account.status == "trial" and account.trial_ends_at and account.trial_ends_at.replace(tzinfo=timezone.utc) > now:
+        return True
+    if account.status == "active" and account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now:
+        return True
+    return False
+
+
+@app.get("/auth/google")
+async def auth_google_start(request: Request):
+    """Redirect to Google OAuth consent screen."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google OAuth not configured")
+    state = secrets.token_urlsafe(16)
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "offline",
+        "prompt": "select_account",
+    }
+    from urllib.parse import urlencode
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    response = RedirectResponse(url)
+    response.set_cookie("oauth_state", state, max_age=600, httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/auth/google/callback")
+async def auth_google_callback(request: Request, code: str = None, state: str = None, error: str = None):
+    """Handle Google OAuth callback — create/find account, set session cookie."""
+    if error or not code:
+        return RedirectResponse(f"{DASHBOARD_URL}?error=oauth_denied")
+
+    saved_state = request.cookies.get("oauth_state")
+    if not saved_state or saved_state != state:
+        return RedirectResponse(f"{DASHBOARD_URL}?error=invalid_state")
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post("https://oauth2.googleapis.com/token", data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        })
+        if token_resp.status_code != 200:
+            return RedirectResponse(f"{DASHBOARD_URL}?error=token_exchange_failed")
+        tokens = token_resp.json()
+
+        userinfo_resp = await client.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        if userinfo_resp.status_code != 200:
+            return RedirectResponse(f"{DASHBOARD_URL}?error=userinfo_failed")
+        userinfo = userinfo_resp.json()
+
+    db = next(get_db())
+    try:
+        google_sub = userinfo.get("sub")
+        email = userinfo.get("email", "").lower()
+        account = db.query(EnterpriseAccount).filter_by(google_sub=google_sub).first()
+        if not account:
+            account = db.query(EnterpriseAccount).filter_by(email=email).first()
+        if not account:
+            account = EnterpriseAccount(
+                id=str(uuid.uuid4()),
+                email=email,
+                name=userinfo.get("name"),
+                google_sub=google_sub,
+                status="trial",
+                trial_ends_at=datetime.now(timezone.utc) + timedelta(days=30),
+            )
+            db.add(account)
+        else:
+            account.google_sub = google_sub
+            if not account.name:
+                account.name = userinfo.get("name")
+        db.commit()
+        db.refresh(account)
+    finally:
+        db.close()
+
+    session_token = _make_session_token(account.id)
+    response = RedirectResponse(f"{DASHBOARD_URL}/dashboard")
+    response.set_cookie(
+        "at_session", session_token,
+        max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax", secure=True,
+    )
+    response.delete_cookie("oauth_state")
+    return response
+
+
+@app.post("/auth/logout")
+async def auth_logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("at_session")
+    return response
+
+
+@app.get("/enterprise/me")
+async def enterprise_me(account: EnterpriseAccount = Depends(_get_current_account)):
+    return {
+        "id": account.id,
+        "email": account.email,
+        "name": account.name,
+        "org_name": account.org_name,
+        "status": account.status,
+        "subscription_active": _subscription_active(account),
+        "trial_ends_at": account.trial_ends_at.isoformat() if account.trial_ends_at else None,
+        "sub_expires_at": account.sub_expires_at.isoformat() if account.sub_expires_at else None,
+    }
+
+
+@app.get("/enterprise/subscription/payment-details")
+async def enterprise_payment_details(account: EnterpriseAccount = Depends(_get_current_account)):
+    """Return the RLUSD payment details for subscription renewal."""
+    return {
+        "wallet": ENTERPRISE_WALLET,
+        "amount_rlusd": SUBSCRIPTION_RLUSD,
+        "memo": account.id,
+        "memo_note": "Include your account ID in the transaction memo field so we can attribute your payment.",
+        "currency": "RLUSD",
+        "network": "XRPL",
+        "receipt_note": "Your transaction hash is your receipt — permanently on the XRPL ledger.",
+    }
+
+
+# --- Wallet linking ---
+
+class LinkWalletRequest(BaseModel):
+    xrpl_address: str
+    label: Optional[str] = None
+
+
+@app.post("/enterprise/wallets")
+async def enterprise_link_wallet(
+    req: LinkWalletRequest,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    existing = db.query(LinkedWallet).filter_by(account_id=account.id, xrpl_address=req.xrpl_address).first()
+    if existing:
+        return {"wallet_id": existing.id, "status": "already_linked"}
+    wallet = LinkedWallet(
+        account_id=account.id,
+        xrpl_address=req.xrpl_address,
+        label=req.label,
+        verify_challenge=secrets.token_hex(16),
+    )
+    db.add(wallet)
+    db.commit()
+    db.refresh(wallet)
+    return {
+        "wallet_id": wallet.id,
+        "xrpl_address": wallet.xrpl_address,
+        "verified": False,
+        "challenge": wallet.verify_challenge,
+        "verify_instructions": (
+            f"To verify ownership, send an XRPL AccountSet transaction from {req.xrpl_address} "
+            f"with a Memo containing: {wallet.verify_challenge}"
+        ),
+    }
+
+
+@app.get("/enterprise/wallets")
+async def enterprise_list_wallets(
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+    return [
+        {
+            "wallet_id": w.id,
+            "xrpl_address": w.xrpl_address,
+            "label": w.label,
+            "verified": w.verified,
+            "created_at": w.created_at.isoformat(),
+        }
+        for w in wallets
+    ]
+
+
+@app.delete("/enterprise/wallets/{wallet_id}")
+async def enterprise_unlink_wallet(
+    wallet_id: int,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    db.delete(wallet)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/enterprise/wallets/{wallet_id}/verify")
+async def enterprise_verify_wallet(
+    wallet_id: int,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Check XRPL for the challenge memo — mark wallet verified if found."""
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    if wallet.verified:
+        return {"verified": True}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(XRPL_URL, json={
+            "method": "account_tx",
+            "params": [{"account": wallet.xrpl_address, "limit": 20}],
+        })
+    txns = resp.json().get("result", {}).get("transactions", [])
+    for entry in txns:
+        memos = entry.get("tx", {}).get("Memos", [])
+        for m in memos:
+            memo_data = m.get("Memo", {}).get("MemoData", "")
+            try:
+                decoded = bytes.fromhex(memo_data).decode("utf-8")
+                if wallet.verify_challenge and wallet.verify_challenge in decoded:
+                    wallet.verified = True
+                    db.commit()
+                    return {"verified": True}
+            except Exception:
+                continue
+    return {"verified": False, "message": "Challenge not found yet. Submit the AccountSet tx and try again."}
+
+
+# --- Dashboard data ---
+
+@app.get("/enterprise/escrows")
+async def enterprise_escrows(
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+    limit: int = 50,
+    offset: int = 0,
+):
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+    addresses = [w.xrpl_address for w in wallets]
+    if not addresses:
+        return {"escrows": [], "total": 0}
+    escrows = (
+        db.query(EscrowVault)
+        .filter(EscrowVault.buyer_address.in_(addresses))
+        .order_by(EscrowVault.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    total = db.query(EscrowVault).filter(EscrowVault.buyer_address.in_(addresses)).count()
+    return {
+        "escrows": [
+            {
+                "escrow_id": e.escrow_id,
+                "status": e.status,
+                "amount": e.amount_rlusd or e.amount_xrp,
+                "currency": e.currency,
+                "worker_address": e.worker_address,
+                "task_description": e.task_description,
+                "ai_verdict": e.ai_verdict,
+                "escrow_tx_hash": e.escrow_tx_hash,
+                "auto_finish_hash": e.auto_finish_hash,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "project_label": e.project_label,
+                "buyer_address": e.buyer_address,
+            }
+            for e in escrows
+        ],
+        "total": total,
+    }
+
+
+@app.get("/enterprise/audit/{escrow_id}")
+async def enterprise_audit_detail(
+    escrow_id: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Full audit record for a single escrow — only accessible if buyer wallet is linked."""
+    if not _subscription_active(account):
+        raise HTTPException(status_code=402, detail="Subscription required")
+    wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+    addresses = {w.xrpl_address for w in wallets}
+    escrow = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not escrow or escrow.buyer_address not in addresses:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    return {
+        "escrow_id": escrow.escrow_id,
+        "status": escrow.status,
+        "buyer_address": escrow.buyer_address,
+        "worker_address": escrow.worker_address,
+        "amount": escrow.amount_rlusd or escrow.amount_xrp,
+        "currency": escrow.currency,
+        "task_description": escrow.task_description,
+        "invoice_requirements": escrow.invoice_requirements,
+        "ai_verdict": escrow.ai_verdict,
+        "model_used": escrow.model_used,
+        "worker_submission": escrow.worker_submission,
+        "escrow_tx_hash": escrow.escrow_tx_hash,
+        "auto_finish_hash": escrow.auto_finish_hash,
+        "project_label": escrow.project_label,
+        "created_at": escrow.created_at.isoformat() if escrow.created_at else None,
+        "xrpl_explorer": f"https://livenet.xrpl.org/transactions/{escrow.auto_finish_hash}" if escrow.auto_finish_hash else None,
+    }
+
+
+# --- Subscription payment detection (background poller) ---
+
+async def _poll_enterprise_subscriptions():
+    """Poll XRPL every 5 minutes for incoming RLUSD payments to ENTERPRISE_WALLET."""
+    if not ENTERPRISE_WALLET:
+        return
+    await asyncio.sleep(30)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(XRPL_URL, json={
+                    "method": "account_tx",
+                    "params": [{"account": ENTERPRISE_WALLET, "limit": 50, "ledger_index_min": -1}],
+                })
+            txns = resp.json().get("result", {}).get("transactions", [])
+            db = next(get_db())
+            try:
+                for entry in txns:
+                    tx = entry.get("tx", {})
+                    if tx.get("TransactionType") != "Payment":
+                        continue
+                    delivered = entry.get("meta", {}).get("delivered_amount", {})
+                    if not isinstance(delivered, dict):
+                        continue
+                    if delivered.get("currency") != "524C555344000000000000000000000000000000":  # RLUSD hex
+                        continue
+                    amount = float(delivered.get("value", 0))
+                    if amount < SUBSCRIPTION_RLUSD * 0.99:
+                        continue
+                    tx_hash = tx.get("hash", "")
+                    # Find account_id from Memo
+                    account_id = None
+                    for m in tx.get("Memos", []):
+                        try:
+                            account_id = bytes.fromhex(m["Memo"]["MemoData"]).decode("utf-8").strip()
+                        except Exception:
+                            continue
+                    if not account_id:
+                        continue
+                    account = db.query(EnterpriseAccount).filter_by(id=account_id).first()
+                    if not account:
+                        continue
+                    if account.last_payment_hash == tx_hash:
+                        continue
+                    now = datetime.now(timezone.utc)
+                    base = account.sub_expires_at.replace(tzinfo=timezone.utc) if account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now else now
+                    account.sub_expires_at = base + timedelta(days=31)
+                    account.status = "active"
+                    account.last_payment_hash = tx_hash
+                    db.commit()
+                    logger.info(f"✅ Enterprise subscription renewed: {account.email} tx={tx_hash}")
+                    if RESEND_API_KEY and account.email:
+                        try:
+                            resend.Emails.send({
+                                "from": RESEND_FROM,
+                                "to": account.email,
+                                "subject": "AgentTrust Enterprise — subscription renewed",
+                                "html": f"""
+                                    <p>Hi {account.name or 'there'},</p>
+                                    <p>Your AgentTrust Enterprise subscription has been renewed for 31 days.</p>
+                                    <p><strong>Receipt:</strong> XRPL transaction <code>{tx_hash}</code><br>
+                                    <a href="https://livenet.xrpl.org/transactions/{tx_hash}">View on XRPL Explorer</a></p>
+                                    <p>Amount: {amount} RLUSD</p>
+                                    <p>Next renewal due: {account.sub_expires_at.strftime('%d %B %Y')}</p>
+                                    <p>— AgentTrust</p>
+                                """,
+                            })
+                        except Exception:
+                            pass
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Enterprise subscription poller error: {e}")
+        await asyncio.sleep(300)
+
+
+# Register poller in lifespan — patch into existing startup
+@app.on_event("startup")
+async def _start_enterprise_poller():
+    asyncio.create_task(_poll_enterprise_subscriptions())
 
 
 # ---------------------------------------------------------------------------
