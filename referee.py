@@ -4676,7 +4676,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         escrow_id             = req.escrow_id,
         condition             = final_condition,
         fulfillment           = encrypt_fulfillment(final_fulfillment),
-        status                = "LOCKED",
+        status                = "PENDING",
         currency              = currency,
         amount_xrp            = amount_xrp,
         amount_rlusd          = amount_rlusd,
@@ -4811,6 +4811,7 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
 
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
+    vault.status          = "LOCKED"
     if not vault.escrow_owner:
         vault.escrow_owner = vault.buyer_address
     db.commit()
@@ -8238,6 +8239,18 @@ async def _poll_expired_escrows():
                 now = datetime.now(timezone.utc)
                 db = next(get_db())
                 try:
+                    # Expire stale PENDING vaults (no on-chain tx after 24h)
+                    stale_cutoff = now - timedelta(hours=24)
+                    stale = db.query(EscrowVault).filter(
+                        EscrowVault.status == "PENDING",
+                        EscrowVault.created_at < stale_cutoff,
+                    ).all()
+                    for vault in stale:
+                        vault.status = "ABANDONED"
+                        logger.info(f"🗑 Stale PENDING vault abandoned: {vault.escrow_id}")
+                    if stale:
+                        db.commit()
+
                     expired = db.query(EscrowVault).filter(
                         EscrowVault.status == "LOCKED",
                         EscrowVault.cancel_after_ts != None,
