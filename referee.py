@@ -8251,6 +8251,19 @@ async def _poll_expired_escrows():
                     if stale:
                         db.commit()
 
+                    # LOCKED but no on-chain tx ever confirmed — orphaned pre-migration vaults
+                    orphaned = db.query(EscrowVault).filter(
+                        EscrowVault.status == "LOCKED",
+                        EscrowVault.escrow_sequence == None,
+                        EscrowVault.cancel_after_ts != None,
+                        EscrowVault.cancel_after_ts < now,
+                    ).all()
+                    for vault in orphaned:
+                        vault.status = "ABANDONED"
+                        logger.info(f"🗑 Orphaned LOCKED vault (no on-chain tx) abandoned: {vault.escrow_id}")
+                    if orphaned:
+                        db.commit()
+
                     expired = db.query(EscrowVault).filter(
                         EscrowVault.status == "LOCKED",
                         EscrowVault.cancel_after_ts != None,
