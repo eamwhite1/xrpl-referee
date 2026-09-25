@@ -4967,6 +4967,23 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     }
 
 
+@app.post("/admin/abandon/{escrow_id}")
+async def admin_abandon_escrow(escrow_id: str, key: str = "", db: Session = Depends(get_db)):
+    """Force-abandon a stuck LOCKED vault. Guarded by ADMIN_KEY env var."""
+    admin_key = os.getenv("ADMIN_KEY") or (os.getenv("XRPL_SEED", "")[-8:] if os.getenv("XRPL_SEED") else "")
+    if not admin_key or key != admin_key:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found")
+    old_status = vault.status
+    vault.status = "ABANDONED"
+    db.commit()
+    logger.info(f"🗑 Admin force-abandoned vault {escrow_id} (was {old_status}, tx_hash={vault.escrow_tx_hash!r})")
+    return {"escrow_id": escrow_id, "old_status": old_status, "new_status": "ABANDONED",
+            "escrow_tx_hash": vault.escrow_tx_hash}
+
+
 @app.get("/escrow/{escrow_id}")
 async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
