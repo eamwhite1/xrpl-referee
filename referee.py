@@ -7726,12 +7726,22 @@ def _get_current_account(request: Request, db: Session = Depends(get_db)) -> Ent
         raise HTTPException(status_code=401, detail="Invalid session")
 
 
-def _subscription_active(account: EnterpriseAccount) -> bool:
+def _subscription_active(account: EnterpriseAccount, db=None) -> bool:
     now = datetime.now(timezone.utc)
-    if account.status == "trial" and account.trial_ends_at and account.trial_ends_at.replace(tzinfo=timezone.utc) > now:
-        return True
-    if account.status == "active" and account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now:
-        return True
+    if account.status == "trial":
+        if account.trial_ends_at and account.trial_ends_at.replace(tzinfo=timezone.utc) > now:
+            return True
+        if db:
+            account.status = "expired"
+            db.commit()
+        return False
+    if account.status == "active":
+        if account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now:
+            return True
+        if db:
+            account.status = "expired"
+            db.commit()
+        return False
     return False
 
 
@@ -7854,6 +7864,7 @@ async def enterprise_payment_details(account: EnterpriseAccount = Depends(_get_c
         "memo_note": "Include your account ID in the transaction memo field so we can attribute your payment.",
         "currency": "RLUSD",
         "network": "XRPL",
+        "period": "annual",
         "receipt_note": "Your transaction hash is your receipt — permanently on the XRPL ledger.",
     }
 
@@ -8087,7 +8098,7 @@ async def _poll_enterprise_subscriptions():
                         continue
                     now = datetime.now(timezone.utc)
                     base = account.sub_expires_at.replace(tzinfo=timezone.utc) if account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now else now
-                    account.sub_expires_at = base + timedelta(days=31)
+                    account.sub_expires_at = base + timedelta(days=365)
                     account.status = "active"
                     account.last_payment_hash = tx_hash
                     db.commit()
@@ -8097,14 +8108,14 @@ async def _poll_enterprise_subscriptions():
                             resend.Emails.send({
                                 "from": RESEND_FROM,
                                 "to": account.email,
-                                "subject": "AgentTrust Enterprise — subscription renewed",
+                                "subject": "AgentTrust Enterprise — annual subscription confirmed",
                                 "html": f"""
                                     <p>Hi {account.name or 'there'},</p>
-                                    <p>Your AgentTrust Enterprise subscription has been renewed for 31 days.</p>
+                                    <p>Your AgentTrust Enterprise annual subscription is confirmed. You have full access for the next 12 months.</p>
                                     <p><strong>Receipt:</strong> XRPL transaction <code>{tx_hash}</code><br>
                                     <a href="https://livenet.xrpl.org/transactions/{tx_hash}">View on XRPL Explorer</a></p>
-                                    <p>Amount: {amount} RLUSD</p>
-                                    <p>Next renewal due: {account.sub_expires_at.strftime('%d %B %Y')}</p>
+                                    <p>Amount paid: {amount} RLUSD</p>
+                                    <p>Subscription valid until: {account.sub_expires_at.strftime('%d %B %Y')}</p>
                                     <p>— AgentTrust</p>
                                 """,
                             })
@@ -8112,6 +8123,41 @@ async def _poll_enterprise_subscriptions():
                             pass
             finally:
                 db.close()
+
+            # Send renewal reminders for subscriptions expiring in ~30 days
+            if RESEND_API_KEY:
+                db2 = next(get_db())
+                try:
+                    now = datetime.now(timezone.utc)
+                    remind_from = now + timedelta(days=29)
+                    remind_to   = now + timedelta(days=31)
+                    expiring = db2.query(EnterpriseAccount).filter(
+                        EnterpriseAccount.status == "active",
+                        EnterpriseAccount.sub_expires_at >= remind_from,
+                        EnterpriseAccount.sub_expires_at <= remind_to,
+                    ).all()
+                    for acct in expiring:
+                        try:
+                            resend.Emails.send({
+                                "from": RESEND_FROM,
+                                "to": acct.email,
+                                "subject": "AgentTrust Enterprise — subscription renews in 30 days",
+                                "html": f"""
+                                    <p>Hi {acct.name or 'there'},</p>
+                                    <p>Your AgentTrust Enterprise subscription expires on <strong>{acct.sub_expires_at.strftime('%d %B %Y')}</strong>.</p>
+                                    <p>To renew for another year, send <strong>199 RLUSD</strong> on the XRP Ledger to:</p>
+                                    <p><strong>Wallet:</strong> <code>{ENTERPRISE_WALLET}</code><br>
+                                    <strong>Memo:</strong> <code>{acct.id}</code></p>
+                                    <p>Your transaction hash will be your receipt. We'll extend your subscription automatically within 5 minutes of payment.</p>
+                                    <p>— AgentTrust</p>
+                                """,
+                            })
+                            logger.info(f"📧 Renewal reminder sent to {acct.email}")
+                        except Exception:
+                            pass
+                finally:
+                    db2.close()
+
         except Exception as e:
             logger.warning(f"Enterprise subscription poller error: {e}")
         await asyncio.sleep(300)
