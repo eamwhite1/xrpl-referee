@@ -35,7 +35,7 @@ from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx, SubmitOnly, AccountInfo, Fee
-from xrpl.models.transactions import EscrowFinish
+from xrpl.models.transactions import EscrowFinish, EscrowCancel
 from xrpl.core.addresscodec import decode_seed
 from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
 from xrpl.utils import xrp_to_drops
@@ -8229,10 +8229,65 @@ async def _poll_enterprise_subscriptions():
         await asyncio.sleep(300)
 
 
+async def _poll_expired_escrows():
+    """Every 5 minutes: cancel expired LOCKED escrows on-chain and mark them CANCELLED in DB."""
+    await asyncio.sleep(60)  # let app finish booting
+    while True:
+        try:
+            if referee_wallet:
+                now = datetime.now(timezone.utc)
+                db = next(get_db())
+                try:
+                    expired = db.query(EscrowVault).filter(
+                        EscrowVault.status == "LOCKED",
+                        EscrowVault.cancel_after_ts != None,
+                        EscrowVault.cancel_after_ts < now,
+                        EscrowVault.escrow_sequence != None,
+                    ).all()
+                    for vault in expired:
+                        try:
+                            client = AsyncJsonRpcClient(XRPL_URL)
+                            cancel_tx = EscrowCancel(
+                                account=referee_wallet.address,
+                                owner=vault.buyer_address,
+                                offer_sequence=vault.escrow_sequence,
+                            )
+                            result = await async_submit_and_wait(cancel_tx, client, referee_wallet)
+                            tx_hash = result.result.get("hash", "")
+                            vault.status = "CANCELLED"
+                            vault.delivery_status = "CANCELLED"
+                            db.commit()
+                            logger.info(f"⏱ Expired escrow cancelled: {vault.escrow_id} tx={tx_hash}")
+                            if RESEND_API_KEY and vault.buyer_email:
+                                try:
+                                    resend.Emails.send({
+                                        "from": RESEND_FROM,
+                                        "to": vault.buyer_email,
+                                        "subject": "AgentTrust — escrow expired, funds returned",
+                                        "html": f"""
+                                            <p>Hi,</p>
+                                            <p>Your AgentTrust escrow <strong>{vault.project_label or vault.escrow_id}</strong> expired on {vault.cancel_after_ts.strftime('%d %B %Y')} with no work submitted.</p>
+                                            <p>Funds have been returned to your wallet automatically.</p>
+                                            <p><strong>Cancel tx:</strong> <a href="https://livenet.xrpl.org/transactions/{tx_hash}">{tx_hash}</a></p>
+                                            <p>— AgentTrust</p>
+                                        """,
+                                    })
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel expired escrow {vault.escrow_id}: {e}")
+                finally:
+                    db.close()
+        except Exception as e:
+            logger.warning(f"Expired escrow poller error: {e}")
+        await asyncio.sleep(300)
+
+
 # Register poller in lifespan — patch into existing startup
 @app.on_event("startup")
 async def _start_enterprise_poller():
     asyncio.create_task(_poll_enterprise_subscriptions())
+    asyncio.create_task(_poll_expired_escrows())
 
 
 # ---------------------------------------------------------------------------
