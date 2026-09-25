@@ -7810,7 +7810,7 @@ async def auth_google_callback(request: Request, code: str = None, state: str = 
         db.close()
 
     session_token = _make_session_token(account.id)
-    response = RedirectResponse(f"{DASHBOARD_URL}/dashboard")
+    response = RedirectResponse(DASHBOARD_URL)
     response.set_cookie(
         "at_session", session_token,
         max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax", secure=True,
