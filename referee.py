@@ -139,8 +139,12 @@ async def _payment_required_handler(request: Request, exc: PaymentRequired):
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,  # Cannot combine allow_credentials=True with allow_origins=["*"]
+    allow_origins=[
+        "https://app.cryptovault.co.uk",
+        "https://www.cryptovault.co.uk",
+        "https://cryptovault.co.uk",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
