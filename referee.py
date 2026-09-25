@@ -8252,14 +8252,10 @@ async def _poll_expired_escrows():
                         db.commit()
 
                     # LOCKED but no on-chain tx hash — no real escrow exists on-chain.
-                    # Use escrow_tx_hash as the definitive guard (sequence may be set incorrectly
-                    # on pre-migration vaults). Abandon if deadline passed or created >24h ago.
+                    # Abandon unconditionally: there is nothing to cancel on-chain.
                     orphaned = db.query(EscrowVault).filter(
                         EscrowVault.status == "LOCKED",
                         or_(EscrowVault.escrow_tx_hash == None, EscrowVault.escrow_tx_hash == ""),
-                    ).filter(
-                        (EscrowVault.cancel_after_ts != None) & (EscrowVault.cancel_after_ts < now)
-                        | (EscrowVault.cancel_after_ts == None) & (EscrowVault.created_at < stale_cutoff)
                     ).all()
                     for vault in orphaned:
                         vault.status = "ABANDONED"
