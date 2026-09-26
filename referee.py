@@ -4966,7 +4966,18 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
     if currency == "RLUSD" and req.amount_rlusd:
         amount_field = {"currency": RLUSD_HEX, "issuer": RLUSD_ISSUER, "value": str(req.amount_rlusd)}
     else:
-        amount_xrp = req.amount_xrp or (vault.amount_xrp or 0)
+        registered_xrp = vault.amount_xrp or 0
+        if req.amount_xrp and registered_xrp:
+            tolerance = registered_xrp * 0.001  # 0.1% rounding tolerance
+            if abs(req.amount_xrp - registered_xrp) > tolerance:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"amount_xrp {req.amount_xrp} does not match the registered vault amount "
+                        f"{registered_xrp} XRP. Use the amount from create_escrow_vault()."
+                    ),
+                )
+        amount_xrp = registered_xrp or req.amount_xrp or 0
         amount_field = str(int(amount_xrp * 1_000_000))
 
     cancel_after_ripple = None

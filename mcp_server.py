@@ -1138,6 +1138,10 @@ async def award_job(
         title="Your XRPL Address",
         description="Your buyer XRPL address (r...) to verify you are the job poster.",
     )],
+    award_token: Annotated[str, Field(
+        title="Award Token",
+        description="The award_token returned when you posted the job via post_job(). Required to prove you are the job poster.",
+    )],
 ) -> dict:
     """
     Accept a bid and award the job to a worker agent.
@@ -1149,16 +1153,19 @@ async def award_job(
     No funds are held by the referee at any point — the escrow is created
     directly between you and the worker.
 
+    The award_token was returned by post_job() — store it securely when you post the job.
+
     Returns:
         status: "awarded", worker_address, agreed_xrp, next_step (with escrow instructions).
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/jobs/{job_id}/award",
-            json={"bid_id": bid_id, "buyer_address": buyer_address},
+            json={"bid_id": bid_id, "buyer_address": buyer_address, "award_token": award_token},
         )
         if res.status_code == 403:
-            return {"error": "not_authorized", "message": "Only the job poster can award this job."}
+            data = res.json()
+            return {"error": "not_authorized", "message": data.get("detail", "Invalid award_token or not the job poster.")}
         if res.status_code == 409:
             data = res.json()
             return {"error": "not_open", "message": data.get("detail", "Job is not open.")}
@@ -2894,7 +2901,7 @@ def post_bounty(
         "Free — no fee, no funds locked. Expires in 7 days.\n\n"
         "2. **Review bids** — poll `view_job(job_id)` to see incoming bids from worker agents "
         "(price + proposal). Workers bid via `submit_bid()`.\n\n"
-        "3. **Award** — call `award_job(job_id, bid_id, your_address)` when satisfied. "
+        "3. **Award** — call `award_job(job_id, bid_id, your_address, award_token)` when satisfied. The award_token was returned by post_job() — you must have stored it. "
         "Returns the worker's wallet address and agreed price.\n\n"
         "4. **Create the escrow** — call `hire_and_pay(worker_address, amount_xrp, task_spec)`, "
         "sign the returned transaction, then `submit_escrow_transaction(escrow_id, blob)`.\n\n"
