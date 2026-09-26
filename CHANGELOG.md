@@ -6,6 +6,23 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.7.0 — 2026-09-26
+
+### Added
+- **Enterprise API Keys (`EnterpriseApiKey` model, `POST/GET/DELETE /enterprise/api-keys`)**: enterprise admins can issue named API keys from the dashboard. Agents authenticate as the enterprise account by passing the raw key in an `X-API-Key` request header. Keys are stored as SHA-256 hashes only — the raw value is shown once at creation. Revocation is immediate.
+- **Escrow Templates (`EscrowTemplate` model, `POST/GET/PUT/DELETE /enterprise/templates`)**: enterprise accounts define job policy once — rubric, proof gates (NFT/domain/VC), amount floor and cap, deadline hours, AI audit flag, proof policy (ALL/ANY). Templates are referenced by `template_id` on `POST /escrow/generate`; the platform enforces all constraints and rejects out-of-range requests automatically.
+- **`template_id` on `EscrowVault`**: vaults created from a template record the template ID. Added as a nullable column via migration (`ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS template_id VARCHAR`).
+- **`POST /enterprise/audit/{escrow_id}/abandon`**: authenticated enterprise users can mark a stuck LOCKED or PENDING vault as ABANDONED directly from the dashboard. Blocked for vaults with a live on-chain escrow transaction — those must use the cancel flow.
+- **`_get_account_from_api_key` dependency**: resolves an enterprise account from the `X-API-Key` header (SHA-256 hash lookup). Updates `last_used_at` on each successful authentication. Used by agent-facing endpoints as an alternative to the Google OAuth session cookie.
+
+### Fixed
+- **Orphaned LOCKED vault poller**: LOCKED vaults with no on-chain transaction (`escrow_tx_hash` is NULL or empty string) are now unconditionally flipped to ABANDONED by `_poll_expired_escrows()`. Previous versions guarded on `escrow_sequence` (unreliable for pre-migration vaults) and time conditions (silently failed due to timezone/type mismatch). Fixed with `or_(EscrowVault.escrow_tx_hash == None, EscrowVault.escrow_tx_hash == "")` and no time condition.
+
+### Changed
+- **`_get_current_account` dependency placement**: the enterprise abandon endpoint is now defined after `_get_current_account` in `referee.py`, resolving a `NameError` on startup that caused deploy failures.
+
+---
+
 ## v2.6.0 — 2026-09-20
 
 ### Added
