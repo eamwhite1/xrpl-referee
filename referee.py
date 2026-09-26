@@ -787,6 +787,8 @@ class EscrowVault(Base):
     require_ai_audit     = Column(Boolean, default=True)    # False = skip AI; proof gates alone release payment
     # Template reference
     template_id          = Column(String,  nullable=True)   # optional: EscrowTemplate.id
+    # Worker auth token — v2.8.0
+    evaluate_token_hash  = Column(String,  nullable=True)   # SHA-256 of one-time evaluate token
 
 
 class JobPosting(Base):
@@ -1680,7 +1682,8 @@ def run_migrations():
             proof_policy           VARCHAR DEFAULT 'ALL',
             created_at             TIMESTAMP
         )""",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS template_id VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS template_id          VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluate_token_hash  VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2353,6 +2356,8 @@ class AuditRequest(BaseModel):
     vc_jwt:              Optional[str] = None   # W3C Verifiable Credential JWT
     # Gitcoin Passport removed — field kept for backwards compat
     passport_eth_address: Optional[str] = None  # ignored
+    # Worker auth token — v2.8.0
+    evaluate_token:       Optional[str] = None
 
 class StandaloneAuditRequest(BaseModel):
     task:                str
@@ -4163,23 +4168,7 @@ async def debug_wallet_age(address: str):
     except Exception as e:
         results["data_ripple_com"] = {"error": str(e)}
 
-    # Source 2: s2.ripple.com JSON-RPC
-    for url in ["https://s2.ripple.com:51234", "https://s1.ripple.com:51234"]:
-        key = url.split("//")[1].split(":")[0]
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.post(url, json={
-                    "method": "account_tx",
-                    "params": [{"account": address, "limit": 1, "forward": True,
-                                "ledger_index_min": 0, "ledger_index_max": -1}]
-                })
-            txs = r.json().get("result", {}).get("transactions", [])
-            results[key] = {"status": r.status_code, "tx_count": len(txs),
-                            "first_tx": txs[0] if txs else None}
-        except Exception as e:
-            results[key] = {"error": str(e)}
-
-    # Source 3: xrplcluster.com (no-forward, just to see what it returns)
+    # Source 2: xrplcluster.com (no-forward, just to see what it returns)
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.post(XRPL_URL, json={
@@ -4711,6 +4700,10 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
                 detail=f"Seller wallet {req.worker_address} does not have a RLUSD trustline. The seller must add one before this escrow can be created: Assets → Add Asset → RLUSD (issuer: {RLUSD_ISSUER}).",
             )
 
+    # Generate evaluate token (worker auth for POST /evaluate)
+    evaluate_token      = secrets.token_urlsafe(32)
+    evaluate_token_hash = hashlib.sha256(evaluate_token.encode()).hexdigest()
+
     # Generate crypto-condition
     preimage_bytes    = secrets.token_bytes(32)
     preimage_hex      = preimage_bytes.hex().upper()
@@ -4797,6 +4790,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         invoice_requirements   = json.dumps(req.invoice_requirements) if req.invoice_requirements else None,
         require_ai_audit       = req.require_ai_audit,
         template_id            = req.template_id,
+        evaluate_token_hash    = evaluate_token_hash,
     )
     db.add(vault)
     db.commit()
@@ -4855,6 +4849,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "cancel_after_ripple": cancel_after_ripple,
         "cancel_after_human":  cancel_after_ts.strftime("%Y-%m-%d %H:%M UTC") if cancel_after_ts else None,
         "worker_email_sent":   bool(req.worker_email),
+        "evaluate_token":      evaluate_token,
+        "evaluate_token_hint": "Share this token with the worker — they must include it in evaluate_escrow_work(). Store it securely; it is not shown again.",
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
@@ -5142,6 +5138,19 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="This escrow has already been released.")
     if vault.status == "CANCELLED":
         raise HTTPException(status_code=409, detail="This escrow has been cancelled.")
+
+    # Evaluate token check — vaults created after v2.8.0 require this
+    if vault.evaluate_token_hash:
+        provided = (req.evaluate_token or "").strip()
+        if not provided:
+            raise HTTPException(
+                status_code=403,
+                detail="evaluate_token is required for this escrow. The buyer receives it at vault creation and must share it with the worker.",
+            )
+        provided_hash = hashlib.sha256(provided.encode()).hexdigest()
+        if not secrets.compare_digest(provided_hash, vault.evaluate_token_hash):
+            raise HTTPException(status_code=403, detail="Invalid evaluate_token.")
+
     if not vault.escrow_sequence:
         raise HTTPException(
             status_code=402,

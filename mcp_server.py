@@ -55,7 +55,8 @@ mcp = FastMCP(
         "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow). "
         "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25).\n"
         "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
-        "  evaluate_escrow_work(escrow_id, work) — submit proof; payment auto-releases on PASS. "
+        "  evaluate_escrow_work(escrow_id, work, evaluate_token) — submit proof; payment auto-releases on PASS. "
+        "The buyer receives evaluate_token when creating the vault and must share it with the worker before submission. "
         "Workers get 3 attempts by default. Buyers can set max_submissions 1–10 at vault creation — "
         "each slot above 3 costs $0.05 extra at creation time. "
         "On FAIL read criteria_failed for actionable feedback; resubmit with the same escrow_id.\n"
@@ -417,6 +418,10 @@ async def evaluate_escrow_work(
         title="Evidence Links",
         description="Up to 3 URLs that are fetched and snapshotted at submission time as supporting evidence.",
     )] = None,
+    evaluate_token: Annotated[str | None, Field(
+        title="Evaluate Token",
+        description="The evaluate_token returned by create_escrow_vault() or hire_and_pay(). The buyer must share this with the worker before submission. Required for vaults created after v2.8.0.",
+    )] = None,
 ) -> dict:
     """
     Submit proof of completed work against an existing escrow vault.
@@ -469,16 +474,16 @@ async def evaluate_escrow_work(
     better hiring decisions.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
-        res = await client.post(
-            f"{REFEREE_BASE}/evaluate",
-            json={
-                "escrow_id":         escrow_id,
-                "work":              work,
-                "task_category":     task_category,
-                "require_consensus": require_consensus,
-                "evidence_links":    evidence_links or [],
-            },
-        )
+        body: dict = {
+            "escrow_id":         escrow_id,
+            "work":              work,
+            "task_category":     task_category,
+            "require_consensus": require_consensus,
+            "evidence_links":    evidence_links or [],
+        }
+        if evaluate_token:
+            body["evaluate_token"] = evaluate_token
+        res = await client.post(f"{REFEREE_BASE}/evaluate", json=body)
         if res.status_code == 429:
             data = res.json()
             return {
@@ -1766,31 +1771,28 @@ async def verify_wallet_domain(
     openWorldHint=True,
 ))
 async def get_dex_quote(
-    from_currency: Annotated[str, Field(
-        title="From Currency",
-        description="Currency to swap from, e.g. 'XRP' or 'RLUSD'.",
+    xrp_amount: Annotated[float, Field(
+        title="XRP Amount",
+        description="Amount of XRP to get a conversion quote for.",
+        gt=0,
     )],
-    to_currency: Annotated[str, Field(
-        title="To Currency",
-        description="Currency to swap to, e.g. 'XRP' or 'RLUSD'.",
-    )],
-    amount: Annotated[float, Field(
-        title="Amount",
-        description="Amount of the from_currency to quote.",
+    worker_address: Annotated[str, Field(
+        title="Worker XRPL Address",
+        description="Your XRPL wallet address (r...). Also used to check whether your RLUSD trustline is active.",
     )],
 ) -> dict:
     """
-    Get a live DEX price quote for swapping between XRP and RLUSD on the XRPL DEX.
+    Get a live XRP to RLUSD conversion quote via the XRPL DEX.
 
-    Use this to price escrows in a stable currency (RLUSD) while paying in XRP,
-    or to understand the current exchange rate before committing to a job budget.
+    Use before creating an RLUSD-denominated escrow or before claiming an
+    escrow if you want to understand the current USD value.
 
-    Returns: from_amount, to_amount, rate, and slippage estimate.
+    Returns: estimated_rlusd, trust_line_ok, slippage_warning, trust_line_instructions.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/dex/quote",
-            json={"from_currency": from_currency, "to_currency": to_currency, "amount": amount},
+            json={"xrp_amount": xrp_amount, "worker_address": worker_address},
         )
         res.raise_for_status()
         return res.json()

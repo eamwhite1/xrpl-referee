@@ -6,6 +6,20 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.8.0 — 2026-09-26
+
+### Fixed
+- **DEX schema drift (`get_dex_quote` MCP tool)**: MCP tool was sending `from_currency`, `to_currency`, `amount` to `POST /dex/quote` which expects `worker_address` and `xrp_amount`, causing HTTP 422 on every call. Updated tool parameters to match the REST endpoint.
+- **Evaluate griefing (K1/A4)**: `POST /evaluate` accepted submissions from any caller who knew the `escrow_id`, allowing attempt-slot burning without being the awarded worker. Fixed by generating a one-time `evaluate_token` (URL-safe random, SHA-256 hashed) at `POST /escrow/generate` time. Hash stored on `EscrowVault.evaluate_token_hash`; plaintext returned to the buyer who shares it with the worker. `/evaluate` rejects requests with a missing or invalid token (HTTP 403) when the vault has a hash set. Existing vaults without the column value are unaffected (backwards compatible).
+- **Debug endpoint RPC reliability**: removed `s1.ripple.com` and `s2.ripple.com` JSON-RPC sources from `GET /wallet/debug-age/{address}`. Production XRPL calls exclusively use `XRPL_URL` (default: `xrplcluster.com`).
+
+### Added
+- `evaluate_token` and `evaluate_token_hash` fields on `EscrowVault` (migration: `ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluate_token_hash VARCHAR`).
+- `evaluate_token` field on `AuditRequest` Pydantic model.
+- `evaluate_token` parameter on MCP `evaluate_escrow_work` tool.
+
+---
+
 ## v2.7.0 — 2026-09-26
 
 ### Added
