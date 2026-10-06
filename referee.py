@@ -35,7 +35,10 @@ from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx, SubmitOnly, AccountInfo, Fee
-from xrpl.models.transactions import EscrowFinish, EscrowCancel
+from xrpl.models.transactions import EscrowFinish, EscrowCancel, NFTokenAcceptOffer
+from xrpl.models.transactions.batch import Batch, BatchSigner, BatchFlag
+from xrpl.models.transactions.transaction import Transaction as XrplTransaction
+from xrpl.asyncio.transaction import autofill
 from xrpl.core.addresscodec import decode_seed
 from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
 from xrpl.utils import xrp_to_drops
@@ -5804,6 +5807,88 @@ async def register_nft_dvp_offer(escrow_id: str, req: NftDvpOfferRequest, db: Se
         "nft_token_id": req.nft_token_id,
         "offer_index":  vault.nft_dvp_offer_id,
         "message":      "NFT sell offer verified on-chain. Buyer has been notified to accept it. Payment will release automatically once accepted.",
+    }
+
+
+@app.get("/escrow/{escrow_id}/batch-dvp-payload")
+async def get_batch_dvp_payload(escrow_id: str, db: Session = Depends(get_db)):
+    """
+    XLS-56: Return a pre-built Batch transaction the buyer signs once to atomically
+    accept the NFT and release the escrow payment in a single ledger close.
+    Requires the vault to be in PASS_AWAITING_NFT state with an offer registered.
+
+    The buyer signs the returned `batch_tx_json` with their wallet (e.g. Xaman/XUMM
+    or xrpl-py) and submits it. Both legs succeed or both revert — no gap between NFT
+    transfer and payment release.
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Escrow vault not found.")
+    if not vault.nft_dvp:
+        raise HTTPException(status_code=400, detail="This escrow does not use NFT DvP mode.")
+    if vault.status != "PASS_AWAITING_NFT":
+        raise HTTPException(status_code=400, detail=f"Vault must be in PASS_AWAITING_NFT state (current: {vault.status}).")
+    if not vault.nft_dvp_offer_id:
+        raise HTTPException(status_code=400, detail="No NFT sell offer registered yet. Seller must call POST /escrow/{id}/nft-offer first.")
+    if not vault.buyer_address:
+        raise HTTPException(status_code=400, detail="Buyer address not set on this vault.")
+    if not vault.escrow_sequence or not (vault.escrow_owner or vault.buyer_address):
+        raise HTTPException(status_code=400, detail="Escrow sequence or owner missing — vault may not be fully activated.")
+
+    try:
+        plaintext_fulfillment = decrypt_fulfillment(vault.fulfillment)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not decrypt fulfillment: {e}")
+
+    escrow_owner  = vault.escrow_owner or vault.buyer_address
+    finish_fee    = _calc_finish_fee(plaintext_fulfillment)
+    TF_INNER      = 0x80000000  # TF_INNER_BATCH_TXN flag required on all inner txs
+
+    # Inner tx 1: buyer accepts the NFT sell offer (Amount=0, so free transfer)
+    accept_inner = NFTokenAcceptOffer(
+        account        = vault.buyer_address,
+        nftoken_sell_offer = vault.nft_dvp_offer_id,
+        fee            = "0",   # inner txs pay no fee; outer Batch pays all
+        flags          = TF_INNER,
+        sequence       = 0,    # autofilled by outer Batch
+    )
+
+    # Inner tx 2: EscrowFinish releases payment to the seller
+    finish_inner = EscrowFinish(
+        account        = referee_wallet.address if referee_wallet else escrow_owner,
+        owner          = escrow_owner,
+        offer_sequence = vault.escrow_sequence,
+        fulfillment    = plaintext_fulfillment.upper(),
+        condition      = vault.condition.upper() if vault.condition else "",
+        fee            = "0",   # outer pays
+        flags          = TF_INNER,
+        sequence       = 0,
+    )
+
+    # Outer Batch — TF_ALL_OR_NOTHING: both succeed or both revert
+    batch_tx = Batch(
+        account          = vault.buyer_address,
+        raw_transactions = [accept_inner, finish_inner],
+        flags            = BatchFlag.TF_ALL_OR_NOTHING,
+        fee              = finish_fee,  # buyer pays the combined fee
+    )
+
+    # Return unsigned tx JSON for the buyer to sign and submit
+    batch_dict = batch_tx.to_dict()
+    return {
+        "xls56":          True,
+        "atomic":         True,
+        "batch_tx_json":  batch_dict,
+        "instructions": (
+            "Sign `batch_tx_json` with your buyer wallet and submit to XRPL. "
+            "Both the NFT transfer and escrow payment release will happen atomically "
+            "in a single ledger close (XLS-56 Batch). "
+            "If either inner transaction fails, both revert."
+        ),
+        "inner_transactions": [
+            {"type": "NFTokenAcceptOffer", "offer_id": vault.nft_dvp_offer_id, "note": "Accepts the NFT sell offer"},
+            {"type": "EscrowFinish",       "sequence": vault.escrow_sequence,  "note": "Releases XRP payment to seller"},
+        ],
     }
 
 

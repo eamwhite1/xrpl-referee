@@ -2858,6 +2858,33 @@ async def recommend_release_conditions(job_type: str) -> dict:
     }
 
 
+@mcp.tool()
+async def get_batch_dvp_payload(
+    escrow_id: Annotated[str, Field(description="The escrow vault ID for an NFT DvP job in PASS_AWAITING_NFT state.")],
+) -> dict:
+    """
+    XLS-56 Atomic NFT DvP (available from 9 October 2026 on XRPL mainnet).
+
+    Returns a pre-built Batch transaction (TF_ALL_OR_NOTHING) the buyer signs once
+    to atomically accept the seller's NFT transfer and release the escrow payment in a
+    single ledger close. Both legs succeed or both revert — no settlement gap.
+
+    Prerequisites:
+    - Vault must be in PASS_AWAITING_NFT state (work evaluated and PASSed)
+    - Seller must have registered their NFTokenCreateOffer via POST /escrow/{id}/nft-offer
+
+    Buyer workflow:
+    1. Call this tool to get `batch_tx_json`
+    2. Autofill sequences/fees with your XRPL client
+    3. Sign the Batch tx with your buyer wallet
+    4. Submit to XRPL — NFT arrives and payment releases atomically
+
+    Falls back to the legacy two-step flow if XLS-56 is not yet active.
+    """
+    res = await _http_get(f"{REFEREE_BASE}/escrow/{escrow_id}/batch-dvp-payload")
+    return res
+
+
 @mcp.prompt()
 def post_bounty(
     task: Annotated[str, Field(description="Description of the work you need done.")] = "",

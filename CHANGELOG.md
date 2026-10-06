@@ -6,6 +6,24 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.9.0 — 2026-10-06
+
+### Added
+- **XLS-56 Atomic NFT DvP (`GET /escrow/{id}/batch-dvp-payload`)**: returns a pre-built `Batch` transaction (XLS-56 `TF_ALL_OR_NOTHING`) the buyer signs once to atomically accept the seller's NFT transfer and release escrow payment in a single ledger close. Requires vault to be in `PASS_AWAITING_NFT` state with an NFT sell offer registered. Both inner transactions (`NFTokenAcceptOffer` + `EscrowFinish`) succeed or both revert — eliminates the settlement gap in the legacy two-step DvP flow. Activates on XRPL mainnet 9 October 2026.
+- **`get_batch_dvp_payload()` MCP tool**: exposes the XLS-56 Batch DvP endpoint as a first-class tool with buyer workflow instructions.
+- **xrpl-py imports**: `NFTokenAcceptOffer`, `Batch`, `BatchSigner`, `BatchFlag`, `autofill` added to support XLS-56 Batch construction.
+
+### Changed
+- Legacy two-step NFT DvP flow (`/escrow/{id}/nft-offer` + auto-finish) remains fully operational for wallets not yet on XLS-56.
+
+---
+
+All notable changes to the AgentTrust MCP server and REST API.
+
+Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2.0.0.
+
+---
+
 ## v2.8.0 — 2026-09-26
 
 ### Fixed
