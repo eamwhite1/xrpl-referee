@@ -6,6 +6,20 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v2.9.1 — 2026-10-07
+
+### Fixed
+- **Batch DvP invalid signer (temBAD_SIGNER)**: inner `EscrowFinish` was using `referee_wallet.address` as `Account`, requiring a `BatchSigner` entry that was absent. Fixed by setting both inner tx `Account` fields to `vault.buyer_address` — anyone may submit `EscrowFinish` on a conditional escrow if they hold the fulfillment, so the Batch is single-account and needs no `BatchSigners`. `signing_pub_key=""` and `fee="0"` set explicitly on both inner txs per XLS-56 spec.
+- **confirm_wallet_ownership (2a)**: now rejects transactions carrying a `Delegate` field (XLS-75 delegated txs could spoof ownership); requires `validated=true` and `meta.TransactionResult == tesSUCCESS`.
+- **Enterprise linked-wallet verify (2b)**: now requires `tx.Account == wallet.xrpl_address`, no `Delegate` field, `validated=true`, and `tesSUCCESS` before accepting a challenge memo. Previously, any incoming tx with the challenge memo (including from a third party sending 1 drop) would pass.
+- **confirm_escrow_tx (2c)**: now requires `validated=true`, `tesSUCCESS`, and `tx.Account == vault.buyer_address`. Prevents mismatched `Owner` in auto-finish when a delegated account creates the escrow.
+- **fulfillment_note added to Batch payload response**: documents that the embedded fulfillment is safe to share — `EscrowFinish` can only release funds to the pre-set `Destination`.
+
+### Changed
+- `xrpl-py` pinned to `>=5.1.0` (first version with `Batch`, `DelegateSet`, `Transaction.delegate`).
+
+---
+
 ## v2.9.0 — 2026-10-06
 
 ### Added

@@ -4882,10 +4882,19 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
         tx_res  = await client.request(Tx(transaction=tx_hash))
         if not tx_res.is_successful():
             raise HTTPException(status_code=400, detail=f"Transaction {tx_hash} not found on the XRPL ledger.")
+        if not tx_res.result.get("validated"):
+            raise HTTPException(status_code=400, detail="Transaction is not yet validated. Wait for ledger confirmation and retry.")
+        meta = tx_res.result.get("meta") or {}
+        engine_result = meta.get("TransactionResult", "") if isinstance(meta, dict) else ""
+        if engine_result != "tesSUCCESS":
+            raise HTTPException(status_code=400, detail=f"Transaction did not succeed on-chain (result: {engine_result}).")
         tx_data   = tx_res.result.get("tx_json") or tx_res.result.get("tx") or tx_res.result
         tx_type   = tx_data.get("TransactionType", "")
         if tx_type != "EscrowCreate":
             raise HTTPException(status_code=400, detail=f"Transaction is a {tx_type}, not an EscrowCreate.")
+        tx_account = tx_data.get("Account", "")
+        if vault.buyer_address and tx_account and tx_account != vault.buyer_address:
+            raise HTTPException(status_code=400, detail=f"Transaction Account ({tx_account}) does not match the vault buyer address ({vault.buyer_address}). With XLS-75 delegation, auto-finish targets Owner = buyer_address; mismatches cause silent failures.")
         on_chain_condition = tx_data.get("Condition", "")
         if on_chain_condition and vault.condition and on_chain_condition.upper() != vault.condition.upper():
             raise HTTPException(status_code=400, detail="Transaction condition does not match this vault.")
@@ -4893,7 +4902,7 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
         if destination and vault.worker_address and destination != vault.worker_address:
             raise HTTPException(status_code=400, detail="Transaction destination does not match the worker address.")
         sequence = tx_data.get("Sequence")
-        logger.info(f"✅ EscrowCreate confirmed: hash={tx_hash[:16]}... seq={sequence}")
+        logger.info(f"✅ EscrowCreate confirmed: hash={tx_hash[:16]}... seq={sequence} account={tx_account}")
     except HTTPException:
         raise
     except Exception as e:
@@ -5844,23 +5853,27 @@ async def get_batch_dvp_payload(escrow_id: str, db: Session = Depends(get_db)):
     finish_fee    = _calc_finish_fee(plaintext_fulfillment)
     TF_INNER      = 0x80000000  # TF_INNER_BATCH_TXN flag required on all inner txs
 
-    # Inner tx 1: buyer accepts the NFT sell offer (Amount=0, so free transfer)
+    # Both inner txs use buyer_address as Account — EscrowFinish on a conditional
+    # escrow can be submitted by any account that holds the fulfillment, so this
+    # makes the Batch single-account (no BatchSigners needed, avoiding temBAD_SIGNER).
+    # Owner/OfferSequence still point at the original escrow creator.
     accept_inner = NFTokenAcceptOffer(
-        account        = vault.buyer_address,
+        account            = vault.buyer_address,
         nftoken_sell_offer = vault.nft_dvp_offer_id,
-        fee            = "0",   # inner txs pay no fee; outer Batch pays all
-        flags          = TF_INNER,
-        sequence       = 0,    # autofilled by outer Batch
+        fee                = "0",   # inner txs carry Fee=0; outer Batch pays all fees
+        signing_pub_key    = "",
+        flags              = TF_INNER,
+        sequence           = 0,
     )
 
-    # Inner tx 2: EscrowFinish releases payment to the seller
     finish_inner = EscrowFinish(
-        account        = referee_wallet.address if referee_wallet else escrow_owner,
+        account        = vault.buyer_address,  # single-account Batch; anyone may finish a conditional escrow
         owner          = escrow_owner,
         offer_sequence = vault.escrow_sequence,
         fulfillment    = plaintext_fulfillment.upper(),
         condition      = vault.condition.upper() if vault.condition else "",
-        fee            = "0",   # outer pays
+        fee            = "0",
+        signing_pub_key = "",
         flags          = TF_INNER,
         sequence       = 0,
     )
@@ -5870,24 +5883,32 @@ async def get_batch_dvp_payload(escrow_id: str, db: Session = Depends(get_db)):
         account          = vault.buyer_address,
         raw_transactions = [accept_inner, finish_inner],
         flags            = BatchFlag.TF_ALL_OR_NOTHING,
-        fee              = finish_fee,  # buyer pays the combined fee
+        fee              = finish_fee,
     )
 
-    # Return unsigned tx JSON for the buyer to sign and submit
+    # NOTE: plaintext_fulfillment is included in the Batch payload. This is safe —
+    # EscrowFinish with the fulfillment only ever pays the Destination (seller).
+    # Anyone submitting this tx still cannot redirect funds; they can only trigger
+    # the intended release. Document this in API responses so callers are aware.
     batch_dict = batch_tx.to_dict()
     return {
         "xls56":          True,
         "atomic":         True,
         "batch_tx_json":  batch_dict,
+        "fulfillment_note": (
+            "The fulfillment is embedded in this payload. It is safe to share — "
+            "EscrowFinish can only release funds to the pre-set Destination (seller). "
+            "A third party submitting this tx cannot redirect funds."
+        ),
         "instructions": (
-            "Sign `batch_tx_json` with your buyer wallet and submit to XRPL. "
-            "Both the NFT transfer and escrow payment release will happen atomically "
-            "in a single ledger close (XLS-56 Batch). "
-            "If either inner transaction fails, both revert."
+            "Autofill the outer Batch sequence and fee with your XRPL client, "
+            "then sign with your buyer wallet and submit. "
+            "Both inner transactions (NFT accept + escrow release) land atomically "
+            "in a single ledger close. If either fails, both revert."
         ),
         "inner_transactions": [
             {"type": "NFTokenAcceptOffer", "offer_id": vault.nft_dvp_offer_id, "note": "Accepts the NFT sell offer"},
-            {"type": "EscrowFinish",       "sequence": vault.escrow_sequence,  "note": "Releases XRP payment to seller"},
+            {"type": "EscrowFinish",       "sequence": vault.escrow_sequence,  "note": "Releases XRP payment to seller — Account=buyer for single-account Batch"},
         ],
     }
 
@@ -7591,6 +7612,20 @@ async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session 
     if tx_data.get("status") == "error" or not tx_data:
         raise HTTPException(400, "Transaction not found on the XRPL ledger. Make sure the tx has been confirmed.")
 
+    # Require validated + tesSUCCESS
+    if not tx_data.get("validated"):
+        raise HTTPException(400, "Transaction is not yet validated. Wait for ledger confirmation and retry.")
+    meta = tx_data.get("meta") or tx_data.get("tx_json", {}).get("meta") or {}
+    engine_result = meta.get("TransactionResult", "") if isinstance(meta, dict) else ""
+    if engine_result != "tesSUCCESS":
+        raise HTTPException(400, f"Transaction did not succeed on-chain (result: {engine_result}).")
+
+    # Reject delegated transactions — XLS-75: a delegate holding AccountSet permission
+    # could send this tx on behalf of the wallet owner; "only the key-holder can sign" must hold.
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    if tx_json.get("Delegate"):
+        raise HTTPException(400, "Delegated transactions cannot be used for ownership proof. The wallet owner must sign directly.")
+
     # Verify it was submitted by the claimed wallet
     account = (
         tx_data.get("Account")
@@ -8172,7 +8207,19 @@ async def enterprise_verify_wallet(
         })
     txns = resp.json().get("result", {}).get("transactions", [])
     for entry in txns:
-        memos = entry.get("tx", {}).get("Memos", [])
+        tx  = entry.get("tx_json") or entry.get("tx") or {}
+        # Require the tx was sent by the wallet itself (not incoming, not delegated)
+        if tx.get("Account") != wallet.xrpl_address:
+            continue
+        if tx.get("Delegate"):
+            continue
+        # Require validated + tesSUCCESS
+        if not entry.get("validated"):
+            continue
+        meta = entry.get("meta") or {}
+        if isinstance(meta, dict) and meta.get("TransactionResult") != "tesSUCCESS":
+            continue
+        memos = tx.get("Memos", [])
         for m in memos:
             memo_data = m.get("Memo", {}).get("MemoData", "")
             try:
