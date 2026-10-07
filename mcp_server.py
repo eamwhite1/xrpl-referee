@@ -2869,8 +2869,18 @@ async def get_batch_dvp_payload(
     to atomically accept the seller's NFT transfer and release the escrow payment in a
     single ledger close. Both legs succeed or both revert — no settlement gap.
 
+    Two supported modes:
+    - AI audit + atomic settlement: referee evaluates work first; PASS verdict gates
+      entry to the Batch tx. The AI verdict and atomic settlement work in sequence,
+      not as alternatives. Use when the deliverable needs independent verification.
+    - Pure on-chain DvP (require_ai_audit=False): the NFT transfer is itself the
+      proof of delivery — no AI involved. XLS-56 handles the entire settlement
+      on-chain. Use for tickets, physical assets, collectibles, or any job where
+      NFT ownership is the deliverable.
+
     Prerequisites:
-    - Vault must be in PASS_AWAITING_NFT state (work evaluated and PASSed)
+    - Vault must be in PASS_AWAITING_NFT state (AI PASSed, or ai_audit=False and
+      proof gates satisfied)
     - Seller must have registered their NFTokenCreateOffer via POST /escrow/{id}/nft-offer
 
     Buyer workflow:
@@ -2878,8 +2888,6 @@ async def get_batch_dvp_payload(
     2. Autofill sequences/fees with your XRPL client
     3. Sign the Batch tx with your buyer wallet
     4. Submit to XRPL — NFT arrives and payment releases atomically
-
-    Falls back to the legacy two-step flow if XLS-56 is not yet active.
     """
     res = await _http_get(f"{REFEREE_BASE}/escrow/{escrow_id}/batch-dvp-payload")
     return res
