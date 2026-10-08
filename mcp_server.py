@@ -2002,6 +2002,10 @@ async def hire_and_pay(
         title="Metadata (JSON string)",
         description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.). Example: '{\"invoice_id\": \"INV-2026-0042\"}'.",
     )] = None,
+    delegate_address: Annotated[Optional[str], Field(
+        title="Delegate Agent Address (XLS-75)",
+        description="XLS-75 delegated agent XRPL address. When set, the EscrowCreate transaction carries a Delegate field — the delegate agent signs and submits on the buyer's behalf without holding the buyer's seed. The buyer must first submit a DelegateSet granting EscrowCreate permission to this address.",
+    )] = None,
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -2076,16 +2080,16 @@ async def hire_and_pay(
         vault_data = vault_res.json()
 
         # Step 2: prepare the ready-to-sign transaction
-        prep_res = await client.post(
-            f"{REFEREE_BASE}/escrow/prepare",
-            json={
-                "escrow_id":      escrow_id,
-                "buyer_address":  buyer_address,
-                "worker_address": worker_address,
-                "amount_xrp":     amount_xrp,
-                "currency":       "XRP",
-            },
-        )
+        prep_body: dict = {
+            "escrow_id":      escrow_id,
+            "buyer_address":  buyer_address,
+            "worker_address": worker_address,
+            "amount_xrp":     amount_xrp,
+            "currency":       "XRP",
+        }
+        if delegate_address:
+            prep_body["delegate_address"] = delegate_address
+        prep_res = await client.post(f"{REFEREE_BASE}/escrow/prepare", json=prep_body)
         if prep_res.status_code != 200:
             return {
                 "error":      "prepare_failed",
@@ -2096,16 +2100,23 @@ async def hire_and_pay(
 
         prep_data = prep_res.json()
 
+    delegate_note = (
+        f" IMPORTANT: This transaction carries a Delegate field — the delegated agent "
+        f"({delegate_address}) must sign and submit it, NOT the buyer."
+        if delegate_address else ""
+    )
     return {
         "escrow_id":          escrow_id,
         "condition":          vault_data.get("condition"),
         "cancel_after_human": vault_data.get("cancel_after_human"),
         "transaction":        prep_data.get("transaction"),
+        "delegate_mode":      bool(delegate_address),
         "next_step": (
             "Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
             f"then call submit_escrow_transaction('{escrow_id}', signed.tx_blob) — "
             "that submits to XRPL and activates the vault in one step. "
             "The worker submits their work via evaluate_escrow_work() and gets paid automatically on PASS."
+            + delegate_note
         ),
         "free_tier": vault_data.get("free_tier"),
         "audits_remaining": vault_data.get("audits_remaining"),
@@ -2283,6 +2294,48 @@ async def get_wallet_setup_guide() -> dict:
             "Wallet address verified on XRPL mainnet before accepting work",
             "Only public address shared with AgentTrust and counterparties",
         ],
+        "optional_xls75_delegation": {
+            "description": (
+                "XLS-75 Permission Delegation (live mainnet 8 Oct 2026): "
+                "Let a hot agent key sign escrows on behalf of a cold buyer wallet — "
+                "the buyer's seed never touches the agent environment."
+            ),
+            "delegatable_tx_types": [
+                "EscrowCreate", "EscrowFinish", "EscrowCancel",
+                "Payment", "NFTokenCreateOffer", "NFTokenAcceptOffer",
+            ],
+            "not_delegatable": [
+                "Batch (outer)", "SetRegularKey", "SignerListSet",
+                "DelegateSet", "AccountDelete", "AccountSet",
+            ],
+            "setup_code": (
+                "# Buyer submits this once — no spend cap, max 10 permissions per DelegateSet\n"
+                "from xrpl.models.transactions import DelegateSet\n"
+                "from xrpl.models.transactions.delegate_set import Delegate as DelegateEntry\n"
+                "tx = DelegateSet(\n"
+                "    account=buyer_wallet.address,\n"
+                "    authorize=agent_wallet.address,\n"
+                "    permissions=[{'Permission': {'PermissionValue': 'EscrowCreate'}}],\n"
+                ")\n"
+            ),
+            "revoke_code": (
+                "# Revoke: submit DelegateSet with empty permissions list\n"
+                "tx = DelegateSet(\n"
+                "    account=buyer_wallet.address,\n"
+                "    authorize=agent_wallet.address,\n"
+                "    permissions=[],\n"
+                ")\n"
+            ),
+            "how_to_use_with_agenttrust": (
+                "Pass delegate_address=agent_wallet.address to hire_and_pay() or POST /escrow/prepare. "
+                "The returned EscrowCreate tx carries a Delegate field — the agent signs and submits it. "
+                "Account stays as buyer_address so escrow ownership and cancellation rights remain with the buyer."
+            ),
+            "warning": (
+                "XLS-75 has no spend caps. Only delegate to addresses you control. "
+                "Revoke immediately if the agent key is compromised."
+            ),
+        },
     }
 
 

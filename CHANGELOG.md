@@ -6,6 +6,19 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v3.0.0 — 2026-10-08
+
+### Added
+- **XLS-75 Permission Delegation (`delegate_address` on `POST /escrow/prepare` and `hire_and_pay`)**: buyers can let a hot agent key sign and submit EscrowCreate on their behalf without sharing their seed. Pass `delegate_address` to get a tx with a `Delegate` field — the agent signs it, `Account` stays as the buyer so ownership and cancellation rights remain with the buyer. The endpoint validates that a live XLS-75 delegate ledger object exists for (buyer → delegate) before building the tx.
+- **`delegate_address` MCP parameter on `hire_and_pay()`**: first-class XLS-75 support with full docstring, `delegate_mode` flag in response, and clear "agent signs, not buyer" note.
+- **DelegateSet guide in `get_wallet_setup_guide()`**: `optional_xls75_delegation` section covers setup code, revoke code, delegatable/non-delegatable tx types, spend-cap warning, and how to use with AgentTrust.
+- **`telCAN_NOT_QUEUE` → HTTP 503**: clear "network busy, retry" message instead of opaque 400 in `POST /escrow/{id}/submit`.
+
+### Changed
+- `AccountObjects` added to xrpl-py imports for delegate ledger object validation.
+
+---
+
 ## v2.9.1 — 2026-10-07
 
 ### Fixed

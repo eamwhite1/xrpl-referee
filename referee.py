@@ -34,7 +34,7 @@ except ImportError:
 from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
-from xrpl.models.requests import Tx, SubmitOnly, AccountInfo, Fee
+from xrpl.models.requests import Tx, SubmitOnly, AccountInfo, AccountObjects, Fee
 from xrpl.models.transactions import EscrowFinish, EscrowCancel, NFTokenAcceptOffer
 from xrpl.models.transactions.batch import Batch, BatchSigner, BatchFlag
 from xrpl.models.transactions.transaction import Transaction as XrplTransaction
@@ -4926,6 +4926,7 @@ class PrepareEscrowRequest(BaseModel):
     amount_rlusd:     Optional[float] = None
     currency:         str = "XRP"
     cancel_after_hrs: int = 168
+    delegate_address: Optional[str] = None  # XLS-75: agent submits on buyer's behalf
 
 
 @app.post("/escrow/prepare")
@@ -4965,6 +4966,27 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
         ledger_res = await client.request(Fee())
         base_fee   = int(ledger_res.result.get("drops", {}).get("base_fee", 12))
         current_ledger = ledger_res.result.get("ledger_current_index", 0)
+
+        # XLS-75: validate delegate ledger object exists for (buyer → delegate)
+        if req.delegate_address:
+            objs_res = await client.request(AccountObjects(
+                account=req.buyer_address,
+                type="delegate",
+                ledger_index="validated",
+            ))
+            delegate_objects = objs_res.result.get("account_objects", [])
+            valid_delegate = any(
+                obj.get("Authorize") == req.delegate_address
+                for obj in delegate_objects
+            )
+            if not valid_delegate:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"No active XLS-75 delegation found from {req.buyer_address} to {req.delegate_address}. "
+                        "The buyer must submit a DelegateSet transaction granting EscrowCreate permission first."
+                    ),
+                )
     except HTTPException:
         raise
     except Exception as e:
@@ -5004,15 +5026,25 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
     }
     if cancel_after_ripple:
         tx["CancelAfter"] = cancel_after_ripple
+    if req.delegate_address:
+        # XLS-75: delegate agent signs and submits on behalf of buyer
+        tx["Delegate"] = req.delegate_address
 
+    delegation_note = (
+        f" The delegated agent ({req.delegate_address}) must sign and submit this transaction — "
+        "Account remains the buyer's address."
+        if req.delegate_address else ""
+    )
     return {
-        "escrow_id":   req.escrow_id,
-        "transaction": tx,
+        "escrow_id":      req.escrow_id,
+        "transaction":    tx,
         "instructions": (
             "Sign this transaction with your buyer wallet and submit the signed blob to the XRPL. "
             "Then call POST /escrow/{escrow_id}/confirm with the resulting tx hash."
+            + delegation_note
         ),
-        "condition": vault.condition,
+        "condition":      vault.condition,
+        "delegate_mode":  bool(req.delegate_address),
     }
 
 
@@ -5044,6 +5076,11 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
         engine  = res.get("engine_result", "")
         tx_hash = res.get("tx_json", {}).get("hash") or res.get("hash", "")
 
+        if engine == "telCAN_NOT_QUEUE":
+            raise HTTPException(
+                status_code=503,
+                detail="XRPL network busy — transaction queue full. Wait a few seconds and retry.",
+            )
         if engine not in ("tesSUCCESS", "terQUEUED") and not engine.startswith("tes"):
             raise HTTPException(
                 status_code=400,
