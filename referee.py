@@ -278,7 +278,7 @@ def serve_agent_json():
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
         "provider": {"organization": "Boxclever Media Ltd (trading as AgentTrust)", "url": "https://www.cryptovault.co.uk"},
-        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True},
+        "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True, "delegation": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
             "description": (
@@ -291,7 +291,7 @@ def serve_agent_json():
         "payment": {"currency": "XRP", "amount": "0.1", "destination": "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR", "network": "XRPL Mainnet"},
         "skills": [
             {"id": "standalone-audit",  "name": "AI Verdict",                   "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit",            "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow"]},
-            {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. Pass `invoice_requirements` (po_number, supplier_name, services_description, require_date, require_line_items) to require the seller to submit a matching invoice alongside their proof of work — the AI referee verifies every field before releasing payment. Verified invoices are forwarded to the buyer's accounts team via the `accounts_email` field.",              "endpoint": "/escrow/generate",  "method": "POST"},
+            {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. Pass `invoice_requirements` (po_number, supplier_name, services_description, require_date, require_line_items) to require the seller to submit a matching invoice alongside their proof of work — the AI referee verifies every field before releasing payment. Verified invoices are forwarded to the buyer's accounts team via the `accounts_email` field. Pass `delegate_address` to POST /escrow/prepare to get an XLS-75 delegated EscrowCreate tx — the agent signs on the buyer's behalf without holding their seed.",              "endpoint": "/escrow/generate",  "method": "POST"},
             {"id": "escrow-evaluate",   "name": "Submit Work for Escrow Audit",  "description": "Seller submits proof. On PASS the referee auto-releases funds to seller.",        "endpoint": "/evaluate",         "method": "POST"},
         ],
         "defaultInputModes": ["application/json"],
@@ -8268,6 +8268,39 @@ async def enterprise_verify_wallet(
             except Exception:
                 continue
     return {"verified": False, "message": "Challenge not found yet. Submit the AccountSet tx and try again."}
+
+
+@app.get("/enterprise/wallets/{wallet_id}/delegations")
+async def enterprise_wallet_delegations(
+    wallet_id: int,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Return active XLS-75 delegation grants from this wallet to agent addresses."""
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    try:
+        client  = AsyncJsonRpcClient(XRPL_URL)
+        res     = await client.request(AccountObjects(
+            account=wallet.xrpl_address,
+            type="delegate",
+            ledger_index="validated",
+        ))
+        objects = res.result.get("account_objects", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"XRPL lookup failed: {e}")
+
+    delegations = [
+        {
+            "delegate":    obj.get("Authorize"),
+            "permissions": [p.get("Permission", {}).get("PermissionValue") for p in obj.get("Permissions", [])],
+        }
+        for obj in objects
+        if obj.get("LedgerEntryType") == "Delegate"
+    ]
+    return {"wallet": wallet.xrpl_address, "delegations": delegations}
 
 
 # --- Dashboard data ---
