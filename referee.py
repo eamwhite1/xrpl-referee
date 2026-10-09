@@ -273,7 +273,7 @@ def serve_agent_json():
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
-        "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT, domain, W3C VC, NFT DvP), marketplace job board, wallet trust scoring, and x402 payment protocol.",
+        "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT, domain, W3C VC, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and x402 payment protocol.",
         "url": "https://mcp.cryptovault.co.uk",
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
@@ -292,7 +292,8 @@ def serve_agent_json():
         "skills": [
             {"id": "standalone-audit",  "name": "AI Verdict",                   "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit",            "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow"]},
             {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. Pass `invoice_requirements` (po_number, supplier_name, services_description, require_date, require_line_items) to require the seller to submit a matching invoice alongside their proof of work — the AI referee verifies every field before releasing payment. Verified invoices are forwarded to the buyer's accounts team via the `accounts_email` field. Pass `delegate_address` to POST /escrow/prepare to get an XLS-75 delegated EscrowCreate tx — the agent signs on the buyer's behalf without holding their seed.",              "endpoint": "/escrow/generate",  "method": "POST"},
-            {"id": "escrow-evaluate",   "name": "Submit Work for Escrow Audit",  "description": "Seller submits proof. On PASS the referee auto-releases funds to seller.",        "endpoint": "/evaluate",         "method": "POST"},
+            {"id": "escrow-evaluate",   "name": "Submit Work for Escrow Audit",  "description": "Seller submits proof. On PASS the referee auto-releases funds to seller. For NFT DvP vaults (nft_dvp=True), PASS sets status to PASS_AWAITING_NFT — seller registers NFTokenCreateOffer, buyer calls /escrow/{id}/batch-dvp-payload for XLS-56 atomic settlement.", "endpoint": "/evaluate", "method": "POST"},
+            {"id": "batch-dvp",         "name": "XLS-56 Atomic NFT DvP",         "description": "Returns a pre-built Batch (TF_ALL_OR_NOTHING) tx for single-ledger atomic NFT transfer + escrow release. Live on XRPL mainnet.", "endpoint": "/escrow/{id}/batch-dvp-payload", "method": "GET"},
         ],
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json"],
@@ -311,8 +312,10 @@ def serve_mcp_server_card():
             "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents. "
             "Supports four trust layers: NFT from trusted issuer, XRPL domain verification, "
             "W3C Verifiable Credential, and XRPL wallet trust score — buyers can require any combination. "
-            "NFT Delivery-vs-Payment (DvP) mode: payment holds until the seller transfers an NFT to the buyer "
-            "on-chain, then releases automatically — no sequential transaction risk. "
+            "NFT Delivery-vs-Payment (DvP) mode: XLS-56 Batch Transactions (live on XRPL mainnet) — "
+            "NFT transfer and payment release atomically in a single ledger close via get_batch_dvp_payload(). "
+            "XLS-75 delegation: buyers can grant a hot agent key permission to sign EscrowCreate "
+            "on their behalf via hire_and_pay(delegate_address=...) without sharing their seed. "
             "Implements the x402 payment protocol: call any paid endpoint without payment to receive "
             "a 402 with an X-Payment-Required header describing exactly how to pay in XRP."
         ),
@@ -345,6 +348,7 @@ def serve_mcp_server_card():
             {"name": "verify_vc",                 "description": "POST /vc/verify — verify a W3C Verifiable Credential JWT. Checks expiry, issuer DID, credential type, and optionally resolves the DID via the Universal Resolver. Accepts credentials from any W3C-compliant issuer."},
             {"name": "register_nft_dvp_offer",    "description": "POST /escrow/{id}/nft-offer — after a PASS verdict on an NFT DvP escrow, seller registers their on-chain NFTokenCreateOffer (Destination=buyer, Amount=0). System verifies the offer on XRPL and emails buyer to accept. Payment releases automatically once buyer accepts."},
             {"name": "check_nft_dvp_status",      "description": "GET /escrow/{id}/nft-status — poll whether the buyer has accepted the NFT offer yet. Returns accepted/pending/expired. Triggers automatic escrow release when accepted."},
+            {"name": "get_batch_dvp_payload",     "description": "GET /escrow/{id}/batch-dvp-payload — XLS-56 Atomic NFT DvP (live on XRPL mainnet). Returns a pre-built TF_ALL_OR_NOTHING Batch transaction the buyer signs once to atomically accept the seller's NFT and release escrow payment in a single ledger close. Vault must be in PASS_AWAITING_NFT state with the seller's NFTokenCreateOffer registered."},
             {"name": "company_xrpl_lookup",       "description": "GET /gleif/xrpl-lookup?q= — search the AgentTrust registry for a company by name and return their verified XRPL wallet address."},
             {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain."},
             {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification via domain records."},

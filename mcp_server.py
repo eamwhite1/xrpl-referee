@@ -467,6 +467,13 @@ async def evaluate_escrow_work(
     with the worker so they know exactly what to fix before resubmitting.
     Resubmit by calling evaluate_escrow_work again with the same escrow_id.
 
+    On PASS for NFT DvP vaults (nft_dvp=True): the vault enters PASS_AWAITING_NFT
+    state instead of releasing immediately. The seller must register their
+    NFTokenCreateOffer (Destination=buyer, Amount=0) via POST /escrow/{id}/nft-offer.
+    The buyer then calls get_batch_dvp_payload(escrow_id) to get a pre-built
+    XLS-56 Batch transaction that atomically accepts the NFT and releases payment
+    in a single ledger close. Both legs succeed or both revert.
+
     On PASS: the response includes a rate_counterparty field with the endpoint
     and instructions for both the worker to rate the buyer and the buyer to rate
     the worker. Call rate_wallet() with the details provided — peer ratings
@@ -2916,7 +2923,7 @@ async def get_batch_dvp_payload(
     escrow_id: Annotated[str, Field(description="The escrow vault ID for an NFT DvP job in PASS_AWAITING_NFT state.")],
 ) -> dict:
     """
-    XLS-56 Atomic NFT DvP (live on XRPL mainnet from 9 October 2026).
+    XLS-56 Atomic NFT DvP — live on XRPL mainnet.
 
     Returns a pre-built Batch transaction (TF_ALL_OR_NOTHING) the buyer signs once
     to atomically accept the seller's NFT transfer and release the escrow payment in a

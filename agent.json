@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "name": "AgentTrust Referee",
-  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
+  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
   "url": "https://mcp.cryptovault.co.uk",
   "agentVersion": "9.0.0",
   "protocolVersion": "0.6.0",
@@ -24,7 +24,9 @@
     "walletTrustScore": true,
     "kycVerification": true,
     "sanctions": true,
-    "whiteLabel": true
+    "whiteLabel": true,
+    "atomicBatchDvP": true,
+    "delegation": true
   },
   "authentication": {
     "schemes": ["x402", "x-payment-hash"],
@@ -190,6 +192,14 @@
       "endpoint": "/evaluate/purchase-attempt",
       "method": "POST",
       "tags": ["escrow"]
+    },
+    {
+      "id": "batch-dvp-payload",
+      "name": "XLS-56 Atomic NFT DvP Payload",
+      "description": "Returns a pre-built XLS-56 Batch (TF_ALL_OR_NOTHING) transaction the buyer signs once to atomically accept the seller's NFT and release escrow payment in a single ledger close. Live on XRPL mainnet. Vault must be in PASS_AWAITING_NFT state with the seller's NFTokenCreateOffer registered.",
+      "endpoint": "/escrow/{id}/batch-dvp-payload",
+      "method": "GET",
+      "tags": ["nft", "escrow", "xls56", "atomic"]
     }
   ],
   "defaultInputModes": ["application/json"],
