@@ -6,6 +6,13 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v3.0.1 — 2026-10-09
+
+### Changed
+- **XLS-56 live on XRPL mainnet**: `get_batch_dvp_payload()` docstring updated from "available from 9 October 2026" to "live on XRPL mainnet from 9 October 2026". The endpoint was already fully implemented in v2.9.0 — no code changes required.
+
+---
+
 ## v3.0.0 — 2026-10-08
 
 ### Added

@@ -2916,7 +2916,7 @@ async def get_batch_dvp_payload(
     escrow_id: Annotated[str, Field(description="The escrow vault ID for an NFT DvP job in PASS_AWAITING_NFT state.")],
 ) -> dict:
     """
-    XLS-56 Atomic NFT DvP (available from 9 October 2026 on XRPL mainnet).
+    XLS-56 Atomic NFT DvP (live on XRPL mainnet from 9 October 2026).
 
     Returns a pre-built Batch transaction (TF_ALL_OR_NOTHING) the buyer signs once
     to atomically accept the seller's NFT transfer and release the escrow payment in a
