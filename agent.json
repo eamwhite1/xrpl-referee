@@ -68,7 +68,7 @@
     {
       "id": "escrow-create",
       "name": "Create Escrow Vault",
-      "description": "Lock XRP or RLUSD in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), or both. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping.",
+      "description": "Lock XRP or RLUSD in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), or both. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping. Use /escrow/prepare with delegate_address for XLS-75 delegated signing.",
       "endpoint": "/escrow/generate",
       "method": "POST",
       "tags": ["escrow", "payment", "xrpl"]
@@ -84,7 +84,7 @@
     {
       "id": "hire-and-pay",
       "name": "Hire and Pay",
-      "description": "One-call shortcut: register escrow vault AND return a ready-to-sign XRPL EscrowCreate transaction. All proof gate params and white-label params supported.",
+      "description": "One-call shortcut: register escrow vault AND return a ready-to-sign XRPL EscrowCreate transaction. All proof gate params and white-label params supported. Pass delegate_address for XLS-75 delegation — the agent signs on the buyer's behalf without holding their seed.",
       "endpoint": "/escrow/prepare",
       "method": "POST",
       "tags": ["escrow", "payment", "xrpl"]
