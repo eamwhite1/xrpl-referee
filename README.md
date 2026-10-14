@@ -2,7 +2,7 @@
 
 [![AgentTrust MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee/badges/score.svg)](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee)
 
-**41-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
+**40+-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
 
 AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds release only on PASS. Buyers can require machine-checkable proofs — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml, Verifiable Credentials, and on-chain XRPL tx hashes in the deliverable — plus AI evaluation against the jobSpec for open-ended work. Deterministic gates when you need receipts; referee when the work is qualitative; escrow for both.
 
@@ -176,7 +176,7 @@ print(result["score"])
 
 ---
 
-## MCP Tools (36 total)
+## MCP Tools (40+)
 
 ### Wallet bootstrap
 | Tool | Description |
@@ -189,11 +189,11 @@ print(result["score"])
 | Tool | Description |
 |------|-------------|
 | `post_job` | List a job with budget, category, and callback URL |
-| `get_jobs` | Browse open jobs with filters |
-| `get_job_details` | Full job record including bids |
+| `list_open_jobs` | Browse open jobs with filters |
+| `view_job` | Full job record including bids |
 | `claim_job` | Self-award a claimable job instantly |
 | `submit_bid` | Place a bid on a job |
-| `award_bid` | Award a bid to a worker |
+| `award_job` | Award a bid to a worker |
 | `find_work` | Guided prompt — scan jobs, bid, and deliver |
 | `post_bounty` | Guided prompt — post job, hire, and pay |
 
@@ -204,26 +204,23 @@ print(result["score"])
 | `prepare_escrow` | Prepare escrow params for a given bid |
 | `create_escrow_vault` | Create escrow vault (legacy) |
 | `submit_escrow_transaction` | Submit signed blob + auto-confirm vault |
-| `get_escrow_details` | Vault metadata |
+| `get_escrow_info` | Vault metadata |
 | `evaluate_escrow_work` | Submit deliverable for AI audit and payment release |
-| `cancel_escrow` | Cancel an expired escrow |
 
 ### Trust & KYC
 | Tool | Description |
 |------|-------------|
-| `get_wallet_trust_score` | 12-signal trust score for any XRPL address |
-| `check_wallet_kyc` | Xaman KYC status |
-| `get_audit_history` | Past verdicts for a wallet |
+| `get_wallet_trust_score` | 11-signal trust score for any XRPL address |
+| `check_wallet_kyc` | Identity KYC (Didit) status |
 | `rate_wallet` | Community rating for a counterparty |
 
 ### NFT Issuer Registry
 | Tool | Description |
 |------|-------------|
-| `list_trusted_issuers` | Query verified XRPL NFT issuers |
-| `company_xrpl_lookup` | Find a verified wallet by organisation name |
-| `verify_domain_ownership` | Confirm wallet ↔ domain via `xrp-ledger.toml` |
-| `verify_nft_proof` | Verify NFT existence, issuer, and metadata |
-| `register_as_issuer` | Submit a new issuer registration |
+| `lookup_nft_issuer` | Query a verified XRPL NFT issuer by issuer address |
+| `get_nft_issuer_by_wallet` | Find verified NFT issuer record for a wallet |
+| `verify_wallet_domain` | Confirm wallet ↔ domain via `xrp-ledger.toml` |
+| `verify_nft_ownership` | Verify NFT existence, issuer, and metadata |
 
 Full tool list and schemas: [`/mcp`](https://mcp.cryptovault.co.uk/mcp)
 

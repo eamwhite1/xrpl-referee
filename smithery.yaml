@@ -32,7 +32,7 @@ description: >
   tools with no HTTP code required. Call assess_counterparty_and_job() for a single pre-flight
   check before locking any funds, recommend_release_conditions(job_type) for recommended escrow
   parameters, or explain_agenttrust_trust_model() for the full trust model. Wallet trust scoring
-  (12 signals: sanctions screening, Xaman KYC, escrow history, domain verification, and more)
+  (11 signals: sanctions screening, identity KYC (Didit), escrow history, domain verification, and more)
   lets agents assess counterparties before committing funds. New wallets with trust score ≥ 25
   get 3 free audits. KYC-verified wallets unlock higher escrow limits. Includes the open XRPL
   NFT Issuer Registry (spec v1.1.0): look up verified organisation wallet addresses, check NFT
