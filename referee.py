@@ -1464,6 +1464,7 @@ class LinkedWallet(Base):
     label          = Column(String,  nullable=True)
     verified       = Column(Boolean, default=False)
     verify_challenge = Column(String, nullable=True)
+    privy_wallet_id  = Column(String, nullable=True)
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -1718,6 +1719,7 @@ def run_migrations():
         )""",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS template_id          VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluate_token_hash  VARCHAR",
+        "ALTER TABLE linked_wallet ADD COLUMN IF NOT EXISTS privy_wallet_id VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -8269,6 +8271,7 @@ async def enterprise_create_privy_wallet(
         xrpl_address=xrpl_address,
         label="Privy wallet",
         verify_challenge=secrets.token_hex(16),
+        privy_wallet_id=privy_wallet_id,
     )
     db.add(wallet)
     db.commit()
@@ -8279,6 +8282,100 @@ async def enterprise_create_privy_wallet(
         "privy_wallet_id": privy_wallet_id,
         "status": "created",
         "message": "Wallet created via Privy and linked to your account. Fund with at least 1 XRP to activate it on-ledger.",
+    }
+
+
+@app.post("/enterprise/wallets/{wallet_id}/withdraw")
+async def enterprise_withdraw_privy_wallet(
+    wallet_id: int,
+    req: Request,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Sign and submit an XRPL Payment from a Privy-managed wallet."""
+    body = await req.json()
+    destination = body.get("destination", "").strip()
+    amount_xrp = body.get("amount_xrp")
+    if not destination or not amount_xrp:
+        raise HTTPException(status_code=400, detail="destination and amount_xrp are required.")
+    try:
+        amount_xrp = float(amount_xrp)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="amount_xrp must be a number.")
+    if amount_xrp <= 0:
+        raise HTTPException(status_code=400, detail="amount_xrp must be positive.")
+
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found.")
+    if not wallet.privy_wallet_id:
+        raise HTTPException(status_code=400, detail="This wallet was not created via Privy and cannot be signed here.")
+
+    privy_app_id = os.getenv("PRIVY_APP_ID")
+    privy_app_secret = os.getenv("PRIVY_APP_SECRET")
+    if not privy_app_id or not privy_app_secret:
+        raise HTTPException(status_code=503, detail="Privy is not configured on this server.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        seq_resp = await client.post(XRPL_URL, json={
+            "method": "account_info",
+            "params": [{"account": wallet.xrpl_address, "ledger_index": "current"}],
+        })
+    seq_data = seq_resp.json()
+    result = seq_data.get("result", {})
+    if result.get("status") != "success":
+        raise HTTPException(status_code=502, detail=f"XRPL account_info failed: {result.get('error_message', 'unknown')}")
+    sequence = result["account_data"]["Sequence"]
+
+    drops = str(int(round(amount_xrp * 1_000_000)))
+    tx = {
+        "TransactionType": "Payment",
+        "Account": wallet.xrpl_address,
+        "Destination": destination,
+        "Amount": drops,
+        "Fee": "12",
+        "Sequence": sequence,
+        "LastLedgerSequence": result["ledger_current_index"] + 20,
+        "SigningPubKey": "",
+    }
+
+    import base64 as _b64
+    creds = _b64.b64encode(f"{privy_app_id}:{privy_app_secret}".encode()).decode()
+    async with httpx.AsyncClient(timeout=20) as client:
+        sign_resp = await client.post(
+            f"https://api.privy.io/v1/wallets/{wallet.privy_wallet_id}/rpc",
+            headers={
+                "Authorization": f"Basic {creds}",
+                "privy-app-id": privy_app_id,
+                "Content-Type": "application/json",
+            },
+            json={"method": "xrpl_signTransaction", "params": {"transaction": tx}},
+        )
+    if sign_resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Privy sign error: {sign_resp.text}")
+
+    sign_data = sign_resp.json()
+    signed_tx = sign_data.get("data", {}).get("signed_transaction") or sign_data.get("signed_transaction")
+    if not signed_tx:
+        raise HTTPException(status_code=502, detail=f"Privy returned no signed transaction: {sign_data}")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        submit_resp = await client.post(XRPL_URL, json={
+            "method": "submit",
+            "params": [{"tx_blob": signed_tx}],
+        })
+    submit_data = submit_resp.json()
+    submit_result = submit_data.get("result", {})
+    engine_result = submit_result.get("engine_result", "")
+    if not engine_result.startswith("tes"):
+        raise HTTPException(status_code=502, detail=f"XRPL submit failed: {engine_result} — {submit_result.get('engine_result_message', '')}")
+
+    return {
+        "status": "submitted",
+        "engine_result": engine_result,
+        "tx_hash": submit_result.get("tx_json", {}).get("hash"),
+        "amount_xrp": amount_xrp,
+        "destination": destination,
     }
 
 
@@ -8295,6 +8392,7 @@ async def enterprise_list_wallets(
             "label": w.label,
             "verified": w.verified,
             "created_at": w.created_at.isoformat(),
+            "privy_wallet_id": w.privy_wallet_id,
         }
         for w in wallets
     ]
