@@ -104,6 +104,7 @@ async def _lifespan(app):
 
 app = FastAPI(
     title="AgentTrust Protocol Core",
+    docs_url=None,
     description=(
         "Enterprise-grade AI task verification and autonomous payment rail on XRPL. "
         "Every agent action generates a tamper-proof audit trail — cryptographic verdict, timestamp, "
@@ -218,6 +219,32 @@ def serve_ui(request: Request):
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
     return {"status": "online", "version": "7.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+
+@app.get("/docs", include_in_schema=False)
+def serve_docs():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html>
+<head>
+  <title>AgentTrust API Docs</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui.min.css">
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.min.js"></script>
+<script>
+  SwaggerUIBundle({
+    url: "/openapi.json",
+    dom_id: "#swagger-ui",
+    presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+    layout: "BaseLayout",
+    deepLinking: true,
+  });
+</script>
+</body>
+</html>""")
 
 @app.get("/playground")
 def serve_playground():
