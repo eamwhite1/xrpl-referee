@@ -8391,6 +8391,7 @@ async def enterprise_list_wallets(
             "xrpl_address": w.xrpl_address,
             "label": w.label,
             "verified": w.verified,
+            "verify_challenge": w.verify_challenge if not w.verified else None,
             "created_at": w.created_at.isoformat(),
             "privy_wallet_id": w.privy_wallet_id,
         }
@@ -8456,6 +8457,79 @@ async def enterprise_verify_wallet(
             except Exception:
                 continue
     return {"verified": False, "message": "Challenge not found yet. Submit the AccountSet tx and try again."}
+
+
+@app.post("/enterprise/wallets/{wallet_id}/verify-privy")
+async def enterprise_verify_privy_wallet(
+    wallet_id: int,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Auto-verify a Privy wallet by signing and submitting an AccountSet with the challenge memo."""
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    if wallet.verified:
+        return {"verified": True, "status": "already_verified"}
+    if not wallet.privy_wallet_id:
+        raise HTTPException(status_code=400, detail="Not a Privy wallet — verify manually.")
+    if not wallet.verify_challenge:
+        raise HTTPException(status_code=400, detail="No challenge found for this wallet.")
+
+    privy_app_id = os.getenv("PRIVY_APP_ID")
+    privy_app_secret = os.getenv("PRIVY_APP_SECRET")
+    if not privy_app_id or not privy_app_secret:
+        raise HTTPException(status_code=503, detail="Privy is not configured on this server.")
+
+    # Fetch sequence + ledger index
+    async with httpx.AsyncClient(timeout=15) as client:
+        seq_resp = await client.post(XRPL_URL, json={
+            "method": "account_info",
+            "params": [{"account": wallet.xrpl_address, "ledger_index": "current"}],
+        })
+    result = seq_resp.json().get("result", {})
+    if result.get("status") != "success":
+        raise HTTPException(status_code=502, detail=f"XRPL account_info failed: {result.get('error_message', 'not activated — fund with 1 XRP first')}")
+
+    sequence = result["account_data"]["Sequence"]
+    memo_hex = wallet.verify_challenge.encode("utf-8").hex().upper()
+
+    tx = {
+        "TransactionType": "AccountSet",
+        "Account": wallet.xrpl_address,
+        "Fee": "12",
+        "Sequence": sequence,
+        "LastLedgerSequence": result["ledger_current_index"] + 20,
+        "Memos": [{"Memo": {"MemoData": memo_hex}}],
+        "SigningPubKey": "",
+    }
+
+    import base64 as _b64
+    creds = _b64.b64encode(f"{privy_app_id}:{privy_app_secret}".encode()).decode()
+    async with httpx.AsyncClient(timeout=20) as client:
+        sign_resp = await client.post(
+            f"https://api.privy.io/v1/wallets/{wallet.privy_wallet_id}/rpc",
+            headers={"Authorization": f"Basic {creds}", "privy-app-id": privy_app_id, "Content-Type": "application/json"},
+            json={"method": "xrpl_signTransaction", "params": {"transaction": tx}},
+        )
+    if sign_resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Privy sign error: {sign_resp.text}")
+
+    sign_data = sign_resp.json()
+    signed_tx = sign_data.get("data", {}).get("signed_transaction") or sign_data.get("signed_transaction")
+    if not signed_tx:
+        raise HTTPException(status_code=502, detail="Privy returned no signed transaction.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        submit_resp = await client.post(XRPL_URL, json={"method": "submit", "params": [{"tx_blob": signed_tx}]})
+    submit_result = submit_resp.json().get("result", {})
+    engine_result = submit_result.get("engine_result", "")
+    if not engine_result.startswith("tes"):
+        raise HTTPException(status_code=502, detail=f"XRPL submit failed: {engine_result} — {submit_result.get('engine_result_message', '')}")
+
+    wallet.verified = True
+    db.commit()
+    return {"verified": True, "status": "verified", "tx_hash": submit_result.get("tx_json", {}).get("hash")}
 
 
 @app.get("/enterprise/wallets/{wallet_id}/delegations")
