@@ -81,8 +81,12 @@ mcp = FastMCP(
         "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
         "\n"
         "WALLET BOOTSTRAP (do this first if you have no XRPL wallet):\n"
-        "  PRODUCTION (recommended): call get_wallet_setup_guide() — generate locally with Wallet.create(),\n"
+        "  PRODUCTION option A (local seed): call get_wallet_setup_guide() — generate with Wallet.create(),\n"
         "     store seed in .env, pass only your public address to AgentTrust. Seed never leaves your environment.\n"
+        "  PRODUCTION option B (Privy — no seed): use PrivyWallet from @eamwhite1/agenttrust-sdk.\n"
+        "     Key lives in Privy's secure enclave; your agent never handles the seed.\n"
+        "     Human buyers: one-click wallet creation at app.cryptovault.co.uk → Wallets → 'Create wallet with Privy'.\n"
+        "     Full guide: https://www.cryptovault.co.uk/privy-wallet/ | call get_wallet_setup_guide() for SDK code.\n"
         "  DEVELOPMENT / QUICK START: create_agent_wallet() — generates a keypair and returns the seed.\n"
         "     ⚠ Seed is returned in plaintext. Do not use in production. Free tier: 3 free escrows included.\n"
         "  FUNDING (onramp only — Coinbase is not the settlement layer):\n"
@@ -2284,6 +2288,34 @@ async def get_wallet_setup_guide() -> dict:
                 "# Buyer: lock funds\n"
                 "create_escrow_vault(buyer_address=wallet.address, worker_address='rSeller...', ...)\n\n"
                 "# AgentTrust signs the EscrowFinish with its own key — you sign EscrowCreate locally\n"
+            ),
+        },
+        "privy_server_wallet": {
+            "description": (
+                "Privy server wallet — zero-seed alternative for agents and human buyers. "
+                "Privy holds the key in a secure enclave; your agent never sees the seed. "
+                "Use PrivyWallet from @eamwhite1/agenttrust-sdk (v2.1.0+) or call the "
+                "AgentTrust dashboard's one-click 'Create wallet with Privy' button."
+            ),
+            "sdk_usage": (
+                "import { PrivyWallet } from '@eamwhite1/agenttrust-sdk';\n"
+                "const privy = new PrivyWallet({ appId: process.env.PRIVY_APP_ID, appSecret: process.env.PRIVY_APP_SECRET });\n"
+                "const { id, address } = await privy.createWallet();   // address starts with r\n"
+                "// To sign a transaction later:\n"
+                "const signedTx = await privy.signTransaction(id, address, publicKey, tx);\n"
+            ),
+            "dashboard": (
+                "Human buyers: log into app.cryptovault.co.uk → Wallets → "
+                "'Create wallet with Privy'. No seed phrase or browser extension needed — "
+                "sign in with email/Google/Apple and your XRPL address is created instantly. "
+                "Use the Send button on the wallet card to withdraw funds."
+            ),
+            "guide": "https://www.cryptovault.co.uk/privy-wallet/",
+            "when_to_use": (
+                "Choose Privy when: (a) you are building a server-side agent that must not "
+                "store a seed in env vars, (b) your users are non-technical and need a "
+                "one-click wallet, or (c) you want Privy's policy engine to constrain what "
+                "transactions the wallet can sign."
             ),
         },
         "ripple_official_skill": {
