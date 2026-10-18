@@ -8228,6 +8228,60 @@ async def enterprise_link_wallet(
     }
 
 
+@app.post("/enterprise/wallets/privy")
+async def enterprise_create_privy_wallet(
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Create an XRPL wallet via Privy server-side API and auto-link it to the account."""
+    privy_app_id = os.getenv("PRIVY_APP_ID")
+    privy_app_secret = os.getenv("PRIVY_APP_SECRET")
+    if not privy_app_id or not privy_app_secret:
+        raise HTTPException(status_code=503, detail="Privy wallet creation is not configured on this server.")
+
+    import base64 as _b64
+    creds = _b64.b64encode(f"{privy_app_id}:{privy_app_secret}".encode()).decode()
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://api.privy.io/v1/wallets",
+            headers={
+                "Authorization": f"Basic {creds}",
+                "privy-app-id": privy_app_id,
+                "Content-Type": "application/json",
+            },
+            json={"chain_type": "xrpl"},
+        )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Privy API error: {resp.text}")
+
+    privy_data = resp.json()
+    xrpl_address = privy_data.get("address")
+    privy_wallet_id = privy_data.get("id")
+    if not xrpl_address:
+        raise HTTPException(status_code=502, detail="Privy returned no address.")
+
+    existing = db.query(LinkedWallet).filter_by(account_id=account.id, xrpl_address=xrpl_address).first()
+    if existing:
+        return {"wallet_id": existing.id, "xrpl_address": xrpl_address, "status": "already_linked", "privy_wallet_id": privy_wallet_id}
+
+    wallet = LinkedWallet(
+        account_id=account.id,
+        xrpl_address=xrpl_address,
+        label="Privy wallet",
+        verify_challenge=secrets.token_hex(16),
+    )
+    db.add(wallet)
+    db.commit()
+    db.refresh(wallet)
+    return {
+        "wallet_id": wallet.id,
+        "xrpl_address": xrpl_address,
+        "privy_wallet_id": privy_wallet_id,
+        "status": "created",
+        "message": "Wallet created via Privy and linked to your account. Fund with at least 1 XRP to activate it on-ledger.",
+    }
+
+
 @app.get("/enterprise/wallets")
 async def enterprise_list_wallets(
     account: EnterpriseAccount = Depends(_get_current_account),
