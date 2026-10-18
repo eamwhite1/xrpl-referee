@@ -8532,6 +8532,97 @@ async def enterprise_verify_privy_wallet(
     return {"verified": True, "status": "verified", "tx_hash": submit_result.get("tx_json", {}).get("hash")}
 
 
+@app.post("/enterprise/wallets/{wallet_id}/delegate")
+async def enterprise_wallet_delegate(
+    wallet_id: int,
+    req: Request,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Build (and auto-sign for Privy wallets) a DelegateSet transaction granting XLS-75 permissions."""
+    body = await req.json()
+    delegate_address = body.get("delegate_address", "").strip()
+    permissions = body.get("permissions", [])  # list of strings e.g. ["EscrowCreate","Payment"]
+    if not delegate_address:
+        raise HTTPException(status_code=400, detail="delegate_address is required.")
+    if not permissions:
+        raise HTTPException(status_code=400, detail="At least one permission is required.")
+
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        seq_resp = await client.post(XRPL_URL, json={
+            "method": "account_info",
+            "params": [{"account": wallet.xrpl_address, "ledger_index": "current"}],
+        })
+    seq_data = seq_resp.json()
+    result = seq_data.get("result", {})
+    if result.get("status") != "success":
+        raise HTTPException(status_code=502, detail=f"XRPL account_info failed: {result.get('error_message', 'unknown')}")
+    sequence = result["account_data"]["Sequence"]
+
+    tx = {
+        "TransactionType": "DelegateSet",
+        "Account": wallet.xrpl_address,
+        "Authorize": delegate_address,
+        "Permissions": [{"Permission": {"PermissionValue": p}} for p in permissions],
+        "Fee": "12",
+        "Sequence": sequence,
+        "LastLedgerSequence": result["ledger_current_index"] + 20,
+        "SigningPubKey": "",
+    }
+
+    if not wallet.privy_wallet_id:
+        # Return unsigned tx for the user to sign with their own wallet
+        return {"status": "unsigned", "tx": tx, "message": "Sign and submit this transaction with your wallet (e.g. via Xaman or xrpl.js)."}
+
+    privy_app_id = os.getenv("PRIVY_APP_ID")
+    privy_app_secret = os.getenv("PRIVY_APP_SECRET")
+    if not privy_app_id or not privy_app_secret:
+        raise HTTPException(status_code=503, detail="Privy is not configured on this server.")
+
+    import base64 as _b64
+    creds = _b64.b64encode(f"{privy_app_id}:{privy_app_secret}".encode()).decode()
+    async with httpx.AsyncClient(timeout=20) as client:
+        sign_resp = await client.post(
+            f"https://api.privy.io/v1/wallets/{wallet.privy_wallet_id}/rpc",
+            headers={
+                "Authorization": f"Basic {creds}",
+                "privy-app-id": privy_app_id,
+                "Content-Type": "application/json",
+            },
+            json={"method": "xrpl_signTransaction", "params": {"transaction": tx}},
+        )
+    if sign_resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Privy sign error: {sign_resp.text}")
+
+    sign_data = sign_resp.json()
+    signed_tx = sign_data.get("data", {}).get("signed_transaction") or sign_data.get("signed_transaction")
+    if not signed_tx:
+        raise HTTPException(status_code=502, detail=f"Privy returned no signed transaction: {sign_data}")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        submit_resp = await client.post(XRPL_URL, json={
+            "method": "submit",
+            "params": [{"tx_blob": signed_tx}],
+        })
+    submit_data = submit_resp.json()
+    submit_result = submit_data.get("result", {})
+    engine_result = submit_result.get("engine_result", "")
+    if not engine_result.startswith("tes"):
+        raise HTTPException(status_code=502, detail=f"XRPL submit failed: {engine_result} — {submit_result.get('engine_result_message', '')}")
+
+    return {
+        "status": "submitted",
+        "engine_result": engine_result,
+        "tx_hash": submit_result.get("tx_json", {}).get("hash"),
+        "delegate": delegate_address,
+        "permissions": permissions,
+    }
+
+
 @app.get("/enterprise/wallets/{wallet_id}/delegations")
 async def enterprise_wallet_delegations(
     wallet_id: int,
