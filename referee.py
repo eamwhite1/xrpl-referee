@@ -7245,7 +7245,7 @@ async def debug_seed():
 
 
 @app.get("/nft/issuers")
-async def list_nft_issuers(category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
+async def list_nft_issuers(q: str = None, category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
     if include_pending:
         statuses = ("verified", "public", "pending")
     else:
@@ -7264,14 +7264,17 @@ async def list_nft_issuers(category: str = None, include_pending: bool = False, 
         if "verified" in existing_cols else
         f"SELECT id, wallet_address{optional['wallet_addresses']}, NULL as verified"
         f"{optional['lei']}{optional['nft_types']}, name, category, description, website"
-        f" FROM nft_issuer"
+        f" FROM nft_issuer WHERE 1=1"
     )
     if "verified" in existing_cols and category:
         sql += " AND category = :category"
         params["category"] = category
     elif category:
-        sql += " WHERE category = :category"
+        sql += " AND category = :category"
         params["category"] = category
+    if q:
+        sql += " AND LOWER(name) LIKE :q"
+        params["q"] = f"%{q.lower()}%"
     sql += " ORDER BY name"
     rows = db.execute(text(sql), params).fetchall()
     base_url = "https://mcp.cryptovault.co.uk"
@@ -7393,6 +7396,8 @@ async def issuer_registry_feed(
     where_clauses = ["verified IN ('verified','public')"]
     params: dict = {}
 
+    if verified == "true":
+        verified = "verified"
     if verified in ("verified", "public", "pending", "disputed", "revoked"):
         where_clauses = [f"verified = :verified"]
         params["verified"] = verified

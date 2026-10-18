@@ -1485,7 +1485,7 @@ async def lookup_nft_issuer(
         res.raise_for_status()
         data = res.json()
 
-    results = data if isinstance(data, list) else data.get("results", [])
+    results = data if isinstance(data, list) else data.get("issuers", data.get("results", []))
     # Filter out "not found" sentinel entries that have no wallet
     real_results = [r for r in results if r.get("xrpl_wallet") or r.get("wallet_address")]
 
