@@ -258,8 +258,9 @@ def _wrap_mcp_with_logger(asgi_app):
                 m = saved_msgs[replay_idx[0]]
                 replay_idx[0] += 1
                 return m
-            # All original messages replayed; signal disconnect so app doesn't hang
-            return {"type": "http.disconnect"}
+            # Body fully replayed — delegate to the original receive so FastMCP can
+            # detect the real client disconnect without getting a premature signal.
+            return await receive()
         t0 = _time_mod.monotonic()
         try:
             await asgi_app(scope, replaying_receive, capturing_send)
@@ -310,32 +311,30 @@ if _mcp_http_app is not None:
     logger.info("✅ MCP server ready (with tool-call logging)")
 
     async def _dispatch_to_mcp(request: Request):
-        """Forward a request to the MCP ASGI app with path rewritten to '/'."""
+        """Return an ASGI pass-through that rewrites path to '/' and streams directly.
+
+        Critically, this never buffers the response body — SSE and JSON-RPC streaming
+        both work because send() is passed straight through to the underlying transport.
+        After replaying the buffered request body, receive() delegates to the real ASGI
+        connection receive so FastMCP can detect genuine client disconnect.
+        """
         body = await request.body()
-        body_idx = [0]
-        async def replay():
-            if body_idx[0] == 0:
-                body_idx[0] = 1
-                return {"type": "http.request", "body": body, "more_body": False}
-            return {"type": "http.disconnect"}
-        scope = dict(request.scope)
-        scope["path"] = "/"
-        scope["raw_path"] = b"/"
-        response_info: dict = {}
-        chunks: list = []
-        async def capture(message):
-            if message["type"] == "http.response.start":
-                response_info["status"] = message["status"]
-                response_info["headers"] = message.get("headers", [])
-            elif message["type"] == "http.response.body":
-                chunks.append(message.get("body", b""))
-        await _mcp_http_app(scope, replay, capture)
-        from starlette.responses import Response as _R
-        return _R(
-            content=b"".join(chunks),
-            status_code=response_info.get("status", 200),
-            headers=dict((k.decode(), v.decode()) for k, v in response_info.get("headers", [])),
-        )
+
+        class _MCPPassthrough:
+            async def __call__(self, scope, receive, send):
+                body_idx = [0]
+                async def replay():
+                    if body_idx[0] == 0:
+                        body_idx[0] = 1
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    # Delegate to real ASGI receive — lets FastMCP block on disconnect
+                    return await receive()
+                new_scope = dict(scope)
+                new_scope["path"] = "/"
+                new_scope["raw_path"] = b"/"
+                await _mcp_http_app(new_scope, replay, send)
+
+        return _MCPPassthrough()
 
     # Serve /mcp and /mcp/ without any redirect — both go straight to the MCP app.
     _mcp_methods = ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"]
@@ -1185,39 +1184,46 @@ _OFAC_FALLBACK_URL = "https://www.treasury.gov/ofac/downloads/sdn.xml"
 
 def _parse_ofac_xml(content: bytes) -> dict:
     """Parse OFAC SDN XML bytes into {xrp_address: entity_name} for all XRP SDN entries."""
+    import re as _re
     addr_map: dict = {}
-    _ns_strip = lambda tag: tag.split('}', 1)[-1] if '}' in tag else tag
     try:
         root = ET.fromstring(content)
-        # Collect all sdnEntry elements regardless of namespace
-        entries = [el for el in root.iter() if _ns_strip(el.tag) == 'sdnEntry']
+        # Detect namespace from root element (OFAC uses xmlns="http://tempuri.org/sdnList.xsd")
+        ns = ''
+        if root.tag.startswith('{'):
+            ns = root.tag.split('}', 1)[0] + '}'  # e.g. '{http://tempuri.org/sdnList.xsd}'
+        n = lambda tag: f'{ns}{tag}'
+
+        entries = root.findall(f'.//{n("sdnEntry")}')
+        logger.info(f"OFAC XML: {len(entries)} sdnEntry elements, ns={ns!r}")
+
         for entry in entries:
-            # Entity name: lastName for entities/individuals
+            # Entity name: lastName for organizations, firstName+lastName for individuals
             entity_name = ''
-            for child in entry:
-                t = _ns_strip(child.tag)
-                if t in ('lastName', 'entityName') and child.text:
-                    entity_name = child.text.strip()
+            for name_tag in ('lastName', 'entityName', 'firstName'):
+                el = entry.find(n(name_tag))
+                if el is not None and el.text and el.text.strip():
+                    entity_name = el.text.strip()
                     break
-            # Walk all id elements within this entry
-            for el in entry.iter():
-                if _ns_strip(el.tag) != 'id':
+
+            # Walk id elements inside idList
+            id_list = entry.find(n('idList'))
+            if id_list is None:
+                continue
+            for id_el in id_list.findall(n('id')):
+                id_type_el  = id_el.find(n('idType'))
+                id_num_el   = id_el.find(n('idNumber'))
+                if id_type_el is None or id_num_el is None:
                     continue
-                id_type_text = ''
-                id_number_text = ''
-                for child in el:
-                    t = _ns_strip(child.tag)
-                    if t == 'idType' and child.text:
-                        id_type_text = child.text.strip().upper()
-                    elif t == 'idNumber' and child.text:
-                        id_number_text = child.text.strip()
-                if 'XRP' in id_type_text and id_number_text.startswith('r') and len(id_number_text) >= 25:
-                    addr_map[id_number_text] = entity_name or 'UNKNOWN SDN ENTITY'
-        logger.info(f"OFAC XML parsed via ElementTree: {len(entries)} entries, {len(addr_map)} XRP addresses")
+                if 'XRP' not in (id_type_el.text or '').upper():
+                    continue
+                addr = (id_num_el.text or '').strip()
+                if addr.startswith('r') and len(addr) >= 25:
+                    addr_map[addr] = entity_name or 'UNKNOWN SDN ENTITY'
+
+        logger.info(f"OFAC XML parsed (ET): {len(addr_map)} XRP addresses")
     except Exception as parse_err:
-        logger.warning(f"OFAC ET parse failed ({parse_err}), falling back to regex")
-        import re as _re
-        # Regex fallback — DOTALL handles multi-line XML
+        logger.warning(f"OFAC ET parse error: {parse_err} — falling back to regex")
         matches = _re.findall(
             r'<idType>[^<]*XRP[^<]*</idType>.*?<idNumber>([^<]+)</idNumber>',
             content.decode('utf-8', errors='replace'), _re.DOTALL | _re.IGNORECASE
@@ -1227,6 +1233,20 @@ def _parse_ofac_xml(content: bytes) -> dict:
             if addr.startswith('r') and len(addr) >= 25:
                 addr_map[addr] = 'UNKNOWN SDN ENTITY'
         logger.info(f"OFAC regex fallback: {len(addr_map)} XRP addresses")
+
+    # Also run the regex pass to catch any addresses the ET parser missed
+    # (different XML structures, nested elements, etc.)
+    if addr_map:
+        regex_addrs = _re.findall(
+            r'<idType>[^<]*XRP[^<]*</idType>.*?<idNumber>([^<]+)</idNumber>',
+            content.decode('utf-8', errors='replace'), _re.DOTALL | _re.IGNORECASE
+        )
+        for addr in regex_addrs:
+            addr = addr.strip()
+            if addr.startswith('r') and len(addr) >= 25 and addr not in addr_map:
+                addr_map[addr] = 'UNKNOWN SDN ENTITY'
+                logger.info(f"OFAC: regex found additional address not in ET results: {addr}")
+
     return addr_map
 
 
