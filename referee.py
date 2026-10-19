@@ -4574,9 +4574,23 @@ class WalletRatingRequest(BaseModel):
     comment:       Optional[str] = None
 
 
+_bootstrap_rate: dict[str, list] = {}  # ip -> [timestamp, ...]
+_BOOTSTRAP_LIMIT  = 3    # max wallet creations per IP
+_BOOTSTRAP_WINDOW = 86400  # per 24 hours
+
 @app.post("/wallet/{address}/bootstrap")
-async def bootstrap_wallet(address: str, db: Session = Depends(get_db)):
+async def bootstrap_wallet(address: str, request: Request, db: Session = Depends(get_db)):
     """Register a wallet as bootstrapped (created via create_agent_wallet) for free tier eligibility."""
+    # Rate-limit by IP: max 3 new bootstrapped wallets per IP per 24 h
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    now = time.time()
+    bucket = _bootstrap_rate.setdefault(ip, [])
+    _bootstrap_rate[ip] = [t for t in bucket if now - t < _BOOTSTRAP_WINDOW]
+    if len(_bootstrap_rate[ip]) >= _BOOTSTRAP_LIMIT:
+        raise HTTPException(status_code=429, detail=f"Too many wallet creations from this IP ({_BOOTSTRAP_LIMIT} per 24 h). Try again later.")
+    _bootstrap_rate[ip].append(now)
+
     existing = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == address).first()
     if not existing:
         db.add(BootstrappedWallet(wallet_address=address))
