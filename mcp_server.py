@@ -2673,7 +2673,9 @@ async def assess_counterparty_and_job(
 
     # --- Parse sanctions ---
     sanctions_data = responses.get("sanctions", {})
+    # None means list was stale/unavailable — treat as unverified (fail closed)
     sanctioned = sanctions_data.get("sanctioned", False)
+    sanctions_unverified = sanctioned is None
 
     # --- Escrow cap logic ---
     if sanctioned:
@@ -2717,6 +2719,8 @@ async def assess_counterparty_and_job(
 
     if sanctioned:
         blockers.append("SANCTIONED — wallet appears on OFAC SDN list. Do not proceed under any circumstances.")
+    elif sanctions_unverified:
+        blockers.append("SANCTIONS UNVERIFIED — sanctions list is stale or unavailable. Do not proceed until sanctions status can be confirmed.")
     if trust_score == 0 and not trust_data.get("error"):
         blockers.append("Trust score is 0 — wallet has no on-chain history. Do not lock significant funds.")
     if amount_xrp > 0 and amount_xrp > escrow_cap_xrp:
@@ -2747,8 +2751,11 @@ async def assess_counterparty_and_job(
         },
         "sanctions": {
             "sanctioned": sanctioned,
+            "unverified": sanctions_unverified,
+            "risk_level": sanctions_data.get("risk_level"),
+            "entity": sanctions_data.get("entity"),
             "source": sanctions_data.get("source"),
-            "list": sanctions_data.get("list"),
+            "list_as_of": sanctions_data.get("list_as_of"),
         },
         "nft_issuer": {
             "queried": nft_issuer_query or None,

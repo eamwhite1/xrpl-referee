@@ -66,6 +66,7 @@ load_dotenv()
 # Mcp-Session-Id header on the second request (tools/list), causing a 400 that
 # Smithery misreads as "Authorization Required".
 _mcp_http_app = None
+_raw_mcp_http_app = None  # un-wrapped Starlette app — used to wire its lifespan
 try:
     from mcp_server import mcp
     try:
@@ -75,6 +76,7 @@ try:
         # Older FastMCP versions don't have stateless_http — fall back
         _mcp_http_app = mcp.http_app(path="/")
         logger.info("✅ MCP server loaded (streamable HTTP, path='/')")
+    _raw_mcp_http_app = _mcp_http_app  # save before wrapping
 except Exception as e:
     logger.error(f"❌ MCP server failed to load: {e}", exc_info=True)
 
@@ -89,16 +91,28 @@ class PaymentRequired(Exception):
 
 @asynccontextmanager
 async def _lifespan(app):
-    # Seed public registry entries from known XRPL organisations
-    _seed_public_issuers()
-    # XUMM connectivity check
-    await _verify_xumm()
-    # Prime OFAC list on startup (non-fatal if network unavailable)
-    try:
-        await _refresh_ofac_list()
-    except Exception as _ofac_ex:
-        logger.warning(f"OFAC startup refresh failed (non-fatal): {_ofac_ex}")
-    yield
+    import contextlib
+    async with contextlib.AsyncExitStack() as _stack:
+        # Start FastMCP's internal task group (streaming HTTP session manager).
+        # add_route() doesn't trigger mounted-app lifespans, so we wire it manually.
+        if _raw_mcp_http_app is not None:
+            try:
+                await _stack.enter_async_context(
+                    _raw_mcp_http_app.router.lifespan_context(_raw_mcp_http_app)
+                )
+                logger.info("✅ FastMCP lifespan started")
+            except Exception as _mcp_ls_err:
+                logger.error(f"FastMCP lifespan start failed: {_mcp_ls_err}", exc_info=True)
+        # Seed public registry entries from known XRPL organisations
+        _seed_public_issuers()
+        # XUMM connectivity check
+        await _verify_xumm()
+        # Prime OFAC list on startup (non-fatal if network unavailable)
+        try:
+            await _refresh_ofac_list()
+        except Exception as _ofac_ex:
+            logger.warning(f"OFAC startup refresh failed (non-fatal): {_ofac_ex}")
+        yield
 
 
 app = FastAPI(
@@ -329,39 +343,8 @@ if _mcp_http_app is not None:
     app.add_route("/mcp/", _dispatch_to_mcp, methods=_mcp_methods, include_in_schema=False)
     logger.info("✅ MCP server routed at /mcp and /mcp/")
 
-    # POST / with JSON-RPC body dispatches to the MCP app (some clients POST to root)
-    @app.post("/", include_in_schema=False)
-    async def root_jsonrpc(request: Request):
-        try:
-            body = await request.body()
-            if b'"jsonrpc"' in body:
-                body_idx = [0]
-                async def replay():
-                    if body_idx[0] == 0:
-                        body_idx[0] = 1
-                        return {"type": "http.request", "body": body, "more_body": False}
-                    return {"type": "http.disconnect"}
-                scope = dict(request.scope)
-                scope["path"] = "/"
-                scope["raw_path"] = b"/"
-                response_info: dict = {}
-                chunks: list = []
-                async def _send(message):
-                    if message["type"] == "http.response.start":
-                        response_info["status"] = message["status"]
-                        response_info["headers"] = message.get("headers", [])
-                    elif message["type"] == "http.response.body":
-                        chunks.append(message.get("body", b""))
-                await _mcp_http_app(scope, replay, _send)
-                from starlette.responses import Response as _R
-                return _R(
-                    content=b"".join(chunks),
-                    status_code=response_info.get("status", 200),
-                    headers=dict((k.decode(), v.decode()) for k, v in response_info.get("headers", [])),
-                )
-        except Exception as _e:
-            logger.warning(f"POST / jsonrpc dispatch error: {_e}")
-        return {"status": "online", "version": "7.0.0", "service": "AgentTrust Referee"}
+    # POST / routes directly to the MCP app — agents that POST to the bare host connect here.
+    app.add_route("/", _dispatch_to_mcp, methods=["POST"], include_in_schema=False)
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -1194,10 +1177,58 @@ class KycRecord(Base):
 # ---------------------------------------------------------------------------
 # OFAC SDN sanctions list — cached in memory, refreshed daily
 # ---------------------------------------------------------------------------
-_ofac_sanctioned_xrpl: set = set()
+_ofac_sanctioned_xrpl: dict = {}  # {xrp_address: entity_name}
 _ofac_last_refresh: datetime = None
 _OFAC_PRIMARY_URL  = "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.XML"
 _OFAC_FALLBACK_URL = "https://www.treasury.gov/ofac/downloads/sdn.xml"
+
+
+def _parse_ofac_xml(content: bytes) -> dict:
+    """Parse OFAC SDN XML bytes into {xrp_address: entity_name} for all XRP SDN entries."""
+    addr_map: dict = {}
+    _ns_strip = lambda tag: tag.split('}', 1)[-1] if '}' in tag else tag
+    try:
+        root = ET.fromstring(content)
+        # Collect all sdnEntry elements regardless of namespace
+        entries = [el for el in root.iter() if _ns_strip(el.tag) == 'sdnEntry']
+        for entry in entries:
+            # Entity name: lastName for entities/individuals
+            entity_name = ''
+            for child in entry:
+                t = _ns_strip(child.tag)
+                if t in ('lastName', 'entityName') and child.text:
+                    entity_name = child.text.strip()
+                    break
+            # Walk all id elements within this entry
+            for el in entry.iter():
+                if _ns_strip(el.tag) != 'id':
+                    continue
+                id_type_text = ''
+                id_number_text = ''
+                for child in el:
+                    t = _ns_strip(child.tag)
+                    if t == 'idType' and child.text:
+                        id_type_text = child.text.strip().upper()
+                    elif t == 'idNumber' and child.text:
+                        id_number_text = child.text.strip()
+                if 'XRP' in id_type_text and id_number_text.startswith('r') and len(id_number_text) >= 25:
+                    addr_map[id_number_text] = entity_name or 'UNKNOWN SDN ENTITY'
+        logger.info(f"OFAC XML parsed via ElementTree: {len(entries)} entries, {len(addr_map)} XRP addresses")
+    except Exception as parse_err:
+        logger.warning(f"OFAC ET parse failed ({parse_err}), falling back to regex")
+        import re as _re
+        # Regex fallback — DOTALL handles multi-line XML
+        matches = _re.findall(
+            r'<idType>[^<]*XRP[^<]*</idType>.*?<idNumber>([^<]+)</idNumber>',
+            content.decode('utf-8', errors='replace'), _re.DOTALL | _re.IGNORECASE
+        )
+        for addr in matches:
+            addr = addr.strip()
+            if addr.startswith('r') and len(addr) >= 25:
+                addr_map[addr] = 'UNKNOWN SDN ENTITY'
+        logger.info(f"OFAC regex fallback: {len(addr_map)} XRP addresses")
+    return addr_map
+
 
 async def _refresh_ofac_list():
     """Download OFAC SDN XML with redirect-follow and fail-safe cache preservation."""
@@ -1205,33 +1236,26 @@ async def _refresh_ofac_list():
     now = datetime.now(timezone.utc)
     if _ofac_last_refresh and (now - _ofac_last_refresh).total_seconds() < 3600:
         return  # fresh — retry hourly so failures recover quickly
-    import re as _re
     for url in (_OFAC_PRIMARY_URL, _OFAC_FALLBACK_URL):
         try:
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
                 r = await client.get(url, headers={"User-Agent": "AgentTrust-Compliance/1.0"})
-            if r.status_code != 200 or len(r.text) < 1000:
-                logger.error(f"OFAC SDN fetch failed from {url}: status={r.status_code} body_len={len(r.text)}")
+            if r.status_code != 200 or len(r.content) < 1000:
+                logger.error(f"OFAC SDN fetch failed from {url}: status={r.status_code} body_len={len(r.content)}")
                 continue
-            xrp_id_blocks = _re.findall(
-                r'<idType>[^<]*[Dd]igital [Cc]urrency [Aa]ddress\s*-\s*XRP[^<]*</idType>\s*<idNumber>([^<]+)</idNumber>',
-                r.text
-            )
-            # Also match simpler "XRP" idType patterns for XML variants
-            xrp_id_blocks += _re.findall(
-                r'<idType>[^<]*\bXRP\b[^<]*</idType>\s*<idNumber>([^<]+)</idNumber>',
-                r.text
-            )
-            addrs = {a.strip() for a in xrp_id_blocks if a.strip().startswith("r")}
-            _ofac_sanctioned_xrpl = addrs
+            addr_map = _parse_ofac_xml(r.content)
+            if not addr_map:
+                logger.warning(f"OFAC SDN: parsed 0 XRP addresses from {url} — skipping")
+                continue
+            _ofac_sanctioned_xrpl = addr_map
             _ofac_last_refresh = now
-            logger.info(f"OFAC SDN: loaded {len(addrs)} sanctioned XRP addresses from {url}")
+            logger.info(f"OFAC SDN refresh complete: {len(addr_map)} sanctioned XRP addresses loaded from {url}")
             # Persist to DB so a restart doesn't run with an empty list
             try:
                 with Session(engine) as db:
                     db.execute(text(
                         "INSERT INTO ofac_cache (fetched_at, address_count, address_list) VALUES (:ts, :cnt, :lst)"
-                    ), {"ts": now, "cnt": len(addrs), "lst": ",".join(addrs)})
+                    ), {"ts": now, "cnt": len(addr_map), "lst": json.dumps(addr_map)})
                     db.commit()
             except Exception as dbe:
                 logger.warning(f"OFAC DB persist failed (non-fatal): {dbe}")
@@ -1251,11 +1275,19 @@ def _load_ofac_from_db():
                 "SELECT fetched_at, address_list FROM ofac_cache ORDER BY fetched_at DESC LIMIT 1"
             )).fetchone()
             if row and row.address_list:
-                addrs = {a.strip() for a in row.address_list.split(",") if a.strip()}
-                _ofac_sanctioned_xrpl = addrs
+                try:
+                    data = json.loads(row.address_list)
+                    if isinstance(data, dict):
+                        addr_map = {k: v for k, v in data.items() if k.startswith('r')}
+                    else:
+                        addr_map = {a: 'UNKNOWN SDN ENTITY' for a in data if isinstance(a, str) and a.startswith('r')}
+                except (json.JSONDecodeError, TypeError):
+                    # Legacy comma-separated format
+                    addr_map = {a.strip(): 'UNKNOWN SDN ENTITY' for a in row.address_list.split(',') if a.strip().startswith('r')}
+                _ofac_sanctioned_xrpl = addr_map
                 ts = row.fetched_at
                 _ofac_last_refresh = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
-                logger.info(f"OFAC SDN: seeded {len(addrs)} addresses from DB (as of {row.fetched_at})")
+                logger.info(f"OFAC SDN: seeded {len(addr_map)} addresses from DB (as of {row.fetched_at})")
     except Exception as e:
         logger.warning(f"OFAC DB seed failed (non-fatal): {e}")
 
@@ -1454,12 +1486,13 @@ async def is_wallet_sanctioned(
         detail = bei
     else:
         sanctioned = await is_ofac_sanctioned(wallet_address)
+        entity_name = _ofac_sanctioned_xrpl.get(wallet_address) if sanctioned else None
         detail = {
             "sanctioned": sanctioned,
-            "risk_score": None,
-            "risk_level": "unknown",
-            "entity": None,
-            "category": None,
+            "risk_score": 100 if sanctioned else None,
+            "risk_level": "high" if sanctioned else "unknown",
+            "entity": entity_name,
+            "category": "SDN" if sanctioned else None,
             "source": "ofac_sdn_xml",
         }
 
