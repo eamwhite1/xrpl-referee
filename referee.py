@@ -955,10 +955,16 @@ def _check_score_rate_limit(ip: str) -> bool:
 
 
 class BootstrappedWallet(Base):
-    """Wallets created via create_agent_wallet — eligible for free tier regardless of trust score."""
+    """Wallets created via create_agent_wallet or Privy — eligible for free tier regardless of trust score.
+
+    privy_user_id: set for enterprise/dashboard Privy-created wallets — all wallets sharing
+    the same privy_user_id draw from a single pool of FREE_AUDIT_LIMIT credits (per account,
+    not per wallet). NULL means per-wallet counting (bare keypairs from create_agent_wallet).
+    """
     __tablename__ = "bootstrapped_wallet"
     id             = Column(Integer, primary_key=True, index=True)
     wallet_address = Column(String, unique=True, index=True, nullable=False)
+    privy_user_id  = Column(String, nullable=True, index=True)
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -2043,6 +2049,9 @@ def run_migrations():
             err_count INTEGER DEFAULT 0,
             UNIQUE (day, tool)
         )""",
+        # per-account free-tier credits for Privy-created wallets
+        "ALTER TABLE bootstrapped_wallet ADD COLUMN IF NOT EXISTS privy_user_id VARCHAR",
+        "CREATE INDEX IF NOT EXISTS bootstrapped_wallet_privy_idx ON bootstrapped_wallet (privy_user_id)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2775,10 +2784,21 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                 pass
 
         if free_wallet:
-            used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
+            bootstrapped = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == free_wallet).first()
+            is_bootstrapped = bootstrapped is not None
+            privy_user_id = bootstrapped.privy_user_id if bootstrapped else None
+
+            if privy_user_id:
+                # Privy account: count credits across ALL wallets owned by this account
+                sibling_addrs = [
+                    bw.wallet_address for bw in
+                    db.query(BootstrappedWallet).filter(BootstrappedWallet.privy_user_id == privy_user_id).all()
+                ]
+                used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address.in_(sibling_addrs)).count()
+            else:
+                used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
+
             if used < FREE_AUDIT_LIMIT:
-                # Wallets created via create_agent_wallet bypass the trust score requirement
-                is_bootstrapped = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == free_wallet).first() is not None
                 min_score = FREE_AUDIT_MIN_SCORE_BOOTSTRAPPED if is_bootstrapped else FREE_AUDIT_MIN_SCORE
                 try:
                     score_data = await compute_xrpl_trust_score(free_wallet, db)
@@ -2790,13 +2810,15 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                     db.add(FreeAuditUsage(wallet_address=free_wallet, escrow_id=escrow_id, resource=resource))
                     db.commit()
                     remaining = FREE_AUDIT_LIMIT - used - 1
-                    logger.info(f"🎁 FREE AUDIT granted: wallet={free_wallet} score={score} used={used+1}/{FREE_AUDIT_LIMIT}")
+                    acct_label = f"privy_account={privy_user_id}" if privy_user_id else f"wallet={free_wallet}"
+                    logger.info(f"🎁 FREE AUDIT granted: {acct_label} score={score} used={used+1}/{FREE_AUDIT_LIMIT}")
+                    scope_label = "this account" if privy_user_id else "this wallet"
                     return {
                         "free_tier": True,
                         "audits_remaining": remaining,
                         "sender": free_wallet,
                         "amount_xrp": 0,
-                        "message": f"Free audit applied ({used + 1}/{FREE_AUDIT_LIMIT}). {remaining} free audit{'s' if remaining != 1 else ''} remaining for this wallet.",
+                        "message": f"Free audit applied ({used + 1}/{FREE_AUDIT_LIMIT}). {remaining} free audit{'s' if remaining != 1 else ''} remaining for {scope_label}.",
                     }
 
         _raise_402(resource, "Payment required. Provide a fee_hash (x402 v1) or PAYMENT-SIGNATURE header (x402 v2).", min_xrp=required_xrp)
@@ -8617,6 +8639,12 @@ async def enterprise_create_privy_wallet(
         privy_wallet_id=privy_wallet_id,
     )
     db.add(wallet)
+    # Register as bootstrapped so free tier applies regardless of trust score.
+    # privy_user_id = account.id ensures all wallets in this account share one
+    # pool of FREE_AUDIT_LIMIT credits rather than getting fresh credits per wallet.
+    existing_boot = db.query(BootstrappedWallet).filter_by(wallet_address=xrpl_address).first()
+    if not existing_boot:
+        db.add(BootstrappedWallet(wallet_address=xrpl_address, privy_user_id=str(account.id)))
     db.commit()
     db.refresh(wallet)
     return {
@@ -8624,6 +8652,7 @@ async def enterprise_create_privy_wallet(
         "xrpl_address": xrpl_address,
         "privy_wallet_id": privy_wallet_id,
         "status": "created",
+        "free_tier": f"{FREE_AUDIT_LIMIT} free audits included (shared across all wallets in this account).",
         "message": "Wallet created via Privy and linked to your account. Fund with at least 1 XRP to activate it on-ledger.",
     }
 
