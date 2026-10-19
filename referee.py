@@ -200,9 +200,130 @@ async def mcp_smithery_compat(request, call_next):
 # Mount MCP at /mcp/ (Streamable HTTP — Smithery and MCP clients POST here).
 # We also mount at /mcp so Starlette's built-in redirect is replaced by our own
 # clean mount, avoiding the 307 that confuses some clients.
+import hashlib as _hashlib
+import time as _time_mod
+
+def _wrap_mcp_with_logger(asgi_app):
+    """Wrap MCP ASGI app to log each tool/call with duration, tool name, and hashed IP."""
+    async def logged_app(scope, receive, send):
+        if scope.get("type") != "http":
+            await asgi_app(scope, receive, send)
+            return
+        # Buffer the request body so we can inspect and replay it
+        body_chunks = []
+        async def buffering_receive():
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                body_chunks.append(msg.get("body", b""))
+            return msg
+        # Drain body before app sees it
+        first_msg = await receive()
+        body_chunks.append(first_msg.get("body", b"") if first_msg.get("type") == "http.request" else b"")
+        more = first_msg.get("more_body", False)
+        while more:
+            chunk = await receive()
+            body_chunks.append(chunk.get("body", b""))
+            more = chunk.get("more_body", False)
+        full_body = b"".join(body_chunks)
+        tool_name = "unknown"
+        try:
+            import json as _json
+            parsed = _json.loads(full_body)
+            method = parsed.get("method", "")
+            if method == "tools/call":
+                tool_name = parsed.get("params", {}).get("name", "unknown")
+            else:
+                tool_name = method
+        except Exception:
+            pass
+        status_code = [200]
+        async def capturing_send(message):
+            if message.get("type") == "http.response.start":
+                status_code[0] = message.get("status", 200)
+            await send(message)
+        body_idx = [0]
+        async def replaying_receive():
+            if body_idx[0] == 0:
+                body_idx[0] = 1
+                return {"type": "http.request", "body": full_body, "more_body": False}
+            return await receive()
+        t0 = _time_mod.monotonic()
+        try:
+            await asgi_app(scope, replaying_receive, capturing_send)
+            ok = status_code[0] < 400
+        except Exception:
+            ok = False
+            raise
+        finally:
+            duration_ms = int((_time_mod.monotonic() - t0) * 1000)
+            headers = dict(scope.get("headers", []))
+            forwarded = headers.get(b"x-forwarded-for", b"").decode()
+            raw_ip = (forwarded.split(",")[0].strip() if forwarded
+                      else (scope.get("client") or ("",))[0])
+            ip_hash = _hashlib.sha256(raw_ip.encode()).hexdigest()[:12]
+            status_str = "ok" if ok else "error"
+            logger.info(
+                f"MCP tool_call tool={tool_name} duration={duration_ms}ms "
+                f"status={status_code[0]} result={status_str} ip={ip_hash}"
+            )
+            # Increment DB counter (fire-and-forget, non-blocking)
+            if tool_name not in ("unknown", "initialize", "tools/list", "notifications/initialized"):
+                try:
+                    import asyncio as _aio
+                    _aio.get_event_loop().run_in_executor(None, _log_tool_stat, tool_name, ok)
+                except Exception:
+                    pass
+    return logged_app
+
+
+def _log_tool_stat(tool_name: str, ok: bool):
+    """Write to tool_call_stats table (called in thread pool)."""
+    try:
+        col = "ok_count" if ok else "err_count"
+        with engine.connect() as conn:
+            conn.execute(text(f"""
+                INSERT INTO tool_call_stats (day, tool, ok_count, err_count)
+                VALUES (CURRENT_DATE, :tool, :ok, :err)
+                ON CONFLICT (day, tool) DO UPDATE
+                    SET {col} = tool_call_stats.{col} + 1
+            """), {"tool": tool_name, "ok": 1 if ok else 0, "err": 0 if ok else 1})
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"tool_call_stats write failed (non-fatal): {e}")
+
+
 if _mcp_http_app is not None:
+    _mcp_http_app = _wrap_mcp_with_logger(_mcp_http_app)
     app.mount("/mcp", _mcp_http_app)
-    logger.info("✅ MCP server mounted at /mcp")
+    logger.info("✅ MCP server mounted at /mcp (with tool-call logging)")
+
+    # POST / with JSON-RPC body dispatches to the MCP app (some clients POST to root)
+    @app.post("/", include_in_schema=False)
+    async def root_jsonrpc(request: Request):
+        try:
+            body = await request.body()
+            if b'"jsonrpc"' in body:
+                scope = dict(request.scope)
+                scope["path"] = "/mcp"
+                scope["raw_path"] = b"/mcp"
+                response_info: dict = {}
+                chunks: list = []
+                async def _send(message):
+                    if message["type"] == "http.response.start":
+                        response_info["status"] = message["status"]
+                        response_info["headers"] = message.get("headers", [])
+                    elif message["type"] == "http.response.body":
+                        chunks.append(message.get("body", b""))
+                await _mcp_http_app(scope, request._receive, _send)
+                from starlette.responses import Response as _R
+                return _R(
+                    content=b"".join(chunks),
+                    status_code=response_info.get("status", 200),
+                    headers=dict((k.decode(), v.decode()) for k, v in response_info.get("headers", [])),
+                )
+        except Exception as _e:
+            logger.warning(f"POST / jsonrpc dispatch error: {_e}")
+        return {"status": "online", "version": "7.0", "service": "AgentTrust Referee"}
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -268,13 +389,36 @@ def serve_playground():
 @app.head("/status")
 @app.head("/health")
 def health_check():
+    now = datetime.now(timezone.utc)
+    ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
     return {
         "status": "online",
         "version": "7.0",
         "protocol_version": "agenttrust/0.1.0",
         "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": now,
+        "ofac_last_refresh": _ofac_last_refresh.isoformat() if _ofac_last_refresh else None,
+        "ofac_addresses_loaded": len(_ofac_sanctioned_xrpl),
+        "ofac_stale": ofac_age_s is None or ofac_age_s > 172800,
     }
+
+@app.get("/stats/tools")
+def stats_tools(days: int = 7):
+    """Aggregated tool-call counts for the past N days (unauthenticated, read-only)."""
+    try:
+        with Session(engine) as db:
+            rows = db.execute(text(
+                "SELECT day, tool, ok_count, err_count FROM tool_call_stats "
+                "WHERE day >= CURRENT_DATE - (:days * INTERVAL '1 day') "
+                "ORDER BY day DESC, tool"
+            ), {"days": days}).fetchall()
+            return {"days": days, "stats": [
+                {"day": str(r.day), "tool": r.tool, "ok_count": r.ok_count, "err_count": r.err_count}
+                for r in rows
+            ]}
+    except Exception as e:
+        return {"days": days, "stats": [], "error": str(e)}
+
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
@@ -292,11 +436,52 @@ def robots_txt():
         "Sitemap: https://mcp.cryptovault.co.uk/openapi.json",
     ])
 
+def _build_agent_card():
+    """Build A2A agent card from live FastMCP tool registry."""
+    skills = []
+    try:
+        from mcp_server import mcp as _mcp_ref
+        tool_map = getattr(getattr(_mcp_ref, "_tool_manager", None), "_tools", None) or {}
+        for tool_name, tool_obj in tool_map.items():
+            fn = getattr(tool_obj, "fn", None)
+            doc = ((fn.__doc__ if fn else None) or "").strip()
+            first_para = doc.split("\n\n")[0].replace("\n", " ").strip()
+            skills.append({
+                "id": tool_name,
+                "name": tool_name.replace("_", " ").title(),
+                "description": first_para or tool_name,
+            })
+    except Exception as e:
+        logger.warning(f"agent-card tool enumeration failed: {e}")
+    return {
+        "schemaVersion": "1.0",
+        "name": "AgentTrust",
+        "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS.",
+        "url": "https://mcp.cryptovault.co.uk/mcp/",
+        "version": "7.0.0",
+        "provider": {"organization": "Boxclever Media Ltd", "url": "https://www.cryptovault.co.uk"},
+        "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": False},
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "authentication": {"schemes": ["none"]},
+        "skills": skills,
+    }
+
+@app.get("/.well-known/agent-card.json")
+def serve_agent_card():
+    """A2A agent card generated from live FastMCP tool registry."""
+    return _build_agent_card()
+
 @app.get("/.well-known/agent.json")
 def serve_agent_json():
+    """A2A agent card (alias for older clients). Also serves static file if present."""
     path = ".well-known/agent.json"
     if os.path.exists(path):
         return FileResponse(path, media_type="application/json")
+    return _build_agent_card()
+
+@app.get("/.well-known/agent.json_legacy", include_in_schema=False)
+def _agent_json_legacy_unused():
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
@@ -692,7 +877,7 @@ else:
     if "neon.tech" in DATABASE_URL and "sslmode" not in DATABASE_URL:
         DATABASE_URL += "?sslmode=require"
 
-engine_args = {"pool_pre_ping": True, "pool_recycle": 300}
+engine_args = {"pool_pre_ping": True, "pool_recycle": 1800}
 if "sqlite" not in DATABASE_URL:
     engine_args["connect_args"] = {"sslmode": "require"}
 
@@ -969,40 +1154,68 @@ class KycRecord(Base):
 # ---------------------------------------------------------------------------
 _ofac_sanctioned_xrpl: set = set()
 _ofac_last_refresh: datetime = None
+_OFAC_PRIMARY_URL  = "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.XML"
+_OFAC_FALLBACK_URL = "https://www.treasury.gov/ofac/downloads/sdn.xml"
 
 async def _refresh_ofac_list():
-    """Download and cache the OFAC SDN XML, extracting XRP digital currency addresses."""
+    """Download OFAC SDN XML with redirect-follow and fail-safe cache preservation."""
     global _ofac_sanctioned_xrpl, _ofac_last_refresh
     now = datetime.now(timezone.utc)
-    if _ofac_last_refresh and (now - _ofac_last_refresh).total_seconds() < 86400:
-        return  # still fresh
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(
-                "https://www.treasury.gov/ofac/downloads/sdn.xml",
-                headers={"User-Agent": "AgentTrust-Compliance/1.0"}
+    if _ofac_last_refresh and (now - _ofac_last_refresh).total_seconds() < 3600:
+        return  # fresh — retry hourly so failures recover quickly
+    import re as _re
+    for url in (_OFAC_PRIMARY_URL, _OFAC_FALLBACK_URL):
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                r = await client.get(url, headers={"User-Agent": "AgentTrust-Compliance/1.0"})
+            if r.status_code != 200 or len(r.text) < 1000:
+                logger.error(f"OFAC SDN fetch failed from {url}: status={r.status_code} body_len={len(r.text)}")
+                continue
+            xrp_id_blocks = _re.findall(
+                r'<idType>[^<]*[Dd]igital [Cc]urrency [Aa]ddress\s*-\s*XRP[^<]*</idType>\s*<idNumber>([^<]+)</idNumber>',
+                r.text
             )
-        root = ET.fromstring(r.text)
-        addrs: set = set()
-        # The SDN XML uses a namespace; we iterate generically to handle both ns and no-ns
-        for entry in root.iter():
-            if entry.tag.endswith("idType") and ("XRP" in (entry.text or "") or "xrp" in (entry.text or "").lower()):
-                # Sibling idNumber element contains the actual address
-                parent = entry.getparent() if hasattr(entry, "getparent") else None
-                # ElementTree doesn't expose getparent; use find on parent context instead
-                pass
-        # Robust fallback: text search the raw XML for XRP addresses in id blocks
-        import re as _re
-        xrp_id_blocks = _re.findall(
-            r'<idType>[^<]*[Xx][Rr][Pp][^<]*</idType>\s*<idNumber>([^<]+)</idNumber>',
-            r.text
-        )
-        addrs = {a.strip() for a in xrp_id_blocks if a.strip().startswith("r")}
-        _ofac_sanctioned_xrpl = addrs
-        _ofac_last_refresh = now
-        logger.info(f"OFAC SDN: loaded {len(addrs)} sanctioned XRP addresses")
+            # Also match simpler "XRP" idType patterns for XML variants
+            xrp_id_blocks += _re.findall(
+                r'<idType>[^<]*\bXRP\b[^<]*</idType>\s*<idNumber>([^<]+)</idNumber>',
+                r.text
+            )
+            addrs = {a.strip() for a in xrp_id_blocks if a.strip().startswith("r")}
+            _ofac_sanctioned_xrpl = addrs
+            _ofac_last_refresh = now
+            logger.info(f"OFAC SDN: loaded {len(addrs)} sanctioned XRP addresses from {url}")
+            # Persist to DB so a restart doesn't run with an empty list
+            try:
+                with Session(engine) as db:
+                    db.execute(text(
+                        "INSERT INTO ofac_cache (fetched_at, address_count, address_list) VALUES (:ts, :cnt, :lst)"
+                    ), {"ts": now, "cnt": len(addrs), "lst": ",".join(addrs)})
+                    db.commit()
+            except Exception as dbe:
+                logger.warning(f"OFAC DB persist failed (non-fatal): {dbe}")
+            return
+        except Exception as e:
+            logger.error(f"OFAC SDN refresh failed from {url}: {e}")
+    # All URLs failed — keep previous cache, do NOT update _ofac_last_refresh so it retries
+    logger.error("OFAC SDN: all fetch attempts failed — keeping previous cached set")
+
+
+def _load_ofac_from_db():
+    """Seed OFAC cache at startup from the most recent persisted DB copy."""
+    global _ofac_sanctioned_xrpl, _ofac_last_refresh
+    try:
+        with Session(engine) as db:
+            row = db.execute(text(
+                "SELECT fetched_at, address_list FROM ofac_cache ORDER BY fetched_at DESC LIMIT 1"
+            )).fetchone()
+            if row and row.address_list:
+                addrs = {a.strip() for a in row.address_list.split(",") if a.strip()}
+                _ofac_sanctioned_xrpl = addrs
+                ts = row.fetched_at
+                _ofac_last_refresh = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+                logger.info(f"OFAC SDN: seeded {len(addrs)} addresses from DB (as of {row.fetched_at})")
     except Exception as e:
-        logger.warning(f"OFAC SDN refresh failed: {e}")
+        logger.warning(f"OFAC DB seed failed (non-fatal): {e}")
 
 
 async def is_ofac_sanctioned(wallet_address: str) -> bool:
@@ -1720,6 +1933,21 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS template_id          VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluate_token_hash  VARCHAR",
         "ALTER TABLE linked_wallet ADD COLUMN IF NOT EXISTS privy_wallet_id VARCHAR",
+        # ops fixes — OFAC cache persistence and tool-call stats
+        """CREATE TABLE IF NOT EXISTS ofac_cache (
+            id            SERIAL PRIMARY KEY,
+            fetched_at    TIMESTAMP NOT NULL,
+            address_count INTEGER,
+            address_list  TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS tool_call_stats (
+            id        SERIAL PRIMARY KEY,
+            day       DATE NOT NULL,
+            tool      VARCHAR NOT NULL,
+            ok_count  INTEGER DEFAULT 0,
+            err_count INTEGER DEFAULT 0,
+            UNIQUE (day, tool)
+        )""",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -1731,6 +1959,7 @@ def run_migrations():
     logger.info("✅ Database migrations complete.")
 
 run_migrations()
+_load_ofac_from_db()
 
 
 def get_db():
@@ -7772,10 +8001,14 @@ async def check_sanctions(address: str):
     Always returns a result — never raises on data unavailability.
     """
     sanctioned, detail = await is_wallet_sanctioned(address)
+    now = datetime.now(timezone.utc)
+    ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
     return {
         "address":    address,
         "sanctioned": sanctioned,
         **{k: v for k, v in detail.items() if k != "sanctioned"},
+        "list_as_of": _ofac_last_refresh.isoformat() if _ofac_last_refresh else None,
+        "stale": ofac_age_s is None or ofac_age_s > 172800,
         "note": "Not a substitute for professional compliance advice.",
     }
 
