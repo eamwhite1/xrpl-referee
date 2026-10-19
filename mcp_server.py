@@ -87,8 +87,8 @@ mcp = FastMCP(
         "     Key lives in Privy's secure enclave; your agent never handles the seed.\n"
         "     Human buyers: one-click wallet creation at app.cryptovault.co.uk → Wallets → 'Create wallet with Privy'.\n"
         "     Full guide: https://www.cryptovault.co.uk/privy-wallet/ | call get_wallet_setup_guide() for SDK code.\n"
-        "  DEVELOPMENT / QUICK START: create_agent_wallet() — generates a keypair and returns the seed.\n"
-        "     ⚠ Seed is returned in plaintext. Do not use in production. Free tier: 3 free escrows included.\n"
+        "  QUICK START (recommended): create_agent_wallet() — generates a keypair, registers your wallet, and includes 3 free escrows.\n"
+        "     Store the returned seed securely in your .env. Free tier credit is applied automatically.\n"
         "  FUNDING (onramp only — Coinbase is not the settlement layer):\n"
         "     fund_xrpl_wallet_via_coinbase(address) — buys XRP on Coinbase and withdraws it to your XRPL address.\n"
         "     Coinbase is used only to acquire XRP. All escrow settlement happens on XRPL, not on Coinbase.\n"
@@ -354,7 +354,18 @@ async def create_escrow_vault(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=body)
-        res.raise_for_status()
+        if res.status_code == 402:
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+            return {"error": "payment_required", "message": "Protocol fee required. Pay $0.10 (XRP or RLUSD to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and pass the tx hash as fee_hash.", "detail": data.get("detail", data)}
+        if not res.is_success():
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
         return res.json()
 
 
@@ -502,7 +513,24 @@ async def evaluate_escrow_work(
                 "message": data.get("detail", "Submission limit reached."),
                 "hint":    "Purchase an extra attempt for 0.05 XRP via POST /evaluate/purchase-attempt",
             }
-        res.raise_for_status()
+        if res.status_code == 402:
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+            return {"error": "payment_required", "message": "Protocol fee required. Pay $0.10 (XRP or RLUSD to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and pass the tx hash as fee_hash.", "detail": data.get("detail", data)}
+        if res.status_code == 403:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": "forbidden", "message": detail}
+        if not res.is_success():
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
         return res.json()
 
 
@@ -541,6 +569,56 @@ async def purchase_extra_attempt(
             json={"escrow_id": escrow_id, "fee_hash": fee_hash},
         )
         res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Reissue Evaluate Token",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def reissue_evaluate_token(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The escrow vault ID whose evaluate_token was lost.",
+    )],
+    wallet_address: Annotated[str, Field(
+        title="Buyer Wallet Address",
+        description="Your XRPL wallet address (r...) — must match the buyer address on the vault.",
+    )],
+    tx_hash: Annotated[str, Field(
+        title="Verification Transaction Hash",
+        description="Hash of an XRPL AccountSet tx you submitted from wallet_address with a Memo containing the challenge string from get_wallet_verification_challenge(). This proves you own the buyer wallet.",
+    )],
+) -> dict:
+    """
+    Reissue a lost evaluate_token by proving ownership of the buyer wallet.
+
+    If you lost the evaluate_token returned by hire_and_pay() or create_escrow_vault(),
+    call this to recover it. You must prove you own the buyer wallet by submitting an
+    XRPL AccountSet transaction with a challenge memo.
+
+    Steps:
+      1. Call get_wallet_verification_challenge(wallet=buyer_address) — get a challenge string
+      2. Submit an XRPL AccountSet tx from buyer_address with the challenge in a Memo (hex-encoded)
+      3. Call this tool with the tx hash — returns the evaluate_token
+
+    Returns:
+        evaluate_token (the new token to share with the worker), escrow_id.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/{escrow_id}/reissue-token",
+            json={"wallet_address": wallet_address, "tx_hash": tx_hash},
+        )
+        if not res.is_success():
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
         return res.json()
 
 
@@ -900,23 +978,34 @@ async def get_xrp_price() -> dict:
     idempotentHint=True,
     openWorldHint=False,
 ))
-async def get_fees() -> dict:
+async def get_fees(
+    wallet_address: Annotated[Optional[str], Field(
+        title="Wallet Address",
+        description="Optional XRPL wallet address (r...) to check free_escrows_remaining for that wallet.",
+        default=None,
+    )] = None,
+) -> dict:
     """
     Return the current fee schedule, accepted payment assets, free-tier rules, and escrow limits.
 
     Call this before calling any paid endpoint. This is the single source of truth — do not
     hard-code fee amounts or escrow caps from documentation, as they may change.
 
+    Pass wallet_address to see how many free escrows remain for that wallet.
+
     Returns:
     - audit_fee: USD amount, accepted assets (XRP/RLUSD on XRPL, USDC on Base), destination
       addresses, current XRP amount at live price, fee_hash field name and format
-    - free_tier: free audit count, minimum trust score required, how to check your score
+    - free_tier: free escrow count, eligibility rules, free_escrows_remaining (if wallet_address passed)
     - escrow_limits: default cap ($3,000 USD), KYC cap ($10,000 USD), Travel Rule warn threshold
     - free_endpoints: endpoints that never require payment
     - paid_endpoints: endpoints that require a fee_hash or X-PAYMENT header
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(f"{REFEREE_BASE}/fees")
+        params = {}
+        if wallet_address:
+            params["wallet_address"] = wallet_address
+        res = await client.get(f"{REFEREE_BASE}/fees", params=params)
         res.raise_for_status()
         return res.json()
 
@@ -2116,21 +2205,26 @@ async def hire_and_pay(
         f"({delegate_address}) must sign and submit it, NOT the buyer."
         if delegate_address else ""
     )
+    evaluate_token = vault_data.get("evaluate_token")
+    free_tier_used = vault_data.get("free_tier", False)
+    audits_remaining = vault_data.get("audits_remaining")
     return {
         "escrow_id":          escrow_id,
         "condition":          vault_data.get("condition"),
         "cancel_after_human": vault_data.get("cancel_after_human"),
         "transaction":        prep_data.get("transaction"),
         "delegate_mode":      bool(delegate_address),
+        "evaluate_token":     evaluate_token,
+        "evaluate_token_hint": "⚠ SAVE THIS TOKEN. Share it with the worker before they call evaluate_escrow_work(). It is not shown again. If lost, call reissue_evaluate_token() with proof of buyer wallet ownership.",
         "next_step": (
-            "Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
-            f"then call submit_escrow_transaction('{escrow_id}', signed.tx_blob) — "
-            "that submits to XRPL and activates the vault in one step. "
-            "The worker submits their work via evaluate_escrow_work() and gets paid automatically on PASS."
+            "1. Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
+            f"then call submit_escrow_transaction('{escrow_id}', signed.tx_blob) to submit to XRPL. "
+            "2. Share evaluate_token with the worker — they must pass it to evaluate_escrow_work(). "
+            "3. Worker submits work via evaluate_escrow_work() and gets paid automatically on PASS."
             + delegate_note
         ),
-        "free_tier": vault_data.get("free_tier"),
-        "audits_remaining": vault_data.get("audits_remaining"),
+        "free_tier": {"used": bool(free_tier_used), "free_escrows_remaining": audits_remaining} if free_tier_used else {"used": False},
+        "audits_remaining": audits_remaining,
     }
 
 
@@ -2218,9 +2312,10 @@ async def create_agent_wallet() -> dict:
         "status":       "unfunded",
         "reserve_xrp":  1,
         "note": (
-            "This wallet is NOT yet active. Send at least 1 XRP to 'address' to activate it on mainnet. "
+            "This wallet is NOT yet active. Fund it before use. "
+            "Minimum per escrow: 1 XRP base reserve + 0.2 XRP object reserve + bounty amount + fees. "
+            "For a 0.1 XRP bounty: minimum ~1.31 XRP. Recommend sending 2+ XRP to start. "
             "Until funded: you cannot transact, and you cannot be an escrow destination. "
-            "Each object you hold (escrow, offer, trust line) adds 0.2 XRP to the reserve. "
             "Store 'seed' securely — it cannot be recovered if lost."
         ),
         "funding_instructions": {
@@ -2230,11 +2325,11 @@ async def create_agent_wallet() -> dict:
                 "Coinbase is the onramp only; all settlement happens on XRPL after this. "
                 "Requires your own Coinbase API key (free account)."
             ),
-            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw ≥1 XRP to the address.",
-            "from_wallet":   "Ask your operator or client to send ≥1 XRP to the address.",
+            "from_exchange": "Buy XRP on Coinbase/Kraken/Binance → withdraw ≥2 XRP to the address (covers reserve + one 0.1 XRP escrow).",
+            "from_wallet":   "Ask your operator or client to send ≥2 XRP to the address.",
         },
         "next_step": (
-            "IMPORTANT: Fund this address with at least 1 XRP before sharing it or accepting work. "
+            "IMPORTANT: Fund this address with at least 2 XRP before sharing it or accepting work (1 XRP base reserve + 0.2 XRP object reserve + bounty). "
             "If you have a Coinbase account, call fund_xrpl_wallet_via_coinbase(address, usd_amount=5.0) — "
             "it buys XRP and withdraws it to your XRPL address (Coinbase is the onramp only; "
             "escrow settlement happens entirely on XRPL). "
@@ -2242,6 +2337,56 @@ async def create_agent_wallet() -> dict:
             "Once funded, call list_open_jobs() to find work or hire_and_pay() to hire."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Register existing wallet for free tier via ownership proof
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Register Wallet Free Tier",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def register_wallet_free_tier(
+    wallet_address: Annotated[str, Field(
+        title="XRPL Wallet Address",
+        description="Your XRPL wallet address (r...) to register for the free tier.",
+    )],
+    tx_hash: Annotated[str, Field(
+        title="Verification Transaction Hash",
+        description="Hash of an XRPL AccountSet tx you submitted from wallet_address with a Memo containing the challenge string from get_wallet_verification_challenge(). This proves you own the wallet.",
+    )],
+) -> dict:
+    """
+    Register an existing wallet for 3 free escrows by proving ownership.
+
+    Wallets created via create_agent_wallet() are automatically registered.
+    If you created your wallet elsewhere (Wallet.create(), Privy, Xaman, etc.),
+    call this to claim the same 3 free escrows.
+
+    Steps:
+      1. Call get_wallet_verification_challenge(wallet=your_address) — get a challenge string
+      2. Submit an XRPL AccountSet tx from your wallet with the challenge in a Memo (hex-encoded)
+      3. Call this tool with the tx hash — your wallet is registered for the free tier
+
+    Returns:
+        status, free_escrows_remaining.
+    """
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/wallet/{wallet_address}/register-free-tier",
+            json={"tx_hash": tx_hash},
+        )
+        if not res.is_success():
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
+        return res.json()
 
 
 # ---------------------------------------------------------------------------
@@ -2265,8 +2410,8 @@ async def get_wallet_setup_guide() -> dict:
         "why": (
             "AgentTrust only needs your public address and signed transactions. "
             "The seed (private key) should never be passed to any external service, "
-            "including this MCP server. create_agent_wallet() is a convenience tool "
-            "for development only — it returns the seed in plaintext."
+            "including this MCP server. create_agent_wallet() is the recommended quick-start path "
+            "— it registers your wallet and grants 3 free escrows. Store the seed securely in your .env."
         ),
         "step_1_generate": {
             "description": "Generate a wallet locally — run this once, offline if possible",
@@ -2924,8 +3069,20 @@ async def recommend_release_conditions(job_type: str) -> dict:
             "example_call": "create_escrow_vault(..., require_ai_audit=True, invoice_requirements={require_date: true, require_line_items: true})",
         }
 
-    # --- Software / code / technical work ---
-    if any(k in jt for k in ["code", "software", "dev", "bug", "feature", "pr", "pull request", "script", "api", "engineer"]):
+    # --- Scraping / data collection / ETL (check before code so "api scraping" hits this branch) ---
+    if any(k in jt for k in ["scraping", "scrape", "crawl", "etl", "data collection", "data pipeline", "extraction", "web data", "dataset"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_ai_audit": True,
+            },
+            "rationale": "AI audit verifies the data output matches your spec (schema, row count, source URLs, freshness). Include a detailed task_description with expected schema and sample for best results.",
+            "tip": "Attach a sample of the expected output format in task_description so the referee can check schema compliance.",
+            "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='Scrape X with schema Y, return Z rows')",
+        }
+
+    # --- Software / code / technical work (after scraping so "api scraping" doesn't match here) ---
+    if any(k in jt for k in ["code", "software", "dev", "bug", "feature", "pr", "pull request", "script", "engineer", "api integration", "api development"]):
         return {
             "job_type": job_type,
             "recommended": {
@@ -2946,18 +3103,6 @@ async def recommend_release_conditions(job_type: str) -> dict:
             },
             "rationale": "Open-ended qualitative work. AI audit evaluates submission against your task spec. Write a detailed spec for best results.",
             "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='<detailed spec>')",
-        }
-
-    # --- Scraping / data collection / ETL ---
-    if any(k in jt for k in ["scraping", "scrape", "crawl", "etl", "data collection", "data pipeline", "extraction", "web data", "dataset"]):
-        return {
-            "job_type": job_type,
-            "recommended": {
-                "require_ai_audit": True,
-            },
-            "rationale": "AI audit verifies the data output matches your spec (schema, row count, source URLs, freshness). Include a detailed task_description with expected schema and sample for best results.",
-            "tip": "Attach a sample of the expected output format in task_description so the referee can check schema compliance.",
-            "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='Scrape X with schema Y, return Z rows')",
         }
 
     # --- High-value / hybrid ---

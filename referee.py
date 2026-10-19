@@ -604,11 +604,16 @@ def serve_marketplace_json():
     }
 
 
-def _get_free_escrows_remaining(wallet_address: str) -> int:
+def _get_free_escrows_remaining(wallet_address: str) -> dict:
+    """Return eligibility info and remaining free escrows for a wallet."""
     db = SessionLocal()
     try:
+        bootstrapped = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == wallet_address).first()
+        if not bootstrapped:
+            return {"remaining": 0, "eligible": False, "reason": "Wallet not registered through AgentTrust. Use create_agent_wallet for instant free-tier access, or call register_wallet_free_tier after building on-chain history (score >= 25)."}
         used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count()
-        return max(0, FREE_AUDIT_LIMIT - used)
+        remaining = max(0, FREE_AUDIT_LIMIT - used)
+        return {"remaining": remaining, "eligible": True, "reason": "AgentTrust-registered wallet"}
     finally:
         db.close()
 
@@ -684,11 +689,11 @@ async def get_fees(wallet_address: Optional[str] = None):
             ],
         },
         "free_tier": {
-            "rule": f"Wallets created through AgentTrust (create_agent_wallet) receive {FREE_AUDIT_LIMIT} free escrows — omit fee_hash. Other wallets with trust score >= {FREE_AUDIT_MIN_SCORE} also qualify.",
+            "rule": f"Wallets registered through AgentTrust (via create_agent_wallet or register_wallet_free_tier with score >= {FREE_AUDIT_MIN_SCORE}) receive {FREE_AUDIT_LIMIT} free escrows — omit fee_hash.",
             "free_escrows": FREE_AUDIT_LIMIT,
             "min_trust_score_for_non_bootstrapped": FREE_AUDIT_MIN_SCORE,
             "check_score": "GET /wallet/score/{address}",
-            **({"free_escrows_remaining": _get_free_escrows_remaining(wallet_address)} if wallet_address else {}),
+            **(_get_free_escrows_remaining(wallet_address) if wallet_address else {}),
         },
         "escrow_limits": {
             "default_cap_usd": THRESHOLD_BLOCK_USD,
@@ -802,7 +807,7 @@ async def serve_payment_required():
             "/wallet/sanctions/{address}", "/jobs (GET)", "/jobs/{id}", "/status",
             "/.well-known/*",
         ],
-        "freeAudits":   "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash.",
+        "freeAudits":   f"Wallets registered through AgentTrust receive {FREE_AUDIT_LIMIT} free escrows — omit fee_hash. Call /wallet/{{address}}/register-free-tier with ownership proof to qualify.",
         "liveAmounts": {
             "audit_xrp":           fee_xrp,
             "premium_audit_xrp":   premium_xrp,
@@ -2048,6 +2053,8 @@ def run_migrations():
         "CREATE INDEX IF NOT EXISTS bootstrapped_wallet_privy_idx ON bootstrapped_wallet (privy_user_id)",
         # Backfill: r4oLryibHQk6ajWWgxxuK3WegeJHUrwTqr was created via create_agent_wallet before bootstrap tracking
         "INSERT INTO bootstrapped_wallet (wallet_address) VALUES ('r4oLryibHQk6ajWWgxxuK3WegeJHUrwTqr') ON CONFLICT DO NOTHING",
+        # Reset free tier credits for r4oL so it starts fresh with 3
+        "DELETE FROM free_audit_usage WHERE wallet_address = 'r4oLryibHQk6ajWWgxxuK3WegeJHUrwTqr'",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2799,14 +2806,15 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                     qualifies = score >= FREE_AUDIT_MIN_SCORE
 
                 if qualifies:
-                    db.add(FreeAuditUsage(wallet_address=free_wallet, escrow_id=escrow_id, resource=resource))
-                    db.commit()
+                    # Do NOT insert FreeAuditUsage here — caller inserts AFTER vault is created
+                    # so that a failed vault creation doesn't burn a free credit.
                     remaining = FREE_AUDIT_LIMIT - used - 1
                     acct_label = f"privy_account={privy_user_id}" if privy_user_id else f"wallet={free_wallet}"
                     logger.info(f"🎁 FREE AUDIT granted: {acct_label} bootstrapped={is_bootstrapped} used={used+1}/{FREE_AUDIT_LIMIT}")
                     scope_label = "this account" if privy_user_id else "this wallet"
                     return {
                         "free_tier": True,
+                        "_free_tier_wallet": free_wallet,  # caller inserts FreeAuditUsage after vault created
                         "audits_remaining": remaining,
                         "sender": free_wallet,
                         "amount_xrp": 0,
@@ -4594,6 +4602,14 @@ _BOOTSTRAP_WINDOW = 86400  # per 24 hours
 @app.post("/wallet/{address}/bootstrap")
 async def bootstrap_wallet(address: str, request: Request, db: Session = Depends(get_db)):
     """Register a wallet as bootstrapped (created via create_agent_wallet) for free tier eligibility."""
+    # Check secret FIRST — before revealing anything about rate limits to unauthorised callers
+    expected_secret = os.getenv("BOOTSTRAP_SECRET")
+    if not expected_secret:
+        raise HTTPException(status_code=403, detail="Bootstrap endpoint not configured.")
+    provided = request.headers.get("X-Bootstrap-Secret", "")
+    if not provided or provided != expected_secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Bootstrap-Secret.")
+
     # Rate-limit by IP: max 3 new bootstrapped wallets per IP per 24 h
     forwarded = request.headers.get("x-forwarded-for", "")
     ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
@@ -4604,14 +4620,6 @@ async def bootstrap_wallet(address: str, request: Request, db: Session = Depends
         raise HTTPException(status_code=429, detail=f"Too many wallet creations from this IP ({_BOOTSTRAP_LIMIT} per 24 h). Try again later.")
     _bootstrap_rate[ip].append(now)
 
-    # Only allow calls from the MCP tool (BOOTSTRAP_SECRET required)
-    expected_secret = os.getenv("BOOTSTRAP_SECRET")
-    if not expected_secret:
-        raise HTTPException(status_code=403, detail="Bootstrap endpoint not configured.")
-    provided = request.headers.get("X-Bootstrap-Secret", "")
-    if not provided or provided != expected_secret:
-        raise HTTPException(status_code=403, detail="Invalid or missing X-Bootstrap-Secret.")
-
     existing = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == address).first()
     if not existing:
         db.add(BootstrappedWallet(wallet_address=address))
@@ -4620,6 +4628,94 @@ async def bootstrap_wallet(address: str, request: Request, db: Session = Depends
     used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == address).count()
     remaining = max(0, FREE_AUDIT_LIMIT - used)
     return {"address": address, "bootstrapped": True, "free_tier_credits": FREE_AUDIT_LIMIT, "free_escrows_remaining": remaining}
+
+
+@app.post("/wallet/{address}/register-free-tier")
+async def register_wallet_free_tier(address: str, body: dict, request: Request, db: Session = Depends(get_db)):
+    """
+    Register an existing wallet for the free tier by proving ownership via XRPL AccountSet tx.
+
+    The wallet must have a trust score >= FREE_AUDIT_MIN_SCORE (25) to qualify.
+    Wallets created via create_agent_wallet bypass this check (already bootstrapped).
+
+    Body: {tx_hash: "64-char hex"}
+
+    Steps:
+      1. GET /verify/challenge?wallet=your_address — get a challenge string
+      2. Submit AccountSet tx from your wallet with challenge in Memo (hex-encoded)
+      3. POST here with tx_hash
+    """
+    tx_hash = (body.get("tx_hash") or "").strip().upper()
+    if not tx_hash or len(tx_hash) != 64:
+        raise HTTPException(status_code=400, detail="tx_hash must be a 64-char XRPL transaction hash.")
+
+    # Rate-limit same as bootstrap
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    now = time.time()
+    bucket = _bootstrap_rate.setdefault(ip, [])
+    _bootstrap_rate[ip] = [t for t in bucket if now - t < _BOOTSTRAP_WINDOW]
+    if len(_bootstrap_rate[ip]) >= _BOOTSTRAP_LIMIT:
+        raise HTTPException(status_code=429, detail=f"Too many registrations from this IP ({_BOOTSTRAP_LIMIT} per 24 h). Try again later.")
+    _bootstrap_rate[ip].append(now)
+
+    # Verify wallet ownership
+    if address not in _verify_challenges:
+        raise HTTPException(status_code=400, detail="No pending verification challenge for this wallet. Call GET /verify/challenge?wallet=... first.")
+    challenge_str, expires_at = _verify_challenges[address]
+    if datetime.now(timezone.utc) > expires_at:
+        del _verify_challenges[address]
+        raise HTTPException(status_code=400, detail="Verification challenge expired. Request a new one via GET /verify/challenge.")
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash}]})
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
+    if not tx_data.get("validated"):
+        raise HTTPException(status_code=400, detail="Transaction is not yet validated.")
+    meta = tx_data.get("meta") or {}
+    if (meta.get("TransactionResult") if isinstance(meta, dict) else "") != "tesSUCCESS":
+        raise HTTPException(status_code=400, detail="Transaction did not succeed on-chain.")
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    account = tx_data.get("Account") or tx_json.get("Account")
+    if account != address:
+        raise HTTPException(status_code=403, detail=f"Transaction account ({account}) does not match wallet address ({address}).")
+    memos = tx_json.get("Memos") or tx_data.get("Memos") or []
+    expected_hex = challenge_str.encode().hex().upper()
+    if not any(m.get("Memo", {}).get("MemoData", "").upper() == expected_hex for m in memos):
+        raise HTTPException(status_code=403, detail="Transaction Memo does not contain the expected challenge string.")
+
+    del _verify_challenges[address]
+
+    # Check already bootstrapped
+    existing = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == address).first()
+    if existing:
+        used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == address).count()
+        return {"status": "already_registered", "address": address, "free_escrows_remaining": max(0, FREE_AUDIT_LIMIT - used)}
+
+    # Check trust score threshold
+    try:
+        score_data = await compute_xrpl_trust_score(address, db)
+        score = score_data.get("score", 0)
+    except Exception:
+        score = 0
+
+    if score < FREE_AUDIT_MIN_SCORE:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Wallet trust score ({score}) is below the minimum for self-registration ({FREE_AUDIT_MIN_SCORE}). "
+                   f"Use create_agent_wallet() for instant free-tier access, or build on-chain history to qualify.",
+        )
+
+    db.add(BootstrappedWallet(wallet_address=address))
+    db.commit()
+    logger.info(f"🎁 FREE TIER self-registered: {address} (score={score})")
+    return {"status": "registered", "address": address, "free_escrows_remaining": FREE_AUDIT_LIMIT}
 
 
 @app.post("/wallet/{address}/rate")
@@ -5215,6 +5311,12 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     db.add(vault)
     db.commit()
 
+    # Debit free tier credit AFTER vault is successfully created — prevents burning credits on failed vaults
+    _free_tier_wallet = fee_result.get("_free_tier_wallet")
+    if _free_tier_wallet:
+        db.add(FreeAuditUsage(wallet_address=_free_tier_wallet, escrow_id=req.escrow_id, resource="/escrow/generate"))
+        db.commit()
+
     logger.info(f"🔒 VAULT CREATED: {req.escrow_id} | currency={currency} | seller_wants={req.seller_currency}")
 
     # Send worker receipt email + buyer escrow confirmation
@@ -5335,6 +5437,87 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
 
 
+@app.post("/escrow/{escrow_id}/reissue-token")
+async def reissue_evaluate_token_endpoint(escrow_id: str, body: dict, db: Session = Depends(get_db)):
+    """
+    Reissue a lost evaluate_token for an escrow vault.
+
+    The caller proves ownership of the buyer wallet by submitting an XRPL AccountSet
+    transaction with a Memo containing a challenge string. If the proof passes, a new
+    evaluate_token is generated and returned.
+
+    Body: {wallet_address: "r...", tx_hash: "64-char hex"}
+
+    Steps:
+      1. GET /verify/challenge?wallet=buyer_address — get a challenge string
+      2. Submit AccountSet tx from buyer_address with challenge in Memo (hex-encoded)
+      3. POST here with wallet_address + tx_hash
+    """
+    wallet_address = (body.get("wallet_address") or "").strip()
+    tx_hash = (body.get("tx_hash") or "").strip().upper()
+
+    if not wallet_address or not wallet_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="wallet_address (r...) is required.")
+    if not tx_hash or len(tx_hash) != 64:
+        raise HTTPException(status_code=400, detail="tx_hash must be a 64-char XRPL transaction hash.")
+
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Vault '{escrow_id}' not found.")
+    if vault.buyer_address and vault.buyer_address != wallet_address:
+        raise HTTPException(status_code=403, detail="wallet_address does not match the buyer address on this vault.")
+
+    # Verify wallet ownership via XRPL AccountSet tx + challenge memo
+    if wallet_address not in _verify_challenges:
+        raise HTTPException(status_code=400, detail="No pending verification challenge for this wallet. Call GET /verify/challenge?wallet=... first.")
+    challenge_str, expires_at = _verify_challenges[wallet_address]
+    if datetime.now(timezone.utc) > expires_at:
+        del _verify_challenges[wallet_address]
+        raise HTTPException(status_code=400, detail="Verification challenge expired. Request a new one via GET /verify/challenge.")
+
+    # Look up tx on XRPL
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash}]})
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
+    if not tx_data.get("validated"):
+        raise HTTPException(status_code=400, detail="Transaction is not yet validated.")
+    meta = tx_data.get("meta") or {}
+    if (meta.get("TransactionResult") if isinstance(meta, dict) else "") != "tesSUCCESS":
+        raise HTTPException(status_code=400, detail="Transaction did not succeed on-chain.")
+
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    account = tx_data.get("Account") or tx_json.get("Account")
+    if account != wallet_address:
+        raise HTTPException(status_code=403, detail=f"Transaction account ({account}) does not match wallet_address ({wallet_address}).")
+
+    memos = tx_json.get("Memos") or tx_data.get("Memos") or []
+    expected_hex = challenge_str.encode().hex().upper()
+    if not any(m.get("Memo", {}).get("MemoData", "").upper() == expected_hex for m in memos):
+        raise HTTPException(status_code=403, detail="Transaction Memo does not contain the expected challenge string.")
+
+    # Clear the used challenge
+    del _verify_challenges[wallet_address]
+
+    # Generate new evaluate_token
+    new_token = secrets.token_urlsafe(32)
+    new_token_hash = hashlib.sha256(new_token.encode()).hexdigest()
+    vault.evaluate_token_hash = new_token_hash
+    db.commit()
+
+    logger.info(f"🔑 evaluate_token reissued for {escrow_id} by buyer {wallet_address}")
+    return {
+        "escrow_id": escrow_id,
+        "evaluate_token": new_token,
+        "evaluate_token_hint": "Share this token with the worker — they must include it in evaluate_escrow_work(). Store it securely.",
+    }
+
+
 class PrepareEscrowRequest(BaseModel):
     escrow_id:        str
     buyer_address:    str
@@ -5439,7 +5622,7 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
         "Condition":          vault.condition,
         "Fee":                str(base_fee),
         "Sequence":           sequence,
-        "LastLedgerSequence": current_ledger + 20,
+        "LastLedgerSequence": current_ledger + 80,
     }
     if cancel_after_ripple:
         tx["CancelAfter"] = cancel_after_ripple
