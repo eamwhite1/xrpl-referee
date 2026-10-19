@@ -107,11 +107,9 @@ async def _lifespan(app):
         _seed_public_issuers()
         # XUMM connectivity check
         await _verify_xumm()
-        # Prime OFAC list on startup (non-fatal if network unavailable)
-        try:
-            await _refresh_ofac_list()
-        except Exception as _ofac_ex:
-            logger.warning(f"OFAC startup refresh failed (non-fatal): {_ofac_ex}")
+        # Prime OFAC list on startup in background — DB-seeded copy is already in _ofac_sanctioned_xrpl.
+        # Don't block startup waiting for the network fetch.
+        asyncio.create_task(_refresh_ofac_list())
         yield
 
 
@@ -532,8 +530,17 @@ def _agent_json_legacy_unused():
     }
 
 @app.get("/.well-known/mcp/server-card.json")
-def serve_mcp_server_card():
+async def serve_mcp_server_card():
     """Smithery server card — lets Smithery skip scanning and use this metadata directly."""
+    # Build tool list dynamically from FastMCP registry to keep count in sync with tools/list
+    _tools_list = []
+    try:
+        from mcp_server import mcp as _mcp_ref
+        _registered = await _mcp_ref.get_tools()
+        for _t in _registered.values():
+            _tools_list.append({"name": _t.name, "description": (_t.description or "").split("\n")[0][:120]})
+    except Exception:
+        pass
     return {
         "name":        "AgentTrust Referee",
         "version":     "7.0.0",
@@ -557,40 +564,8 @@ def serve_mcp_server_card():
         "license":     "MIT",
         "transport":   ["http"],
         "auth":        {"type": "none"},
-        "tools": [
-            {"name": "audit_task",               "description": "Verify completed work against a task spec. Fee: $0.10 (XRP or RLUSD on XRPL, USDC on Base) (chain 8453). Returns PASS/FAIL with score and feedback."},
-            {"name": "create_escrow_vault",       "description": "Lock XRP or RLUSD in XRPL crypto-condition escrow gated by AI verdict. Optional trust-layer fields: nft_dvp (bool — require NFT transfer before payment releases), required_nft_issuer (wallet address), required_domain (XRPL domain verification), required_vc_issuer_did (W3C VC issuer DID), proof_policy ('ALL' or 'ANY')."},
-            {"name": "confirm_escrow_transaction","description": "Register an EscrowCreate tx hash to activate a vault."},
-            {"name": "evaluate_escrow_work",      "description": "Submit proof of work. On PASS, payment releases automatically — no EscrowFinish needed. For NFT DvP jobs (nft_dvp=true), PASS sets status to PASS_AWAITING_NFT — seller must then create an NFTokenCreateOffer (Destination=buyer, Amount=0) and register it via POST /escrow/{id}/nft-offer before payment releases."},
-            {"name": "get_escrow_info",           "description": "Retrieve task spec, status, and attempts remaining for an escrow vault."},
-            {"name": "list_marketplace_jobs",     "description": "Browse live XRPL escrow bounties. Returns structured job data."},
-            {"name": "post_job",                  "description": "Post a job to the job board. No fee or funds — workers bid, you negotiate and award."},
-            {"name": "list_open_jobs",            "description": "Browse jobs posted by buyers that are open for bidding."},
-            {"name": "submit_bid",                "description": "Submit a bid (price + proposal) on an open job."},
-            {"name": "view_job",                  "description": "View job details and all current bids."},
-            {"name": "award_job",                 "description": "Accept a bid. Returns worker address and agreed price to use in create_escrow_vault()."},
-            {"name": "list_marketplace_skills",   "description": "Browse skill agents/humans offering services. Filter by category and rate. Supports direct hire."},
-            {"name": "create_skill_listing",      "description": "List your skills publicly for 30 days ($0.10/month). Buyers can direct-hire you from the listing."},
-            {"name": "direct_hire",               "description": "Get a skill provider's wallet address for immediate escrow creation — no bidding needed."},
-            {"name": "get_rlusd_quote",           "description": "Get live XRP to RLUSD conversion quote via the XRPL DEX."},
-            {"name": "get_xrp_price",             "description": "Get current live XRP/USD and XRP/GBP prices."},
-            {"name": "get_wallet_trust_score",    "description": "GET /wallet/score/{address} — AgentTrust Wallet Trust Score (0–100). The first open trust-scoring system built natively for XRPL wallets. Combines 11 independent signals: account age, XRP balance, on-chain activity, domain verification, on-chain ownership proof, sanctions screening (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan verified entity + security flags), identity KYC (Didit verification; human-only signal), NFTs held, AgentTrust escrow completion rate, and peer ratings from counterparties. Returns a full score breakdown by signal so agents can reason about why a wallet scores high or low. A score below 30 is low-trust, 30–60 is moderate, 60+ is established. Free to query for any XRPL address."},
-            {"name": "verify_nft_proof",          "description": "POST /nft/verify — verify that an XRPL NFT exists in a wallet, was minted by a required issuer, and contains required metadata fields. Used to confirm event-based proof (ticket purchased, cargo shipped, etc)."},
-            {"name": "verify_domain_ownership",   "description": "POST /domain/verify — verify that an XRPL wallet is cryptographically linked to a domain via the account Domain field and xrp-ledger.toml. Proves the wallet owner controls the specified organisation's domain."},
-            {"name": "verify_vc",                 "description": "POST /vc/verify — verify a W3C Verifiable Credential JWT. Checks expiry, issuer DID, credential type, and optionally resolves the DID via the Universal Resolver. Accepts credentials from any W3C-compliant issuer."},
-            {"name": "register_nft_dvp_offer",    "description": "POST /escrow/{id}/nft-offer — after a PASS verdict on an NFT DvP escrow, seller registers their on-chain NFTokenCreateOffer (Destination=buyer, Amount=0). System verifies the offer on XRPL and emails buyer to accept. Payment releases automatically once buyer accepts."},
-            {"name": "check_nft_dvp_status",      "description": "GET /escrow/{id}/nft-status — poll whether the buyer has accepted the NFT offer yet. Returns accepted/pending/expired. Triggers automatic escrow release when accepted."},
-            {"name": "get_batch_dvp_payload",     "description": "GET /escrow/{id}/batch-dvp-payload — XLS-56 Atomic NFT DvP (live on XRPL mainnet). Returns a pre-built TF_ALL_OR_NOTHING Batch transaction the buyer signs once to atomically accept the seller's NFT and release escrow payment in a single ledger close. Vault must be in PASS_AWAITING_NFT state with the seller's NFTokenCreateOffer registered."},
-            {"name": "company_xrpl_lookup",       "description": "GET /gleif/xrpl-lookup?q= — search the AgentTrust registry for a company by name and return their verified XRPL wallet address."},
-            {"name": "list_trusted_issuers",      "description": "GET /nft/issuers — list all verified trusted NFT issuers in the AgentTrust registry. These are organisations (shipping companies, ticket platforms, certification bodies) whose XRPL wallet has been verified against their domain."},
-            {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification via domain records."},
-            {"name": "create_eth_challenge",      "description": "POST /eth/challenge — generate an EIP-191 challenge string for an Ethereum address. The address holder must sign this with their ETH wallet to prove ownership. Use before submitting an Ethereum address as identity proof."},
-            {"name": "verify_eth_signature",      "description": "POST /eth/verify-signature — verify that an Ethereum address signed the challenge string. Confirms the submitter genuinely controls the ETH address, preventing fake address claims."},
-            {"name": "hire_and_pay",              "description": "Convenience tool: create an escrow vault funded from a delegated (XLS-75) hot-wallet key. Pass delegate_address to sign EscrowCreate on behalf of the buyer without sharing their seed. Combines direct_hire + create_escrow_vault in one call."},
-            {"name": "check_wallet_sanctions",    "description": "Check whether an XRPL wallet address appears on the OFAC SDN list or AnChain.ai multi-jurisdiction sanctions database. Returns sanctioned (bool), risk_score, risk_level, entity, category, and list_as_of. If the sanctions list is stale or unavailable, returns sanctioned: null and stale: true — never assumes clear."},
-            {"name": "check_wallet_kyc",          "description": "Check whether a wallet has completed Didit KYC identity verification. Returns verified (bool), tier, and verification date."},
-            {"name": "create_agent_wallet",       "description": "Create a new XRPL wallet (Privy server wallet or classic keypair). Returns address and funding instructions. Supports XLS-75 delegation — pass delegate_to to pre-authorise a hot agent key."},
-        ],
+        "tools":       _tools_list or [{"name": "(loading)", "description": "Tool list loading from MCP registry."}],
+        "tool_count":  len(_tools_list),
         "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3", "nft", "trust", "identity"],
     }
 
@@ -630,10 +605,11 @@ def serve_marketplace_json():
 
 
 @app.get("/fees")
-async def get_fees():
+async def get_fees(wallet_address: Optional[str] = None, db: Session = Depends(get_db)):
     """
     Machine-readable fee schedule, escrow limits, and free-tier rules.
     This is the single source of truth — agents should read this before calling any paid endpoint.
+    Pass ?wallet_address=r... to see free_escrows_remaining for that wallet.
     """
     fee_xrp = await get_required_fee_xrp()
     premium_fee_xrp = await get_required_fee_xrp(premium=True)
@@ -699,10 +675,11 @@ async def get_fees():
             ],
         },
         "free_tier": {
-            "rule": "Wallets with trust score >= 25 receive 3 free audits — omit fee_hash",
-            "free_audits": FREE_AUDIT_LIMIT,
-            "min_trust_score": FREE_AUDIT_MIN_SCORE,
+            "rule": f"Wallets created through AgentTrust (create_agent_wallet) receive {FREE_AUDIT_LIMIT} free escrows — omit fee_hash. Other wallets with trust score >= {FREE_AUDIT_MIN_SCORE} also qualify.",
+            "free_escrows": FREE_AUDIT_LIMIT,
+            "min_trust_score_for_non_bootstrapped": FREE_AUDIT_MIN_SCORE,
             "check_score": "GET /wallet/score/{address}",
+            **({"free_escrows_remaining": max(0, FREE_AUDIT_LIMIT - db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count())} if wallet_address else {}),
         },
         "escrow_limits": {
             "default_cap_usd": THRESHOLD_BLOCK_USD,
@@ -2052,6 +2029,8 @@ def run_migrations():
         # per-account free-tier credits for Privy-created wallets
         "ALTER TABLE bootstrapped_wallet ADD COLUMN IF NOT EXISTS privy_user_id VARCHAR",
         "CREATE INDEX IF NOT EXISTS bootstrapped_wallet_privy_idx ON bootstrapped_wallet (privy_user_id)",
+        # Backfill: r4oLryibHQk6ajWWgxxuK3WegeJHUrwTqr was created via create_agent_wallet before bootstrap tracking
+        "INSERT INTO bootstrapped_wallet (wallet_address) VALUES ('r4oLryibHQk6ajWWgxxuK3WegeJHUrwTqr') ON CONFLICT DO NOTHING",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2799,29 +2778,54 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                 used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
 
             if used < FREE_AUDIT_LIMIT:
-                min_score = FREE_AUDIT_MIN_SCORE_BOOTSTRAPPED if is_bootstrapped else FREE_AUDIT_MIN_SCORE
-                try:
-                    score_data = await compute_xrpl_trust_score(free_wallet, db)
-                    score = score_data.get("score", 0)
-                except Exception:
-                    score = 0
+                # Bootstrapped wallets (created via create_agent_wallet) always qualify — no score check.
+                # Non-bootstrapped wallets must meet the minimum trust score.
+                qualifies = is_bootstrapped
+                if not qualifies:
+                    try:
+                        score_data = await compute_xrpl_trust_score(free_wallet, db)
+                        score = score_data.get("score", 0)
+                    except Exception:
+                        score = 0
+                    qualifies = score >= FREE_AUDIT_MIN_SCORE
 
-                if score >= min_score:
+                if qualifies:
                     db.add(FreeAuditUsage(wallet_address=free_wallet, escrow_id=escrow_id, resource=resource))
                     db.commit()
                     remaining = FREE_AUDIT_LIMIT - used - 1
                     acct_label = f"privy_account={privy_user_id}" if privy_user_id else f"wallet={free_wallet}"
-                    logger.info(f"🎁 FREE AUDIT granted: {acct_label} score={score} used={used+1}/{FREE_AUDIT_LIMIT}")
+                    logger.info(f"🎁 FREE AUDIT granted: {acct_label} bootstrapped={is_bootstrapped} used={used+1}/{FREE_AUDIT_LIMIT}")
                     scope_label = "this account" if privy_user_id else "this wallet"
                     return {
                         "free_tier": True,
                         "audits_remaining": remaining,
                         "sender": free_wallet,
                         "amount_xrp": 0,
-                        "message": f"Free audit applied ({used + 1}/{FREE_AUDIT_LIMIT}). {remaining} free audit{'s' if remaining != 1 else ''} remaining for {scope_label}.",
+                        "message": f"Free escrow applied ({used + 1}/{FREE_AUDIT_LIMIT}). {remaining} free escrow{'s' if remaining != 1 else ''} remaining for {scope_label}.",
                     }
-
-        _raise_402(resource, "Payment required. Provide a fee_hash (x402 v1) or PAYMENT-SIGNATURE header (x402 v2).", min_xrp=required_xrp)
+                else:
+                    _raise_402(
+                        resource,
+                        f"Wallet trust score is below the free-tier minimum ({FREE_AUDIT_MIN_SCORE}). "
+                        f"Wallets created through AgentTrust (create_agent_wallet) bypass this check. "
+                        f"Otherwise pay $0.10 (XRP/RLUSD to {PROTOCOL_WALLET}, or USDC on Base chain 8453) and include the tx hash as fee_hash.",
+                        min_xrp=required_xrp,
+                    )
+            else:
+                scope_label = "this account" if privy_user_id else "this wallet"
+                _raise_402(
+                    resource,
+                    f"Free tier exhausted — {FREE_AUDIT_LIMIT} free escrows for {scope_label} have been used. "
+                    f"Pay $0.10 (XRP/RLUSD to {PROTOCOL_WALLET}, or USDC on Base chain 8453) and include the tx hash as fee_hash.",
+                    min_xrp=required_xrp,
+                )
+        else:
+            _raise_402(
+                resource,
+                f"Payment required. Wallets created through AgentTrust (create_agent_wallet) receive {FREE_AUDIT_LIMIT} free escrows. "
+                f"Otherwise pay $0.10 (XRP/RLUSD to {PROTOCOL_WALLET}, or USDC on Base chain 8453) and include the tx hash as fee_hash.",
+                min_xrp=required_xrp,
+            )
 
     # Route EVM transaction hashes (0x-prefixed, 66 chars) to Base USDC verification
     if fee_hash.startswith("0x") and len(fee_hash) == 66:
@@ -4535,7 +4539,7 @@ async def batch_wallet_scores(
     }
 
 
-@app.get("/wallet/debug-age/{address}")
+@app.get("/wallet/debug-age/{address}", include_in_schema=False)
 async def debug_wallet_age(address: str):
     """Debug endpoint: shows raw result from each age-calculation source."""
     from datetime import datetime, timezone
@@ -4591,11 +4595,22 @@ async def bootstrap_wallet(address: str, request: Request, db: Session = Depends
         raise HTTPException(status_code=429, detail=f"Too many wallet creations from this IP ({_BOOTSTRAP_LIMIT} per 24 h). Try again later.")
     _bootstrap_rate[ip].append(now)
 
+    # Only allow calls from the MCP tool (BOOTSTRAP_SECRET required)
+    expected_secret = os.getenv("BOOTSTRAP_SECRET")
+    if not expected_secret:
+        raise HTTPException(status_code=403, detail="Bootstrap endpoint not configured.")
+    provided = request.headers.get("X-Bootstrap-Secret", "")
+    if not provided or provided != expected_secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Bootstrap-Secret.")
+
     existing = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == address).first()
     if not existing:
         db.add(BootstrappedWallet(wallet_address=address))
         db.commit()
-    return {"address": address, "bootstrapped": True, "free_tier_credits": FREE_AUDIT_LIMIT}
+
+    used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == address).count()
+    remaining = max(0, FREE_AUDIT_LIMIT - used)
+    return {"address": address, "bootstrapped": True, "free_tier_credits": FREE_AUDIT_LIMIT, "free_escrows_remaining": remaining}
 
 
 @app.post("/wallet/{address}/rate")
@@ -7586,7 +7601,7 @@ class NftIssuerWalletUpdate(BaseModel):
     contact_email: str           # must match registered email to authorise
     wallets:       list          # complete new list of wallets (replaces existing)
 
-@app.get("/nft/issuers/debug-seed")
+@app.get("/nft/issuers/debug-seed", include_in_schema=False)
 async def debug_seed():
     """Manually run the seed and report results — for diagnostics only."""
     db_url = os.getenv("DATABASE_URL", "NOT SET")

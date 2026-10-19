@@ -1966,7 +1966,7 @@ async def hire_and_pay(
     )],
     fee_hash: Annotated[str, Field(
         title="Protocol Fee Hash",
-        description="64-char hex hash of your $0.10 payment (XRP/RLUSD/USDC) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier (if eligible).",
+        description="64-char hex hash of your $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR (XRP or RLUSD on XRPL) or USDC on Base (chain 8453, 0x-prefixed tx hash). Omit to use free tier (wallets created via create_agent_wallet get 3 free escrows).",
     )] = "",
     cancel_after_hrs: Annotated[int, Field(
         title="Deadline (hours)",
@@ -2200,9 +2200,14 @@ async def create_agent_wallet() -> dict:
     from xrpl.wallet import Wallet as XrplWallet
     w = XrplWallet.create()
     # Register as bootstrapped so free tier applies regardless of trust score
+    import os as _os
+    _bootstrap_secret = _os.getenv("BOOTSTRAP_SECRET", "")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(f"{REFEREE_BASE}/wallet/{w.address}/bootstrap")
+            await client.post(
+                f"{REFEREE_BASE}/wallet/{w.address}/bootstrap",
+                headers={"X-Bootstrap-Secret": _bootstrap_secret},
+            )
     except Exception:
         pass  # non-fatal — free tier just falls back to trust score check
     return {
@@ -2667,9 +2672,10 @@ async def assess_counterparty_and_job(
     # --- Parse trust score ---
     trust_data = responses.get("trust", {})
     trust_score = trust_data.get("score", 0)
-    trust_breakdown = trust_data.get("breakdown", {})
-    kyc_verified = trust_data.get("kyc_verified", False)
-    domain_verified = trust_data.get("domain_verified", False)
+    signals = trust_data.get("signals", {})
+    trust_breakdown = signals.get("score_breakdown", {})
+    kyc_verified = signals.get("kyc_verified", False)
+    domain_verified = signals.get("has_domain", False)
 
     # --- Parse sanctions ---
     sanctions_data = responses.get("sanctions", {})
@@ -2677,13 +2683,24 @@ async def assess_counterparty_and_job(
     sanctioned = sanctions_data.get("sanctioned", False)
     sanctions_unverified = sanctioned is None
 
+    # --- Live XRP price for escrow cap (fail closed: cap=0 if unavailable) ---
+    xrp_price_usd = 0.0
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as _pc:
+            _pr = await _pc.get("https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT")
+            xrp_price_usd = float(_pr.json()["price"])
+    except Exception:
+        pass
+
     # --- Escrow cap logic ---
     if sanctioned:
         escrow_cap_xrp = 0
+    elif xrp_price_usd <= 0:
+        escrow_cap_xrp = 0  # fail closed — cannot determine cap without live price
     elif kyc_verified:
-        escrow_cap_xrp = 10000 / max(trust_data.get("xrp_price_usd", 0.5), 0.01)
+        escrow_cap_xrp = 10000 / xrp_price_usd
     else:
-        escrow_cap_xrp = 3000 / max(trust_data.get("xrp_price_usd", 0.5), 0.01)
+        escrow_cap_xrp = 3000 / xrp_price_usd
 
     # --- NFT issuer check ---
     issuer_data = responses.get("issuer")
@@ -2929,6 +2946,18 @@ async def recommend_release_conditions(job_type: str) -> dict:
             },
             "rationale": "Open-ended qualitative work. AI audit evaluates submission against your task spec. Write a detailed spec for best results.",
             "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='<detailed spec>')",
+        }
+
+    # --- Scraping / data collection / ETL ---
+    if any(k in jt for k in ["scraping", "scrape", "crawl", "etl", "data collection", "data pipeline", "extraction", "web data", "dataset"]):
+        return {
+            "job_type": job_type,
+            "recommended": {
+                "require_ai_audit": True,
+            },
+            "rationale": "AI audit verifies the data output matches your spec (schema, row count, source URLs, freshness). Include a detailed task_description with expected schema and sample for best results.",
+            "tip": "Attach a sample of the expected output format in task_description so the referee can check schema compliance.",
+            "example_call": "create_escrow_vault(..., require_ai_audit=True, task_description='Scrape X with schema Y, return Z rows')",
         }
 
     # --- High-value / hybrid ---
