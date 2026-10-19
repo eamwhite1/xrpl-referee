@@ -604,8 +604,17 @@ def serve_marketplace_json():
     }
 
 
+def _get_free_escrows_remaining(wallet_address: str) -> int:
+    db = SessionLocal()
+    try:
+        used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count()
+        return max(0, FREE_AUDIT_LIMIT - used)
+    finally:
+        db.close()
+
+
 @app.get("/fees")
-async def get_fees(wallet_address: Optional[str] = None, db: Session = Depends(get_db)):
+async def get_fees(wallet_address: Optional[str] = None):
     """
     Machine-readable fee schedule, escrow limits, and free-tier rules.
     This is the single source of truth — agents should read this before calling any paid endpoint.
@@ -679,7 +688,7 @@ async def get_fees(wallet_address: Optional[str] = None, db: Session = Depends(g
             "free_escrows": FREE_AUDIT_LIMIT,
             "min_trust_score_for_non_bootstrapped": FREE_AUDIT_MIN_SCORE,
             "check_score": "GET /wallet/score/{address}",
-            **({"free_escrows_remaining": max(0, FREE_AUDIT_LIMIT - db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count())} if wallet_address else {}),
+            **({"free_escrows_remaining": _get_free_escrows_remaining(wallet_address)} if wallet_address else {}),
         },
         "escrow_limits": {
             "default_cap_usd": THRESHOLD_BLOCK_USD,
