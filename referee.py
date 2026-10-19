@@ -93,13 +93,7 @@ async def _lifespan(app):
     _seed_public_issuers()
     # XUMM connectivity check
     await _verify_xumm()
-    if _mcp_http_app is not None:
-        # Pass the MCP http app itself (not the parent FastAPI app) so the
-        # session manager stores its state in the correct app scope.
-        async with _mcp_http_app.lifespan(_mcp_http_app):
-            yield
-    else:
-        yield
+    yield
 
 
 app = FastAPI(
