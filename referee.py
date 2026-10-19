@@ -8639,12 +8639,6 @@ async def enterprise_create_privy_wallet(
         privy_wallet_id=privy_wallet_id,
     )
     db.add(wallet)
-    # Register as bootstrapped so free tier applies regardless of trust score.
-    # privy_user_id = account.id ensures all wallets in this account share one
-    # pool of FREE_AUDIT_LIMIT credits rather than getting fresh credits per wallet.
-    existing_boot = db.query(BootstrappedWallet).filter_by(wallet_address=xrpl_address).first()
-    if not existing_boot:
-        db.add(BootstrappedWallet(wallet_address=xrpl_address, privy_user_id=str(account.id)))
     db.commit()
     db.refresh(wallet)
     return {
@@ -8652,7 +8646,6 @@ async def enterprise_create_privy_wallet(
         "xrpl_address": xrpl_address,
         "privy_wallet_id": privy_wallet_id,
         "status": "created",
-        "free_tier": f"{FREE_AUDIT_LIMIT} free audits included (shared across all wallets in this account).",
         "message": "Wallet created via Privy and linked to your account. Fund with at least 1 XRP to activate it on-ledger.",
     }
 
