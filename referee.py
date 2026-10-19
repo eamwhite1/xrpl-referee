@@ -887,6 +887,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base         = declarative_base()
 
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 class PaymentLog(Base):
     __tablename__ = "payment_logs"
     id           = Column(Integer, primary_key=True, index=True)
@@ -2043,14 +2051,6 @@ def run_migrations():
 
 run_migrations()
 _load_ofac_from_db()
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # ---------------------------------------------------------------------------
