@@ -93,6 +93,11 @@ async def _lifespan(app):
     _seed_public_issuers()
     # XUMM connectivity check
     await _verify_xumm()
+    # Prime OFAC list on startup (non-fatal if network unavailable)
+    try:
+        await _refresh_ofac_list()
+    except Exception as _ofac_ex:
+        logger.warning(f"OFAC startup refresh failed (non-fatal): {_ofac_ex}")
     yield
 
 
@@ -203,22 +208,20 @@ def _wrap_mcp_with_logger(asgi_app):
         if scope.get("type") != "http":
             await asgi_app(scope, receive, send)
             return
-        # Buffer the request body so we can inspect and replay it
-        body_chunks = []
-        async def buffering_receive():
-            msg = await receive()
-            if msg.get("type") == "http.request":
-                body_chunks.append(msg.get("body", b""))
-            return msg
-        # Drain body before app sees it
-        first_msg = await receive()
-        body_chunks.append(first_msg.get("body", b"") if first_msg.get("type") == "http.request" else b"")
-        more = first_msg.get("more_body", False)
+        # Buffer the entire request body by draining all http.request messages,
+        # then replay them to the inner app via replaying_receive.
+        # Important: after the body is fully replayed, return http.disconnect so
+        # the inner app never blocks waiting for more data on the already-drained channel.
+        saved_msgs = []
+        more = True
         while more:
-            chunk = await receive()
-            body_chunks.append(chunk.get("body", b""))
-            more = chunk.get("more_body", False)
-        full_body = b"".join(body_chunks)
+            msg = await receive()
+            saved_msgs.append(msg)
+            if msg.get("type") == "http.request":
+                more = msg.get("more_body", False)
+            else:
+                more = False
+        full_body = b"".join(m.get("body", b"") for m in saved_msgs if m.get("type") == "http.request")
         tool_name = "unknown"
         try:
             import json as _json
@@ -235,12 +238,14 @@ def _wrap_mcp_with_logger(asgi_app):
             if message.get("type") == "http.response.start":
                 status_code[0] = message.get("status", 200)
             await send(message)
-        body_idx = [0]
+        replay_idx = [0]
         async def replaying_receive():
-            if body_idx[0] == 0:
-                body_idx[0] = 1
-                return {"type": "http.request", "body": full_body, "more_body": False}
-            return await receive()
+            if replay_idx[0] < len(saved_msgs):
+                m = saved_msgs[replay_idx[0]]
+                replay_idx[0] += 1
+                return m
+            # All original messages replayed; signal disconnect so app doesn't hang
+            return {"type": "http.disconnect"}
         t0 = _time_mod.monotonic()
         try:
             await asgi_app(scope, replaying_receive, capturing_send)
@@ -288,8 +293,41 @@ def _log_tool_stat(tool_name: str, ok: bool):
 
 if _mcp_http_app is not None:
     _mcp_http_app = _wrap_mcp_with_logger(_mcp_http_app)
-    app.mount("/mcp", _mcp_http_app)
-    logger.info("✅ MCP server mounted at /mcp (with tool-call logging)")
+    logger.info("✅ MCP server ready (with tool-call logging)")
+
+    async def _dispatch_to_mcp(request: Request):
+        """Forward a request to the MCP ASGI app with path rewritten to '/'."""
+        body = await request.body()
+        body_idx = [0]
+        async def replay():
+            if body_idx[0] == 0:
+                body_idx[0] = 1
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+        scope = dict(request.scope)
+        scope["path"] = "/"
+        scope["raw_path"] = b"/"
+        response_info: dict = {}
+        chunks: list = []
+        async def capture(message):
+            if message["type"] == "http.response.start":
+                response_info["status"] = message["status"]
+                response_info["headers"] = message.get("headers", [])
+            elif message["type"] == "http.response.body":
+                chunks.append(message.get("body", b""))
+        await _mcp_http_app(scope, replay, capture)
+        from starlette.responses import Response as _R
+        return _R(
+            content=b"".join(chunks),
+            status_code=response_info.get("status", 200),
+            headers=dict((k.decode(), v.decode()) for k, v in response_info.get("headers", [])),
+        )
+
+    # Serve /mcp and /mcp/ without any redirect — both go straight to the MCP app.
+    _mcp_methods = ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"]
+    app.add_route("/mcp",  _dispatch_to_mcp, methods=_mcp_methods, include_in_schema=False)
+    app.add_route("/mcp/", _dispatch_to_mcp, methods=_mcp_methods, include_in_schema=False)
+    logger.info("✅ MCP server routed at /mcp and /mcp/")
 
     # POST / with JSON-RPC body dispatches to the MCP app (some clients POST to root)
     @app.post("/", include_in_schema=False)
@@ -297,9 +335,15 @@ if _mcp_http_app is not None:
         try:
             body = await request.body()
             if b'"jsonrpc"' in body:
+                body_idx = [0]
+                async def replay():
+                    if body_idx[0] == 0:
+                        body_idx[0] = 1
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    return {"type": "http.disconnect"}
                 scope = dict(request.scope)
-                scope["path"] = "/mcp"
-                scope["raw_path"] = b"/mcp"
+                scope["path"] = "/"
+                scope["raw_path"] = b"/"
                 response_info: dict = {}
                 chunks: list = []
                 async def _send(message):
@@ -308,7 +352,7 @@ if _mcp_http_app is not None:
                         response_info["headers"] = message.get("headers", [])
                     elif message["type"] == "http.response.body":
                         chunks.append(message.get("body", b""))
-                await _mcp_http_app(scope, request._receive, _send)
+                await _mcp_http_app(scope, replay, _send)
                 from starlette.responses import Response as _R
                 return _R(
                     content=b"".join(chunks),
@@ -317,7 +361,7 @@ if _mcp_http_app is not None:
                 )
         except Exception as _e:
             logger.warning(f"POST / jsonrpc dispatch error: {_e}")
-        return {"status": "online", "version": "7.0", "service": "AgentTrust Referee"}
+        return {"status": "online", "version": "7.0.0", "service": "AgentTrust Referee"}
 
 # ---------------------------------------------------------------------------
 # 3. ROUTES — HEALTH, PLAYGROUND, DISCOVERY
@@ -333,7 +377,7 @@ def serve_ui(request: Request):
 <title>AgentTrust Referee</title></head>
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
-    return {"status": "online", "version": "7.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+    return {"status": "online", "version": "7.0.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
 
 @app.get("/docs", include_in_schema=False)
 def serve_docs():
@@ -387,7 +431,7 @@ def health_check():
     ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
     return {
         "status": "online",
-        "version": "7.0",
+        "version": "7.0.0",
         "protocol_version": "agenttrust/0.1.0",
         "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "timestamp": now,
@@ -560,6 +604,10 @@ def serve_mcp_server_card():
             {"name": "register_as_issuer",        "description": "POST /nft/issuers — register your organisation as a trusted NFT issuer. Provide your XRPL wallet, organisation name, category, website. Pending manual verification via domain records."},
             {"name": "create_eth_challenge",      "description": "POST /eth/challenge — generate an EIP-191 challenge string for an Ethereum address. The address holder must sign this with their ETH wallet to prove ownership. Use before submitting an Ethereum address as identity proof."},
             {"name": "verify_eth_signature",      "description": "POST /eth/verify-signature — verify that an Ethereum address signed the challenge string. Confirms the submitter genuinely controls the ETH address, preventing fake address claims."},
+            {"name": "hire_and_pay",              "description": "Convenience tool: create an escrow vault funded from a delegated (XLS-75) hot-wallet key. Pass delegate_address to sign EscrowCreate on behalf of the buyer without sharing their seed. Combines direct_hire + create_escrow_vault in one call."},
+            {"name": "check_wallet_sanctions",    "description": "Check whether an XRPL wallet address appears on the OFAC SDN list or AnChain.ai multi-jurisdiction sanctions database. Returns sanctioned (bool), risk_score, risk_level, entity, category, and list_as_of. If the sanctions list is stale or unavailable, returns sanctioned: null and stale: true — never assumes clear."},
+            {"name": "check_wallet_kyc",          "description": "Check whether a wallet has completed Didit KYC identity verification. Returns verified (bool), tier, and verification date."},
+            {"name": "create_agent_wallet",       "description": "Create a new XRPL wallet (Privy server wallet or classic keypair). Returns address and funding instructions. Supports XLS-75 delegation — pass delegate_to to pre-authorise a hot agent key."},
         ],
         "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3", "nft", "trust", "identity"],
     }
@@ -7997,12 +8045,27 @@ async def check_sanctions(address: str):
     sanctioned, detail = await is_wallet_sanctioned(address)
     now = datetime.now(timezone.utc)
     ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
+    is_stale = ofac_age_s is None or ofac_age_s > 172800
+    list_empty = len(_ofac_sanctioned_xrpl) == 0
+    # Fail closed: if list is stale or empty and no authoritative source confirmed clear,
+    # return sanctioned=null rather than false so callers don't treat silence as safe.
+    if is_stale or list_empty:
+        source = detail.get("source", "")
+        authoritative = source not in ("", "ofac_sdn_xml") or detail.get("sanctioned") is True
+        if not authoritative:
+            return {
+                "address":    address,
+                "sanctioned": None,
+                "stale": True,
+                "list_as_of": _ofac_last_refresh.isoformat() if _ofac_last_refresh else None,
+                "note": "Sanctions list unavailable or stale — result withheld; treat as unverified.",
+            }
     return {
         "address":    address,
         "sanctioned": sanctioned,
         **{k: v for k, v in detail.items() if k != "sanctioned"},
         "list_as_of": _ofac_last_refresh.isoformat() if _ofac_last_refresh else None,
-        "stale": ofac_age_s is None or ofac_age_s > 172800,
+        "stale": is_stale,
         "note": "Not a substitute for professional compliance advice.",
     }
 
