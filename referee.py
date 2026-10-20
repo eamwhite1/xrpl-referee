@@ -113,6 +113,26 @@ async def _lifespan(app):
         yield
 
 
+# ---------------------------------------------------------------------------
+# Global free-tier daily cap (50 AI calls/day across all wallets)
+# ---------------------------------------------------------------------------
+_free_tier_daily: dict = {"date": None, "count": 0}
+_free_tier_lock = asyncio.Lock()
+
+
+async def _check_and_increment_free_daily_cap() -> bool:
+    """Returns True if allowed (under cap), False if daily cap exceeded."""
+    global _free_tier_daily
+    async with _free_tier_lock:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if _free_tier_daily["date"] != today:
+            _free_tier_daily = {"date": today, "count": 0}
+        if _free_tier_daily["count"] >= 50:
+            return False
+        _free_tier_daily["count"] += 1
+        return True
+
+
 app = FastAPI(
     title="AgentTrust Protocol Core",
     docs_url=None,
@@ -2756,7 +2776,7 @@ class QuoteRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # 7. FEE VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None, buyer_address: str = None) -> dict:
+async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp: float = None, resource: str = "/", reviewer_token: str = None, payment_signature: str = None, buyer_address: str = None, allow_free_tier: bool = True) -> dict:
     required_xrp = min_xrp if min_xrp is not None else await get_required_fee_xrp()
 
     if REVIEWER_BYPASS_TOKEN and REVIEWER_BYPASS_TOKEN in (reviewer_token, fee_hash):
@@ -2766,7 +2786,7 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
     if payment_signature:
         return await verify_x402_v2_payment(payment_signature, escrow_id, db, resource)
 
-    if not fee_hash:
+    if not fee_hash and allow_free_tier:
         # ── Free tier: grant up to FREE_AUDIT_LIMIT audits for established wallets ──
         # Use passed buyer_address directly, or fall back to escrow record lookup
         free_wallet = buyer_address or None
@@ -2806,6 +2826,14 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                     qualifies = score >= FREE_AUDIT_MIN_SCORE
 
                 if qualifies:
+                    # Check global daily cap before granting free credit
+                    if not await _check_and_increment_free_daily_cap():
+                        _raise_402(
+                            resource,
+                            "Daily free-tier quota exhausted (50/day). Try again tomorrow or pay the standard fee "
+                            f"($0.10 — XRP/RLUSD to {PROTOCOL_WALLET}, or USDC on Base chain 8453).",
+                            min_xrp=required_xrp,
+                        )
                     # Do NOT insert FreeAuditUsage here — caller inserts AFTER vault is created
                     # so that a failed vault creation doesn't burn a free credit.
                     remaining = FREE_AUDIT_LIMIT - used - 1
@@ -5021,7 +5049,7 @@ async def standalone_audit(
         )
 
     audit_id = f"audit-{(fee_hash or 'reviewer')[:16].lower()}"
-    fee_result = await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token, payment_signature=payment_signature)
+    fee_result = await verify_fee_payment(fee_hash=fee_hash, escrow_id=audit_id, db=db, resource="/audit", reviewer_token=x_reviewer_token, payment_signature=payment_signature, allow_free_tier=False)
     if response is not None and fee_result.get("payment_response_header"):
         response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
