@@ -91,6 +91,7 @@ class PaymentRequired(Exception):
 
 @asynccontextmanager
 async def _lifespan(app):
+    global _db_available
     import contextlib
     async with contextlib.AsyncExitStack() as _stack:
         # Start FastMCP's internal task group (streaming HTTP session manager).
@@ -103,6 +104,16 @@ async def _lifespan(app):
                 logger.info("✅ FastMCP lifespan started")
             except Exception as _mcp_ls_err:
                 logger.error(f"FastMCP lifespan start failed: {_mcp_ls_err}", exc_info=True)
+        # Run DB migrations — wrapped so a quota/unreachable DB doesn't crash startup
+        try:
+            Base.metadata.create_all(bind=engine)
+            run_migrations()
+            _load_ofac_from_db()
+            _db_available = True
+            logger.info("✅ Database ready")
+        except Exception as _db_err:
+            logger.error(f"⚠️ Database unavailable at startup — DB-backed routes will return 503: {_db_err}")
+            _db_available = False
         # Seed public registry entries from known XRPL organisations
         _seed_public_issuers()
         # XUMM connectivity check
@@ -110,7 +121,15 @@ async def _lifespan(app):
         # Prime OFAC list on startup in background — DB-seeded copy is already in _ofac_sanctioned_xrpl.
         # Don't block startup waiting for the network fetch.
         asyncio.create_task(_refresh_ofac_list())
-        yield
+        # Start background pollers (moved here from @app.on_event("startup") which FastAPI
+        # ignores when lifespan= is set). Run every 30 min, not 5 min.
+        asyncio.create_task(_poll_enterprise_subscriptions())
+        asyncio.create_task(_poll_expired_escrows())
+        try:
+            yield
+        finally:
+            # Flush buffered tool stats to DB on shutdown
+            await _flush_tool_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +137,9 @@ async def _lifespan(app):
 # ---------------------------------------------------------------------------
 _free_tier_daily: dict = {"date": None, "count": 0}
 _free_tier_lock = asyncio.Lock()
+
+# Set True in _lifespan after DB migrations succeed; False means DB is down.
+_db_available: bool = False
 
 
 async def _check_and_increment_free_daily_cap() -> bool:
@@ -298,30 +320,105 @@ def _wrap_mcp_with_logger(asgi_app):
                 f"MCP tool_call tool={tool_name} duration={duration_ms}ms "
                 f"status={status_code[0]} result={status_str} ip={ip_hash}"
             )
-            # Increment DB counter (fire-and-forget, non-blocking)
+            # Buffer tool stat (no DB write per call — flushed every 45 min)
             if tool_name not in ("unknown", "initialize", "tools/list", "notifications/initialized"):
                 try:
-                    import asyncio as _aio
-                    _aio.get_event_loop().run_in_executor(None, _log_tool_stat, tool_name, ok)
+                    _log_tool_stat(tool_name, ok)
+                    # Periodic flush every 45 minutes
+                    now_ts = _time_mod.monotonic()
+                    if (_tool_stat_last_flush is None or
+                            (datetime.now(timezone.utc) - _tool_stat_last_flush).total_seconds() > 2700):
+                        import asyncio as _aio2
+                        _aio2.ensure_future(_flush_tool_stats())
                 except Exception:
                     pass
     return logged_app
 
 
+# ---------------------------------------------------------------------------
+# Tool-call stats — buffered in memory, flushed to DB every 45 min (not per-call)
+# so MCP discovery traffic never wakes Neon.
+# ---------------------------------------------------------------------------
+_tool_stat_buffer: dict = {}   # {(tool, ok): count}
+_tool_stat_last_flush: datetime = None
+_TOOL_STAT_MAX_KEYS = 500
+
+# ---------------------------------------------------------------------------
+# Response cache — keeps GET /marketplace/jobs and GET /jobs off Neon for 5 min
+# ---------------------------------------------------------------------------
+_response_cache: dict = {}   # cache_key -> {"data": ..., "expires": datetime}
+_RESPONSE_CACHE_TTL  = 300   # seconds
+_RESPONSE_CACHE_MAX  = 50    # max entries
+
+
+def _cache_get(key: str):
+    entry = _response_cache.get(key)
+    if entry and datetime.now(timezone.utc) < entry["expires"]:
+        return entry["data"]
+    if key in _response_cache:
+        del _response_cache[key]
+    return None
+
+
+def _cache_set(key: str, data):
+    if len(_response_cache) >= _RESPONSE_CACHE_MAX:
+        # Evict oldest entry
+        oldest = min(_response_cache, key=lambda k: _response_cache[k]["expires"])
+        del _response_cache[oldest]
+    _response_cache[key] = {
+        "data": data,
+        "expires": datetime.now(timezone.utc) + timedelta(seconds=_RESPONSE_CACHE_TTL),
+    }
+
+
+def _cache_invalidate_jobs():
+    """Clear all job-listing cache entries on any job mutation."""
+    to_del = [k for k in _response_cache if k.startswith("jobs:") or k.startswith("mktjobs:")]
+    for k in to_del:
+        del _response_cache[k]
+
+
 def _log_tool_stat(tool_name: str, ok: bool):
-    """Write to tool_call_stats table (called in thread pool)."""
+    """Accumulate in memory; flush to DB lazily in _flush_tool_stats."""
+    global _tool_stat_last_flush
+    key = (tool_name, ok)
+    _tool_stat_buffer[key] = _tool_stat_buffer.get(key, 0) + 1
+    # If buffer is too large, flush immediately
+    if len(_tool_stat_buffer) >= _TOOL_STAT_MAX_KEYS:
+        import asyncio as _aio
+        try:
+            loop = _aio.get_event_loop()
+            if loop.is_running():
+                _aio.ensure_future(_flush_tool_stats())
+        except Exception:
+            pass
+
+
+async def _flush_tool_stats():
+    """Flush accumulated tool stats to DB. Called every 45 min and on shutdown."""
+    global _tool_stat_buffer, _tool_stat_last_flush
+    if not _tool_stat_buffer or not _db_available:
+        return
+    snapshot, _tool_stat_buffer = _tool_stat_buffer, {}
+    _tool_stat_last_flush = datetime.now(timezone.utc)
     try:
-        col = "ok_count" if ok else "err_count"
         with engine.connect() as conn:
-            conn.execute(text(f"""
-                INSERT INTO tool_call_stats (day, tool, ok_count, err_count)
-                VALUES (CURRENT_DATE, :tool, :ok, :err)
-                ON CONFLICT (day, tool) DO UPDATE
-                    SET {col} = tool_call_stats.{col} + 1
-            """), {"tool": tool_name, "ok": 1 if ok else 0, "err": 0 if ok else 1})
+            for (tool_name, ok), count in snapshot.items():
+                col = "ok_count" if ok else "err_count"
+                conn.execute(text(f"""
+                    INSERT INTO tool_call_stats (day, tool, ok_count, err_count)
+                    VALUES (CURRENT_DATE, :tool, :ok, :err)
+                    ON CONFLICT (day, tool) DO UPDATE
+                        SET {col} = tool_call_stats.{col} + :count
+                """), {"tool": tool_name, "ok": count if ok else 0,
+                       "err": 0 if ok else count, "count": count})
             conn.commit()
+        logger.debug(f"tool_call_stats flushed {len(snapshot)} keys")
     except Exception as e:
-        logger.debug(f"tool_call_stats write failed (non-fatal): {e}")
+        logger.debug(f"tool_call_stats flush failed (non-fatal): {e}")
+        # Put counts back so they aren't lost
+        for k, v in snapshot.items():
+            _tool_stat_buffer[k] = _tool_stat_buffer.get(k, 0) + v
 
 
 if _mcp_http_app is not None:
@@ -427,6 +524,7 @@ def serve_playground():
 @app.head("/status")
 @app.head("/health")
 def health_check():
+    # Never touches the DB — uses in-memory flags only so Neon is not woken by health pings.
     now = datetime.now(timezone.utc)
     ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
     return {
@@ -435,6 +533,7 @@ def health_check():
         "protocol_version": "agenttrust/0.1.0",
         "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "timestamp": now,
+        "db": "ok" if _db_available else "unavailable",
         "ofac_last_refresh": _ofac_last_refresh.isoformat() if _ofac_last_refresh else None,
         "ofac_addresses_loaded": len(_ofac_sanctioned_xrpl),
         "ofac_stale": ofac_age_s is None or ofac_age_s > 172800,
@@ -912,9 +1011,11 @@ else:
     if "neon.tech" in DATABASE_URL and "sslmode" not in DATABASE_URL:
         DATABASE_URL += "?sslmode=require"
 
-engine_args = {"pool_pre_ping": True, "pool_recycle": 1800}
+engine_args = {"pool_pre_ping": True, "pool_recycle": 300}
 if "sqlite" not in DATABASE_URL:
-    engine_args["connect_args"] = {"sslmode": "require"}
+    engine_args["pool_size"] = 2
+    engine_args["max_overflow"] = 2
+    engine_args["connect_args"] = {"sslmode": "require", "connect_timeout": 5}
 
 engine       = create_engine(DATABASE_URL, **engine_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -1271,6 +1372,11 @@ def _parse_ofac_xml(content: bytes) -> dict:
             if addr.startswith('r') and len(addr) >= 25 and addr not in addr_map:
                 addr_map[addr] = 'UNKNOWN SDN ENTITY'
                 logger.info(f"OFAC: regex found additional address not in ET results: {addr}")
+
+    # Cap at 10,000 entries (XRPL-relevant subset is typically much smaller)
+    if len(addr_map) > 10000:
+        logger.warning(f"OFAC: truncating addr_map from {len(addr_map)} to 10000 entries")
+        addr_map = dict(list(addr_map.items())[:10000])
 
     return addr_map
 
@@ -1833,9 +1939,6 @@ class EscrowTemplate(Base):
     created_at           = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-Base.metadata.create_all(bind=engine)
-
-
 def run_migrations():
     migrations = [
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS buyer_name          VARCHAR",
@@ -2085,8 +2188,6 @@ def run_migrations():
                 logger.warning(f"Migration skipped ({sql[:60]}...): {e}")
     logger.info("✅ Database migrations complete.")
 
-run_migrations()
-_load_ofac_from_db()
 
 
 # ---------------------------------------------------------------------------
@@ -4626,6 +4727,7 @@ class WalletRatingRequest(BaseModel):
 _bootstrap_rate: dict[str, list] = {}  # ip -> [timestamp, ...]
 _BOOTSTRAP_LIMIT  = 3    # max wallet creations per IP
 _BOOTSTRAP_WINDOW = 86400  # per 24 hours
+_BOOTSTRAP_RATE_MAX_IPS = 1000  # cap dict size to prevent memory growth
 
 @app.post("/wallet/{address}/bootstrap")
 async def bootstrap_wallet(address: str, request: Request, db: Session = Depends(get_db)):
@@ -4642,6 +4744,12 @@ async def bootstrap_wallet(address: str, request: Request, db: Session = Depends
     forwarded = request.headers.get("x-forwarded-for", "")
     ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
     now = time.time()
+    # Evict stale IPs if dict is too large
+    if len(_bootstrap_rate) >= _BOOTSTRAP_RATE_MAX_IPS:
+        cutoff = now - _BOOTSTRAP_WINDOW - 3600
+        stale_ips = [k for k, ts_list in _bootstrap_rate.items() if not any(t > cutoff for t in ts_list)]
+        for k in stale_ips:
+            del _bootstrap_rate[k]
     bucket = _bootstrap_rate.setdefault(ip, [])
     _bootstrap_rate[ip] = [t for t in bucket if now - t < _BOOTSTRAP_WINDOW]
     if len(_bootstrap_rate[ip]) >= _BOOTSTRAP_LIMIT:
@@ -4677,10 +4785,15 @@ async def register_wallet_free_tier(address: str, body: dict, request: Request, 
     if not tx_hash or len(tx_hash) != 64:
         raise HTTPException(status_code=400, detail="tx_hash must be a 64-char XRPL transaction hash.")
 
-    # Rate-limit same as bootstrap
+    # Rate-limit same as bootstrap (with same size cap)
     forwarded = request.headers.get("x-forwarded-for", "")
     ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
     now = time.time()
+    if len(_bootstrap_rate) >= _BOOTSTRAP_RATE_MAX_IPS:
+        cutoff = now - _BOOTSTRAP_WINDOW - 3600
+        stale_ips = [k for k, ts_list in _bootstrap_rate.items() if not any(t > cutoff for t in ts_list)]
+        for k in stale_ips:
+            del _bootstrap_rate[k]
     bucket = _bootstrap_rate.setdefault(ip, [])
     _bootstrap_rate[ip] = [t for t in bucket if now - t < _BOOTSTRAP_WINDOW]
     if len(_bootstrap_rate[ip]) >= _BOOTSTRAP_LIMIT:
@@ -6918,6 +7031,10 @@ async def marketplace_jobs(
     Use POST /jobs to post a job, POST /jobs/{id}/bid to bid, POST /jobs/{id}/award to award.
     """
     limit = min(limit, 100)
+    cache_key = f"mktjobs:{category}:{min_bounty_xrp}:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     now   = datetime.now(timezone.utc)
 
     real_jobs = []
@@ -6969,7 +7086,7 @@ async def marketplace_jobs(
 
     combined = (real_jobs + seed)[:limit]
 
-    return {
+    result = {
         "jobs":            combined,
         "total":           len(combined),
         "real_jobs":       len(real_jobs),
@@ -6981,6 +7098,8 @@ async def marketplace_jobs(
             "Demo jobs (is_demo=true) are illustrative — submit a real bid via the job board."
         ),
     }
+    _cache_set(cache_key, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -7041,6 +7160,7 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
     )
     db.add(job)
     db.commit()
+    _cache_invalidate_jobs()
 
     logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={body.get('budget_xrp')} XRP")
 
@@ -7077,6 +7197,10 @@ async def list_jobs(
 ):
     """List open job postings available for bidding."""
     limit = min(limit, 100)
+    cache_key = f"jobs:{category}:{min_budget}:{max_budget}:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     now   = datetime.now(timezone.utc)
 
     q = db.query(JobPosting).filter(
@@ -7123,7 +7247,9 @@ async def list_jobs(
         if len(result) >= limit:
             break
 
-    return {"jobs": result, "total": len(result)}
+    out = {"jobs": result, "total": len(result)}
+    _cache_set(cache_key, out)
+    return out
 
 
 @app.get("/jobs/{job_id}")
@@ -7344,6 +7470,7 @@ async def award_job(job_id: str, body: dict, db: Session = Depends(get_db)):
         b.status = "rejected"
 
     db.commit()
+    _cache_invalidate_jobs()
 
     logger.info(f"🏆 JOB AWARDED: {job_id} → bid={bid_id} | worker={bid.worker_address} | price={bid.proposed_xrp} XRP")
 
@@ -7451,6 +7578,7 @@ async def claim_job(job_id: str, body: dict, db: Session = Depends(get_db)):
     job.status         = "awarded"
     job.awarded_bid_id = bid_id
     db.commit()
+    _cache_invalidate_jobs()
 
     logger.info(f"🎯 JOB CLAIMED: {job_id} → worker={worker_address}")
 
@@ -7642,6 +7770,7 @@ async def cancel_job(job_id: str, body: dict, db: Session = Depends(get_db)):
 
     job.status = "cancelled"
     db.commit()
+    _cache_invalidate_jobs()
 
     logger.info(f"🗑️ JOB CANCELLED: {job_id} | was={job.status}")
     return {
@@ -9595,19 +9724,35 @@ async def delete_template(
 
 # --- Subscription payment detection (background poller) ---
 
+_enterprise_last_ledger: int = -1   # track last-seen ledger to skip DB when no new txns
+
+
 async def _poll_enterprise_subscriptions():
-    """Poll XRPL every 5 minutes for incoming RLUSD payments to ENTERPRISE_WALLET."""
+    """Poll XRPL every 30 minutes for incoming RLUSD payments to ENTERPRISE_WALLET."""
+    global _enterprise_last_ledger
     if not ENTERPRISE_WALLET:
         return
-    await asyncio.sleep(30)
+    await asyncio.sleep(60)
     while True:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(XRPL_URL, json={
                     "method": "account_tx",
-                    "params": [{"account": ENTERPRISE_WALLET, "limit": 50, "ledger_index_min": -1}],
+                    "params": [{"account": ENTERPRISE_WALLET, "limit": 50,
+                                "ledger_index_min": max(_enterprise_last_ledger, -1)}],
                 })
-            txns = resp.json().get("result", {}).get("transactions", [])
+            result_data = resp.json().get("result", {})
+            txns = result_data.get("transactions", [])
+            # Update last-seen ledger so next poll only looks at new txns
+            new_max = result_data.get("ledger_index_max", _enterprise_last_ledger)
+            if not txns:
+                _enterprise_last_ledger = new_max
+                await asyncio.sleep(1800)
+                continue
+            _enterprise_last_ledger = new_max
+            if not _db_available:
+                await asyncio.sleep(1800)
+                continue
             db = next(get_db())
             try:
                 for entry in txns:
@@ -9701,15 +9846,15 @@ async def _poll_enterprise_subscriptions():
 
         except Exception as e:
             logger.warning(f"Enterprise subscription poller error: {e}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(1800)
 
 
 async def _poll_expired_escrows():
-    """Every 5 minutes: cancel expired LOCKED escrows on-chain and mark them CANCELLED in DB."""
-    await asyncio.sleep(60)  # let app finish booting
+    """Every 30 minutes: cancel expired LOCKED escrows on-chain and mark them CANCELLED in DB."""
+    await asyncio.sleep(120)  # let app finish booting
     while True:
         try:
-            if referee_wallet:
+            if referee_wallet and _db_available:
                 now = datetime.now(timezone.utc)
                 db = next(get_db())
                 try:
@@ -9779,14 +9924,11 @@ async def _poll_expired_escrows():
                     db.close()
         except Exception as e:
             logger.warning(f"Expired escrow poller error: {e}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(1800)
 
 
-# Register poller in lifespan — patch into existing startup
-@app.on_event("startup")
-async def _start_enterprise_poller():
-    asyncio.create_task(_poll_enterprise_subscriptions())
-    asyncio.create_task(_poll_expired_escrows())
+# Pollers are started in _lifespan (above) — @app.on_event("startup") is ignored
+# when lifespan= is set on FastAPI.
 
 
 # ---------------------------------------------------------------------------
