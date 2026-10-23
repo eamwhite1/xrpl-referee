@@ -1368,10 +1368,11 @@ class EscrowVault(Base):
     # Template reference
     template_id          = Column(String,  nullable=True)   # optional: EscrowTemplate.id
     # Release/cancel tx hashes — proof of payment
-    release_tx_hash = Column(String,              nullable=True)
-    released_at     = Column(DateTime(timezone=True), nullable=True)
-    cancel_tx_hash  = Column(String,              nullable=True)
-    cancelled_at    = Column(DateTime(timezone=True), nullable=True)
+    release_tx_hash   = Column(String,              nullable=True)
+    released_at       = Column(DateTime(timezone=True), nullable=True)
+    cancel_tx_hash    = Column(String,              nullable=True)
+    cancelled_at      = Column(DateTime(timezone=True), nullable=True)
+    backfill_attempts = Column(Integer, default=0,  nullable=True)
     # Worker auth token — v2.8.0
     evaluate_token_hash  = Column(String,  nullable=True)   # SHA-256 of one-time evaluate token
 
@@ -2399,6 +2400,7 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS released_at     TIMESTAMPTZ",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancel_tx_hash  TEXT",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancelled_at    TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS backfill_attempts INT DEFAULT 0",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -6576,7 +6578,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             "escrow_id": req.escrow_id,
         }
 
-    finish_hash = vault.release_tx_hash or vault.auto_finish_hash if is_approved else None
+    finish_hash = (vault.release_tx_hash or getattr(vault, 'auto_finish_hash', None)) if is_approved else None
     return {
         "escrow_id":            req.escrow_id,
         "status":               "approved" if is_approved else "rejected",
@@ -7521,6 +7523,27 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
     except Exception:
         tags = []
 
+    # Include escrow tx hashes if there's a linked vault
+    escrow_proof = {}
+    if job.escrow_id:
+        try:
+            vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == job.escrow_id).first()
+            if vault:
+                escrow_proof = {
+                    "release_tx_hash": vault.release_tx_hash,
+                    "released_at":     vault.released_at.isoformat() if vault.released_at else None,
+                    "cancel_tx_hash":  vault.cancel_tx_hash,
+                    "cancelled_at":    vault.cancelled_at.isoformat() if vault.cancelled_at else None,
+                    "explorer_url": (
+                        f"https://livenet.xrpl.org/transactions/{vault.release_tx_hash}"
+                        if vault.release_tx_hash else
+                        f"https://livenet.xrpl.org/transactions/{vault.cancel_tx_hash}"
+                        if vault.cancel_tx_hash else None
+                    ),
+                }
+        except Exception:
+            pass
+
     return {
         "id":            job.id,
         "title":         job.title,
@@ -7538,6 +7561,7 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
         "proof_policy":  job.proof_policy or "ALL",
         "claimable":     bool(job.claimable) if hasattr(job, "claimable") else False,
         "bids":          bids_out,
+        **escrow_proof,
     }
 
 
@@ -10018,22 +10042,33 @@ async def _poll_enterprise_subscriptions_once():
         logger.warning(f"Enterprise subscription poller error: {e}")
 
 
-async def _get_escrow_sequence(tx_hash: str):
-    """Fetch the Sequence field from an EscrowCreate tx hash."""
+def _ledger_time_to_utc(ripple_time: int) -> datetime:
+    """Convert XRPL ledger close time (seconds since Ripple epoch 2000-01-01) to UTC datetime."""
+    RIPPLE_EPOCH = 946684800  # Unix timestamp of 2000-01-01T00:00:00Z
+    return datetime.fromtimestamp(ripple_time + RIPPLE_EPOCH, tz=timezone.utc)
+
+
+async def _get_escrow_create_info(tx_hash: str):
+    """Fetch the Sequence and Account (owner) from an EscrowCreate tx hash."""
     try:
         async with httpx.AsyncClient(timeout=10) as hc:
             r = await hc.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash}]})
-            return r.json().get("result", {}).get("Sequence")
+            result = r.json().get("result", {})
+            seq = result.get("Sequence")
+            owner = result.get("Account")
+            if seq and owner:
+                return {"sequence": seq, "owner": owner}
     except Exception:
-        return None
+        pass
+    return None
 
 
-async def _fetch_escrow_final_tx(buyer_address: str, offer_sequence: int):
-    """Paginate account_tx to find a tesSUCCESS EscrowFinish or EscrowCancel for offer_sequence."""
+async def _fetch_escrow_final_tx(owner: str, offer_sequence: int):
+    """Paginate account_tx to find a tesSUCCESS EscrowFinish or EscrowCancel for owner+offer_sequence."""
     try:
         marker = None
         for _ in range(5):
-            params = {"account": buyer_address, "limit": 200, "ledger_index_min": -1}
+            params = {"account": owner, "limit": 200, "ledger_index_min": -1}
             if marker:
                 params["marker"] = marker
             async with httpx.AsyncClient(timeout=15) as hc:
@@ -10042,9 +10077,12 @@ async def _fetch_escrow_final_tx(buyer_address: str, offer_sequence: int):
             for tx_envelope in data.get("transactions", []):
                 tx = tx_envelope.get("tx", tx_envelope)
                 if (tx.get("OfferSequence") == offer_sequence and
+                        tx.get("Owner") == owner and
                         tx.get("TransactionType") in ("EscrowFinish", "EscrowCancel") and
                         tx_envelope.get("meta", {}).get("TransactionResult") == "tesSUCCESS"):
                     tx["hash"] = tx_envelope.get("hash", tx.get("hash"))
+                    ledger_date = tx_envelope.get("date") or tx.get("date")
+                    tx["_ledger_close_time"] = ledger_date
                     return tx
             marker = data.get("marker")
             if not marker:
@@ -10055,47 +10093,88 @@ async def _fetch_escrow_final_tx(buyer_address: str, offer_sequence: int):
 
 
 async def _backfill_escrow_hashes(db):
-    """Backfill release_tx_hash / cancel_tx_hash for RELEASED/CANCELLED vaults missing them."""
+    """Backfill release_tx_hash / cancel_tx_hash for RELEASED/CANCELLED vaults missing them.
+    Uses real escrow owner (from EscrowCreate tx Account field), not buyer_address.
+    Caps at 3 attempts per vault to avoid rescanning forever."""
     try:
         released = db.query(EscrowVault).filter(
             EscrowVault.status == "RELEASED",
-            EscrowVault.release_tx_hash == None,
+            (EscrowVault.release_tx_hash == None) | (EscrowVault.released_at == None),
             EscrowVault.escrow_tx_hash != None,
+            (EscrowVault.backfill_attempts == None) | (EscrowVault.backfill_attempts < 3),
         ).limit(20).all()
         for vault in released:
             try:
-                seq = await _get_escrow_sequence(vault.escrow_tx_hash)
-                if seq is None:
-                    continue
-                tx = await _fetch_escrow_final_tx(vault.buyer_address, seq)
+                # Use cached owner/sequence or fetch from EscrowCreate tx
+                owner = vault.escrow_owner
+                seq = vault.escrow_sequence
+                if not owner or not seq:
+                    info = await _get_escrow_create_info(vault.escrow_tx_hash)
+                    if not info:
+                        vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
+                        db.commit()
+                        continue
+                    owner = info["owner"]
+                    seq = info["sequence"]
+                    vault.escrow_owner = owner
+                    vault.escrow_sequence = seq
+                    db.commit()
+                tx = await _fetch_escrow_final_tx(owner, seq)
+                vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                 if tx and tx.get("TransactionType") == "EscrowFinish":
                     vault.release_tx_hash = tx.get("hash")
-                    if not vault.released_at:
-                        vault.released_at = datetime.now(timezone.utc)
+                    close_time = tx.get("_ledger_close_time")
+                    vault.released_at = _ledger_time_to_utc(close_time) if close_time else (vault.released_at or datetime.now(timezone.utc))
                     db.commit()
                     logger.info(f"Backfilled release_tx_hash for {vault.escrow_id}")
+                else:
+                    db.commit()
             except Exception as e:
                 logger.warning(f"Backfill RELEASED failed for {vault.escrow_id}: {e}")
+                try:
+                    vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
+                    db.commit()
+                except Exception:
+                    pass
 
         cancelled = db.query(EscrowVault).filter(
             EscrowVault.status == "CANCELLED",
-            EscrowVault.cancel_tx_hash == None,
+            (EscrowVault.cancel_tx_hash == None) | (EscrowVault.cancelled_at == None),
             EscrowVault.escrow_tx_hash != None,
+            (EscrowVault.backfill_attempts == None) | (EscrowVault.backfill_attempts < 3),
         ).limit(20).all()
         for vault in cancelled:
             try:
-                seq = await _get_escrow_sequence(vault.escrow_tx_hash)
-                if seq is None:
-                    continue
-                tx = await _fetch_escrow_final_tx(vault.buyer_address, seq)
+                owner = vault.escrow_owner
+                seq = vault.escrow_sequence
+                if not owner or not seq:
+                    info = await _get_escrow_create_info(vault.escrow_tx_hash)
+                    if not info:
+                        vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
+                        db.commit()
+                        continue
+                    owner = info["owner"]
+                    seq = info["sequence"]
+                    vault.escrow_owner = owner
+                    vault.escrow_sequence = seq
+                    db.commit()
+                tx = await _fetch_escrow_final_tx(owner, seq)
+                vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                 if tx and tx.get("TransactionType") == "EscrowCancel":
                     vault.cancel_tx_hash = tx.get("hash")
-                    if not vault.cancelled_at:
-                        vault.cancelled_at = datetime.now(timezone.utc)
+                    close_time = tx.get("_ledger_close_time")
+                    vault.cancelled_at = _ledger_time_to_utc(close_time) if close_time else (vault.cancelled_at or datetime.now(timezone.utc))
                     db.commit()
                     logger.info(f"Backfilled cancel_tx_hash for {vault.escrow_id}")
+                else:
+                    db.commit()
             except Exception as e:
                 logger.warning(f"Backfill CANCELLED failed for {vault.escrow_id}: {e}")
+                try:
+                    vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
+                    db.commit()
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning(f"_backfill_escrow_hashes failed: {e}")
 
@@ -10113,14 +10192,16 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
             data = r.json().get("result", {})
             for tx_envelope in data.get("transactions", []):
                 tx = tx_envelope.get("tx", tx_envelope)
-                if tx.get("OfferSequence") == sequence:
+                if tx.get("OfferSequence") == sequence and tx.get("Owner") == owner:
                     tx_type = tx.get("TransactionType")
                     meta_result = tx_envelope.get("meta", {}).get("TransactionResult", "")
+                    ledger_date = tx_envelope.get("date") or tx.get("date")
+                    ts = _ledger_time_to_utc(ledger_date) if ledger_date else datetime.now(timezone.utc)
                     if tx_type == "EscrowFinish" and meta_result == "tesSUCCESS":
                         vault.status = "RELEASED"
                         vault.delivery_status = "RELEASED"
                         vault.release_tx_hash = tx_envelope.get("hash") or tx.get("hash")
-                        vault.released_at     = datetime.now(timezone.utc)
+                        vault.released_at     = ts
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
                         return
@@ -10128,7 +10209,7 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         vault.status = "CANCELLED"
                         vault.delivery_status = "CANCELLED"
                         vault.cancel_tx_hash  = tx_envelope.get("hash") or tx.get("hash")
-                        vault.cancelled_at    = datetime.now(timezone.utc)
+                        vault.cancelled_at    = ts
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → CANCELLED (EscrowCancel found)")
                         return

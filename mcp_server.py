@@ -1221,9 +1221,13 @@ async def view_job(
 
     Use this to check the status of a job you posted or bid on.
     If status is 'awarded', awarded_bid_id shows the winning bid.
+    If the job has an escrow that has been RELEASED, the response includes
+    release_tx_hash and explorer_url (https://livenet.xrpl.org/transactions/<hash>)
+    so you can verify payment on-chain.
 
     Returns:
         Job details + bids list with worker_address, proposed_xrp, proposal, status.
+        RELEASED escrows include: release_tx_hash, released_at, explorer_url.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/jobs/{job_id}")
