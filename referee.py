@@ -121,10 +121,14 @@ async def _lifespan(app):
         # Prime OFAC list on startup in background — DB-seeded copy is already in _ofac_sanctioned_xrpl.
         # Don't block startup waiting for the network fetch.
         asyncio.create_task(_refresh_ofac_list())
-        # Start background pollers (moved here from @app.on_event("startup") which FastAPI
-        # ignores when lifespan= is set). Run every 30 min, not 5 min.
-        asyncio.create_task(_poll_enterprise_subscriptions())
-        asyncio.create_task(_poll_expired_escrows())
+        # Single unified hourly DB window — all background DB work runs here sequentially.
+        # Replaces separate enterprise + escrow pollers (which were being started as
+        # independent tasks but are now single-run functions called by _hourly_db_window).
+        if _db_available:
+            asyncio.create_task(_hourly_db_window())
+            asyncio.create_task(_refresh_jobs_snapshot())  # initial snapshot on startup
+        else:
+            asyncio.create_task(_db_recovery_loop())
         try:
             yield
         finally:
@@ -320,16 +324,10 @@ def _wrap_mcp_with_logger(asgi_app):
                 f"MCP tool_call tool={tool_name} duration={duration_ms}ms "
                 f"status={status_code[0]} result={status_str} ip={ip_hash}"
             )
-            # Buffer tool stat (no DB write per call — flushed every 45 min)
+            # Buffer tool stat (no DB write per call — flushed hourly by _hourly_db_window)
             if tool_name not in ("unknown", "initialize", "tools/list", "notifications/initialized"):
                 try:
                     _log_tool_stat(tool_name, ok)
-                    # Periodic flush every 45 minutes
-                    now_ts = _time_mod.monotonic()
-                    if (_tool_stat_last_flush is None or
-                            (datetime.now(timezone.utc) - _tool_stat_last_flush).total_seconds() > 2700):
-                        import asyncio as _aio2
-                        _aio2.ensure_future(_flush_tool_stats())
                 except Exception:
                     pass
     return logged_app
@@ -372,10 +370,145 @@ def _cache_set(key: str, data):
 
 
 def _cache_invalidate_jobs():
-    """Clear all job-listing cache entries on any job mutation."""
+    """Clear all job-listing cache entries and schedule a snapshot refresh on any job mutation."""
     to_del = [k for k in _response_cache if k.startswith("jobs:") or k.startswith("mktjobs:")]
     for k in to_del:
         del _response_cache[k]
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_refresh_jobs_snapshot())
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Job-list snapshot — served from memory; DB never queried on GET /marketplace/jobs
+# or GET /jobs. Refreshed hourly by _hourly_db_window (and immediately after writes).
+# ---------------------------------------------------------------------------
+_jobs_snapshot: dict = {
+    "marketplace_jobs": [],   # list of marketplace job dicts
+    "open_jobs": [],          # list of open job dicts
+    "refreshed_at": None,     # datetime or None
+    "stale_since": None,      # datetime if last refresh failed
+}
+_jobs_snapshot_lock = asyncio.Lock()
+
+
+async def _refresh_jobs_snapshot(db_session=None):
+    """Rebuild in-memory job snapshot from DB. Never raises — keeps old data on error."""
+    own_session = db_session is None
+    try:
+        db = db_session or SessionLocal()
+        now = datetime.now(timezone.utc)
+        try:
+            # Marketplace jobs
+            from sqlalchemy import or_ as _or
+            q = db.query(JobPosting).filter(
+                JobPosting.status == "open",
+                _or(JobPosting.expires_at == None, JobPosting.expires_at > now),
+            ).order_by(JobPosting.created_at.desc()).limit(200)
+            posts = q.all()
+            marketplace = []
+            for j in posts:
+                budget = j.budget_xrp or 0
+                try:
+                    tags = json.loads(j.tags) if j.tags else []
+                except Exception:
+                    tags = []
+                bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
+                expires_hrs = max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None
+                marketplace.append({
+                    "id": j.id, "title": j.title, "description": j.description,
+                    "category": j.category or "default", "bounty": budget, "currency": "XRP",
+                    "poster": j.buyer_address or "", "poster_name": j.buyer_name or "",
+                    "deadline": j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
+                    "deadline_hrs": expires_hrs, "tags": tags, "status": "OPEN",
+                    "bid_count": bid_count, "is_demo": False,
+                    "claimable": bool(getattr(j, "claimable", False)),
+                })
+
+            # Open jobs (for /jobs endpoint)
+            open_jobs_raw = db.query(JobPosting).filter(
+                JobPosting.status == "open",
+                _or(JobPosting.expires_at == None, JobPosting.expires_at > now),
+            ).order_by(JobPosting.created_at.desc()).limit(200).all()
+            open_jobs = []
+            for j in open_jobs_raw:
+                try:
+                    tags = json.loads(j.tags) if j.tags else []
+                except Exception:
+                    tags = []
+                bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
+                open_jobs.append({
+                    "id": j.id, "title": j.title, "description": j.description,
+                    "budget_xrp": j.budget_xrp, "buyer_address": j.buyer_address,
+                    "buyer_name": j.buyer_name or "", "category": j.category or "default",
+                    "tags": tags, "status": j.status, "bid_count": bid_count,
+                    "created_at": (j.created_at.isoformat() + "Z") if j.created_at else None,
+                    "expires_at": j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
+                    "expires_hrs": max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
+                    "required_nft_issuer": j.required_nft_issuer or None,
+                    "required_domain": j.required_domain or None,
+                    "required_vc_issuer_did": j.required_vc_issuer_did or None,
+                    "required_vc_type": j.required_vc_type or None,
+                    "proof_policy": j.proof_policy or "ALL",
+                })
+
+            _on_db_success()
+            async with _jobs_snapshot_lock:
+                _jobs_snapshot["marketplace_jobs"] = marketplace
+                _jobs_snapshot["open_jobs"] = open_jobs
+                _jobs_snapshot["refreshed_at"] = now
+                _jobs_snapshot["stale_since"] = None
+            logger.debug(f"Job snapshot refreshed: {len(marketplace)} marketplace, {len(open_jobs)} open")
+        finally:
+            if own_session:
+                db.close()
+    except Exception as e:
+        logger.warning(f"Job snapshot refresh failed: {e}")
+        async with _jobs_snapshot_lock:
+            if _jobs_snapshot["stale_since"] is None:
+                _jobs_snapshot["stale_since"] = datetime.now(timezone.utc)
+        _on_db_failure()
+
+
+# ---------------------------------------------------------------------------
+# DB recovery loop — retries SELECT 1 with backoff; starts hourly window on success
+# ---------------------------------------------------------------------------
+async def _db_recovery_loop():
+    backoff_minutes = [1, 2, 5, 10]
+    attempt = 0
+    while True:
+        delay = backoff_minutes[min(attempt, len(backoff_minutes) - 1)] * 60
+        await asyncio.sleep(delay)
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            global _db_available
+            _db_available = True
+            logger.info("✅ DB connection recovered — starting hourly window task")
+            asyncio.create_task(_hourly_db_window())
+            await _refresh_jobs_snapshot()
+            return
+        except Exception as e:
+            attempt += 1
+            logger.warning(f"DB recovery attempt {attempt} failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Unified hourly DB window — single task; all DB work happens here once per hour
+# ---------------------------------------------------------------------------
+async def _hourly_db_window():
+    await asyncio.sleep(60)  # let app finish booting
+    while True:
+        if _db_available:
+            await _refresh_jobs_snapshot()
+            await _flush_tool_stats()
+            await _poll_expired_escrows_once()
+            if ENTERPRISE_WALLET:
+                await _poll_enterprise_subscriptions_once()
+        await asyncio.sleep(3600)
 
 
 def _log_tool_stat(tool_name: str, ok: bool):
@@ -1026,8 +1159,38 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+        _on_db_success()
+    except Exception:
+        _on_db_failure()
+        raise
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# DB availability helpers — called from get_db and background tasks
+# ---------------------------------------------------------------------------
+_db_recovery_task_ref: list = [None]  # mutable container so non-async code can update it
+
+
+def _on_db_success():
+    global _db_available
+    _db_available = True
+
+
+def _on_db_failure():
+    global _db_available
+    if _db_available:
+        logger.warning("DB connection lost — entering unavailable state")
+    _db_available = False
+    task = _db_recovery_task_ref[0]
+    if task is None or task.done():
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                _db_recovery_task_ref[0] = asyncio.create_task(_db_recovery_loop())
+        except Exception:
+            pass
 
 
 class PaymentLog(Base):
@@ -7018,66 +7181,28 @@ async def marketplace_jobs(
     category:       str   = "all",
     min_bounty_xrp: float = 0,
     limit:          int   = 20,
-    db: Session = Depends(get_db),
 ):
     """
     Machine-readable job listing for agents and API consumers.
-    Returns open job board posts — workers bid, buyer awards, then escrow is created.
-
-    XRPL escrow requires the worker's address at creation time, so there is no
-    open-claim model. All jobs (including 'bug bounty'-style) go through:
-    bid → award → create_escrow_vault → confirm_escrow_transaction → evaluate_escrow_work.
+    Served from in-memory snapshot — never queries the DB on GET requests.
+    Snapshot is refreshed hourly and immediately after any job write.
 
     Use POST /jobs to post a job, POST /jobs/{id}/bid to bid, POST /jobs/{id}/award to award.
     """
     limit = min(limit, 100)
-    cache_key = f"mktjobs:{category}:{min_bounty_xrp}:{limit}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-    now   = datetime.now(timezone.utc)
+    snapshot = _jobs_snapshot
+    if snapshot["stale_since"] is not None and not snapshot["marketplace_jobs"]:
+        return JSONResponse({"error": "job list temporarily unavailable"}, status_code=503)
 
-    real_jobs = []
-    try:
-        q = db.query(JobPosting).filter(
-            JobPosting.status == "open",
-            or_(JobPosting.expires_at == None, JobPosting.expires_at > now),
-        )
-        if category != "all":
-            q = q.filter(JobPosting.category == category)
-        posts = q.order_by(JobPosting.created_at.desc()).limit(200).all()
-        for j in posts:
-            budget = j.budget_xrp or 0
-            if min_bounty_xrp > 0 and budget < min_bounty_xrp:
-                continue
-            try:
-                tags = json.loads(j.tags) if j.tags else []
-            except Exception:
-                tags = []
-            bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
-            expires_hrs = max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None
-            real_jobs.append({
-                "id":           j.id,
-                "title":        j.title,
-                "description":  j.description,
-                "category":     j.category or "default",
-                "bounty":       budget,
-                "currency":     "XRP",
-                "poster":       j.buyer_address or "",
-                "poster_name":  j.buyer_name or "",
-                "deadline":     j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
-                "deadline_hrs": expires_hrs,
-                "tags":         tags,
-                "status":       "OPEN",
-                "bid_count":    bid_count,
-                "is_demo":      False,
-            })
-            if len(real_jobs) >= limit:
-                break
-    except Exception as e:
-        logger.warning(f"⚠️ marketplace_jobs DB query failed: {e}")
+    now = datetime.now(timezone.utc)
+    real_jobs = list(snapshot["marketplace_jobs"])
+    # Apply filters in Python
+    if category != "all":
+        real_jobs = [j for j in real_jobs if j.get("category") == category]
+    if min_bounty_xrp > 0:
+        real_jobs = [j for j in real_jobs if (j.get("bounty") or 0) >= min_bounty_xrp]
 
-    # Seed demo jobs — shown when the job board is empty, illustrate the bid flow
+    # Seed demo jobs — shown when the job board is empty
     seed = _MARKETPLACE_SEED_JOBS
     if category != "all":
         seed = [j for j in seed if j["category"] == category]
@@ -7085,6 +7210,7 @@ async def marketplace_jobs(
         seed = [j for j in seed if j["bounty"] >= min_bounty_xrp]
 
     combined = (real_jobs + seed)[:limit]
+    age_s = int((now - snapshot["refreshed_at"]).total_seconds()) if snapshot["refreshed_at"] else None
 
     result = {
         "jobs":            combined,
@@ -7092,13 +7218,14 @@ async def marketplace_jobs(
         "real_jobs":       len(real_jobs),
         "demo_jobs":       len([j for j in combined if j.get("is_demo")]),
         "marketplace_url": f"{SITE_URL}/marketplace",
+        "snapshot_age_seconds": age_s,
+        **({"stale_since": snapshot["stale_since"].isoformat()} if snapshot["stale_since"] else {}),
         "note":            (
             "To claim a job: submit a bid via POST /jobs/{id}/bid. "
             "The buyer awards your bid, then creates an escrow with your wallet address. "
             "Demo jobs (is_demo=true) are illustrative — submit a real bid via the job board."
         ),
     }
-    _cache_set(cache_key, result)
     return result
 
 
@@ -7193,63 +7320,30 @@ async def list_jobs(
     min_budget:  float = 0,
     max_budget:  float = 0,
     limit:       int   = 20,
-    db: Session = Depends(get_db),
 ):
-    """List open job postings available for bidding."""
+    """List open job postings available for bidding. Served from in-memory snapshot — no DB query."""
     limit = min(limit, 100)
-    cache_key = f"jobs:{category}:{min_budget}:{max_budget}:{limit}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-    now   = datetime.now(timezone.utc)
+    snapshot = _jobs_snapshot
+    if snapshot["stale_since"] is not None and not snapshot["open_jobs"]:
+        return JSONResponse({"error": "job list temporarily unavailable"}, status_code=503)
 
-    q = db.query(JobPosting).filter(
-        JobPosting.status == "open",
-        or_(JobPosting.expires_at == None, JobPosting.expires_at > now),
-    )
+    jobs = list(snapshot["open_jobs"])
     if category != "all":
-        q = q.filter(JobPosting.category == category)
+        jobs = [j for j in jobs if j.get("category") == category]
+    if min_budget > 0:
+        jobs = [j for j in jobs if (j.get("budget_xrp") or 0) >= min_budget]
+    if max_budget > 0:
+        jobs = [j for j in jobs if (j.get("budget_xrp") or 0) <= max_budget]
+    jobs = jobs[:limit]
 
-    jobs = q.order_by(JobPosting.created_at.desc()).limit(200).all()
-
-    result = []
-    for j in jobs:
-        budget = j.budget_xrp or 0
-        if min_budget > 0 and budget < min_budget:
-            continue
-        if max_budget > 0 and budget > max_budget:
-            continue
-        try:
-            tags = json.loads(j.tags) if j.tags else []
-        except Exception:
-            tags = []
-        bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
-        result.append({
-            "id":           j.id,
-            "title":        j.title,
-            "description":  j.description,
-            "budget_xrp":   j.budget_xrp,
-            "buyer_address": j.buyer_address,
-            "buyer_name":   j.buyer_name or "",
-            "category":     j.category or "default",
-            "tags":         tags,
-            "status":       j.status,
-            "bid_count":    bid_count,
-            "created_at":   (j.created_at.isoformat() + "Z") if j.created_at else None,
-            "expires_at":   j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
-            "expires_hrs":  max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
-            "required_nft_issuer":   j.required_nft_issuer or None,
-            "required_domain":        j.required_domain or None,
-            "required_vc_issuer_did": j.required_vc_issuer_did or None,
-            "required_vc_type":       j.required_vc_type or None,
-            "proof_policy":           j.proof_policy or "ALL",
-        })
-        if len(result) >= limit:
-            break
-
-    out = {"jobs": result, "total": len(result)}
-    _cache_set(cache_key, out)
-    return out
+    now = datetime.now(timezone.utc)
+    age_s = int((now - snapshot["refreshed_at"]).total_seconds()) if snapshot["refreshed_at"] else None
+    return {
+        "jobs": jobs,
+        "total": len(jobs),
+        "snapshot_age_seconds": age_s,
+        **({"stale_since": snapshot["stale_since"].isoformat()} if snapshot["stale_since"] else {}),
+    }
 
 
 @app.get("/jobs/{job_id}")
@@ -9727,207 +9821,236 @@ async def delete_template(
 _enterprise_last_ledger: int = -1   # track last-seen ledger to skip DB when no new txns
 
 
-async def _poll_enterprise_subscriptions():
-    """Poll XRPL every 30 minutes for incoming RLUSD payments to ENTERPRISE_WALLET."""
+async def _poll_enterprise_subscriptions_once():
+    """Single-run: check XRPL for new RLUSD payments to ENTERPRISE_WALLET and update DB."""
     global _enterprise_last_ledger
-    if not ENTERPRISE_WALLET:
+    if not ENTERPRISE_WALLET or not _db_available:
         return
-    await asyncio.sleep(60)
-    while True:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(XRPL_URL, json={
+                "method": "account_tx",
+                "params": [{"account": ENTERPRISE_WALLET, "limit": 50,
+                            "ledger_index_min": max(_enterprise_last_ledger, -1)}],
+            })
+        result_data = resp.json().get("result", {})
+        txns = result_data.get("transactions", [])
+        new_max = result_data.get("ledger_index_max", _enterprise_last_ledger)
+        _enterprise_last_ledger = new_max
+        if not txns:
+            return
+        db = next(get_db())
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(XRPL_URL, json={
-                    "method": "account_tx",
-                    "params": [{"account": ENTERPRISE_WALLET, "limit": 50,
-                                "ledger_index_min": max(_enterprise_last_ledger, -1)}],
-                })
-            result_data = resp.json().get("result", {})
-            txns = result_data.get("transactions", [])
-            # Update last-seen ledger so next poll only looks at new txns
-            new_max = result_data.get("ledger_index_max", _enterprise_last_ledger)
-            if not txns:
-                _enterprise_last_ledger = new_max
-                await asyncio.sleep(1800)
-                continue
-            _enterprise_last_ledger = new_max
-            if not _db_available:
-                await asyncio.sleep(1800)
-                continue
-            db = next(get_db())
-            try:
-                for entry in txns:
-                    tx = entry.get("tx", {})
-                    if tx.get("TransactionType") != "Payment":
+            for entry in txns:
+                tx = entry.get("tx", {})
+                if tx.get("TransactionType") != "Payment":
+                    continue
+                delivered = entry.get("meta", {}).get("delivered_amount", {})
+                if not isinstance(delivered, dict):
+                    continue
+                if delivered.get("currency") != "524C555344000000000000000000000000000000":
+                    continue
+                amount = float(delivered.get("value", 0))
+                if amount < SUBSCRIPTION_RLUSD * 0.99:
+                    continue
+                tx_hash = tx.get("hash", "")
+                account_id = None
+                for m in tx.get("Memos", []):
+                    try:
+                        account_id = bytes.fromhex(m["Memo"]["MemoData"]).decode("utf-8").strip()
+                    except Exception:
                         continue
-                    delivered = entry.get("meta", {}).get("delivered_amount", {})
-                    if not isinstance(delivered, dict):
-                        continue
-                    if delivered.get("currency") != "524C555344000000000000000000000000000000":  # RLUSD hex
-                        continue
-                    amount = float(delivered.get("value", 0))
-                    if amount < SUBSCRIPTION_RLUSD * 0.99:
-                        continue
-                    tx_hash = tx.get("hash", "")
-                    # Find account_id from Memo
-                    account_id = None
-                    for m in tx.get("Memos", []):
-                        try:
-                            account_id = bytes.fromhex(m["Memo"]["MemoData"]).decode("utf-8").strip()
-                        except Exception:
-                            continue
-                    if not account_id:
-                        continue
-                    account = db.query(EnterpriseAccount).filter_by(id=account_id).first()
-                    if not account:
-                        continue
-                    if account.last_payment_hash == tx_hash:
-                        continue
-                    now = datetime.now(timezone.utc)
-                    base = account.sub_expires_at.replace(tzinfo=timezone.utc) if account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now else now
-                    account.sub_expires_at = base + timedelta(days=365)
-                    account.status = "active"
-                    account.last_payment_hash = tx_hash
-                    db.commit()
-                    logger.info(f"✅ Enterprise subscription renewed: {account.email} tx={tx_hash}")
-                    if RESEND_API_KEY and account.email:
-                        try:
-                            resend.Emails.send({
-                                "from": RESEND_FROM,
-                                "to": account.email,
-                                "subject": "AgentTrust Enterprise — annual subscription confirmed",
-                                "html": f"""
-                                    <p>Hi {account.name or 'there'},</p>
-                                    <p>Your AgentTrust Enterprise annual subscription is confirmed. You have full access for the next 12 months.</p>
-                                    <p><strong>Receipt:</strong> XRPL transaction <code>{tx_hash}</code><br>
-                                    <a href="https://livenet.xrpl.org/transactions/{tx_hash}">View on XRPL Explorer</a></p>
-                                    <p>Amount paid: {amount} RLUSD</p>
-                                    <p>Subscription valid until: {account.sub_expires_at.strftime('%d %B %Y')}</p>
-                                    <p>— AgentTrust</p>
-                                """,
-                            })
-                        except Exception:
-                            pass
-            finally:
-                db.close()
-
-            # Send renewal reminders for subscriptions expiring in ~30 days
-            if RESEND_API_KEY:
-                db2 = next(get_db())
-                try:
-                    now = datetime.now(timezone.utc)
-                    remind_from = now + timedelta(days=29)
-                    remind_to   = now + timedelta(days=31)
-                    expiring = db2.query(EnterpriseAccount).filter(
-                        EnterpriseAccount.status == "active",
-                        EnterpriseAccount.sub_expires_at >= remind_from,
-                        EnterpriseAccount.sub_expires_at <= remind_to,
-                    ).all()
-                    for acct in expiring:
-                        try:
-                            resend.Emails.send({
-                                "from": RESEND_FROM,
-                                "to": acct.email,
-                                "subject": "AgentTrust Enterprise — subscription renews in 30 days",
-                                "html": f"""
-                                    <p>Hi {acct.name or 'there'},</p>
-                                    <p>Your AgentTrust Enterprise subscription expires on <strong>{acct.sub_expires_at.strftime('%d %B %Y')}</strong>.</p>
-                                    <p>To renew for another year, send <strong>199 RLUSD</strong> on the XRP Ledger to:</p>
-                                    <p><strong>Wallet:</strong> <code>{ENTERPRISE_WALLET}</code><br>
-                                    <strong>Memo:</strong> <code>{acct.id}</code></p>
-                                    <p>Your transaction hash will be your receipt. We'll extend your subscription automatically within 5 minutes of payment.</p>
-                                    <p>— AgentTrust</p>
-                                """,
-                            })
-                            logger.info(f"📧 Renewal reminder sent to {acct.email}")
-                        except Exception:
-                            pass
-                finally:
-                    db2.close()
-
-        except Exception as e:
-            logger.warning(f"Enterprise subscription poller error: {e}")
-        await asyncio.sleep(1800)
-
-
-async def _poll_expired_escrows():
-    """Every 30 minutes: cancel expired LOCKED escrows on-chain and mark them CANCELLED in DB."""
-    await asyncio.sleep(120)  # let app finish booting
-    while True:
-        try:
-            if referee_wallet and _db_available:
+                if not account_id:
+                    continue
+                account = db.query(EnterpriseAccount).filter_by(id=account_id).first()
+                if not account or account.last_payment_hash == tx_hash:
+                    continue
                 now = datetime.now(timezone.utc)
-                db = next(get_db())
+                base = account.sub_expires_at.replace(tzinfo=timezone.utc) if account.sub_expires_at and account.sub_expires_at.replace(tzinfo=timezone.utc) > now else now
+                account.sub_expires_at = base + timedelta(days=365)
+                account.status = "active"
+                account.last_payment_hash = tx_hash
+                db.commit()
+                logger.info(f"✅ Enterprise subscription renewed: {account.email} tx={tx_hash}")
+                if RESEND_API_KEY and account.email:
+                    try:
+                        resend.Emails.send({
+                            "from": RESEND_FROM,
+                            "to": account.email,
+                            "subject": "AgentTrust Enterprise — annual subscription confirmed",
+                            "html": f"""
+                                <p>Hi {account.name or 'there'},</p>
+                                <p>Your AgentTrust Enterprise annual subscription is confirmed. You have full access for the next 12 months.</p>
+                                <p><strong>Receipt:</strong> XRPL transaction <code>{tx_hash}</code><br>
+                                <a href="https://livenet.xrpl.org/transactions/{tx_hash}">View on XRPL Explorer</a></p>
+                                <p>Amount paid: {amount} RLUSD</p>
+                                <p>Subscription valid until: {account.sub_expires_at.strftime('%d %B %Y')}</p>
+                                <p>— AgentTrust</p>
+                            """,
+                        })
+                    except Exception:
+                        pass
+        finally:
+            db.close()
+
+        # Renewal reminders for subscriptions expiring in ~30 days
+        if RESEND_API_KEY:
+            db2 = next(get_db())
+            try:
+                now = datetime.now(timezone.utc)
+                remind_from = now + timedelta(days=29)
+                remind_to   = now + timedelta(days=31)
+                expiring = db2.query(EnterpriseAccount).filter(
+                    EnterpriseAccount.status == "active",
+                    EnterpriseAccount.sub_expires_at >= remind_from,
+                    EnterpriseAccount.sub_expires_at <= remind_to,
+                ).all()
+                for acct in expiring:
+                    try:
+                        resend.Emails.send({
+                            "from": RESEND_FROM,
+                            "to": acct.email,
+                            "subject": "AgentTrust Enterprise — subscription renews in 30 days",
+                            "html": f"""
+                                <p>Hi {acct.name or 'there'},</p>
+                                <p>Your AgentTrust Enterprise subscription expires on <strong>{acct.sub_expires_at.strftime('%d %B %Y')}</strong>.</p>
+                                <p>To renew for another year, send <strong>199 RLUSD</strong> on the XRP Ledger to:</p>
+                                <p><strong>Wallet:</strong> <code>{ENTERPRISE_WALLET}</code><br>
+                                <strong>Memo:</strong> <code>{acct.id}</code></p>
+                                <p>Your transaction hash will be your receipt. We'll extend your subscription automatically within 5 minutes of payment.</p>
+                                <p>— AgentTrust</p>
+                            """,
+                        })
+                        logger.info(f"📧 Renewal reminder sent to {acct.email}")
+                    except Exception:
+                        pass
+            finally:
+                db2.close()
+    except Exception as e:
+        logger.warning(f"Enterprise subscription poller error: {e}")
+
+
+async def _poll_expired_escrows_once():
+    """Single-run: cancel expired LOCKED escrows on-chain and mark them CANCELLED/ABANDONED in DB."""
+    if not referee_wallet or not _db_available:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        db = next(get_db())
+        try:
+            # Expire stale PENDING vaults (no on-chain tx after 24h)
+            stale_cutoff = now - timedelta(hours=24)
+            stale = db.query(EscrowVault).filter(
+                EscrowVault.status == "PENDING",
+                EscrowVault.created_at < stale_cutoff,
+            ).all()
+            for vault in stale:
+                vault.status = "ABANDONED"
+                age_hours = (now - vault.created_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                logger.info(f"ABANDONED escrow {vault.escrow_id}: age={age_hours:.1f}h, reason=stale PENDING (no on-chain tx submitted)")
+            if stale:
+                db.commit()
+
+            # LOCKED but no on-chain tx hash — verify on-chain before abandoning
+            orphaned = db.query(EscrowVault).filter(
+                EscrowVault.status == "LOCKED",
+                or_(EscrowVault.escrow_tx_hash == None, EscrowVault.escrow_tx_hash == ""),
+            ).all()
+            for vault in orphaned:
+                # Check on-chain: if an escrow object exists for this buyer/amount, it's live
                 try:
-                    # Expire stale PENDING vaults (no on-chain tx after 24h)
-                    stale_cutoff = now - timedelta(hours=24)
-                    stale = db.query(EscrowVault).filter(
-                        EscrowVault.status == "PENDING",
-                        EscrowVault.created_at < stale_cutoff,
-                    ).all()
-                    for vault in stale:
-                        vault.status = "ABANDONED"
-                        logger.info(f"🗑 Stale PENDING vault abandoned: {vault.escrow_id}")
-                    if stale:
-                        db.commit()
+                    amount_drops = str(int((vault.amount_xrp or 0) * 1_000_000))
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        r = await client.post(XRPL_URL, json={
+                            "method": "account_objects",
+                            "params": [{"account": vault.buyer_address, "type": "escrow", "ledger_index": "validated"}],
+                        })
+                    objects = r.json().get("result", {}).get("account_objects", [])
+                    live = any(o.get("Amount") == amount_drops for o in objects)
+                    if live:
+                        logger.info(f"Skipping ABANDONED for {vault.escrow_id}: escrow object found on-chain")
+                        continue
+                except Exception as check_err:
+                    logger.warning(f"On-chain check failed for {vault.escrow_id}, skipping: {check_err}")
+                    continue
+                age_hours = (now - vault.created_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                vault.status = "ABANDONED"
+                logger.info(f"ABANDONED escrow {vault.escrow_id}: age={age_hours:.1f}h, reason=LOCKED with no on-chain tx hash and no escrow object found")
+            if orphaned:
+                db.commit()
 
-                    # LOCKED but no on-chain tx hash — no real escrow exists on-chain.
-                    # Abandon unconditionally: there is nothing to cancel on-chain.
-                    orphaned = db.query(EscrowVault).filter(
-                        EscrowVault.status == "LOCKED",
-                        or_(EscrowVault.escrow_tx_hash == None, EscrowVault.escrow_tx_hash == ""),
-                    ).all()
-                    for vault in orphaned:
-                        vault.status = "ABANDONED"
-                        logger.info(f"🗑 Orphaned LOCKED vault (no on-chain tx) abandoned: {vault.escrow_id}")
-                    if orphaned:
-                        db.commit()
+            # Cancel expired LOCKED escrows with a known sequence
+            expired = db.query(EscrowVault).filter(
+                EscrowVault.status == "LOCKED",
+                EscrowVault.cancel_after_ts != None,
+                EscrowVault.cancel_after_ts < now,
+                EscrowVault.escrow_sequence != None,
+            ).all()
+            for vault in expired:
+                try:
+                    client = AsyncJsonRpcClient(XRPL_URL)
+                    cancel_tx = EscrowCancel(
+                        account=referee_wallet.address,
+                        owner=vault.buyer_address,
+                        offer_sequence=vault.escrow_sequence,
+                    )
+                    result = await async_submit_and_wait(cancel_tx, client, referee_wallet)
+                    engine_result = result.result.get("meta", {}).get("TransactionResult", "") or result.result.get("engine_result", "")
+                    tx_hash = result.result.get("hash", "")
 
-                    expired = db.query(EscrowVault).filter(
-                        EscrowVault.status == "LOCKED",
-                        EscrowVault.cancel_after_ts != None,
-                        EscrowVault.cancel_after_ts < now,
-                        EscrowVault.escrow_sequence != None,
-                    ).all()
-                    for vault in expired:
+                    if engine_result in ("tecNO_TARGET", "tecNO_ENTRY"):
+                        # Escrow object already gone — find the final tx to set correct status
+                        new_status = "CANCELLED"
                         try:
-                            client = AsyncJsonRpcClient(XRPL_URL)
-                            cancel_tx = EscrowCancel(
-                                account=referee_wallet.address,
-                                owner=vault.buyer_address,
-                                offer_sequence=vault.escrow_sequence,
-                            )
-                            result = await async_submit_and_wait(cancel_tx, client, referee_wallet)
-                            tx_hash = result.result.get("hash", "")
-                            vault.status = "CANCELLED"
-                            vault.delivery_status = "CANCELLED"
-                            db.commit()
-                            logger.info(f"⏱ Expired escrow cancelled: {vault.escrow_id} tx={tx_hash}")
-                            if RESEND_API_KEY and vault.buyer_email:
-                                try:
-                                    resend.Emails.send({
-                                        "from": RESEND_FROM,
-                                        "to": vault.buyer_email,
-                                        "subject": "AgentTrust — escrow expired, funds returned",
-                                        "html": f"""
-                                            <p>Hi,</p>
-                                            <p>Your AgentTrust escrow <strong>{vault.project_label or vault.escrow_id}</strong> expired on {vault.cancel_after_ts.strftime('%d %B %Y')} with no work submitted.</p>
-                                            <p>Funds have been returned to your wallet automatically.</p>
-                                            <p><strong>Cancel tx:</strong> <a href="https://livenet.xrpl.org/transactions/{tx_hash}">{tx_hash}</a></p>
-                                            <p>— AgentTrust</p>
-                                        """,
-                                    })
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel expired escrow {vault.escrow_id}: {e}")
-                finally:
-                    db.close()
-        except Exception as e:
-            logger.warning(f"Expired escrow poller error: {e}")
-        await asyncio.sleep(1800)
+                            async with httpx.AsyncClient(timeout=10) as hclient:
+                                atx = await hclient.post(XRPL_URL, json={
+                                    "method": "account_tx",
+                                    "params": [{"account": vault.buyer_address, "limit": 50, "ledger_index_min": -1}],
+                                })
+                            txns = atx.json().get("result", {}).get("transactions", [])
+                            for entry in txns:
+                                t = entry.get("tx", {})
+                                if t.get("Sequence") == vault.escrow_sequence or t.get("OfferSequence") == vault.escrow_sequence:
+                                    if t.get("TransactionType") == "EscrowFinish":
+                                        new_status = "RELEASED"
+                                    elif t.get("TransactionType") == "EscrowCancel":
+                                        new_status = "CANCELLED"
+                                    break
+                        except Exception:
+                            pass
+                        vault.status = new_status
+                        db.commit()
+                        logger.info(f"tecNO_TARGET on EscrowCancel for {vault.escrow_id}: resolved status={new_status}")
+                    else:
+                        vault.status = "CANCELLED"
+                        vault.delivery_status = "CANCELLED"
+                        db.commit()
+                        logger.info(f"⏱ Expired escrow cancelled: {vault.escrow_id} tx={tx_hash}")
+                        if RESEND_API_KEY and vault.buyer_email:
+                            try:
+                                resend.Emails.send({
+                                    "from": RESEND_FROM,
+                                    "to": vault.buyer_email,
+                                    "subject": "AgentTrust — escrow expired, funds returned",
+                                    "html": f"""
+                                        <p>Hi,</p>
+                                        <p>Your AgentTrust escrow <strong>{vault.project_label or vault.escrow_id}</strong> expired on {vault.cancel_after_ts.strftime('%d %B %Y')} with no work submitted.</p>
+                                        <p>Funds have been returned to your wallet automatically.</p>
+                                        <p><strong>Cancel tx:</strong> <a href="https://livenet.xrpl.org/transactions/{tx_hash}">{tx_hash}</a></p>
+                                        <p>— AgentTrust</p>
+                                    """,
+                                })
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"Failed to cancel expired escrow {vault.escrow_id}: {e}")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Expired escrow poller error: {e}")
 
 
-# Pollers are started in _lifespan (above) — @app.on_event("startup") is ignored
+# Pollers are started in _lifespan via _hourly_db_window — @app.on_event("startup") is ignored
 # when lifespan= is set on FastAPI.
 
 
