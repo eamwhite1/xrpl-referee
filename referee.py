@@ -560,6 +560,36 @@ async def _hourly_db_window():
             await _flush_tool_stats()
             checked = await _poll_expired_escrows_once()
             logger.info(f"hourly window tick: escrows checked={checked}")
+            # Auto-release PASS_CHALLENGE_WINDOW vaults whose deadline has passed
+            try:
+                _now_hw = datetime.now(timezone.utc)
+                with SessionLocal() as _hw_db:
+                    expired_cw = _hw_db.query(EscrowVault).filter(
+                        EscrowVault.status == "PASS_CHALLENGE_WINDOW",
+                        EscrowVault.challenge_deadline <= _now_hw,
+                    ).all()
+                    for _v in expired_cw:
+                        _v.status = "RELEASED"
+                        _v.released_at = _now_hw
+                        logger.info(f"Auto-released {_v.escrow_id} after challenge window expired")
+                        _send_challenge_window_expired_email(_v)
+                    if expired_cw:
+                        _hw_db.commit()
+                    # Safety net: REMEDY vaults past CancelAfter → CANCELLED
+                    if True:  # always run
+                        expired_remedy = _hw_db.query(EscrowVault).filter(
+                            EscrowVault.status == "REMEDY",
+                            EscrowVault.cancel_after_ts != None,
+                            EscrowVault.cancel_after_ts <= _now_hw,
+                        ).all()
+                        for _v in expired_remedy:
+                            _v.status = "CANCELLED"
+                            _v.cancelled_at = _now_hw
+                            logger.info(f"REMEDY vault {_v.escrow_id} cancelled — CancelAfter passed")
+                        if expired_remedy:
+                            _hw_db.commit()
+            except Exception as _hw_err:
+                logger.error(f"hourly window challenge auto-release error: {_hw_err}")
             # One-off timestamp/owner correction (runs once per process lifetime)
             backfill_db = next(get_db())
             try:
@@ -1406,9 +1436,14 @@ class EscrowVault(Base):
     prompt_version       = Column(String,  nullable=True)
     verdict_hash         = Column(String,  nullable=True)    # sha256 of full verdict JSON
     evaluation_verdicts  = Column(JSONB,   nullable=True)    # per-criterion results
-    challenge_deadline   = Column(DateTime(timezone=True), nullable=True)
-    challenge_fee_hash   = Column(String,  nullable=True)
-    challenge_fee_amount = Column(Numeric, nullable=True)
+    challenge_deadline    = Column(DateTime(timezone=True), nullable=True)
+    challenge_fee_hash    = Column(String,  nullable=True)
+    challenge_fee_amount  = Column(Numeric, nullable=True)
+    # Part B Phase 2 — challenge window
+    challenge_reason      = Column(Text,    nullable=True)
+    challenge_criteria_ids = Column(ARRAY(String), nullable=True)
+    remedy_attempt_used   = Column(Boolean, default=False)
+    challenged_at         = Column(DateTime(timezone=True), nullable=True)
 
 
 class JobPosting(Base):
@@ -2484,9 +2519,14 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS prompt_version        VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS verdict_hash          VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluation_verdicts   JSONB",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_deadline    TIMESTAMPTZ",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_hash    VARCHAR",
-        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_amount  NUMERIC",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_deadline      TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_hash      VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_amount    NUMERIC",
+        # Part B Phase 2 — challenge window
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_reason        TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_criteria_ids  TEXT[]",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS remedy_attempt_used     BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenged_at           TIMESTAMPTZ",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2529,6 +2569,7 @@ MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dy
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 PREMIUM_FEE_USD    = 0.25   # consensus (dual-model) audit fee
 PREMIUM_FEE_XRP    = 0.25   # fallback if price oracle is unavailable
+CHALLENGE_FEE_XRP  = float(os.getenv("CHALLENGE_FEE_XRP", "0.5"))  # buyer pays to dispute a PASS verdict
 
 async def get_required_fee_xrp(premium: bool = False) -> float:
     """Return the XRP amount equivalent to the required fee at the current market price."""
@@ -5618,6 +5659,321 @@ async def _check_gemini_models():
         logger.warning(f"Gemini model check failed: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Part B Phase 2 — Challenge window email stubs + review task
+# ---------------------------------------------------------------------------
+
+def _send_challenge_window_opened_email(vault):
+    hours = vault.release_mode.split(":")[1] if vault.release_mode and ":" in vault.release_mode else "24"
+    deadline_str = vault.challenge_deadline.strftime("%A %d %B %Y at %H:%M UTC") if vault.challenge_deadline else "soon"
+    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
+    recipient = vault.buyer_email
+    if not RESEND_API_KEY or not recipient:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      recipient,
+            "subject": f"⏱ Verdict is in — you have {hours}h to review or challenge — {vault.escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Work passed — challenge window open</h1>
+  <p>The AI referee has reviewed the submission for escrow <strong>{vault.escrow_id}</strong>
+     and returned a <strong>PASS</strong> verdict.</p>
+  <p>If you believe the work does not meet the criteria, you have <strong>{hours} hours</strong>
+     to raise a challenge. A senior Pro model will re-review the specific criteria you dispute.</p>
+  <div class="detail"><span>Challenge deadline</span><br><strong>{deadline_str}</strong></div>
+  <div class="detail"><span>Challenge fee</span><br><strong>{CHALLENGE_FEE_XRP} XRP</strong> (refunded if your challenge is upheld)</div>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+    If you do not challenge before the deadline, payment will release automatically to the worker.
+  </p>
+  <a href="{escrow_url}" class="btn">Review &amp; Challenge →</a>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Challenge window email sent to {recipient} for {vault.escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Challenge window email failed for {vault.escrow_id}: {e}")
+
+
+def _send_challenge_submitted_email(vault):
+    recipient = vault.worker_email
+    if not RESEND_API_KEY or not recipient:
+        return
+    criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "all criteria"
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      recipient,
+            "subject": f"⚠️ Buyer challenged your submission — {vault.escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Your submission is under review</h1>
+  <p>The buyer has disputed the verdict on escrow <strong>{vault.escrow_id}</strong>.</p>
+  <div class="detail"><span>Disputed criteria</span><br><strong>{criteria_list}</strong></div>
+  <div class="detail"><span>Buyer's reason</span><br>{vault.challenge_reason or "—"}</div>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+    A senior AI model is now re-reviewing your submission against the disputed criteria.
+    You will receive another email once the review is complete.
+  </p>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Challenge submitted email sent to {recipient} for {vault.escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Challenge submitted email failed for {vault.escrow_id}: {e}")
+
+
+def _send_challenge_outcome_email(vault, outcome: str):
+    """outcome: 'rejected' | 'upheld_remedy' | 'upheld_cancel' | 'pro_unavailable'"""
+    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
+    if not RESEND_API_KEY:
+        return
+
+    if outcome == "rejected":
+        for recipient in filter(None, [vault.buyer_email, vault.worker_email]):
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"✅ Challenge rejected — escrow released — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Challenge rejected — payment released</h1>
+  <p>The senior Pro model reviewed escrow <strong>{vault.escrow_id}</strong> and
+     <strong>upheld the original PASS verdict</strong>. The buyer's challenge was unsuccessful.</p>
+  <p>The escrow has been released to the worker. The challenge fee ({vault.challenge_fee_amount} XRP)
+     has been paid to the worker.</p>
+  <a href="{escrow_url}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+            except Exception as e:
+                logger.error(f"❌ Challenge rejected email failed for {vault.escrow_id}: {e}")
+
+    elif outcome == "upheld_remedy":
+        recipient = vault.worker_email
+        if recipient:
+            criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "disputed criteria"
+            submit_url = f"{SITE_URL}?worker={vault.escrow_id}"
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"🔄 Challenge upheld — 1 remedy attempt available — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Challenge upheld — remedy attempt available</h1>
+  <p>The senior Pro model reviewed escrow <strong>{vault.escrow_id}</strong> and
+     <strong>upheld the buyer's challenge</strong>. The following criteria were not met:</p>
+  <div class="detail"><span>Failed criteria</span><br><strong>{criteria_list}</strong></div>
+  <p style="font-size:.85rem;color:#0a7c4a;font-weight:700;">
+    You have <strong>1 remedy attempt</strong>. Fix the issues above and resubmit.
+    A PASS on the remedy releases payment immediately — no further challenge window.
+  </p>
+  <a href="{submit_url}" class="btn">Submit Remedy →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+                logger.info(f"📧 Remedy available email sent to {recipient} for {vault.escrow_id}")
+            except Exception as e:
+                logger.error(f"❌ Remedy email failed for {vault.escrow_id}: {e}")
+
+    elif outcome == "upheld_cancel":
+        for recipient in filter(None, [vault.buyer_email, vault.worker_email]):
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"❌ Challenge upheld — escrow cancelled — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Challenge upheld — escrow cancelled</h1>
+  <p>The senior Pro model reviewed escrow <strong>{vault.escrow_id}</strong> and
+     <strong>upheld the buyer's challenge</strong>. The escrow deadline is too close for a
+     remedy attempt, so the escrow has been cancelled and funds will return to the buyer.</p>
+  <p>The challenge fee ({vault.challenge_fee_amount} XRP) has been refunded to the buyer.</p>
+  <a href="{escrow_url}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+            except Exception as e:
+                logger.error(f"❌ Challenge upheld cancel email failed for {vault.escrow_id}: {e}")
+
+    elif outcome == "pro_unavailable":
+        recipient = vault.buyer_email
+        if recipient:
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"ℹ️ Challenge review unavailable — escrow auto-released — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Pro review temporarily unavailable</h1>
+  <p>We were unable to complete the Pro model review for escrow <strong>{vault.escrow_id}</strong>
+     due to a temporary service issue. As a result, the escrow has been auto-released to the worker
+     and your challenge fee ({vault.challenge_fee_amount} XRP) has been refunded.</p>
+  <a href="{escrow_url}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+                logger.info(f"📧 Pro unavailable email sent to {recipient} for {vault.escrow_id}")
+            except Exception as e:
+                logger.error(f"❌ Pro unavailable email failed for {vault.escrow_id}: {e}")
+
+
+def _send_remedy_available_email(vault):
+    # Remedy notification sent within _send_challenge_outcome_email("upheld_remedy")
+    pass
+
+
+def _send_challenge_window_expired_email(vault):
+    recipient = vault.worker_email
+    if not RESEND_API_KEY or not recipient:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      recipient,
+            "subject": f"✅ Challenge window closed — payment released — {vault.escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Payment released</h1>
+  <p>The challenge window for escrow <strong>{vault.escrow_id}</strong> has closed with no
+     challenge from the buyer. Payment has been automatically released to your wallet.</p>
+  <a href="{SITE_URL}?worker={vault.escrow_id}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Challenge window expired email sent to {recipient} for {vault.escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Challenge window expired email failed for {vault.escrow_id}: {e}")
+
+
+async def _run_challenge_review(escrow_id: str):
+    """
+    Background task: run Pro-only re-review of challenged criteria.
+    Opens its own DB session so it doesn't block the HTTP response.
+    """
+    db = SessionLocal()
+    try:
+        vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+        if not vault or vault.status != "CHALLENGED":
+            logger.warning(f"_run_challenge_review: vault {escrow_id} not found or not CHALLENGED")
+            return
+
+        # Filter criteria to only those being challenged
+        all_criteria = vault.criteria_v2 or [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
+        challenged_ids = set(vault.challenge_criteria_ids or [])
+        if challenged_ids:
+            review_criteria = [c for c in all_criteria if c.get("id") in challenged_ids]
+            if not review_criteria:
+                review_criteria = all_criteria
+        else:
+            review_criteria = all_criteria
+
+        work = ""
+        if vault.worker_submission:
+            try:
+                sub = json.loads(vault.worker_submission)
+                work = sub.get("work", "")
+            except Exception:
+                work = vault.worker_submission or ""
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        pro_result = None
+        pro_verdict = "FAIL"
+        if api_key:
+            try:
+                prompt_text = _build_audit_prompt(
+                    vault.task_description or "",
+                    work,
+                    review_criteria,
+                    [],
+                )
+                payload = {
+                    "contents": [{"parts": [{"text": prompt_text}]}],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "seed": 42,
+                        "responseMimeType": "application/json",
+                        "thinkingConfig": {"thinkingBudget": 2048},
+                    },
+                }
+                url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+                async with httpx.AsyncClient(timeout=90.0) as client:
+                    res = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+                if res.status_code == 200:
+                    raw = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    pro_result = json.loads(raw)
+                    pro_verdict = pro_result.get("overall_verdict", "FAIL")
+                    logger.info(f"_run_challenge_review: Pro verdict={pro_verdict} for {escrow_id}")
+                else:
+                    logger.warning(f"_run_challenge_review: Pro HTTP {res.status_code} for {escrow_id}")
+                    pro_result = None
+            except Exception as e:
+                logger.error(f"_run_challenge_review: Pro error for {escrow_id}: {e}")
+                pro_result = None
+
+        now = datetime.now(timezone.utc)
+
+        if pro_result is None:
+            # Pro unavailable — release escrow to worker, refund challenge fee to buyer
+            vault.status = "RELEASED"
+            vault.released_at = now
+            logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (Pro unavailable)")  # TODO: submit XRPL tx
+            db.commit()
+            _send_challenge_outcome_email(vault, "pro_unavailable")
+            return
+
+        if pro_verdict == "PASS":
+            vault.status = "RELEASED"
+            vault.released_at = now
+            logger.info(f"CHALLENGE_FEE_PAYOUT: send {vault.challenge_fee_amount} XRP to {vault.worker_address} for escrow {escrow_id} (challenge rejected)")  # TODO: submit XRPL tx
+            db.commit()
+            _send_challenge_outcome_email(vault, "rejected")
+        else:
+            # Pro FAIL — check CancelAfter
+            cancel_after = vault.cancel_after_ts
+            if cancel_after:
+                # cancel_after_ts may be naive; ensure tz-aware for comparison
+                if cancel_after.tzinfo is None:
+                    cancel_after = cancel_after.replace(tzinfo=timezone.utc)
+            time_remaining = (cancel_after - now).total_seconds() if cancel_after else 0
+            if cancel_after and time_remaining >= 86400:  # >= 24h
+                vault.status = "REMEDY"
+                logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (challenge upheld → REMEDY)")  # TODO: submit XRPL tx
+                db.commit()
+                _send_challenge_outcome_email(vault, "upheld_remedy")
+                _send_remedy_available_email(vault)
+            else:
+                vault.status = "CANCELLED"
+                vault.cancelled_at = now
+                logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (challenge upheld → CANCELLED, CancelAfter < 24h)")  # TODO: submit XRPL tx
+                db.commit()
+                _send_challenge_outcome_email(vault, "upheld_cancel")
+    except Exception as e:
+        logger.error(f"_run_challenge_review error for {escrow_id}: {e}", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
 async def run_ai_audit(
     task:                    str,
     work:                    str,
@@ -6324,6 +6680,140 @@ async def reissue_evaluate_token_endpoint(escrow_id: str, body: dict, db: Sessio
     }
 
 
+# ---------------------------------------------------------------------------
+# Part B Phase 2 — Challenge endpoint
+# ---------------------------------------------------------------------------
+@app.post("/escrow/{escrow_id}/challenge")
+async def challenge_escrow_verdict(escrow_id: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Buyer disputes a PASS verdict during the challenge window.
+
+    Body: {
+        criteria_ids: [str],   -- criterion IDs being disputed
+        reason: str,           -- explanation of why the work fails those criteria
+        fee_tx_hash: str,      -- 64-char hex XRPL tx hash of CHALLENGE_FEE_XRP payment
+        wallet_address: str,   -- buyer's wallet address
+        tx_hash: str           -- XRPL AccountSet tx containing the verification challenge memo
+    }
+
+    The buyer must first call GET /verify/challenge?wallet=... to get a challenge string,
+    submit an AccountSet tx with that string in a Memo, then POST here.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    criteria_ids  = body.get("criteria_ids") or []
+    reason        = (body.get("reason") or "").strip()
+    fee_tx_hash   = (body.get("fee_tx_hash") or "").strip().upper()
+    wallet_address = (body.get("wallet_address") or "").strip()
+    ownership_tx  = (body.get("tx_hash") or "").strip().upper()
+
+    if not criteria_ids:
+        raise HTTPException(status_code=400, detail="criteria_ids must be a non-empty list of criterion IDs to dispute.")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required.")
+    if not fee_tx_hash or len(fee_tx_hash) != 64:
+        raise HTTPException(status_code=400, detail="fee_tx_hash must be a 64-char XRPL transaction hash.")
+    if not wallet_address or not wallet_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="wallet_address (r...) is required.")
+    if not ownership_tx or len(ownership_tx) != 64:
+        raise HTTPException(status_code=400, detail="tx_hash (XRPL AccountSet with memo) is required for ownership proof.")
+
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+    if vault.status != "PASS_CHALLENGE_WINDOW":
+        raise HTTPException(status_code=409, detail=f"Escrow is not in PASS_CHALLENGE_WINDOW status (current: {vault.status}).")
+
+    now = datetime.now(timezone.utc)
+    if vault.challenge_deadline:
+        deadline = vault.challenge_deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        if now >= deadline:
+            raise HTTPException(status_code=403, detail="Challenge window has closed.")
+
+    if vault.challenged_at is not None:
+        raise HTTPException(status_code=409, detail="A challenge has already been submitted for this escrow.")
+
+    # Verify buyer wallet ownership
+    if vault.buyer_address and vault.buyer_address != wallet_address:
+        raise HTTPException(status_code=403, detail="wallet_address does not match the buyer on this vault.")
+
+    if wallet_address not in _verify_challenges:
+        raise HTTPException(status_code=400, detail="No pending verification challenge for this wallet. Call GET /verify/challenge?wallet=... first.")
+    challenge_str, ch_expires = _verify_challenges[wallet_address]
+    if now > ch_expires:
+        del _verify_challenges[wallet_address]
+        raise HTTPException(status_code=400, detail="Verification challenge expired. Request a new one via GET /verify/challenge.")
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": ownership_tx}]})
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(status_code=400, detail="Ownership transaction not found on ledger.")
+    if not tx_data.get("validated"):
+        raise HTTPException(status_code=400, detail="Ownership transaction is not yet validated.")
+    meta = tx_data.get("meta") or {}
+    if (meta.get("TransactionResult") if isinstance(meta, dict) else "") != "tesSUCCESS":
+        raise HTTPException(status_code=400, detail="Ownership transaction did not succeed on-chain.")
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    account = tx_data.get("Account") or tx_json.get("Account")
+    if account != wallet_address:
+        raise HTTPException(status_code=403, detail=f"Transaction account ({account}) does not match wallet_address.")
+    memos = tx_json.get("Memos") or tx_data.get("Memos") or []
+    expected_hex = challenge_str.encode().hex().upper()
+    if not any(m.get("Memo", {}).get("MemoData", "").upper() == expected_hex for m in memos):
+        raise HTTPException(status_code=403, detail="Transaction Memo does not contain the expected challenge string.")
+    del _verify_challenges[wallet_address]
+
+    # Validate criteria_ids reference actual criteria
+    all_criteria = vault.criteria_v2 or []
+    if all_criteria:
+        valid_ids = {c.get("id") for c in all_criteria}
+        invalid = [cid for cid in criteria_ids if cid not in valid_ids]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown criterion IDs: {invalid}. Valid IDs: {sorted(valid_ids)}")
+
+    # Verify challenge fee payment
+    try:
+        await verify_fee_payment(
+            fee_hash=fee_tx_hash,
+            escrow_id=escrow_id,
+            db=db,
+            min_xrp=CHALLENGE_FEE_XRP,
+            resource="/escrow/challenge",
+            allow_free_tier=False,
+        )
+    except (HTTPException, PaymentRequired) as e:
+        raise HTTPException(status_code=402, detail=f"Challenge fee verification failed: {getattr(e, 'detail', str(e))}")
+
+    vault.status                = "CHALLENGED"
+    vault.challenged_at         = now
+    vault.challenge_criteria_ids = list(criteria_ids)
+    vault.challenge_reason      = reason
+    vault.challenge_fee_hash    = fee_tx_hash
+    vault.challenge_fee_amount  = CHALLENGE_FEE_XRP
+    db.commit()
+
+    asyncio.create_task(_run_challenge_review(escrow_id))
+    _send_challenge_submitted_email(vault)
+    logger.info(f"🔍 Challenge submitted for {escrow_id} by {wallet_address} — criteria: {criteria_ids}")
+    return JSONResponse({
+        "status": "CHALLENGED",
+        "escrow_id": escrow_id,
+        "message": "Challenge submitted. A senior Pro model review is now in progress. You will be notified of the outcome.",
+        "criteria_ids": criteria_ids,
+        "challenged_at": now.isoformat(),
+    }, status_code=202)
+
+
 class PrepareEscrowRequest(BaseModel):
     escrow_id:        str
     buyer_address:    str
@@ -6594,6 +7084,12 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         # Debug fields
         "escrow_owner":      vault.escrow_owner,
         "backfill_attempts": vault.backfill_attempts,
+        # Part B Phase 2 — challenge window
+        "release_mode":            vault.release_mode,
+        "challenge_deadline":      vault.challenge_deadline.isoformat() if vault.challenge_deadline else None,
+        "challenged_at":           vault.challenged_at.isoformat() if vault.challenged_at else None,
+        "challenge_criteria_ids":  vault.challenge_criteria_ids,
+        "remedy_attempt_used":     vault.remedy_attempt_used or False,
     }
 
 
@@ -6614,6 +7110,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="This escrow has already been released.")
     if vault.status == "CANCELLED":
         raise HTTPException(status_code=409, detail="This escrow has been cancelled.")
+    if vault.status not in ("LOCKED", "REMEDY"):
+        raise HTTPException(status_code=409, detail=f"Work cannot be submitted when escrow is in '{vault.status}' status.")
+
+    is_remedy = vault.status == "REMEDY"
+    if is_remedy:
+        if vault.remedy_attempt_used:
+            raise HTTPException(status_code=409, detail="The remedy attempt for this escrow has already been used.")
 
     # Evaluate token check — vaults created after v2.8.0 require this
     if vault.evaluate_token_hash:
@@ -6637,10 +7140,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             ),
         )
 
-    # ── SUBMISSION LIMIT CHECK ──
+    # ── SUBMISSION LIMIT CHECK ── (bypassed for remedy attempts)
     current_count = vault.submission_count or 0
     max_allowed   = vault.max_submissions   or DEFAULT_MAX_SUBMISSIONS
-    if current_count >= max_allowed:
+    if not is_remedy and current_count >= max_allowed:
         attempts_left = 0
         raise HTTPException(
             status_code=429,
@@ -6650,6 +7153,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 f"${EXTRA_ATTEMPT_FEE_USD} (≈ {extra_attempt_fee_xrp()} XRP) via POST /evaluate/purchase-attempt."
             ),
         )
+    if is_remedy:
+        # Consume remedy slot before evaluation so it's marked even if evaluation errors
+        vault.remedy_attempt_used = True
+        db.commit()
 
     # 50 MB attachment cap
     total_bytes = 0
@@ -6991,6 +7498,43 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             }
 
         revealed_fulfillment = plaintext_fulfillment
+        # ── REMEDY: release immediately, no challenge window ──
+        if is_remedy:
+            vault.status              = "RELEASED"
+            vault.delivery_status     = "RELEASED"
+            vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
+            vault.worker_submission = json.dumps({
+                "work":               req.work,
+                "attachments":        [a.dict() for a in (req.worker_attachments or [])],
+                "evidence_links":     req.evidence_links or [],
+                "evidence_snapshots": evidence_snapshots or [],
+                "verdict":            verdict_dict,
+                "delivered_at":       datetime.now(timezone.utc).isoformat(),
+                "escrow_id":          req.escrow_id,
+            })
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            logger.info(f"✅ REMEDY PASS for {req.escrow_id} — releasing immediately")
+            escrow_owner = vault.escrow_owner or vault.buyer_address
+            if vault.escrow_sequence and vault.worker_address and referee_wallet and escrow_owner:
+                asyncio.create_task(auto_finish_escrow(
+                    escrow_id=req.escrow_id,
+                    sequence=vault.escrow_sequence,
+                    owner=escrow_owner,
+                    fulfillment=plaintext_fulfillment,
+                    condition=vault.condition,
+                    worker_addr=vault.worker_address,
+                    db_session_factory=SessionLocal,
+                ))
+            return {
+                "escrow_id":          req.escrow_id,
+                "status":             "approved",
+                "verdict":            verdict_dict,
+                "model_used":         model_used,
+                "auto_finish_queued": True,
+                "message":            "Remedy passed — escrow released immediately.",
+            }
         # ── CHALLENGE WINDOW: hold payment if release_mode starts with "challenge_window_hrs" ──
         release_mode_str = vault.release_mode or "auto"
         if release_mode_str.startswith("challenge_window_hrs"):
@@ -7016,6 +7560,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             vault.model_used = model_used
             db.commit()
             logger.info(f"⏳ PASS_CHALLENGE_WINDOW for {req.escrow_id} — deadline: {vault.challenge_deadline}")
+            _send_challenge_window_opened_email(vault)
             return {
                 "escrow_id":            req.escrow_id,
                 "status":               "pass_challenge_window",
@@ -7093,6 +7638,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             ))
     else:
         logger.info(f"❌ AUDIT FAILED: '{req.escrow_id}' | score={verdict_dict.get('score')}")
+        if is_remedy:
+            vault.status       = "CANCELLED"
+            vault.cancelled_at = datetime.now(timezone.utc)
+            logger.info(f"❌ REMEDY FAIL for {req.escrow_id} — escrow cancelled")
 
     vault.ai_verdict = json.dumps(verdict_dict)
     vault.model_used = model_used

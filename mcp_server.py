@@ -544,6 +544,16 @@ async def evaluate_escrow_work(
     the worker. Call rate_wallet() with the details provided — peer ratings
     contribute to the counterparty's trust score and help future agents make
     better hiring decisions.
+
+    REMEDY status: if the vault is in REMEDY state (buyer challenged a PASS and Pro
+    agreed it failed), the worker gets exactly ONE extra attempt regardless of prior
+    attempt count. A PASS on the remedy releases immediately with no challenge window.
+    A FAIL on the remedy cancels the escrow.
+
+    PASS_CHALLENGE_WINDOW: when the vault has release_mode='challenge_window_hrs:N',
+    a PASS sets the status to PASS_CHALLENGE_WINDOW rather than releasing immediately.
+    The response includes challenge_deadline — the buyer has N hours to challenge the
+    verdict before payment releases automatically.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
         body: dict = {
@@ -619,6 +629,100 @@ async def purchase_extra_attempt(
             json={"escrow_id": escrow_id, "fee_hash": fee_hash},
         )
         res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Challenge Escrow Verdict",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def challenge_escrow_verdict(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code for the escrow whose PASS verdict you want to dispute.",
+    )],
+    criteria_ids: Annotated[list[str], Field(
+        title="Criterion IDs to Dispute",
+        description="One or more criterion IDs (from the vault's criteria list) that you believe the work failed. Get these from the evaluation_verdicts in the escrow response.",
+    )],
+    reason: Annotated[str, Field(
+        title="Reason for Challenge",
+        description="Explain specifically why the work does not satisfy the listed criteria. The Pro model will review this alongside the original work.",
+    )],
+    fee_tx_hash: Annotated[str, Field(
+        title="Challenge Fee Payment Hash",
+        description="64-char hex XRPL transaction hash paying CHALLENGE_FEE_XRP (default 0.5 XRP) to the protocol wallet. Refunded if your challenge is upheld; paid to the worker if rejected.",
+    )],
+    wallet_address: Annotated[str, Field(
+        title="Buyer Wallet Address",
+        description="Your XRPL wallet address (r...) — must match the buyer on this vault.",
+    )],
+    tx_hash: Annotated[str, Field(
+        title="Ownership Verification Transaction Hash",
+        description="Hash of an XRPL AccountSet tx submitted from wallet_address with a Memo containing the challenge string from get_wallet_verification_challenge(). Proves you own the buyer wallet.",
+    )],
+) -> dict:
+    """
+    Challenge a PASS verdict during the challenge window.
+
+    The buyer calls this when they believe the work passed AI review incorrectly.
+    A senior Pro model re-reviews only the disputed criteria.
+
+    Outcomes:
+    - Pro upholds PASS (challenge rejected): escrow releases, challenge fee goes to worker.
+    - Pro rules FAIL (challenge upheld, CancelAfter ≥ 24h): vault enters REMEDY status.
+      Worker gets one extra attempt to fix the specific failed criteria. A PASS on the
+      remedy releases immediately with no further challenge window.
+    - Pro rules FAIL (CancelAfter < 24h): escrow cancelled, both funds and challenge fee
+      returned to buyer.
+    - Pro unavailable: escrow auto-releases, challenge fee refunded to buyer.
+
+    Prerequisites:
+    1. Call get_wallet_verification_challenge(wallet_address=your_buyer_wallet) to get a nonce.
+    2. Submit an XRPL AccountSet transaction from your buyer wallet with the nonce in a Memo field.
+    3. Pay CHALLENGE_FEE_XRP XRP to the protocol wallet (rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR).
+    4. Call this tool with the AccountSet tx hash (tx_hash), fee tx hash (fee_tx_hash),
+       criteria_ids, and reason.
+
+    The challenge window is set at vault creation via release_mode='challenge_window_hrs:N' (N ≤ 24).
+    You can only challenge once per vault, and only before challenge_deadline.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/{escrow_id}/challenge",
+            json={
+                "criteria_ids":   criteria_ids,
+                "reason":         reason,
+                "fee_tx_hash":    fee_tx_hash,
+                "wallet_address": wallet_address,
+                "tx_hash":        tx_hash,
+            },
+        )
+        if res.status_code == 202:
+            return res.json()
+        if res.status_code == 402:
+            return {"error": "payment_required", "message": "Challenge fee verification failed. Pay CHALLENGE_FEE_XRP XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_tx_hash."}
+        if res.status_code == 403:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": "forbidden", "message": detail}
+        if res.status_code == 409:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": "conflict", "message": detail}
+        if not res.is_success:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
         return res.json()
 
 
