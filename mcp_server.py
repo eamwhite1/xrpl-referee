@@ -643,6 +643,8 @@ async def get_escrow_info(
     Returns:
         task_description, buyer_name, worker_address, amount, deadline,
         escrow_sequence, status, submission_count, attempts_remaining.
+        On RELEASED escrows: release_tx_hash and explorer_url (livenet.xrpl.org link)
+        for proof of payment. On CANCELLED: cancel_tx_hash and explorer_url.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/escrow/{escrow_id}")
