@@ -539,9 +539,10 @@ async def _hourly_db_window():
             await _flush_tool_stats()
             checked = await _poll_expired_escrows_once()
             logger.info(f"hourly window tick: escrows checked={checked}")
-            # Backfill missing release/cancel tx hashes for existing RELEASED/CANCELLED rows
+            # One-off timestamp/owner correction (runs once per process lifetime)
             backfill_db = next(get_db())
             try:
+                await _one_off_backfill_correction(backfill_db)
                 await _backfill_escrow_hashes(backfill_db)
             finally:
                 backfill_db.close()
@@ -5803,8 +5804,8 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
     vault.status          = "LOCKED"
-    if not vault.escrow_owner:
-        vault.escrow_owner = vault.buyer_address
+    # Set escrow_owner from the confirmed EscrowCreate tx Account field (may differ from buyer_address)
+    vault.escrow_owner = vault.buyer_address  # fallback; backfill will correct if wrong
     db.commit()
 
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
@@ -6070,8 +6071,9 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
     vault.status = "LOCKED"
-    if not vault.escrow_owner:
-        vault.escrow_owner = vault.buyer_address
+    # Set from actual EscrowCreate Account field; backfill will correct if this is wrong
+    tx_account = res.get("tx_json", {}).get("Account") or res.get("Account")
+    vault.escrow_owner = tx_account or vault.buyer_address
     try:
         db.commit()
     except Exception as e:
@@ -6157,6 +6159,9 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
             f"https://livenet.xrpl.org/transactions/{vault.cancel_tx_hash}"
             if vault.cancel_tx_hash else None
         ),
+        # Debug fields
+        "escrow_owner":      vault.escrow_owner,
+        "backfill_attempts": vault.backfill_attempts,
     }
 
 
@@ -10092,9 +10097,90 @@ async def _fetch_escrow_final_tx(owner: str, offer_sequence: int):
     return None
 
 
+_one_off_backfill_done: bool = False
+
+
+async def _one_off_backfill_correction(db):
+    """One-time pass per process: re-derives timestamps from ledger close time and corrects
+    wrong escrow_owner values. Resets backfill_attempts=0 for rows still missing hashes."""
+    global _one_off_backfill_done
+    if _one_off_backfill_done:
+        return
+    _one_off_backfill_done = True
+    logger.info("Running one-off backfill correction pass...")
+    try:
+        corrected = 0
+        # Re-correct RELEASED rows
+        released = db.query(EscrowVault).filter(
+            EscrowVault.status == "RELEASED",
+            EscrowVault.release_tx_hash != None,
+        ).all()
+        for vault in released:
+            try:
+                if vault.escrow_tx_hash:
+                    info = await _get_escrow_create_info(vault.escrow_tx_hash)
+                    if info and vault.escrow_owner != info["owner"]:
+                        logger.info(f"One-off: correcting owner for {vault.escrow_id}: {vault.escrow_owner} → {info['owner']}")
+                        vault.escrow_owner = info["owner"]
+                        vault.escrow_sequence = info["sequence"]
+                async with httpx.AsyncClient(timeout=10) as hc:
+                    r = await hc.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": vault.release_tx_hash}]})
+                    tx_result = r.json().get("result", {})
+                    ledger_date = tx_result.get("date") or tx_result.get("close_time")
+                    if ledger_date:
+                        correct_ts = _ledger_time_to_utc(ledger_date)
+                        if vault.released_at != correct_ts:
+                            logger.info(f"One-off: correcting released_at for {vault.escrow_id}: {vault.released_at} → {correct_ts}")
+                            vault.released_at = correct_ts
+                            corrected += 1
+                db.commit()
+            except Exception as e:
+                logger.warning(f"One-off correction failed for {vault.escrow_id}: {e}")
+
+        # Re-correct CANCELLED rows
+        cancelled = db.query(EscrowVault).filter(
+            EscrowVault.status == "CANCELLED",
+            EscrowVault.cancel_tx_hash != None,
+        ).all()
+        for vault in cancelled:
+            try:
+                if vault.escrow_tx_hash:
+                    info = await _get_escrow_create_info(vault.escrow_tx_hash)
+                    if info and vault.escrow_owner != info["owner"]:
+                        logger.info(f"One-off: correcting owner for {vault.escrow_id}: {vault.escrow_owner} → {info['owner']}")
+                        vault.escrow_owner = info["owner"]
+                        vault.escrow_sequence = info["sequence"]
+                async with httpx.AsyncClient(timeout=10) as hc:
+                    r = await hc.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": vault.cancel_tx_hash}]})
+                    tx_result = r.json().get("result", {})
+                    ledger_date = tx_result.get("date") or tx_result.get("close_time")
+                    if ledger_date:
+                        correct_ts = _ledger_time_to_utc(ledger_date)
+                        if vault.cancelled_at != correct_ts:
+                            logger.info(f"One-off: correcting cancelled_at for {vault.escrow_id}: {vault.cancelled_at} → {correct_ts}")
+                            vault.cancelled_at = correct_ts
+                            corrected += 1
+                db.commit()
+            except Exception as e:
+                logger.warning(f"One-off correction failed for {vault.escrow_id}: {e}")
+
+        # Reset backfill_attempts for rows still missing hashes so they get retried
+        db.query(EscrowVault).filter(
+            EscrowVault.status.in_(["RELEASED", "CANCELLED"]),
+            EscrowVault.release_tx_hash == None,
+            EscrowVault.cancel_tx_hash == None,
+            EscrowVault.escrow_tx_hash != None,
+        ).update({"backfill_attempts": 0})
+        db.commit()
+        logger.info(f"One-off backfill correction complete: {corrected} timestamps corrected")
+    except Exception as e:
+        logger.warning(f"One-off backfill correction failed: {e}")
+        _one_off_backfill_done = False  # allow retry on next tick if it crashed
+
+
 async def _backfill_escrow_hashes(db):
     """Backfill release_tx_hash / cancel_tx_hash for RELEASED/CANCELLED vaults missing them.
-    Uses real escrow owner (from EscrowCreate tx Account field), not buyer_address.
+    Always re-fetches owner from EscrowCreate tx (never trusts cached escrow_owner).
     Caps at 3 attempts per vault to avoid rescanning forever."""
     try:
         released = db.query(EscrowVault).filter(
@@ -10105,21 +10191,21 @@ async def _backfill_escrow_hashes(db):
         ).limit(20).all()
         for vault in released:
             try:
-                # Use cached owner/sequence or fetch from EscrowCreate tx
-                owner = vault.escrow_owner
-                seq = vault.escrow_sequence
-                if not owner or not seq:
-                    info = await _get_escrow_create_info(vault.escrow_tx_hash)
-                    if not info:
-                        vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
-                        db.commit()
-                        continue
-                    owner = info["owner"]
-                    seq = info["sequence"]
-                    vault.escrow_owner = owner
-                    vault.escrow_sequence = seq
+                # Always fetch real owner from EscrowCreate tx — never trust cached escrow_owner
+                info = await _get_escrow_create_info(vault.escrow_tx_hash)
+                if not info:
+                    vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                     db.commit()
-                tx = await _fetch_escrow_final_tx(owner, seq)
+                    logger.info(f"Backfill miss (no EscrowCreate tx): {vault.escrow_id} owner={vault.escrow_owner} seq={vault.escrow_sequence} attempts={vault.backfill_attempts}")
+                    continue
+                real_owner = info["owner"]
+                real_seq = info["sequence"]
+                if vault.escrow_owner and vault.escrow_owner != real_owner:
+                    logger.warning(f"Correcting escrow_owner for {vault.escrow_id}: {vault.escrow_owner} → {real_owner}")
+                vault.escrow_owner = real_owner
+                vault.escrow_sequence = real_seq
+                db.commit()
+                tx = await _fetch_escrow_final_tx(real_owner, real_seq)
                 vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                 if tx and tx.get("TransactionType") == "EscrowFinish":
                     vault.release_tx_hash = tx.get("hash")
@@ -10129,6 +10215,7 @@ async def _backfill_escrow_hashes(db):
                     logger.info(f"Backfilled release_tx_hash for {vault.escrow_id}")
                 else:
                     db.commit()
+                    logger.info(f"Backfill miss: {vault.escrow_id} owner={real_owner} seq={real_seq} attempts={vault.backfill_attempts}")
             except Exception as e:
                 logger.warning(f"Backfill RELEASED failed for {vault.escrow_id}: {e}")
                 try:
@@ -10145,20 +10232,21 @@ async def _backfill_escrow_hashes(db):
         ).limit(20).all()
         for vault in cancelled:
             try:
-                owner = vault.escrow_owner
-                seq = vault.escrow_sequence
-                if not owner or not seq:
-                    info = await _get_escrow_create_info(vault.escrow_tx_hash)
-                    if not info:
-                        vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
-                        db.commit()
-                        continue
-                    owner = info["owner"]
-                    seq = info["sequence"]
-                    vault.escrow_owner = owner
-                    vault.escrow_sequence = seq
+                # Always fetch real owner from EscrowCreate tx — never trust cached escrow_owner
+                info = await _get_escrow_create_info(vault.escrow_tx_hash)
+                if not info:
+                    vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                     db.commit()
-                tx = await _fetch_escrow_final_tx(owner, seq)
+                    logger.info(f"Backfill miss (no EscrowCreate tx): {vault.escrow_id} owner={vault.escrow_owner} seq={vault.escrow_sequence} attempts={vault.backfill_attempts}")
+                    continue
+                real_owner = info["owner"]
+                real_seq = info["sequence"]
+                if vault.escrow_owner and vault.escrow_owner != real_owner:
+                    logger.warning(f"Correcting escrow_owner for {vault.escrow_id}: {vault.escrow_owner} → {real_owner}")
+                vault.escrow_owner = real_owner
+                vault.escrow_sequence = real_seq
+                db.commit()
+                tx = await _fetch_escrow_final_tx(real_owner, real_seq)
                 vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                 if tx and tx.get("TransactionType") == "EscrowCancel":
                     vault.cancel_tx_hash = tx.get("hash")
@@ -10168,6 +10256,7 @@ async def _backfill_escrow_hashes(db):
                     logger.info(f"Backfilled cancel_tx_hash for {vault.escrow_id}")
                 else:
                     db.commit()
+                    logger.info(f"Backfill miss: {vault.escrow_id} owner={real_owner} seq={real_seq} attempts={vault.backfill_attempts}")
             except Exception as e:
                 logger.warning(f"Backfill CANCELLED failed for {vault.escrow_id}: {e}")
                 try:

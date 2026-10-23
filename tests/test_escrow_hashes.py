@@ -154,3 +154,87 @@ def test_ledger_time_to_utc():
     import datetime as dt_module
     expected = dt_module.datetime.fromtimestamp(946684800 + 800000000, tz=timezone.utc)
     assert referee._ledger_time_to_utc(800000000) == expected
+
+
+@pytest.mark.asyncio
+async def test_backfill_corrects_wrong_cached_owner():
+    """Backfill overwrites wrong cached escrow_owner with real owner from EscrowCreate tx."""
+    import referee
+
+    mock_vault = MagicMock()
+    mock_vault.escrow_id = "AT-OWNER-FIX"
+    mock_vault.status = "CANCELLED"
+    mock_vault.cancel_tx_hash = None
+    mock_vault.cancelled_at = None
+    mock_vault.release_tx_hash = None
+    mock_vault.escrow_tx_hash = "CREATEHASH" + "0" * 54
+    mock_vault.escrow_owner = "rWRONG_BUYER_ADDRESS"
+    mock_vault.escrow_sequence = None
+    mock_vault.buyer_address = "rWRONG_BUYER_ADDRESS"
+    mock_vault.backfill_attempts = 0
+
+    mock_db = MagicMock()
+    mock_db.query.return_value.filter.return_value.limit.return_value.all.side_effect = [
+        [],
+        [mock_vault],
+    ]
+
+    real_escrow_info = {"sequence": 999, "owner": "rREAL_OWNER_ADDRESS"}
+    cancel_tx = {
+        "TransactionType": "EscrowCancel",
+        "Owner": "rREAL_OWNER_ADDRESS",
+        "OfferSequence": 999,
+        "hash": "CANCELHASH" + "0" * 55,
+        "_ledger_close_time": 800000000,
+    }
+
+    with patch.object(referee, '_get_escrow_create_info', new=AsyncMock(return_value=real_escrow_info)):
+        with patch.object(referee, '_fetch_escrow_final_tx', new=AsyncMock(return_value=cancel_tx)):
+            await referee._backfill_escrow_hashes(mock_db)
+
+    assert mock_vault.escrow_owner == "rREAL_OWNER_ADDRESS", f"Expected real owner, got {mock_vault.escrow_owner}"
+    assert mock_vault.cancel_tx_hash == cancel_tx["hash"]
+
+
+@pytest.mark.asyncio
+async def test_one_off_corrects_now_timestamp():
+    """One-off pass corrects released_at set to now() to real ledger close time."""
+    import referee
+    from datetime import datetime, timezone
+
+    referee._one_off_backfill_done = False
+
+    correct_ledger_time = 812345678
+    correct_ts = referee._ledger_time_to_utc(correct_ledger_time)
+
+    mock_vault = MagicMock()
+    mock_vault.escrow_id = "AT-CR23-A001"
+    mock_vault.status = "RELEASED"
+    mock_vault.release_tx_hash = "08B30D9DA7444A13083E041EB62E00E83144739F9497868355AE4BF1328546BD"
+    mock_vault.released_at = datetime.now(timezone.utc)
+    mock_vault.escrow_tx_hash = "CREATEHASH" + "0" * 54
+    mock_vault.escrow_owner = "rCORRECT"
+    mock_vault.escrow_sequence = 12345
+
+    mock_db = MagicMock()
+    # released query returns [mock_vault]; cancelled query returns []
+    mock_db.query.return_value.filter.return_value.all.side_effect = [
+        [mock_vault],
+        [],
+    ]
+    mock_db.query.return_value.filter.return_value.update.return_value = 0
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"result": {"date": correct_ledger_time}}
+
+    with patch.object(referee, '_get_escrow_create_info', new=AsyncMock(return_value={"sequence": 12345, "owner": "rCORRECT"})):
+        with patch('httpx.AsyncClient') as mock_cls:
+            mock_http = AsyncMock()
+            mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_http.__aexit__ = AsyncMock(return_value=None)
+            mock_http.post = AsyncMock(return_value=mock_response)
+            mock_cls.return_value = mock_http
+            await referee._one_off_backfill_correction(mock_db)
+
+    assert mock_vault.released_at == correct_ts, f"Expected {correct_ts}, got {mock_vault.released_at}"
+    referee._one_off_backfill_done = False
