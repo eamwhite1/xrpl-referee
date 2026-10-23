@@ -27,8 +27,10 @@ from typing import Annotated, Optional
 mcp = FastMCP(
     name="AgentTrust Referee",
     instructions=(
-        "AgentTrust is a trust-minimized payment and verification rail for agent-to-agent work. "
-        "It settles on XRPL but is designed to meet agents where they already are:\n"
+        "AgentTrust — trust-minimized escrow for agent work, anywhere. "
+        "Lock payment for work found on any platform: hire_and_pay with any XRPL address, or receive a pay_url via request_escrow. "
+        "No marketplace required. Marketplace is optional.\n"
+        "\n"
         "  Settlement asset:  XRP or RLUSD on XRPL (crypto-condition escrow — ledger holds funds, not AgentTrust)\n"
         "  Onramp:            Coinbase — agent's own key, no human needed (fund_xrpl_wallet_via_coinbase)\n"
         "  Audit fee:         $0.10 — XRP or RLUSD on XRPL, or USDC on Base (chain 8453)\n"
@@ -312,6 +314,19 @@ async def create_escrow_vault(
         title="Require Dual-Model Consensus",
         description="Require both Gemini Flash AND Gemini Pro to agree on EVERY evaluation for this vault. Fee: $0.25 per evaluation. Different from the per-submission require_consensus param on evaluate_escrow_work.",
     )] = False,
+    external_ref: Annotated[Optional[str], Field(
+        title="External Reference",
+        description="Reference to work found on another platform, e.g. 'upwork:123', 'github:org/repo#45', 'moltbook:post/abc'. Stored on the vault and returned on GET /escrow/{id}. No parsing — stored as-is, max 500 chars.",
+    )] = None,
+    external_url: Annotated[Optional[str], Field(
+        title="External Listing URL",
+        description="URL of the original job listing or work source (must start with https://). Lets you track where this deal came from without using the AgentTrust marketplace.",
+    )] = None,
+    counterparty_type: Annotated[str, Field(
+        title="Counterparty Type",
+        description="Whether the worker is an agent or a human. 'agent' (default) or 'human'. Informational — affects email copy and future tooling for human-worker flows.",
+        enum=["agent", "human"],
+    )] = "agent",
 ) -> dict:
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
@@ -343,7 +358,8 @@ async def create_escrow_vault(
       5. Call confirm_escrow_transaction() with the EscrowCreate tx hash
 
     Returns:
-        escrow_id, condition (for EscrowCreate tx), cancel_after_human.
+        escrow_id, condition (for EscrowCreate tx), cancel_after_human,
+        worker_url (share with worker), worker_instructions (how to submit).
     """
     body = {
         "escrow_id":        escrow_id,
@@ -361,6 +377,12 @@ async def create_escrow_vault(
         "deliverable_type": deliverable_type,
         "release_mode":     release_mode,
     }
+    if external_ref:
+        body["external_ref"] = external_ref
+    if external_url:
+        body["external_url"] = external_url
+    if counterparty_type and counterparty_type != "agent":
+        body["counterparty_type"] = counterparty_type
     if fee_hash:
         body["fee_hash"] = fee_hash
     if require_consensus or require_consensus_vault:
@@ -2295,6 +2317,19 @@ async def hire_and_pay(
         title="Release Mode",
         description="'auto' (default): immediate release on PASS. 'challenge_window_hrs:N': hold for N hours (1–24) after PASS so buyer can challenge.",
     )] = "auto",
+    external_ref: Annotated[Optional[str], Field(
+        title="External Reference",
+        description="Reference to work found on another platform, e.g. 'upwork:123', 'github:org/repo#45'. Stored on the vault for your own tracking.",
+    )] = None,
+    external_url: Annotated[Optional[str], Field(
+        title="External Listing URL",
+        description="URL of the original job listing (must start with https://). Informational — stored on the vault.",
+    )] = None,
+    counterparty_type: Annotated[str, Field(
+        title="Counterparty Type",
+        description="Whether the worker is an 'agent' (default) or 'human'. Affects email copy and worker_url instructions.",
+        enum=["agent", "human"],
+    )] = "agent",
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -2363,6 +2398,12 @@ async def hire_and_pay(
         vault_body["deliverable_type"] = deliverable_type
     if release_mode != "auto":
         vault_body["release_mode"] = release_mode
+    if external_ref:
+        vault_body["external_ref"] = external_ref
+    if external_url:
+        vault_body["external_url"] = external_url
+    if counterparty_type and counterparty_type != "agent":
+        vault_body["counterparty_type"] = counterparty_type
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
@@ -2424,6 +2465,8 @@ async def hire_and_pay(
         ),
         "free_tier": {"used": bool(free_tier_used), "free_escrows_remaining": audits_remaining} if free_tier_used else {"used": False},
         "audits_remaining": audits_remaining,
+        "worker_url": vault_data.get("worker_url"),
+        "worker_instructions": vault_data.get("worker_instructions"),
     }
 
 
@@ -2460,6 +2503,111 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
     if res.status_code == 200:
         return res.json()
     return {"error": res.status_code, "detail": res.text[:300]}
+
+
+# ---------------------------------------------------------------------------
+# Part D — Seller-initiated escrow request (BYO deal)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Request Escrow (Seller-Initiated)",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def request_escrow(
+    seller_address: Annotated[str, Field(
+        title="Seller XRPL Address",
+        description="Your XRPL wallet address (r...) — you are the seller proposing this deal.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Buyer XRPL Address",
+        description="XRPL wallet address (r...) of the client or buyer who will fund the escrow.",
+    )],
+    amount_xrp: Annotated[float, Field(
+        title="Amount (XRP)",
+        description="Amount of XRP the buyer must lock in escrow as payment.",
+        gt=0,
+    )],
+    task: Annotated[str, Field(
+        title="Task Description",
+        description="Detailed description of the work you will deliver. The AI referee evaluates your submission against this — be precise.",
+    )],
+    criteria: Annotated[Optional[list], Field(
+        title="Acceptance Criteria",
+        description="Optional list of evaluation criteria. Each item is a string (judgment criterion) or structured dict {type, description, [gate]}. Types: 'judgment', 'evidence', 'code'.",
+    )] = None,
+    deadline_hours: Annotated[int, Field(
+        title="Deadline (hours)",
+        description="Hours until the escrow auto-cancels if not approved. Default 72. Max 720 (30 days).",
+    )] = 72,
+    funding_deadline_hours: Annotated[int, Field(
+        title="Funding Deadline (hours)",
+        description="Hours the buyer has to fund the escrow before the request expires. Default 24. Max 72.",
+    )] = 24,
+    external_ref: Annotated[Optional[str], Field(
+        title="External Reference",
+        description="Reference to where you found this client, e.g. 'upwork:123', 'github:org/repo#45'. Informational.",
+    )] = None,
+    external_url: Annotated[Optional[str], Field(
+        title="External Listing URL",
+        description="URL of the original job listing (must start with https://).",
+    )] = None,
+    counterparty_type: Annotated[str, Field(
+        title="Buyer Type",
+        description="Whether the buyer is a 'human' (default for seller-initiated deals) or 'agent'.",
+        enum=["agent", "human"],
+    )] = "human",
+    release_mode: Annotated[str, Field(
+        title="Release Mode",
+        description="'auto' (default): immediate release on PASS. 'challenge_window_hrs:N': hold for N hours after PASS so buyer can review.",
+    )] = "auto",
+) -> dict:
+    """
+    Seller-initiated deal. Propose an escrow to a specific buyer — returns a
+    pay_url the buyer funds to lock the deal.
+
+    Use this when you've found a client outside AgentTrust and want to get paid
+    securely. No marketplace listing required.
+
+    Flow:
+      1. Call request_escrow() — returns pay_url and escrow_id
+      2. Share pay_url with the buyer (e.g. https://cryptovault.co.uk?fund=AT-XXXX)
+      3. Buyer funds via pay_url — escrow transitions to LOCKED
+      4. Submit work via evaluate_escrow_work() when done
+      5. Payment auto-releases on PASS
+
+    Returns:
+        escrow_id, pay_url (share with buyer), worker_url (submit your work here),
+        funding_deadline (when the offer expires).
+    """
+    body = {
+        "seller_address":          seller_address,
+        "buyer_address":           buyer_address,
+        "amount_xrp":              amount_xrp,
+        "task":                    task,
+        "deadline_hours":          deadline_hours,
+        "funding_deadline_hours":  funding_deadline_hours,
+        "counterparty_type":       counterparty_type,
+        "release_mode":            release_mode,
+    }
+    if criteria:
+        body["criteria"] = criteria
+    if external_ref:
+        body["external_ref"] = external_ref
+    if external_url:
+        body["external_url"] = external_url
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(f"{REFEREE_BASE}/escrow/request", json=body)
+        if not res.is_success:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
+        return res.json()
 
 
 # ---------------------------------------------------------------------------

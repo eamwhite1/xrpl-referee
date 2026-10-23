@@ -442,7 +442,7 @@ async def _refresh_jobs_snapshot(db_session=None):
                     "deadline": j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
                     "_expires_at_iso": j.expires_at.isoformat() if j.expires_at else None,
                     "tags": tags, "status": "OPEN",
-                    "bid_count": bid_count, "is_demo": False,
+                    "bid_count": bid_count, "is_demo": bool(getattr(j, "is_demo", False)),
                     "claimable": bool(getattr(j, "claimable", False)),
                 })
 
@@ -471,6 +471,7 @@ async def _refresh_jobs_snapshot(db_session=None):
                     "required_vc_issuer_did": j.required_vc_issuer_did or None,
                     "required_vc_type": j.required_vc_type or None,
                     "proof_policy": j.proof_policy or "ALL",
+                    "is_demo": bool(getattr(j, "is_demo", False)),
                 })
 
             _on_db_success()
@@ -574,6 +575,18 @@ async def _hourly_db_window():
                         logger.info(f"Auto-released {_v.escrow_id} after challenge window expired")
                         _send_challenge_window_expired_email(_v)
                     if expired_cw:
+                        _hw_db.commit()
+                    # Expire AWAITING_FUNDING vaults past funding_deadline
+                    expired_requests = _hw_db.query(EscrowVault).filter(
+                        EscrowVault.status == "AWAITING_FUNDING",
+                        EscrowVault.funding_deadline != None,
+                        EscrowVault.funding_deadline <= _now_hw,
+                    ).all()
+                    for _v in expired_requests:
+                        _v.status = "CANCELLED"
+                        _v.cancelled_at = _now_hw
+                        logger.info(f"Escrow request {_v.escrow_id} expired unfunded")
+                    if expired_requests:
                         _hw_db.commit()
                     # Safety net: REMEDY vaults past CancelAfter → CANCELLED
                     if True:  # always run
@@ -1444,6 +1457,13 @@ class EscrowVault(Base):
     challenge_criteria_ids = Column(ARRAY(String), nullable=True)
     remedy_attempt_used   = Column(Boolean, default=False)
     challenged_at         = Column(DateTime(timezone=True), nullable=True)
+    # Part D — Bring-your-own-deal
+    external_ref          = Column(String,  nullable=True)   # e.g. "upwork:123", "github:org/repo#45"
+    external_url          = Column(String,  nullable=True)   # link to original listing
+    counterparty_type     = Column(String,  default="agent") # "agent" | "human"
+    initiated_by          = Column(String,  default="buyer") # "buyer" | "seller"
+    pay_url               = Column(String,  nullable=True)   # for seller-initiated vaults
+    funding_deadline      = Column(DateTime(timezone=True), nullable=True)
 
 
 class JobPosting(Base):
@@ -1477,6 +1497,7 @@ class JobPosting(Base):
     required_vc_issuer_did = Column(String,  nullable=True)
     required_vc_type       = Column(String,  nullable=True)
     proof_policy           = Column(String,  default="ALL")
+    is_demo                = Column(Boolean, default=False)  # operator-seeded demo jobs
 
 
 class Bid(Base):
@@ -2527,6 +2548,14 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_criteria_ids  TEXT[]",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS remedy_attempt_used     BOOLEAN DEFAULT FALSE",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenged_at           TIMESTAMPTZ",
+        # Part D — Bring-your-own-deal
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS external_ref       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS external_url       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS counterparty_type  VARCHAR DEFAULT 'agent'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS initiated_by       VARCHAR DEFAULT 'buyer'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS pay_url            VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS funding_deadline   TIMESTAMPTZ",
+        "ALTER TABLE job_posting  ADD COLUMN IF NOT EXISTS is_demo            BOOLEAN DEFAULT FALSE",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3199,6 +3228,10 @@ class EscrowSetupRequest(BaseModel):
     deliverable_type: str = "work"            # 'work' | 'nft' | 'code' | 'data'
     release_mode:     str = "auto"            # 'auto' | 'challenge_window_hrs:N'
     require_consensus_vault: bool = False     # require dual-model consensus on every evaluation
+    # Part D — Bring-your-own-deal
+    external_ref:      Optional[str] = None  # e.g. "upwork:123", "github:org/repo#45"
+    external_url:      Optional[str] = None  # URL of original listing (must start with https://)
+    counterparty_type: Optional[str] = None  # "agent" | "human"
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -6467,6 +6500,10 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         release_mode           = req.release_mode or "auto",
         require_consensus      = bool(req.require_consensus_vault),
         criteria_v2            = _parse_criteria_safe(req.criteria),
+        # Part D — BYO fields
+        external_ref           = (req.external_ref or "")[:500] or None,
+        external_url           = req.external_url if (req.external_url or "").startswith("https://") else None,
+        counterparty_type      = req.counterparty_type if req.counterparty_type in ("agent", "human") else "agent",
     )
     db.add(vault)
     db.commit()
@@ -6522,6 +6559,22 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     else:
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
+    _referee_base_url = os.getenv("REFEREE_BASE_URL", "https://mcp.cryptovault.co.uk")
+    _worker_url = f"{SITE_URL}?worker={req.escrow_id}"
+    _criteria_summary = [
+        c.get("description", c) if isinstance(c, dict) else c
+        for c in (_parse_criteria_safe(req.criteria) or [])
+    ]
+    _worker_instructions = {
+        "submit_url": f"{_referee_base_url}/evaluate",
+        "submit_method": "POST",
+        "submit_body": {"escrow_id": req.escrow_id, "work": "<your deliverable>", "evaluate_token": "<token provided by buyer>"},
+        "mcp_tool": "evaluate_escrow_work",
+        "deadline": cancel_after_ts.isoformat() if cancel_after_ts else None,
+        "max_attempts": max(1, min(req.max_submissions, 10)),
+        "criteria_summary": _criteria_summary,
+        "note": "Agents: use evaluate_escrow_work via MCP. Humans: visit worker_url to submit via web form.",
+    }
     response_body = {
         "escrow_id":           req.escrow_id,
         "condition":           final_condition,
@@ -6535,6 +6588,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "evaluate_token_hint": "Share this token with the worker — they must include it in evaluate_escrow_work(). Store it securely; it is not shown again.",
         "free_tier":           fee_result.get("free_tier", False),
         "audits_remaining":    fee_result.get("audits_remaining", None),
+        "worker_url":          _worker_url,
+        "worker_instructions": _worker_instructions,
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
@@ -6825,6 +6880,215 @@ class PrepareEscrowRequest(BaseModel):
     delegate_address: Optional[str] = None  # XLS-75: agent submits on buyer's behalf
 
 
+# ---------------------------------------------------------------------------
+# Part D — Seller-initiated escrow request
+# ---------------------------------------------------------------------------
+
+class EscrowRequestBody(BaseModel):
+    seller_address:          str
+    buyer_address:           str
+    amount_xrp:              float
+    task:                    str
+    criteria:                Optional[list]  = None
+    deadline_hours:          int             = 72
+    funding_deadline_hours:  int             = 24
+    external_ref:            Optional[str]   = None
+    external_url:            Optional[str]   = None
+    counterparty_type:       str             = "human"
+    deliverable_type:        str             = "work"
+    release_mode:            str             = "auto"
+    require_consensus_vault: bool            = False
+    worker_email:            Optional[str]   = None
+    buyer_email:             Optional[str]   = None
+
+
+def _is_valid_xrpl_address(addr: str) -> bool:
+    import re
+    return bool(addr and re.match(r'^r[1-9A-HJ-NP-Za-km-z]{24,33}$', addr))
+
+
+@app.post("/escrow/request")
+async def request_escrow(req: EscrowRequestBody, db: Session = Depends(get_db)):
+    """Seller-initiated deal: propose an escrow to a buyer, returns pay_url."""
+    if not _db_available:
+        raise HTTPException(status_code=503, detail={"error": "database unavailable", "retry_after": 60})
+
+    # Validate
+    if not _is_valid_xrpl_address(req.seller_address):
+        raise HTTPException(status_code=400, detail="seller_address must be a valid XRPL r... address.")
+    if not _is_valid_xrpl_address(req.buyer_address):
+        raise HTTPException(status_code=400, detail="buyer_address must be a valid XRPL r... address.")
+    if req.amount_xrp <= 0:
+        raise HTTPException(status_code=400, detail="amount_xrp must be > 0.")
+    if not req.task or not req.task.strip():
+        raise HTTPException(status_code=400, detail="task description is required.")
+    deadline_hours        = max(1, min(int(req.deadline_hours), 720))
+    funding_deadline_hours = max(1, min(int(req.funding_deadline_hours), 72))
+    if req.counterparty_type not in ("agent", "human"):
+        raise HTTPException(status_code=400, detail="counterparty_type must be 'agent' or 'human'.")
+    if req.external_url and not req.external_url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="external_url must start with https://.")
+
+    # OFAC check
+    for addr in [req.seller_address, req.buyer_address]:
+        try:
+            sanctioned, s_detail = await is_wallet_sanctioned(addr)
+            if sanctioned:
+                raise HTTPException(status_code=403, detail=f"Wallet {addr} is flagged on a sanctions list.")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # Generate IDs
+    import uuid
+    escrow_id = f"AT-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+    while db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first():
+        escrow_id = f"AT-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+
+    now_utc           = datetime.now(timezone.utc)
+    cancel_after_ts   = now_utc + timedelta(hours=deadline_hours)
+    funding_deadline  = now_utc + timedelta(hours=funding_deadline_hours)
+
+    preimage_bytes    = secrets.token_bytes(32)
+    preimage_hex      = preimage_bytes.hex().upper()
+    hash_hex          = hashlib.sha256(preimage_bytes).hexdigest().upper()
+    final_condition   = f"A0258020{hash_hex}810120"
+    final_fulfillment = f"A0228020{preimage_hex}"
+    evaluate_token      = secrets.token_urlsafe(32)
+    evaluate_token_hash = hashlib.sha256(evaluate_token.encode()).hexdigest()
+
+    criteria_v2 = _parse_criteria_safe(req.criteria)
+    pay_url     = f"{SITE_URL}?fund={escrow_id}"
+    worker_url  = f"{SITE_URL}?worker={escrow_id}"
+
+    vault = EscrowVault(
+        escrow_id           = escrow_id,
+        condition           = final_condition,
+        fulfillment         = encrypt_fulfillment(final_fulfillment),
+        status              = "AWAITING_FUNDING",
+        currency            = "XRP",
+        amount_xrp          = req.amount_xrp,
+        task_description    = req.task,
+        worker_address      = req.seller_address,  # seller is the worker
+        buyer_address       = req.buyer_address,
+        worker_email        = req.worker_email,
+        buyer_email         = req.buyer_email,
+        cancel_after_ts     = cancel_after_ts,
+        delivery_status     = "PENDING",
+        submission_count    = 0,
+        max_submissions     = 3,
+        require_ai_audit    = True,
+        evaluate_token_hash = evaluate_token_hash,
+        deliverable_type    = req.deliverable_type or "work",
+        release_mode        = req.release_mode or "auto",
+        require_consensus   = bool(req.require_consensus_vault),
+        criteria_v2         = criteria_v2,
+        external_ref        = (req.external_ref or "")[:500] or None,
+        external_url        = req.external_url if (req.external_url or "").startswith("https://") else None,
+        counterparty_type   = req.counterparty_type,
+        initiated_by        = "seller",
+        pay_url             = pay_url,
+        funding_deadline    = funding_deadline,
+    )
+    db.add(vault)
+    db.commit()
+
+    _criteria_summary = [
+        c.get("description", c) if isinstance(c, dict) else c
+        for c in (criteria_v2 or [])
+    ]
+    _referee_base_url = os.getenv("REFEREE_BASE_URL", "https://mcp.cryptovault.co.uk")
+    worker_instructions = {
+        "submit_url": f"{_referee_base_url}/evaluate",
+        "submit_method": "POST",
+        "submit_body": {"escrow_id": escrow_id, "work": "<your deliverable>", "evaluate_token": "<token provided by buyer>"},
+        "mcp_tool": "evaluate_escrow_work",
+        "deadline": cancel_after_ts.isoformat(),
+        "max_attempts": 3,
+        "criteria_summary": _criteria_summary,
+        "note": "Agents: use evaluate_escrow_work via MCP. Humans: visit worker_url to submit via web form.",
+    }
+    logger.info(f"🔗 ESCROW REQUEST created: {escrow_id} seller={req.seller_address} buyer={req.buyer_address} amount={req.amount_xrp} XRP")
+    return {
+        "escrow_id":          escrow_id,
+        "status":             "AWAITING_FUNDING",
+        "pay_url":            pay_url,
+        "funding_deadline":   funding_deadline.isoformat(),
+        "amount_xrp":         req.amount_xrp,
+        "message":            "Share pay_url with the buyer. Once funded, work begins.",
+        "worker_url":         worker_url,
+        "worker_instructions": worker_instructions,
+        "evaluate_token":     evaluate_token,
+        "evaluate_token_hint": "Store this token and share it with the buyer to pass to the worker after funding.",
+    }
+
+
+class FundEscrowBody(BaseModel):
+    tx_hash:        str
+    wallet_address: str
+
+
+@app.post("/escrow/{escrow_id}/fund")
+async def fund_escrow_request(escrow_id: str, body: FundEscrowBody, db: Session = Depends(get_db)):
+    """Buyer funds a seller-initiated escrow request (AWAITING_FUNDING → LOCKED)."""
+    if not _db_available:
+        raise HTTPException(status_code=503, detail={"error": "database unavailable", "retry_after": 60})
+
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+    if vault.status != "AWAITING_FUNDING":
+        raise HTTPException(status_code=409, detail=f"Escrow is not awaiting funding (current status: {vault.status}).")
+    if vault.funding_deadline and datetime.now(timezone.utc) > vault.funding_deadline:
+        raise HTTPException(status_code=403, detail="Funding deadline has passed. This escrow request has expired.")
+    if body.wallet_address != vault.buyer_address:
+        raise HTTPException(status_code=403, detail=f"wallet_address ({body.wallet_address}) does not match buyer address for this escrow.")
+
+    # Verify the tx hash is a valid EscrowCreate on XRPL
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": body.tx_hash}]})
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
+    if not tx_data.get("validated"):
+        raise HTTPException(status_code=400, detail="Transaction is not yet validated.")
+
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    if tx_json.get("TransactionType") != "EscrowCreate":
+        raise HTTPException(status_code=400, detail="Transaction is not an EscrowCreate.")
+    if tx_json.get("Account") != body.wallet_address:
+        raise HTTPException(status_code=403, detail="EscrowCreate Account does not match wallet_address.")
+
+    vault.status       = "LOCKED"
+    vault.escrow_tx_hash = body.tx_hash
+    vault.delivery_status = "PENDING"
+    db.commit()
+
+    # Notify worker
+    if vault.worker_email:
+        import asyncio as _asyncio
+        cancel_str = vault.cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC") if vault.cancel_after_ts else "Not specified"
+        amount_val = vault.amount_xrp or 0
+        _asyncio.create_task(send_worker_receipt_email(
+            worker_email         = vault.worker_email,
+            worker_name          = "",
+            escrow_id            = escrow_id,
+            buyer_name           = vault.buyer_name or vault.buyer_address or "",
+            amount               = amount_val,
+            currency             = "XRP",
+            task_preview         = vault.task_description or "",
+            deadline             = cancel_str,
+        ))
+
+    logger.info(f"✅ ESCROW FUNDED: {escrow_id} by {body.wallet_address} tx={body.tx_hash}")
+    return {"status": "LOCKED", "escrow_id": escrow_id, "message": "Escrow funded and locked. Work can now begin."}
+
+
 @app.post("/escrow/prepare")
 async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db)):
     """
@@ -7090,6 +7354,12 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "challenged_at":           vault.challenged_at.isoformat() if vault.challenged_at else None,
         "challenge_criteria_ids":  vault.challenge_criteria_ids,
         "remedy_attempt_used":     vault.remedy_attempt_used or False,
+        # Part D — BYO
+        "external_ref":            vault.external_ref,
+        "external_url":            vault.external_url,
+        "counterparty_type":       vault.counterparty_type or "agent",
+        "initiated_by":            vault.initiated_by or "buyer",
+        "worker_url":              f"{SITE_URL}?worker={vault.escrow_id}",
     }
 
 
