@@ -27,8 +27,10 @@ from typing import Annotated, Optional
 mcp = FastMCP(
     name="AgentTrust Referee",
     instructions=(
-        "AgentTrust is a trust-minimized payment and verification rail for agent-to-agent work. "
-        "It settles on XRPL but is designed to meet agents where they already are:\n"
+        "AgentTrust — trust-minimized escrow for agent work, anywhere. "
+        "Lock payment for work found on any platform: hire_and_pay with any XRPL address, or receive a pay_url via request_escrow. "
+        "No marketplace required. Marketplace is optional.\n"
+        "\n"
         "  Settlement asset:  XRP or RLUSD on XRPL (crypto-condition escrow — ledger holds funds, not AgentTrust)\n"
         "  Onramp:            Coinbase — agent's own key, no human needed (fund_xrpl_wallet_via_coinbase)\n"
         "  Audit fee:         $0.10 — XRP or RLUSD on XRPL, or USDC on Base (chain 8453)\n"
@@ -282,6 +284,49 @@ async def create_escrow_vault(
         title="Metadata (JSON string)",
         description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.) without storing them on AgentTrust's side. Example: '{\"invoice_id\": \"INV-2026-0042\", \"po_number\": \"PO-9981\"}'.",
     )] = None,
+    criteria: Annotated[Optional[list], Field(
+        title="Structured Criteria",
+        description=(
+            "Optional list of evaluation criteria for the AI referee. "
+            "Each item is either a plain string (treated as a judgment criterion) or a dict with fields: "
+            "id (optional), type ('judgment'|'evidence'|'code'), description (required), "
+            "and for 'code' type: gate ('sha256_of'|'exact_match'|'regex'|'json_schema'|'http_status'|'xrpl_tx') plus gate-specific fields. "
+            "Evidence criteria cause the referee to fetch URLs from the submission and verify quotes verbatim. "
+            "Code criteria run deterministic gate checks before the AI is called. "
+            "INCONCLUSIVE verdicts do NOT consume submission attempts. "
+            "Example: [{\"type\":\"judgment\",\"description\":\"Code compiles\"},{\"type\":\"evidence\",\"description\":\"PR link shows merged status\"}]"
+        ),
+    )] = None,
+    deliverable_type: Annotated[str, Field(
+        title="Deliverable Type",
+        description="Type of deliverable: 'work' (default, general text/files), 'code' (software), 'data' (dataset/analysis), 'nft' (NFT token).",
+        enum=["work", "code", "data", "nft"],
+    )] = "work",
+    release_mode: Annotated[str, Field(
+        title="Release Mode",
+        description=(
+            "'auto' (default): payment releases immediately on PASS. "
+            "'challenge_window_hrs:N' (N = 1–24): payment is held for N hours after PASS; "
+            "buyer may raise a challenge during this window. Payment auto-releases at deadline if no challenge."
+        ),
+    )] = "auto",
+    require_consensus_vault: Annotated[bool, Field(
+        title="Require Dual-Model Consensus",
+        description="Require both Gemini Flash AND Gemini Pro to agree on EVERY evaluation for this vault. Fee: $0.25 per evaluation. Different from the per-submission require_consensus param on evaluate_escrow_work.",
+    )] = False,
+    external_ref: Annotated[Optional[str], Field(
+        title="External Reference",
+        description="Reference to work found on another platform, e.g. 'upwork:123', 'github:org/repo#45', 'moltbook:post/abc'. Stored on the vault and returned on GET /escrow/{id}. No parsing — stored as-is, max 500 chars.",
+    )] = None,
+    external_url: Annotated[Optional[str], Field(
+        title="External Listing URL",
+        description="URL of the original job listing or work source (must start with https://). Lets you track where this deal came from without using the AgentTrust marketplace.",
+    )] = None,
+    counterparty_type: Annotated[str, Field(
+        title="Counterparty Type",
+        description="Whether the worker is an agent or a human. 'agent' (default) or 'human'. Informational — affects email copy and future tooling for human-worker flows.",
+        enum=["agent", "human"],
+    )] = "agent",
 ) -> dict:
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
@@ -291,17 +336,19 @@ async def create_escrow_vault(
     verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
     relevant proof-gate params below.
 
-    Two release modes:
-    - AI audit (default): worker submits text/files; AI referee scores against task_description.
-    - Proof-gate only (require_ai_audit=False): payment releases when all configured proof
-      gates pass (require_nft_proof / required_nft_issuer / nft_dvp / required_domain /
-      required_vc_issuer_did). No AI call. Requires at least one proof gate.
+    Three release modes:
+    - AI audit (default): worker submits text/files; AI referee scores against task_description or criteria.
+    - Proof-gate only (require_ai_audit=False): payment releases when all configured proof gates pass. No AI call.
+    - Challenge window (release_mode='challenge_window_hrs:N'): PASS holds for N hours; buyer can challenge.
+
+    Structured criteria (recommended for complex work):
+    - Pass criteria as a list of strings or typed dicts ({type, description, [gate]}).
+    - Types: 'judgment' (AI decides), 'evidence' (verify URL content), 'code' (deterministic gate).
+    - INCONCLUSIVE verdicts do NOT consume submission attempts.
 
     White-label / headless integration:
-    - Pass callback_url to receive webhook POSTs on all state changes. AgentTrust operates
-      as a silent settlement rail; your platform handles all user-facing surfaces.
-    - Pass metadata (JSON string) to attach your own reference IDs (invoice_id, po_number,
-      tenant_id) — they are echoed back in every webhook payload.
+    - Pass callback_url to receive webhook POSTs on all state changes.
+    - Pass metadata (JSON string) to attach your own reference IDs.
 
     Typical flow after job board negotiation:
       1. award_job() returns the worker's address and agreed price
@@ -311,7 +358,8 @@ async def create_escrow_vault(
       5. Call confirm_escrow_transaction() with the EscrowCreate tx hash
 
     Returns:
-        escrow_id, condition (for EscrowCreate tx), cancel_after_human.
+        escrow_id, condition (for EscrowCreate tx), cancel_after_human,
+        worker_url (share with worker), worker_instructions (how to submit).
     """
     body = {
         "escrow_id":        escrow_id,
@@ -326,11 +374,19 @@ async def create_escrow_vault(
         "max_submissions":  max_submissions,
         "require_ai_audit": require_ai_audit,
         "proof_policy":     proof_policy,
+        "deliverable_type": deliverable_type,
+        "release_mode":     release_mode,
     }
+    if external_ref:
+        body["external_ref"] = external_ref
+    if external_url:
+        body["external_url"] = external_url
+    if counterparty_type and counterparty_type != "agent":
+        body["counterparty_type"] = counterparty_type
     if fee_hash:
         body["fee_hash"] = fee_hash
-    if require_consensus:
-        body["require_consensus"] = True
+    if require_consensus or require_consensus_vault:
+        body["require_consensus_vault"] = True
     if require_nft_proof:
         body["require_nft_proof"] = True
     if required_nft_issuer:
@@ -347,6 +403,8 @@ async def create_escrow_vault(
         body["buyer_callback_url"] = callback_url
     if metadata:
         body["metadata"] = metadata
+    if criteria:
+        body["criteria"] = criteria
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
@@ -446,6 +504,14 @@ async def evaluate_escrow_work(
     verified on the ledger. Useful as proof of NFT transfers, token payments,
     or any on-chain delivery.
 
+    Evaluation pipeline (when the vault has structured criteria):
+    1. Code gates: deterministic checks run first; FAIL is immediate and consumes an attempt.
+    2. Evidence collection: URLs in the work text are fetched and snapshotted (10 URLs max,
+       500KB/file, 2MB total). Evidence criteria require a verbatim quote from fetched content.
+    3. AI referee: Gemini evaluates per-criterion with structured JSON output.
+    4. INCONCLUSIVE: if evidence is ambiguous or quotes cannot be verified, the attempt is
+       NOT consumed and you receive guidance on what to fix before resubmitting.
+
     Response shape on PASS:
 
         {
@@ -453,8 +519,7 @@ async def evaluate_escrow_work(
           "status":           "approved",
           "score":            0-100,
           "summary":          "explanation",
-          "criteria_met":     ["all criteria that passed"],
-          "criteria_failed":  [],
+          "criteria_results": [{"criterion_id": "c1", "verdict": "PASS", ...}],
           "auto_finish_queued": True,
           "model_used":       "gemini-2.5-flash"
         }
@@ -466,10 +531,18 @@ async def evaluate_escrow_work(
           "status":            "rejected",
           "score":             0-100,
           "summary":           "explanation",
-          "criteria_met":      ["criteria that passed"],
-          "criteria_failed":   ["specific unmet criterion — exact reason"],
+          "criteria_results":  [{"criterion_id": "c1", "verdict": "FAIL", "reasoning": "..."}],
           "attempts_remaining": 2,
           "model_used":        "gemini-2.5-flash"
+        }
+
+    Response shape on INCONCLUSIVE (attempt NOT consumed):
+
+        {
+          "status":   "inconclusive",
+          "verdict":  {...},
+          "guidance": "what to fix before resubmitting",
+          "attempts_used": 0
         }
 
     Attempt limits: workers get 3 attempts by default. Buyers can raise this via
@@ -478,8 +551,7 @@ async def evaluate_escrow_work(
     this tool returns error "submission_limit_reached". Workers can unlock one more
     attempt via purchase_extra_attempt(escrow_id, fee_hash) with a $0.05 fee.
 
-    On FAIL: read criteria_failed for specific, actionable feedback. Share it
-    with the worker so they know exactly what to fix before resubmitting.
+    On FAIL: read criteria_results (or criteria_failed) for actionable feedback.
     Resubmit by calling evaluate_escrow_work again with the same escrow_id.
 
     On PASS for NFT DvP vaults (nft_dvp=True): the vault enters PASS_AWAITING_NFT
@@ -494,6 +566,16 @@ async def evaluate_escrow_work(
     the worker. Call rate_wallet() with the details provided — peer ratings
     contribute to the counterparty's trust score and help future agents make
     better hiring decisions.
+
+    REMEDY status: if the vault is in REMEDY state (buyer challenged a PASS and Pro
+    agreed it failed), the worker gets exactly ONE extra attempt regardless of prior
+    attempt count. A PASS on the remedy releases immediately with no challenge window.
+    A FAIL on the remedy cancels the escrow.
+
+    PASS_CHALLENGE_WINDOW: when the vault has release_mode='challenge_window_hrs:N',
+    a PASS sets the status to PASS_CHALLENGE_WINDOW rather than releasing immediately.
+    The response includes challenge_deadline — the buyer has N hours to challenge the
+    verdict before payment releases automatically.
     """
     async with httpx.AsyncClient(timeout=90.0) as client:
         body: dict = {
@@ -569,6 +651,100 @@ async def purchase_extra_attempt(
             json={"escrow_id": escrow_id, "fee_hash": fee_hash},
         )
         res.raise_for_status()
+        return res.json()
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Challenge Escrow Verdict",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def challenge_escrow_verdict(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code for the escrow whose PASS verdict you want to dispute.",
+    )],
+    criteria_ids: Annotated[list[str], Field(
+        title="Criterion IDs to Dispute",
+        description="One or more criterion IDs (from the vault's criteria list) that you believe the work failed. Get these from the evaluation_verdicts in the escrow response.",
+    )],
+    reason: Annotated[str, Field(
+        title="Reason for Challenge",
+        description="Explain specifically why the work does not satisfy the listed criteria. The Pro model will review this alongside the original work.",
+    )],
+    fee_tx_hash: Annotated[str, Field(
+        title="Challenge Fee Payment Hash",
+        description="64-char hex XRPL transaction hash paying CHALLENGE_FEE_XRP (default 0.5 XRP) to the protocol wallet. Refunded if your challenge is upheld; paid to the worker if rejected.",
+    )],
+    wallet_address: Annotated[str, Field(
+        title="Buyer Wallet Address",
+        description="Your XRPL wallet address (r...) — must match the buyer on this vault.",
+    )],
+    tx_hash: Annotated[str, Field(
+        title="Ownership Verification Transaction Hash",
+        description="Hash of an XRPL AccountSet tx submitted from wallet_address with a Memo containing the challenge string from get_wallet_verification_challenge(). Proves you own the buyer wallet.",
+    )],
+) -> dict:
+    """
+    Challenge a PASS verdict during the challenge window.
+
+    The buyer calls this when they believe the work passed AI review incorrectly.
+    A senior Pro model re-reviews only the disputed criteria.
+
+    Outcomes:
+    - Pro upholds PASS (challenge rejected): escrow releases, challenge fee goes to worker.
+    - Pro rules FAIL (challenge upheld, CancelAfter ≥ 24h): vault enters REMEDY status.
+      Worker gets one extra attempt to fix the specific failed criteria. A PASS on the
+      remedy releases immediately with no further challenge window.
+    - Pro rules FAIL (CancelAfter < 24h): escrow cancelled, both funds and challenge fee
+      returned to buyer.
+    - Pro unavailable: escrow auto-releases, challenge fee refunded to buyer.
+
+    Prerequisites:
+    1. Call get_wallet_verification_challenge(wallet_address=your_buyer_wallet) to get a nonce.
+    2. Submit an XRPL AccountSet transaction from your buyer wallet with the nonce in a Memo field.
+    3. Pay CHALLENGE_FEE_XRP XRP to the protocol wallet (rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR).
+    4. Call this tool with the AccountSet tx hash (tx_hash), fee tx hash (fee_tx_hash),
+       criteria_ids, and reason.
+
+    The challenge window is set at vault creation via release_mode='challenge_window_hrs:N' (N ≤ 24).
+    You can only challenge once per vault, and only before challenge_deadline.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/{escrow_id}/challenge",
+            json={
+                "criteria_ids":   criteria_ids,
+                "reason":         reason,
+                "fee_tx_hash":    fee_tx_hash,
+                "wallet_address": wallet_address,
+                "tx_hash":        tx_hash,
+            },
+        )
+        if res.status_code == 202:
+            return res.json()
+        if res.status_code == 402:
+            return {"error": "payment_required", "message": "Challenge fee verification failed. Pay CHALLENGE_FEE_XRP XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_tx_hash."}
+        if res.status_code == 403:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": "forbidden", "message": detail}
+        if res.status_code == 409:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": "conflict", "message": detail}
+        if not res.is_success:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
         return res.json()
 
 
@@ -2128,6 +2304,32 @@ async def hire_and_pay(
         title="Delegate Agent Address (XLS-75)",
         description="XLS-75 delegated agent XRPL address. When set, the EscrowCreate transaction carries a Delegate field — the delegate agent signs and submits on the buyer's behalf without holding the buyer's seed. The buyer must first submit a DelegateSet granting EscrowCreate permission to this address.",
     )] = None,
+    criteria: Annotated[Optional[list], Field(
+        title="Structured Criteria",
+        description="Optional list of evaluation criteria. Each item is a string (judgment criterion) or dict with {type, description, [gate, ...]}. Types: 'judgment', 'evidence' (URL verification), 'code' (deterministic gate). INCONCLUSIVE verdicts do NOT consume attempts.",
+    )] = None,
+    deliverable_type: Annotated[str, Field(
+        title="Deliverable Type",
+        description="Type of deliverable: 'work' (default), 'code', 'data', 'nft'.",
+        enum=["work", "code", "data", "nft"],
+    )] = "work",
+    release_mode: Annotated[str, Field(
+        title="Release Mode",
+        description="'auto' (default): immediate release on PASS. 'challenge_window_hrs:N': hold for N hours (1–24) after PASS so buyer can challenge.",
+    )] = "auto",
+    external_ref: Annotated[Optional[str], Field(
+        title="External Reference",
+        description="Reference to work found on another platform, e.g. 'upwork:123', 'github:org/repo#45'. Stored on the vault for your own tracking.",
+    )] = None,
+    external_url: Annotated[Optional[str], Field(
+        title="External Listing URL",
+        description="URL of the original job listing (must start with https://). Informational — stored on the vault.",
+    )] = None,
+    counterparty_type: Annotated[str, Field(
+        title="Counterparty Type",
+        description="Whether the worker is an 'agent' (default) or 'human'. Affects email copy and worker_url instructions.",
+        enum=["agent", "human"],
+    )] = "agent",
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -2140,6 +2342,10 @@ async def hire_and_pay(
     verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
     relevant proof-gate params (require_nft_proof, required_nft_issuer, nft_dvp,
     required_domain, required_vc_issuer_did).
+
+    Structured criteria: pass criteria as a list of strings or typed dicts. Types: 'judgment',
+    'evidence' (verifies URLs from submission), 'code' (deterministic gate). INCONCLUSIVE
+    verdicts do NOT consume submission attempts.
 
     White-label / headless integration:
     - Pass callback_url to receive webhook POSTs on all state changes.
@@ -2186,6 +2392,18 @@ async def hire_and_pay(
         vault_body["buyer_callback_url"] = callback_url
     if metadata:
         vault_body["metadata"] = metadata
+    if criteria:
+        vault_body["criteria"] = criteria
+    if deliverable_type != "work":
+        vault_body["deliverable_type"] = deliverable_type
+    if release_mode != "auto":
+        vault_body["release_mode"] = release_mode
+    if external_ref:
+        vault_body["external_ref"] = external_ref
+    if external_url:
+        vault_body["external_url"] = external_url
+    if counterparty_type and counterparty_type != "agent":
+        vault_body["counterparty_type"] = counterparty_type
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
@@ -2247,6 +2465,8 @@ async def hire_and_pay(
         ),
         "free_tier": {"used": bool(free_tier_used), "free_escrows_remaining": audits_remaining} if free_tier_used else {"used": False},
         "audits_remaining": audits_remaining,
+        "worker_url": vault_data.get("worker_url"),
+        "worker_instructions": vault_data.get("worker_instructions"),
     }
 
 
@@ -2283,6 +2503,111 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
     if res.status_code == 200:
         return res.json()
     return {"error": res.status_code, "detail": res.text[:300]}
+
+
+# ---------------------------------------------------------------------------
+# Part D — Seller-initiated escrow request (BYO deal)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Request Escrow (Seller-Initiated)",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def request_escrow(
+    seller_address: Annotated[str, Field(
+        title="Seller XRPL Address",
+        description="Your XRPL wallet address (r...) — you are the seller proposing this deal.",
+    )],
+    buyer_address: Annotated[str, Field(
+        title="Buyer XRPL Address",
+        description="XRPL wallet address (r...) of the client or buyer who will fund the escrow.",
+    )],
+    amount_xrp: Annotated[float, Field(
+        title="Amount (XRP)",
+        description="Amount of XRP the buyer must lock in escrow as payment.",
+        gt=0,
+    )],
+    task: Annotated[str, Field(
+        title="Task Description",
+        description="Detailed description of the work you will deliver. The AI referee evaluates your submission against this — be precise.",
+    )],
+    criteria: Annotated[Optional[list], Field(
+        title="Acceptance Criteria",
+        description="Optional list of evaluation criteria. Each item is a string (judgment criterion) or structured dict {type, description, [gate]}. Types: 'judgment', 'evidence', 'code'.",
+    )] = None,
+    deadline_hours: Annotated[int, Field(
+        title="Deadline (hours)",
+        description="Hours until the escrow auto-cancels if not approved. Default 72. Max 720 (30 days).",
+    )] = 72,
+    funding_deadline_hours: Annotated[int, Field(
+        title="Funding Deadline (hours)",
+        description="Hours the buyer has to fund the escrow before the request expires. Default 24. Max 72.",
+    )] = 24,
+    external_ref: Annotated[Optional[str], Field(
+        title="External Reference",
+        description="Reference to where you found this client, e.g. 'upwork:123', 'github:org/repo#45'. Informational.",
+    )] = None,
+    external_url: Annotated[Optional[str], Field(
+        title="External Listing URL",
+        description="URL of the original job listing (must start with https://).",
+    )] = None,
+    counterparty_type: Annotated[str, Field(
+        title="Buyer Type",
+        description="Whether the buyer is a 'human' (default for seller-initiated deals) or 'agent'.",
+        enum=["agent", "human"],
+    )] = "human",
+    release_mode: Annotated[str, Field(
+        title="Release Mode",
+        description="'auto' (default): immediate release on PASS. 'challenge_window_hrs:N': hold for N hours after PASS so buyer can review.",
+    )] = "auto",
+) -> dict:
+    """
+    Seller-initiated deal. Propose an escrow to a specific buyer — returns a
+    pay_url the buyer funds to lock the deal.
+
+    Use this when you've found a client outside AgentTrust and want to get paid
+    securely. No marketplace listing required.
+
+    Flow:
+      1. Call request_escrow() — returns pay_url and escrow_id
+      2. Share pay_url with the buyer (e.g. https://cryptovault.co.uk?fund=AT-XXXX)
+      3. Buyer funds via pay_url — escrow transitions to LOCKED
+      4. Submit work via evaluate_escrow_work() when done
+      5. Payment auto-releases on PASS
+
+    Returns:
+        escrow_id, pay_url (share with buyer), worker_url (submit your work here),
+        funding_deadline (when the offer expires).
+    """
+    body = {
+        "seller_address":          seller_address,
+        "buyer_address":           buyer_address,
+        "amount_xrp":              amount_xrp,
+        "task":                    task,
+        "deadline_hours":          deadline_hours,
+        "funding_deadline_hours":  funding_deadline_hours,
+        "counterparty_type":       counterparty_type,
+        "release_mode":            release_mode,
+    }
+    if criteria:
+        body["criteria"] = criteria
+    if external_ref:
+        body["external_ref"] = external_ref
+    if external_url:
+        body["external_url"] = external_url
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(f"{REFEREE_BASE}/escrow/request", json=body)
+        if not res.is_success:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            return {"error": f"http_{res.status_code}", "message": detail}
+        return res.json()
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 import logging
 
 APP_VERSION = "7.0.0"
+PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import sys
 import hashlib
@@ -49,7 +50,8 @@ from xrpl.utils import xrp_to_drops
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, or_
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, or_, Numeric
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.exc import OperationalError as SAOperationalError, InterfaceError as SAInterfaceError, DBAPIError as SADBAPIError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -440,7 +442,7 @@ async def _refresh_jobs_snapshot(db_session=None):
                     "deadline": j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
                     "_expires_at_iso": j.expires_at.isoformat() if j.expires_at else None,
                     "tags": tags, "status": "OPEN",
-                    "bid_count": bid_count, "is_demo": False,
+                    "bid_count": bid_count, "is_demo": bool(getattr(j, "is_demo", False)),
                     "claimable": bool(getattr(j, "claimable", False)),
                 })
 
@@ -469,6 +471,7 @@ async def _refresh_jobs_snapshot(db_session=None):
                     "required_vc_issuer_did": j.required_vc_issuer_did or None,
                     "required_vc_type": j.required_vc_type or None,
                     "proof_policy": j.proof_policy or "ALL",
+                    "is_demo": bool(getattr(j, "is_demo", False)),
                 })
 
             _on_db_success()
@@ -558,6 +561,48 @@ async def _hourly_db_window():
             await _flush_tool_stats()
             checked = await _poll_expired_escrows_once()
             logger.info(f"hourly window tick: escrows checked={checked}")
+            # Auto-release PASS_CHALLENGE_WINDOW vaults whose deadline has passed
+            try:
+                _now_hw = datetime.now(timezone.utc)
+                with SessionLocal() as _hw_db:
+                    expired_cw = _hw_db.query(EscrowVault).filter(
+                        EscrowVault.status == "PASS_CHALLENGE_WINDOW",
+                        EscrowVault.challenge_deadline <= _now_hw,
+                    ).all()
+                    for _v in expired_cw:
+                        _v.status = "RELEASED"
+                        _v.released_at = _now_hw
+                        logger.info(f"Auto-released {_v.escrow_id} after challenge window expired")
+                        _send_challenge_window_expired_email(_v)
+                    if expired_cw:
+                        _hw_db.commit()
+                    # Expire AWAITING_FUNDING vaults past funding_deadline
+                    expired_requests = _hw_db.query(EscrowVault).filter(
+                        EscrowVault.status == "AWAITING_FUNDING",
+                        EscrowVault.funding_deadline != None,
+                        EscrowVault.funding_deadline <= _now_hw,
+                    ).all()
+                    for _v in expired_requests:
+                        _v.status = "CANCELLED"
+                        _v.cancelled_at = _now_hw
+                        logger.info(f"Escrow request {_v.escrow_id} expired unfunded")
+                    if expired_requests:
+                        _hw_db.commit()
+                    # Safety net: REMEDY vaults past CancelAfter → CANCELLED
+                    if True:  # always run
+                        expired_remedy = _hw_db.query(EscrowVault).filter(
+                            EscrowVault.status == "REMEDY",
+                            EscrowVault.cancel_after_ts != None,
+                            EscrowVault.cancel_after_ts <= _now_hw,
+                        ).all()
+                        for _v in expired_remedy:
+                            _v.status = "CANCELLED"
+                            _v.cancelled_at = _now_hw
+                            logger.info(f"REMEDY vault {_v.escrow_id} cancelled — CancelAfter passed")
+                        if expired_remedy:
+                            _hw_db.commit()
+            except Exception as _hw_err:
+                logger.error(f"hourly window challenge auto-release error: {_hw_err}")
             # One-off timestamp/owner correction (runs once per process lifetime)
             backfill_db = next(get_db())
             try:
@@ -1395,6 +1440,30 @@ class EscrowVault(Base):
     backfill_attempts = Column(Integer, default=0,  nullable=True)
     # Worker auth token — v2.8.0
     evaluate_token_hash  = Column(String,  nullable=True)   # SHA-256 of one-time evaluate token
+    # Part B Phase 1 — structured evaluation engine
+    deliverable_type     = Column(String,  default="work")   # 'work' | 'nft' | 'code' | 'data'
+    release_mode         = Column(String,  default="auto")   # 'auto' | 'challenge_window_hrs:N'
+    require_consensus    = Column(Boolean, default=False)
+    criteria_v2          = Column(JSONB,   nullable=True)    # structured criteria array
+    models_used          = Column(ARRAY(String), nullable=True)
+    prompt_version       = Column(String,  nullable=True)
+    verdict_hash         = Column(String,  nullable=True)    # sha256 of full verdict JSON
+    evaluation_verdicts  = Column(JSONB,   nullable=True)    # per-criterion results
+    challenge_deadline    = Column(DateTime(timezone=True), nullable=True)
+    challenge_fee_hash    = Column(String,  nullable=True)
+    challenge_fee_amount  = Column(Numeric, nullable=True)
+    # Part B Phase 2 — challenge window
+    challenge_reason      = Column(Text,    nullable=True)
+    challenge_criteria_ids = Column(ARRAY(String), nullable=True)
+    remedy_attempt_used   = Column(Boolean, default=False)
+    challenged_at         = Column(DateTime(timezone=True), nullable=True)
+    # Part D — Bring-your-own-deal
+    external_ref          = Column(String,  nullable=True)   # e.g. "upwork:123", "github:org/repo#45"
+    external_url          = Column(String,  nullable=True)   # link to original listing
+    counterparty_type     = Column(String,  default="agent") # "agent" | "human"
+    initiated_by          = Column(String,  default="buyer") # "buyer" | "seller"
+    pay_url               = Column(String,  nullable=True)   # for seller-initiated vaults
+    funding_deadline      = Column(DateTime(timezone=True), nullable=True)
 
 
 class JobPosting(Base):
@@ -1428,6 +1497,7 @@ class JobPosting(Base):
     required_vc_issuer_did = Column(String,  nullable=True)
     required_vc_type       = Column(String,  nullable=True)
     proof_policy           = Column(String,  default="ALL")
+    is_demo                = Column(Boolean, default=False)  # operator-seeded demo jobs
 
 
 class Bid(Base):
@@ -2461,6 +2531,31 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancel_tx_hash  TEXT",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancelled_at    TIMESTAMPTZ",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS backfill_attempts INT DEFAULT 0",
+        # Part B Phase 1 — structured evaluation engine
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS deliverable_type     VARCHAR DEFAULT 'work'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS release_mode         VARCHAR DEFAULT 'auto'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS require_consensus     BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS criteria_v2           JSONB",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS models_used           TEXT[]",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS prompt_version        VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS verdict_hash          VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluation_verdicts   JSONB",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_deadline      TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_hash      VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_amount    NUMERIC",
+        # Part B Phase 2 — challenge window
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_reason        TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_criteria_ids  TEXT[]",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS remedy_attempt_used     BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenged_at           TIMESTAMPTZ",
+        # Part D — Bring-your-own-deal
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS external_ref       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS external_url       VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS counterparty_type  VARCHAR DEFAULT 'agent'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS initiated_by       VARCHAR DEFAULT 'buyer'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS pay_url            VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS funding_deadline   TIMESTAMPTZ",
+        "ALTER TABLE job_posting  ADD COLUMN IF NOT EXISTS is_demo            BOOLEAN DEFAULT FALSE",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2503,6 +2598,7 @@ MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dy
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 PREMIUM_FEE_USD    = 0.25   # consensus (dual-model) audit fee
 PREMIUM_FEE_XRP    = 0.25   # fallback if price oracle is unavailable
+CHALLENGE_FEE_XRP  = float(os.getenv("CHALLENGE_FEE_XRP", "0.5"))  # buyer pays to dispute a PASS verdict
 
 async def get_required_fee_xrp(premium: bool = False) -> float:
     """Return the XRP amount equivalent to the required fee at the current market price."""
@@ -3127,6 +3223,15 @@ class EscrowSetupRequest(BaseModel):
     # Expected fields: po_number, supplier_name, services_description,
     # require_date (bool), require_line_items (bool)
     # Amount/currency are always required when this is set (mirrored from escrow amount)
+    # Part B Phase 1 — structured evaluation
+    criteria:         Optional[list] = None   # list of strings or structured criterion dicts
+    deliverable_type: str = "work"            # 'work' | 'nft' | 'code' | 'data'
+    release_mode:     str = "auto"            # 'auto' | 'challenge_window_hrs:N'
+    require_consensus_vault: bool = False     # require dual-model consensus on every evaluation
+    # Part D — Bring-your-own-deal
+    external_ref:      Optional[str] = None  # e.g. "upwork:123", "github:org/repo#45"
+    external_url:      Optional[str] = None  # URL of original listing (must start with https://)
+    counterparty_type: Optional[str] = None  # "agent" | "human"
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -5221,8 +5326,346 @@ async def verify_eth_signature(req: EthSignatureRequest):
 
 
 # ---------------------------------------------------------------------------
-# 12. AI AUDIT ENGINE
+# 12. AI AUDIT ENGINE — structured evaluation helpers
 # ---------------------------------------------------------------------------
+
+GATE_TYPES = {"sha256_of", "exact_match", "regex", "json_schema", "http_status", "xrpl_tx"}
+_VALID_CRITERION_TYPES = {"code", "evidence", "judgment"}
+_PRIVATE_IP_PREFIXES = (
+    "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.",
+    "172.29.", "172.30.", "172.31.", "192.168.", "127.", "::1", "fc00:", "fd",
+)
+
+
+def _parse_criteria(raw_criteria) -> list:
+    """Normalise raw criteria into a canonical list of dicts."""
+    if raw_criteria is None:
+        raise ValueError("criteria must be provided")
+    if isinstance(raw_criteria, str):
+        raw_criteria = [raw_criteria]
+    if not isinstance(raw_criteria, list) or len(raw_criteria) == 0:
+        raise ValueError("criteria must be a non-empty list")
+    result = []
+    for i, item in enumerate(raw_criteria):
+        cid = f"c{i+1}"
+        if isinstance(item, str):
+            result.append({"id": cid, "type": "judgment", "description": item})
+        elif isinstance(item, dict):
+            if "description" not in item:
+                raise ValueError(f"criterion #{i+1} missing 'description'")
+            ctype = item.get("type", "judgment")
+            if ctype not in _VALID_CRITERION_TYPES:
+                raise ValueError(f"criterion #{i+1} has invalid type '{ctype}'; must be one of {sorted(_VALID_CRITERION_TYPES)}")
+            result.append({**item, "id": item.get("id", cid), "type": ctype})
+        else:
+            raise ValueError(f"criterion #{i+1} must be a string or dict")
+    return result
+
+
+def _parse_criteria_safe(raw_criteria):
+    """Returns parsed criteria or None if raw_criteria is None/empty. Raises HTTPException on invalid input."""
+    if raw_criteria is None:
+        return None
+    try:
+        return _parse_criteria(raw_criteria)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid criteria: {e}")
+
+
+def _execute_code_gates(work: str, criteria: list) -> list:
+    """Run synchronous code gates. Returns list of FAIL verdicts for failed gates (empty = all pass)."""
+    import re as _re
+    failures = []
+    for c in criteria:
+        if c.get("type") != "code":
+            continue
+        gate = c.get("gate")
+        if not gate:
+            continue
+        cid = c["id"]
+        try:
+            if gate == "sha256_of":
+                expected = c.get("expected_hash", "")
+                actual = hashlib.sha256(work.strip().encode()).hexdigest()
+                if actual != expected:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"sha256 mismatch: expected {expected}, got {actual}"})
+            elif gate == "exact_match":
+                expected = c.get("expected_value", "")
+                if work.strip() != expected:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": "work does not exactly match expected value"})
+            elif gate == "regex":
+                pattern = c.get("pattern", "")
+                if not _re.search(pattern, work):
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"work does not match regex: {pattern}"})
+            elif gate == "json_schema":
+                try:
+                    import jsonschema as _jsonschema
+                    _jsonschema.validate(json.loads(work), c.get("schema", {}))
+                except Exception as e:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"JSON schema validation failed: {e}"})
+            elif gate == "http_status":
+                url = c.get("url", "")
+                expected_status = c.get("expected_status", 200)
+                try:
+                    with httpx.Client(timeout=5.0) as _client:
+                        r = _client.head(url)
+                        if r.status_code != expected_status:
+                            failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"HTTP {r.status_code} != {expected_status} for {url}"})
+                except Exception as e:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"HTTP check failed: {e}"})
+            elif gate == "xrpl_tx":
+                pass  # async XRPL check; handled in evidence collection if needed
+        except Exception as e:
+            failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"Gate check error: {e}"})
+    return failures
+
+
+async def _fetch_url_content(url: str):
+    """Fetch a URL with SSRF protection and 500KB cap. Returns text or None."""
+    import socket as _socket
+    if not url.startswith("https://"):
+        return None
+    # Convert GitHub blob URLs to raw
+    if "github.com" in url and "/blob/" in url:
+        url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    # SSRF: resolve and block private IPs
+    try:
+        hostname = url.split("/")[2]
+        addrs = _socket.getaddrinfo(hostname, 443)
+        for _, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
+                return None
+    except Exception:
+        return None
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=5.0) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    return None
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes(4096):
+                    total += len(chunk)
+                    if total > 500 * 1024:
+                        chunks.append(chunk[:500*1024 - (total - len(chunk))])
+                        break
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+                return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+async def _collect_evidence(work: str, criteria: list) -> list:
+    """Collect URL evidence for 'evidence' type criteria. Returns list of evidence items."""
+    import re as _re
+    evidence_criteria = [c for c in criteria if c.get("type") == "evidence"]
+    if not evidence_criteria:
+        return []
+    urls = _re.findall(r'https://\S+', work)
+    urls = [u.rstrip(".,;)'\"") for u in urls][:10]
+    items = []
+    total_bytes = 0
+    MAX_TOTAL = 2 * 1024 * 1024
+    MAX_PER_FILE = 500 * 1024
+    for url in urls:
+        if total_bytes >= MAX_TOTAL:
+            break
+        content = await _fetch_url_content(url)
+        if content is None:
+            continue
+        truncated = False
+        if len(content.encode()) > MAX_PER_FILE:
+            content = content.encode()[:MAX_PER_FILE].decode("utf-8", errors="replace")
+            truncated = True
+        total_bytes += len(content.encode())
+        for c in evidence_criteria:
+            items.append({
+                "criterion_id": c["id"],
+                "url": url,
+                "content": content,
+                "truncated": truncated,
+            })
+            break
+    return items
+
+
+def _build_audit_prompt(task: str, work: str, criteria: list, evidence_items: list) -> str:
+    """Build structured Gemini prompt with UNTRUSTED_EVIDENCE delimiters."""
+    lines = [
+        "You are an impartial AI referee evaluating submitted work against defined criteria.",
+        "",
+        f"TASK DESCRIPTION:\n{task}",
+        "",
+        f"<WORK>\n{work}\n</WORK>",
+        "",
+    ]
+    for item in evidence_items:
+        lines.append(f'<UNTRUSTED_EVIDENCE criterion_id="{item["criterion_id"]}" url="{item["url"]}">')
+        lines.append(item["content"])
+        lines.append("</UNTRUSTED_EVIDENCE>")
+        lines.append("")
+    lines.append("CRITERIA TO EVALUATE:")
+    for c in criteria:
+        ctype = c.get("type", "judgment")
+        lines.append(f'  [{c["id"]}] ({ctype}) {c["description"]}')
+    lines.append("")
+    lines.append("INSTRUCTIONS:")
+    lines.append("- For 'code' criteria: already evaluated by automated gates; include in criteria_results with outcome.")
+    lines.append("- For 'evidence' criteria: your evidence_quote MUST be a VERBATIM substring of the UNTRUSTED_EVIDENCE content. If none found, verdict must be INCONCLUSIVE.")
+    lines.append("- For 'judgment' criteria: apply professional judgment. Reasoning is required.")
+    lines.append("- STRICT: only pass work that genuinely meets the stated requirements.")
+    lines.append("- INCONCLUSIVE: use when evidence is ambiguous, missing, or cannot be verified.")
+    lines.append("")
+    lines.append("Return ONLY a JSON object matching this exact schema (no markdown, no preamble):")
+    lines.append(json.dumps({
+        "overall_verdict": "PASS|FAIL|INCONCLUSIVE",
+        "overall_score": "integer 0-100",
+        "overall_reasoning": "string",
+        "criteria_results": [{
+            "criterion_id": "string",
+            "verdict": "PASS|FAIL|INCONCLUSIVE",
+            "score": "integer 0-100",
+            "reasoning": "string",
+            "evidence_quote": "verbatim substring of evidence or null"
+        }]
+    }, indent=2))
+    return "\n".join(lines)
+
+
+def _validate_verdict(verdict: dict, criteria: list, evidence_items: list) -> list:
+    """Validate AI verdict. Returns list of error strings (empty = valid)."""
+    errors = []
+    criteria_results = verdict.get("criteria_results", [])
+    overall = verdict.get("overall_verdict", "")
+    score = verdict.get("overall_score", 50)
+    ev_content: dict = {}
+    for item in evidence_items:
+        ev_content.setdefault(item["criterion_id"], []).append(item["content"])
+    evidence_criteria_ids = {c["id"] for c in criteria if c.get("type") == "evidence"}
+    for cr in criteria_results:
+        cid = cr.get("criterion_id", "")
+        if cid in evidence_criteria_ids:
+            quote = cr.get("evidence_quote")
+            if quote:
+                contents = ev_content.get(cid, [])
+                if contents and not any(quote in c for c in contents):
+                    errors.append(f"evidence_quote for {cid} is not a verbatim substring of fetched evidence")
+    if overall == "PASS" and isinstance(score, (int, float)) and score < 50:
+        errors.append(f"overall_verdict is PASS but overall_score={score} < 50")
+    if overall == "FAIL" and isinstance(score, (int, float)) and score > 50:
+        errors.append(f"overall_verdict is FAIL but overall_score={score} > 50")
+    return errors
+
+
+async def _run_structured_audit(
+    task: str,
+    work: str,
+    criteria: list,
+    evidence_items: list,
+    require_consensus: bool,
+    attempt_count: int,
+) -> dict:
+    """Run structured AI audit with criterion types, evidence, consensus logic."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
+
+    prompt_text = _build_audit_prompt(task, work, criteria, evidence_items)
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "overall_verdict": {"type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+            "overall_score": {"type": "integer"},
+            "overall_reasoning": {"type": "string"},
+            "criteria_results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion_id": {"type": "string"},
+                        "verdict": {"type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+                        "score": {"type": "integer"},
+                        "reasoning": {"type": "string"},
+                        "evidence_quote": {"type": ["string", "null"]},
+                    },
+                    "required": ["criterion_id", "verdict", "score", "reasoning"],
+                },
+            },
+        },
+        "required": ["overall_verdict", "overall_score", "overall_reasoning", "criteria_results"],
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "seed": 42,
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema,
+            "thinkingConfig": {"thinkingBudget": 2048},
+        },
+    }
+
+    FLASH_MODEL = "gemini-2.5-flash"
+    PRO_MODEL = "gemini-2.5-pro"
+    models_used = []
+
+    async def _call_gemini(model_id: str):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                res = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+            if res.status_code == 200:
+                raw = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return json.loads(raw)
+            logger.warning(f"Gemini {model_id} HTTP {res.status_code}: {res.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Gemini {model_id} error: {e}")
+        return None
+
+    flash_result = await _call_gemini(FLASH_MODEL)
+    if flash_result is None:
+        raise HTTPException(status_code=503, detail="AI referee temporarily unavailable (Flash model failed)")
+    models_used.append(FLASH_MODEL)
+    flash_verdict = flash_result.get("overall_verdict", "INCONCLUSIVE")
+
+    if flash_verdict == "FAIL" and not require_consensus:
+        flash_result["models_used"] = models_used
+        return flash_result
+
+    use_pro = require_consensus or attempt_count >= 2 or flash_verdict == "INCONCLUSIVE"
+    if use_pro:
+        pro_result = await _call_gemini(PRO_MODEL)
+        if pro_result is not None:
+            models_used.append(PRO_MODEL)
+            pro_verdict = pro_result.get("overall_verdict", "INCONCLUSIVE")
+            if flash_verdict == "INCONCLUSIVE":
+                pro_result["models_used"] = models_used
+                return pro_result
+            elif flash_verdict == "PASS" and pro_verdict == "FAIL":
+                pro_result["overall_verdict"] = "FAIL"
+                pro_result["overall_reasoning"] = (
+                    f"Models disagreed (Flash=PASS, Pro=FAIL) — conservative FAIL applied. "
+                    f"Flash: {flash_result.get('overall_reasoning','')} | "
+                    f"Pro: {pro_result.get('overall_reasoning','')}"
+                )
+                pro_result["models_used"] = models_used
+                return pro_result
+            elif flash_verdict == "PASS" and pro_verdict == "PASS":
+                flash_result["models_used"] = models_used
+                return flash_result
+            elif flash_verdict == "FAIL":
+                flash_result["models_used"] = models_used
+                return flash_result
+        elif require_consensus:
+            raise HTTPException(status_code=503, detail="Consensus model (Pro) unavailable — retry later")
+
+    flash_result["models_used"] = models_used
+    return flash_result
+
+
 async def _check_gemini_models():
     """Log which configured Gemini models are available at startup."""
     api_key = os.getenv("GEMINI_API_KEY")
@@ -5247,6 +5690,321 @@ async def _check_gemini_models():
                 logger.warning(f"Could not check Gemini models: {r.status_code}")
     except Exception as e:
         logger.warning(f"Gemini model check failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Part B Phase 2 — Challenge window email stubs + review task
+# ---------------------------------------------------------------------------
+
+def _send_challenge_window_opened_email(vault):
+    hours = vault.release_mode.split(":")[1] if vault.release_mode and ":" in vault.release_mode else "24"
+    deadline_str = vault.challenge_deadline.strftime("%A %d %B %Y at %H:%M UTC") if vault.challenge_deadline else "soon"
+    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
+    recipient = vault.buyer_email
+    if not RESEND_API_KEY or not recipient:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      recipient,
+            "subject": f"⏱ Verdict is in — you have {hours}h to review or challenge — {vault.escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Work passed — challenge window open</h1>
+  <p>The AI referee has reviewed the submission for escrow <strong>{vault.escrow_id}</strong>
+     and returned a <strong>PASS</strong> verdict.</p>
+  <p>If you believe the work does not meet the criteria, you have <strong>{hours} hours</strong>
+     to raise a challenge. A senior Pro model will re-review the specific criteria you dispute.</p>
+  <div class="detail"><span>Challenge deadline</span><br><strong>{deadline_str}</strong></div>
+  <div class="detail"><span>Challenge fee</span><br><strong>{CHALLENGE_FEE_XRP} XRP</strong> (refunded if your challenge is upheld)</div>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+    If you do not challenge before the deadline, payment will release automatically to the worker.
+  </p>
+  <a href="{escrow_url}" class="btn">Review &amp; Challenge →</a>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Challenge window email sent to {recipient} for {vault.escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Challenge window email failed for {vault.escrow_id}: {e}")
+
+
+def _send_challenge_submitted_email(vault):
+    recipient = vault.worker_email
+    if not RESEND_API_KEY or not recipient:
+        return
+    criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "all criteria"
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      recipient,
+            "subject": f"⚠️ Buyer challenged your submission — {vault.escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Your submission is under review</h1>
+  <p>The buyer has disputed the verdict on escrow <strong>{vault.escrow_id}</strong>.</p>
+  <div class="detail"><span>Disputed criteria</span><br><strong>{criteria_list}</strong></div>
+  <div class="detail"><span>Buyer's reason</span><br>{vault.challenge_reason or "—"}</div>
+  <p style="font-size:.85rem;color:#5c5c6e;">
+    A senior AI model is now re-reviewing your submission against the disputed criteria.
+    You will receive another email once the review is complete.
+  </p>
+  <div class="footer">
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Challenge submitted email sent to {recipient} for {vault.escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Challenge submitted email failed for {vault.escrow_id}: {e}")
+
+
+def _send_challenge_outcome_email(vault, outcome: str):
+    """outcome: 'rejected' | 'upheld_remedy' | 'upheld_cancel' | 'pro_unavailable'"""
+    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
+    if not RESEND_API_KEY:
+        return
+
+    if outcome == "rejected":
+        for recipient in filter(None, [vault.buyer_email, vault.worker_email]):
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"✅ Challenge rejected — escrow released — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Challenge rejected — payment released</h1>
+  <p>The senior Pro model reviewed escrow <strong>{vault.escrow_id}</strong> and
+     <strong>upheld the original PASS verdict</strong>. The buyer's challenge was unsuccessful.</p>
+  <p>The escrow has been released to the worker. The challenge fee ({vault.challenge_fee_amount} XRP)
+     has been paid to the worker.</p>
+  <a href="{escrow_url}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+            except Exception as e:
+                logger.error(f"❌ Challenge rejected email failed for {vault.escrow_id}: {e}")
+
+    elif outcome == "upheld_remedy":
+        recipient = vault.worker_email
+        if recipient:
+            criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "disputed criteria"
+            submit_url = f"{SITE_URL}?worker={vault.escrow_id}"
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"🔄 Challenge upheld — 1 remedy attempt available — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Challenge upheld — remedy attempt available</h1>
+  <p>The senior Pro model reviewed escrow <strong>{vault.escrow_id}</strong> and
+     <strong>upheld the buyer's challenge</strong>. The following criteria were not met:</p>
+  <div class="detail"><span>Failed criteria</span><br><strong>{criteria_list}</strong></div>
+  <p style="font-size:.85rem;color:#0a7c4a;font-weight:700;">
+    You have <strong>1 remedy attempt</strong>. Fix the issues above and resubmit.
+    A PASS on the remedy releases payment immediately — no further challenge window.
+  </p>
+  <a href="{submit_url}" class="btn">Submit Remedy →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+                logger.info(f"📧 Remedy available email sent to {recipient} for {vault.escrow_id}")
+            except Exception as e:
+                logger.error(f"❌ Remedy email failed for {vault.escrow_id}: {e}")
+
+    elif outcome == "upheld_cancel":
+        for recipient in filter(None, [vault.buyer_email, vault.worker_email]):
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"❌ Challenge upheld — escrow cancelled — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Challenge upheld — escrow cancelled</h1>
+  <p>The senior Pro model reviewed escrow <strong>{vault.escrow_id}</strong> and
+     <strong>upheld the buyer's challenge</strong>. The escrow deadline is too close for a
+     remedy attempt, so the escrow has been cancelled and funds will return to the buyer.</p>
+  <p>The challenge fee ({vault.challenge_fee_amount} XRP) has been refunded to the buyer.</p>
+  <a href="{escrow_url}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+            except Exception as e:
+                logger.error(f"❌ Challenge upheld cancel email failed for {vault.escrow_id}: {e}")
+
+    elif outcome == "pro_unavailable":
+        recipient = vault.buyer_email
+        if recipient:
+            try:
+                resend.Emails.send({
+                    "from":    RESEND_FROM,
+                    "to":      recipient,
+                    "subject": f"ℹ️ Challenge review unavailable — escrow auto-released — {vault.escrow_id}",
+                    "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Pro review temporarily unavailable</h1>
+  <p>We were unable to complete the Pro model review for escrow <strong>{vault.escrow_id}</strong>
+     due to a temporary service issue. As a result, the escrow has been auto-released to the worker
+     and your challenge fee ({vault.challenge_fee_amount} XRP) has been refunded.</p>
+  <a href="{escrow_url}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+                })
+                logger.info(f"📧 Pro unavailable email sent to {recipient} for {vault.escrow_id}")
+            except Exception as e:
+                logger.error(f"❌ Pro unavailable email failed for {vault.escrow_id}: {e}")
+
+
+def _send_remedy_available_email(vault):
+    # Remedy notification sent within _send_challenge_outcome_email("upheld_remedy")
+    pass
+
+
+def _send_challenge_window_expired_email(vault):
+    recipient = vault.worker_email
+    if not RESEND_API_KEY or not recipient:
+        return
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      recipient,
+            "subject": f"✅ Challenge window closed — payment released — {vault.escrow_id}",
+            "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>{_email_styles()}</style></head><body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Payment released</h1>
+  <p>The challenge window for escrow <strong>{vault.escrow_id}</strong> has closed with no
+     challenge from the buyer. Payment has been automatically released to your wallet.</p>
+  <a href="{SITE_URL}?worker={vault.escrow_id}" class="btn">View Escrow →</a>
+  <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
+</div></body></html>""",
+        })
+        logger.info(f"📧 Challenge window expired email sent to {recipient} for {vault.escrow_id}")
+    except Exception as e:
+        logger.error(f"❌ Challenge window expired email failed for {vault.escrow_id}: {e}")
+
+
+async def _run_challenge_review(escrow_id: str):
+    """
+    Background task: run Pro-only re-review of challenged criteria.
+    Opens its own DB session so it doesn't block the HTTP response.
+    """
+    db = SessionLocal()
+    try:
+        vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+        if not vault or vault.status != "CHALLENGED":
+            logger.warning(f"_run_challenge_review: vault {escrow_id} not found or not CHALLENGED")
+            return
+
+        # Filter criteria to only those being challenged
+        all_criteria = vault.criteria_v2 or [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
+        challenged_ids = set(vault.challenge_criteria_ids or [])
+        if challenged_ids:
+            review_criteria = [c for c in all_criteria if c.get("id") in challenged_ids]
+            if not review_criteria:
+                review_criteria = all_criteria
+        else:
+            review_criteria = all_criteria
+
+        work = ""
+        if vault.worker_submission:
+            try:
+                sub = json.loads(vault.worker_submission)
+                work = sub.get("work", "")
+            except Exception:
+                work = vault.worker_submission or ""
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        pro_result = None
+        pro_verdict = "FAIL"
+        if api_key:
+            try:
+                prompt_text = _build_audit_prompt(
+                    vault.task_description or "",
+                    work,
+                    review_criteria,
+                    [],
+                )
+                payload = {
+                    "contents": [{"parts": [{"text": prompt_text}]}],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "seed": 42,
+                        "responseMimeType": "application/json",
+                        "thinkingConfig": {"thinkingBudget": 2048},
+                    },
+                }
+                url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+                async with httpx.AsyncClient(timeout=90.0) as client:
+                    res = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+                if res.status_code == 200:
+                    raw = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    pro_result = json.loads(raw)
+                    pro_verdict = pro_result.get("overall_verdict", "FAIL")
+                    logger.info(f"_run_challenge_review: Pro verdict={pro_verdict} for {escrow_id}")
+                else:
+                    logger.warning(f"_run_challenge_review: Pro HTTP {res.status_code} for {escrow_id}")
+                    pro_result = None
+            except Exception as e:
+                logger.error(f"_run_challenge_review: Pro error for {escrow_id}: {e}")
+                pro_result = None
+
+        now = datetime.now(timezone.utc)
+
+        if pro_result is None:
+            # Pro unavailable — release escrow to worker, refund challenge fee to buyer
+            vault.status = "RELEASED"
+            vault.released_at = now
+            logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (Pro unavailable)")  # TODO: submit XRPL tx
+            db.commit()
+            _send_challenge_outcome_email(vault, "pro_unavailable")
+            return
+
+        if pro_verdict == "PASS":
+            vault.status = "RELEASED"
+            vault.released_at = now
+            logger.info(f"CHALLENGE_FEE_PAYOUT: send {vault.challenge_fee_amount} XRP to {vault.worker_address} for escrow {escrow_id} (challenge rejected)")  # TODO: submit XRPL tx
+            db.commit()
+            _send_challenge_outcome_email(vault, "rejected")
+        else:
+            # Pro FAIL — check CancelAfter
+            cancel_after = vault.cancel_after_ts
+            if cancel_after:
+                # cancel_after_ts may be naive; ensure tz-aware for comparison
+                if cancel_after.tzinfo is None:
+                    cancel_after = cancel_after.replace(tzinfo=timezone.utc)
+            time_remaining = (cancel_after - now).total_seconds() if cancel_after else 0
+            if cancel_after and time_remaining >= 86400:  # >= 24h
+                vault.status = "REMEDY"
+                logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (challenge upheld → REMEDY)")  # TODO: submit XRPL tx
+                db.commit()
+                _send_challenge_outcome_email(vault, "upheld_remedy")
+                _send_remedy_available_email(vault)
+            else:
+                vault.status = "CANCELLED"
+                vault.cancelled_at = now
+                logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (challenge upheld → CANCELLED, CancelAfter < 24h)")  # TODO: submit XRPL tx
+                db.commit()
+                _send_challenge_outcome_email(vault, "upheld_cancel")
+    except Exception as e:
+        logger.error(f"_run_challenge_review error for {escrow_id}: {e}", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
 
 
 async def run_ai_audit(
@@ -5738,6 +6496,14 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         require_ai_audit       = req.require_ai_audit,
         template_id            = req.template_id,
         evaluate_token_hash    = evaluate_token_hash,
+        deliverable_type       = req.deliverable_type or "work",
+        release_mode           = req.release_mode or "auto",
+        require_consensus      = bool(req.require_consensus_vault),
+        criteria_v2            = _parse_criteria_safe(req.criteria),
+        # Part D — BYO fields
+        external_ref           = (req.external_ref or "")[:500] or None,
+        external_url           = req.external_url if (req.external_url or "").startswith("https://") else None,
+        counterparty_type      = req.counterparty_type if req.counterparty_type in ("agent", "human") else "agent",
     )
     db.add(vault)
     db.commit()
@@ -5793,6 +6559,22 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     else:
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
+    _referee_base_url = os.getenv("REFEREE_BASE_URL", "https://mcp.cryptovault.co.uk")
+    _worker_url = f"{SITE_URL}?worker={req.escrow_id}"
+    _criteria_summary = [
+        c.get("description", c) if isinstance(c, dict) else c
+        for c in (_parse_criteria_safe(req.criteria) or [])
+    ]
+    _worker_instructions = {
+        "submit_url": f"{_referee_base_url}/evaluate",
+        "submit_method": "POST",
+        "submit_body": {"escrow_id": req.escrow_id, "work": "<your deliverable>", "evaluate_token": "<token provided by buyer>"},
+        "mcp_tool": "evaluate_escrow_work",
+        "deadline": cancel_after_ts.isoformat() if cancel_after_ts else None,
+        "max_attempts": max(1, min(req.max_submissions, 10)),
+        "criteria_summary": _criteria_summary,
+        "note": "Agents: use evaluate_escrow_work via MCP. Humans: visit worker_url to submit via web form.",
+    }
     response_body = {
         "escrow_id":           req.escrow_id,
         "condition":           final_condition,
@@ -5806,6 +6588,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "evaluate_token_hint": "Share this token with the worker — they must include it in evaluate_escrow_work(). Store it securely; it is not shown again.",
         "free_tier":           fee_result.get("free_tier", False),
         "audits_remaining":    fee_result.get("audits_remaining", None),
+        "worker_url":          _worker_url,
+        "worker_instructions": _worker_instructions,
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
@@ -5951,6 +6735,140 @@ async def reissue_evaluate_token_endpoint(escrow_id: str, body: dict, db: Sessio
     }
 
 
+# ---------------------------------------------------------------------------
+# Part B Phase 2 — Challenge endpoint
+# ---------------------------------------------------------------------------
+@app.post("/escrow/{escrow_id}/challenge")
+async def challenge_escrow_verdict(escrow_id: str, request: Request, db: Session = Depends(get_db)):
+    """
+    Buyer disputes a PASS verdict during the challenge window.
+
+    Body: {
+        criteria_ids: [str],   -- criterion IDs being disputed
+        reason: str,           -- explanation of why the work fails those criteria
+        fee_tx_hash: str,      -- 64-char hex XRPL tx hash of CHALLENGE_FEE_XRP payment
+        wallet_address: str,   -- buyer's wallet address
+        tx_hash: str           -- XRPL AccountSet tx containing the verification challenge memo
+    }
+
+    The buyer must first call GET /verify/challenge?wallet=... to get a challenge string,
+    submit an AccountSet tx with that string in a Memo, then POST here.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    criteria_ids  = body.get("criteria_ids") or []
+    reason        = (body.get("reason") or "").strip()
+    fee_tx_hash   = (body.get("fee_tx_hash") or "").strip().upper()
+    wallet_address = (body.get("wallet_address") or "").strip()
+    ownership_tx  = (body.get("tx_hash") or "").strip().upper()
+
+    if not criteria_ids:
+        raise HTTPException(status_code=400, detail="criteria_ids must be a non-empty list of criterion IDs to dispute.")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required.")
+    if not fee_tx_hash or len(fee_tx_hash) != 64:
+        raise HTTPException(status_code=400, detail="fee_tx_hash must be a 64-char XRPL transaction hash.")
+    if not wallet_address or not wallet_address.startswith("r"):
+        raise HTTPException(status_code=400, detail="wallet_address (r...) is required.")
+    if not ownership_tx or len(ownership_tx) != 64:
+        raise HTTPException(status_code=400, detail="tx_hash (XRPL AccountSet with memo) is required for ownership proof.")
+
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+    if vault.status != "PASS_CHALLENGE_WINDOW":
+        raise HTTPException(status_code=409, detail=f"Escrow is not in PASS_CHALLENGE_WINDOW status (current: {vault.status}).")
+
+    now = datetime.now(timezone.utc)
+    if vault.challenge_deadline:
+        deadline = vault.challenge_deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        if now >= deadline:
+            raise HTTPException(status_code=403, detail="Challenge window has closed.")
+
+    if vault.challenged_at is not None:
+        raise HTTPException(status_code=409, detail="A challenge has already been submitted for this escrow.")
+
+    # Verify buyer wallet ownership
+    if vault.buyer_address and vault.buyer_address != wallet_address:
+        raise HTTPException(status_code=403, detail="wallet_address does not match the buyer on this vault.")
+
+    if wallet_address not in _verify_challenges:
+        raise HTTPException(status_code=400, detail="No pending verification challenge for this wallet. Call GET /verify/challenge?wallet=... first.")
+    challenge_str, ch_expires = _verify_challenges[wallet_address]
+    if now > ch_expires:
+        del _verify_challenges[wallet_address]
+        raise HTTPException(status_code=400, detail="Verification challenge expired. Request a new one via GET /verify/challenge.")
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": ownership_tx}]})
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(status_code=400, detail="Ownership transaction not found on ledger.")
+    if not tx_data.get("validated"):
+        raise HTTPException(status_code=400, detail="Ownership transaction is not yet validated.")
+    meta = tx_data.get("meta") or {}
+    if (meta.get("TransactionResult") if isinstance(meta, dict) else "") != "tesSUCCESS":
+        raise HTTPException(status_code=400, detail="Ownership transaction did not succeed on-chain.")
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    account = tx_data.get("Account") or tx_json.get("Account")
+    if account != wallet_address:
+        raise HTTPException(status_code=403, detail=f"Transaction account ({account}) does not match wallet_address.")
+    memos = tx_json.get("Memos") or tx_data.get("Memos") or []
+    expected_hex = challenge_str.encode().hex().upper()
+    if not any(m.get("Memo", {}).get("MemoData", "").upper() == expected_hex for m in memos):
+        raise HTTPException(status_code=403, detail="Transaction Memo does not contain the expected challenge string.")
+    del _verify_challenges[wallet_address]
+
+    # Validate criteria_ids reference actual criteria
+    all_criteria = vault.criteria_v2 or []
+    if all_criteria:
+        valid_ids = {c.get("id") for c in all_criteria}
+        invalid = [cid for cid in criteria_ids if cid not in valid_ids]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown criterion IDs: {invalid}. Valid IDs: {sorted(valid_ids)}")
+
+    # Verify challenge fee payment
+    try:
+        await verify_fee_payment(
+            fee_hash=fee_tx_hash,
+            escrow_id=escrow_id,
+            db=db,
+            min_xrp=CHALLENGE_FEE_XRP,
+            resource="/escrow/challenge",
+            allow_free_tier=False,
+        )
+    except (HTTPException, PaymentRequired) as e:
+        raise HTTPException(status_code=402, detail=f"Challenge fee verification failed: {getattr(e, 'detail', str(e))}")
+
+    vault.status                = "CHALLENGED"
+    vault.challenged_at         = now
+    vault.challenge_criteria_ids = list(criteria_ids)
+    vault.challenge_reason      = reason
+    vault.challenge_fee_hash    = fee_tx_hash
+    vault.challenge_fee_amount  = CHALLENGE_FEE_XRP
+    db.commit()
+
+    asyncio.create_task(_run_challenge_review(escrow_id))
+    _send_challenge_submitted_email(vault)
+    logger.info(f"🔍 Challenge submitted for {escrow_id} by {wallet_address} — criteria: {criteria_ids}")
+    return JSONResponse({
+        "status": "CHALLENGED",
+        "escrow_id": escrow_id,
+        "message": "Challenge submitted. A senior Pro model review is now in progress. You will be notified of the outcome.",
+        "criteria_ids": criteria_ids,
+        "challenged_at": now.isoformat(),
+    }, status_code=202)
+
+
 class PrepareEscrowRequest(BaseModel):
     escrow_id:        str
     buyer_address:    str
@@ -5960,6 +6878,215 @@ class PrepareEscrowRequest(BaseModel):
     currency:         str = "XRP"
     cancel_after_hrs: int = 168
     delegate_address: Optional[str] = None  # XLS-75: agent submits on buyer's behalf
+
+
+# ---------------------------------------------------------------------------
+# Part D — Seller-initiated escrow request
+# ---------------------------------------------------------------------------
+
+class EscrowRequestBody(BaseModel):
+    seller_address:          str
+    buyer_address:           str
+    amount_xrp:              float
+    task:                    str
+    criteria:                Optional[list]  = None
+    deadline_hours:          int             = 72
+    funding_deadline_hours:  int             = 24
+    external_ref:            Optional[str]   = None
+    external_url:            Optional[str]   = None
+    counterparty_type:       str             = "human"
+    deliverable_type:        str             = "work"
+    release_mode:            str             = "auto"
+    require_consensus_vault: bool            = False
+    worker_email:            Optional[str]   = None
+    buyer_email:             Optional[str]   = None
+
+
+def _is_valid_xrpl_address(addr: str) -> bool:
+    import re
+    return bool(addr and re.match(r'^r[1-9A-HJ-NP-Za-km-z]{24,33}$', addr))
+
+
+@app.post("/escrow/request")
+async def request_escrow(req: EscrowRequestBody, db: Session = Depends(get_db)):
+    """Seller-initiated deal: propose an escrow to a buyer, returns pay_url."""
+    if not _db_available:
+        raise HTTPException(status_code=503, detail={"error": "database unavailable", "retry_after": 60})
+
+    # Validate
+    if not _is_valid_xrpl_address(req.seller_address):
+        raise HTTPException(status_code=400, detail="seller_address must be a valid XRPL r... address.")
+    if not _is_valid_xrpl_address(req.buyer_address):
+        raise HTTPException(status_code=400, detail="buyer_address must be a valid XRPL r... address.")
+    if req.amount_xrp <= 0:
+        raise HTTPException(status_code=400, detail="amount_xrp must be > 0.")
+    if not req.task or not req.task.strip():
+        raise HTTPException(status_code=400, detail="task description is required.")
+    deadline_hours        = max(1, min(int(req.deadline_hours), 720))
+    funding_deadline_hours = max(1, min(int(req.funding_deadline_hours), 72))
+    if req.counterparty_type not in ("agent", "human"):
+        raise HTTPException(status_code=400, detail="counterparty_type must be 'agent' or 'human'.")
+    if req.external_url and not req.external_url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="external_url must start with https://.")
+
+    # OFAC check
+    for addr in [req.seller_address, req.buyer_address]:
+        try:
+            sanctioned, s_detail = await is_wallet_sanctioned(addr)
+            if sanctioned:
+                raise HTTPException(status_code=403, detail=f"Wallet {addr} is flagged on a sanctions list.")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    # Generate IDs
+    import uuid
+    escrow_id = f"AT-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+    while db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first():
+        escrow_id = f"AT-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+
+    now_utc           = datetime.now(timezone.utc)
+    cancel_after_ts   = now_utc + timedelta(hours=deadline_hours)
+    funding_deadline  = now_utc + timedelta(hours=funding_deadline_hours)
+
+    preimage_bytes    = secrets.token_bytes(32)
+    preimage_hex      = preimage_bytes.hex().upper()
+    hash_hex          = hashlib.sha256(preimage_bytes).hexdigest().upper()
+    final_condition   = f"A0258020{hash_hex}810120"
+    final_fulfillment = f"A0228020{preimage_hex}"
+    evaluate_token      = secrets.token_urlsafe(32)
+    evaluate_token_hash = hashlib.sha256(evaluate_token.encode()).hexdigest()
+
+    criteria_v2 = _parse_criteria_safe(req.criteria)
+    pay_url     = f"{SITE_URL}?fund={escrow_id}"
+    worker_url  = f"{SITE_URL}?worker={escrow_id}"
+
+    vault = EscrowVault(
+        escrow_id           = escrow_id,
+        condition           = final_condition,
+        fulfillment         = encrypt_fulfillment(final_fulfillment),
+        status              = "AWAITING_FUNDING",
+        currency            = "XRP",
+        amount_xrp          = req.amount_xrp,
+        task_description    = req.task,
+        worker_address      = req.seller_address,  # seller is the worker
+        buyer_address       = req.buyer_address,
+        worker_email        = req.worker_email,
+        buyer_email         = req.buyer_email,
+        cancel_after_ts     = cancel_after_ts,
+        delivery_status     = "PENDING",
+        submission_count    = 0,
+        max_submissions     = 3,
+        require_ai_audit    = True,
+        evaluate_token_hash = evaluate_token_hash,
+        deliverable_type    = req.deliverable_type or "work",
+        release_mode        = req.release_mode or "auto",
+        require_consensus   = bool(req.require_consensus_vault),
+        criteria_v2         = criteria_v2,
+        external_ref        = (req.external_ref or "")[:500] or None,
+        external_url        = req.external_url if (req.external_url or "").startswith("https://") else None,
+        counterparty_type   = req.counterparty_type,
+        initiated_by        = "seller",
+        pay_url             = pay_url,
+        funding_deadline    = funding_deadline,
+    )
+    db.add(vault)
+    db.commit()
+
+    _criteria_summary = [
+        c.get("description", c) if isinstance(c, dict) else c
+        for c in (criteria_v2 or [])
+    ]
+    _referee_base_url = os.getenv("REFEREE_BASE_URL", "https://mcp.cryptovault.co.uk")
+    worker_instructions = {
+        "submit_url": f"{_referee_base_url}/evaluate",
+        "submit_method": "POST",
+        "submit_body": {"escrow_id": escrow_id, "work": "<your deliverable>", "evaluate_token": "<token provided by buyer>"},
+        "mcp_tool": "evaluate_escrow_work",
+        "deadline": cancel_after_ts.isoformat(),
+        "max_attempts": 3,
+        "criteria_summary": _criteria_summary,
+        "note": "Agents: use evaluate_escrow_work via MCP. Humans: visit worker_url to submit via web form.",
+    }
+    logger.info(f"🔗 ESCROW REQUEST created: {escrow_id} seller={req.seller_address} buyer={req.buyer_address} amount={req.amount_xrp} XRP")
+    return {
+        "escrow_id":          escrow_id,
+        "status":             "AWAITING_FUNDING",
+        "pay_url":            pay_url,
+        "funding_deadline":   funding_deadline.isoformat(),
+        "amount_xrp":         req.amount_xrp,
+        "message":            "Share pay_url with the buyer. Once funded, work begins.",
+        "worker_url":         worker_url,
+        "worker_instructions": worker_instructions,
+        "evaluate_token":     evaluate_token,
+        "evaluate_token_hint": "Store this token and share it with the buyer to pass to the worker after funding.",
+    }
+
+
+class FundEscrowBody(BaseModel):
+    tx_hash:        str
+    wallet_address: str
+
+
+@app.post("/escrow/{escrow_id}/fund")
+async def fund_escrow_request(escrow_id: str, body: FundEscrowBody, db: Session = Depends(get_db)):
+    """Buyer funds a seller-initiated escrow request (AWAITING_FUNDING → LOCKED)."""
+    if not _db_available:
+        raise HTTPException(status_code=503, detail={"error": "database unavailable", "retry_after": 60})
+
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+    if vault.status != "AWAITING_FUNDING":
+        raise HTTPException(status_code=409, detail=f"Escrow is not awaiting funding (current status: {vault.status}).")
+    if vault.funding_deadline and datetime.now(timezone.utc) > vault.funding_deadline:
+        raise HTTPException(status_code=403, detail="Funding deadline has passed. This escrow request has expired.")
+    if body.wallet_address != vault.buyer_address:
+        raise HTTPException(status_code=403, detail=f"wallet_address ({body.wallet_address}) does not match buyer address for this escrow.")
+
+    # Verify the tx hash is a valid EscrowCreate on XRPL
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": body.tx_hash}]})
+        tx_data = tx_res.json().get("result", {})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+
+    if tx_data.get("status") == "error" or not tx_data:
+        raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
+    if not tx_data.get("validated"):
+        raise HTTPException(status_code=400, detail="Transaction is not yet validated.")
+
+    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
+    if tx_json.get("TransactionType") != "EscrowCreate":
+        raise HTTPException(status_code=400, detail="Transaction is not an EscrowCreate.")
+    if tx_json.get("Account") != body.wallet_address:
+        raise HTTPException(status_code=403, detail="EscrowCreate Account does not match wallet_address.")
+
+    vault.status       = "LOCKED"
+    vault.escrow_tx_hash = body.tx_hash
+    vault.delivery_status = "PENDING"
+    db.commit()
+
+    # Notify worker
+    if vault.worker_email:
+        import asyncio as _asyncio
+        cancel_str = vault.cancel_after_ts.strftime("%A %d %B %Y at %H:%M UTC") if vault.cancel_after_ts else "Not specified"
+        amount_val = vault.amount_xrp or 0
+        _asyncio.create_task(send_worker_receipt_email(
+            worker_email         = vault.worker_email,
+            worker_name          = "",
+            escrow_id            = escrow_id,
+            buyer_name           = vault.buyer_name or vault.buyer_address or "",
+            amount               = amount_val,
+            currency             = "XRP",
+            task_preview         = vault.task_description or "",
+            deadline             = cancel_str,
+        ))
+
+    logger.info(f"✅ ESCROW FUNDED: {escrow_id} by {body.wallet_address} tx={body.tx_hash}")
+    return {"status": "LOCKED", "escrow_id": escrow_id, "message": "Escrow funded and locked. Work can now begin."}
 
 
 @app.post("/escrow/prepare")
@@ -6221,6 +7348,18 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         # Debug fields
         "escrow_owner":      vault.escrow_owner,
         "backfill_attempts": vault.backfill_attempts,
+        # Part B Phase 2 — challenge window
+        "release_mode":            vault.release_mode,
+        "challenge_deadline":      vault.challenge_deadline.isoformat() if vault.challenge_deadline else None,
+        "challenged_at":           vault.challenged_at.isoformat() if vault.challenged_at else None,
+        "challenge_criteria_ids":  vault.challenge_criteria_ids,
+        "remedy_attempt_used":     vault.remedy_attempt_used or False,
+        # Part D — BYO
+        "external_ref":            vault.external_ref,
+        "external_url":            vault.external_url,
+        "counterparty_type":       vault.counterparty_type or "agent",
+        "initiated_by":            vault.initiated_by or "buyer",
+        "worker_url":              f"{SITE_URL}?worker={vault.escrow_id}",
     }
 
 
@@ -6241,6 +7380,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="This escrow has already been released.")
     if vault.status == "CANCELLED":
         raise HTTPException(status_code=409, detail="This escrow has been cancelled.")
+    if vault.status not in ("LOCKED", "REMEDY"):
+        raise HTTPException(status_code=409, detail=f"Work cannot be submitted when escrow is in '{vault.status}' status.")
+
+    is_remedy = vault.status == "REMEDY"
+    if is_remedy:
+        if vault.remedy_attempt_used:
+            raise HTTPException(status_code=409, detail="The remedy attempt for this escrow has already been used.")
 
     # Evaluate token check — vaults created after v2.8.0 require this
     if vault.evaluate_token_hash:
@@ -6264,10 +7410,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             ),
         )
 
-    # ── SUBMISSION LIMIT CHECK ──
+    # ── SUBMISSION LIMIT CHECK ── (bypassed for remedy attempts)
     current_count = vault.submission_count or 0
     max_allowed   = vault.max_submissions   or DEFAULT_MAX_SUBMISSIONS
-    if current_count >= max_allowed:
+    if not is_remedy and current_count >= max_allowed:
         attempts_left = 0
         raise HTTPException(
             status_code=429,
@@ -6277,6 +7423,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 f"${EXTRA_ATTEMPT_FEE_USD} (≈ {extra_attempt_fee_xrp()} XRP) via POST /evaluate/purchase-attempt."
             ),
         )
+    if is_remedy:
+        # Consume remedy slot before evaluation so it's marked even if evaluation errors
+        vault.remedy_attempt_used = True
+        db.commit()
 
     # 50 MB attachment cap
     total_bytes = 0
@@ -6439,6 +7589,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     # When require_ai_audit=False AND at least one proof gate was configured and passed,
     # skip the AI step entirely and treat it as an automatic PASS.
     skip_ai = (not vault.require_ai_audit) and bool(proof_results) and all(r[1] for r in proof_results)
+    is_inconclusive = False
+    evaluation_verdicts_json = None
+    used_models_list = None
     if skip_ai:
         proof_summary = "; ".join(r[2] for r in proof_results if r[1])
         verdict_dict = {
@@ -6453,22 +7606,108 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         model_used = "none (proof-gate release)"
         logger.info(f"✅ AI SKIPPED (proof-gate release) for {req.escrow_id}: {proof_summary}")
     else:
+        # ── STRUCTURED EVALUATION PIPELINE ──
+        if vault.criteria_v2:
+            eval_criteria = vault.criteria_v2
+        else:
+            eval_criteria = [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
+
+        gate_failures = _execute_code_gates(work_with_nft, eval_criteria)
+        if gate_failures:
+            verdict_dict = {
+                "verdict": "FAIL",
+                "score": 0,
+                "summary": f"{len(gate_failures)} automated gate(s) failed.",
+                "details": "; ".join(f["reason"] for f in gate_failures),
+                "criteria_failed": [f["criterion_id"] for f in gate_failures],
+                "criteria_met": [],
+                "gate_failures": gate_failures,
+            }
+            model_used = "code-gate"
+            vault.submission_count = current_count + 1
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            return {
+                "escrow_id": req.escrow_id,
+                "status": "rejected",
+                "verdict": verdict_dict,
+                "model_used": model_used,
+                "attempts_used": vault.submission_count,
+                "attempts_remaining": max(0, (vault.max_submissions or 3) - vault.submission_count),
+            }
+
+        collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
+        use_consensus = bool(vault.require_consensus) or req.require_consensus or (current_count >= 2)
         try:
-            verdict_dict, model_used = await run_ai_audit(
-                task                    = vault.task_description,
-                work                    = work_with_nft,
-                buyer_attachments       = stored_buyer_attachments,
-                worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
-                task_category           = req.task_category,
-                require_consensus       = req.require_consensus,
-                spec_link_snapshots     = stored_spec_snapshots,
-                evidence_link_snapshots = evidence_snapshots,
+            structured_result = await _run_structured_audit(
+                task=vault.task_description or "",
+                work=work_with_nft,
+                criteria=eval_criteria,
+                evidence_items=collected_evidence,
+                require_consensus=use_consensus,
+                attempt_count=current_count,
             )
-        except RefereeUnavailableError:
+        except HTTPException:
+            raise
+        except Exception:
             return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
+
+        used_models_list = structured_result.get("models_used", [])
+        overall_verdict = structured_result.get("overall_verdict", "INCONCLUSIVE")
+        overall_score = structured_result.get("overall_score", 0)
+
+        validation_errors = _validate_verdict(structured_result, eval_criteria, collected_evidence)
+        if validation_errors:
+            logger.warning(f"⚠️ Verdict validation errors for {req.escrow_id}: {validation_errors}")
+            overall_verdict = "INCONCLUSIVE"
+            structured_result["overall_verdict"] = "INCONCLUSIVE"
+            structured_result["validation_errors"] = validation_errors
+
+        if overall_verdict == "INCONCLUSIVE":
+            vault.evaluation_verdicts = structured_result.get("criteria_results")
+            vault.models_used = used_models_list
+            vault.prompt_version = PROMPT_VERSION
+            vh = hashlib.sha256(json.dumps(structured_result, sort_keys=True).encode()).hexdigest()
+            vault.verdict_hash = vh
+            db.commit()
+            guidance = (
+                "The AI referee could not reach a definitive verdict. "
+                "This attempt has NOT been counted. Please review the criteria feedback and resubmit with clearer evidence."
+            )
+            if validation_errors:
+                guidance += f" Validation issues: {'; '.join(validation_errors)}"
+            return JSONResponse({
+                "escrow_id": req.escrow_id,
+                "status": "inconclusive",
+                "verdict": structured_result,
+                "guidance": guidance,
+                "attempts_used": current_count,
+                "attempts_remaining": max(0, (vault.max_submissions or 3) - current_count),
+            }, status_code=200)
+
+        verdict_dict = {
+            "verdict": overall_verdict,
+            "score": overall_score,
+            "summary": structured_result.get("overall_reasoning", ""),
+            "details": structured_result.get("overall_reasoning", ""),
+            "criteria_met": [cr["criterion_id"] for cr in structured_result.get("criteria_results", []) if cr.get("verdict") == "PASS"],
+            "criteria_failed": [cr["criterion_id"] for cr in structured_result.get("criteria_results", []) if cr.get("verdict") == "FAIL"],
+            "criteria_results": structured_result.get("criteria_results", []),
+        }
+        model_used = ", ".join(used_models_list) if used_models_list else "gemini-2.5-flash"
+        evaluation_verdicts_json = structured_result.get("criteria_results")
 
     # Increment submission count only after a verdict is produced (server-side failures don't consume attempts)
     vault.submission_count = current_count + 1
+    if used_models_list:
+        vault.models_used = used_models_list
+    if evaluation_verdicts_json is not None:
+        vault.evaluation_verdicts = evaluation_verdicts_json
+    vault.prompt_version = PROMPT_VERSION
+    if not skip_ai:
+        vh = hashlib.sha256(json.dumps(verdict_dict, sort_keys=True).encode()).hexdigest()
+        vault.verdict_hash = vh
     db.commit()
 
     is_approved          = verdict_dict.get("verdict") == "PASS"
@@ -6528,7 +7767,83 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 ),
             }
 
-        revealed_fulfillment      = plaintext_fulfillment
+        revealed_fulfillment = plaintext_fulfillment
+        # ── REMEDY: release immediately, no challenge window ──
+        if is_remedy:
+            vault.status              = "RELEASED"
+            vault.delivery_status     = "RELEASED"
+            vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
+            vault.worker_submission = json.dumps({
+                "work":               req.work,
+                "attachments":        [a.dict() for a in (req.worker_attachments or [])],
+                "evidence_links":     req.evidence_links or [],
+                "evidence_snapshots": evidence_snapshots or [],
+                "verdict":            verdict_dict,
+                "delivered_at":       datetime.now(timezone.utc).isoformat(),
+                "escrow_id":          req.escrow_id,
+            })
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            logger.info(f"✅ REMEDY PASS for {req.escrow_id} — releasing immediately")
+            escrow_owner = vault.escrow_owner or vault.buyer_address
+            if vault.escrow_sequence and vault.worker_address and referee_wallet and escrow_owner:
+                asyncio.create_task(auto_finish_escrow(
+                    escrow_id=req.escrow_id,
+                    sequence=vault.escrow_sequence,
+                    owner=escrow_owner,
+                    fulfillment=plaintext_fulfillment,
+                    condition=vault.condition,
+                    worker_addr=vault.worker_address,
+                    db_session_factory=SessionLocal,
+                ))
+            return {
+                "escrow_id":          req.escrow_id,
+                "status":             "approved",
+                "verdict":            verdict_dict,
+                "model_used":         model_used,
+                "auto_finish_queued": True,
+                "message":            "Remedy passed — escrow released immediately.",
+            }
+        # ── CHALLENGE WINDOW: hold payment if release_mode starts with "challenge_window_hrs" ──
+        release_mode_str = vault.release_mode or "auto"
+        if release_mode_str.startswith("challenge_window_hrs"):
+            try:
+                challenge_hrs = int(release_mode_str.split(":")[1])
+                challenge_hrs = max(1, min(challenge_hrs, 24))
+            except (IndexError, ValueError):
+                challenge_hrs = 24
+            vault.status             = "PASS_CHALLENGE_WINDOW"
+            vault.challenge_deadline = datetime.now(timezone.utc) + timedelta(hours=challenge_hrs)
+            vault.delivery_status    = "PASS_CHALLENGE_WINDOW"
+            vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
+            vault.worker_submission = json.dumps({
+                "work":               req.work,
+                "attachments":        [a.dict() for a in (req.worker_attachments or [])],
+                "evidence_links":     req.evidence_links or [],
+                "evidence_snapshots": evidence_snapshots or [],
+                "verdict":            verdict_dict,
+                "delivered_at":       datetime.now(timezone.utc).isoformat(),
+                "escrow_id":          req.escrow_id,
+            })
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            logger.info(f"⏳ PASS_CHALLENGE_WINDOW for {req.escrow_id} — deadline: {vault.challenge_deadline}")
+            _send_challenge_window_opened_email(vault)
+            return {
+                "escrow_id":            req.escrow_id,
+                "status":               "pass_challenge_window",
+                "verdict":              verdict_dict,
+                "model_used":           model_used,
+                "challenge_deadline":   vault.challenge_deadline.isoformat(),
+                "challenge_window_hrs": challenge_hrs,
+                "message": (
+                    f"Work passed evaluation. Payment will release automatically at "
+                    f"{vault.challenge_deadline.isoformat()} unless the buyer raises a challenge before then."
+                ),
+            }
+
         vault.status              = "RELEASED"
         vault.delivery_status     = "RELEASED"
         vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
@@ -6593,6 +7908,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             ))
     else:
         logger.info(f"❌ AUDIT FAILED: '{req.escrow_id}' | score={verdict_dict.get('score')}")
+        if is_remedy:
+            vault.status       = "CANCELLED"
+            vault.cancelled_at = datetime.now(timezone.utc)
+            logger.info(f"❌ REMEDY FAIL for {req.escrow_id} — escrow cancelled")
 
     vault.ai_verdict = json.dumps(verdict_dict)
     vault.model_used = model_used

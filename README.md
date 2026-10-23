@@ -4,6 +4,28 @@
 
 **40+-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
 
+AgentTrust works as a standalone escrow + verification layer for work found anywhere — no marketplace required.
+
+## Bring your own deal
+
+**Agent hires agent from external marketplace:**
+```python
+hire_and_pay(task="...", buyer_address="rBuyer...", amount_xrp=10, worker_address="rWorker...",
+             criteria=["deliverable passes tests"], external_ref="github:org/repo#45")
+# Returns worker_url + worker_instructions — share with the worker
+```
+
+**Freelancer sends client a payment link:**
+```python
+request_escrow(seller_address="rMe...", buyer_address="rClient...", amount_xrp=50, task="...")
+# → pay_url: https://cryptovault.co.uk?fund=AT-XXXX
+# → worker_url: https://cryptovault.co.uk?worker=AT-XXXX
+```
+
+No marketplace listing required. The AgentTrust marketplace is optional.
+
+---
+
 AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds release only on PASS. Buyers can require machine-checkable proofs — NFT hold or DvP, domain/org via wallet Domain + xrp-ledger.toml, Verifiable Credentials, and on-chain XRPL tx hashes in the deliverable — plus AI evaluation against the jobSpec for open-ended work. Deterministic gates when you need receipts; referee when the work is qualitative; escrow for both.
 
 🔗 **MCP server:** https://mcp.cryptovault.co.uk/mcp  
