@@ -47,6 +47,7 @@ from xrpl.utils import xrp_to_drops
 
 # Database Imports
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, or_
+from sqlalchemy.exc import OperationalError as SAOperationalError, InterfaceError as SAInterfaceError, DBAPIError as SADBAPIError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -125,10 +126,11 @@ async def _lifespan(app):
         # Replaces separate enterprise + escrow pollers (which were being started as
         # independent tasks but are now single-run functions called by _hourly_db_window).
         if _db_available:
-            asyncio.create_task(_hourly_db_window())
+            _ensure_hourly_window()
             asyncio.create_task(_refresh_jobs_snapshot())  # initial snapshot on startup
         else:
-            asyncio.create_task(_db_recovery_loop())
+            global _db_recovery_task_ref
+            _db_recovery_task_ref[0] = asyncio.create_task(_db_recovery_loop())
         try:
             yield
         finally:
@@ -193,6 +195,12 @@ app = FastAPI(
 @app.exception_handler(PaymentRequired)
 async def _payment_required_handler(request: Request, exc: PaymentRequired):
     return exc.response
+
+
+@app.exception_handler(SAOperationalError)
+async def _db_operational_error_handler(request: Request, exc: SAOperationalError):
+    _on_db_failure()
+    return JSONResponse({"error": "database unavailable", "retry_after": 60}, status_code=503)
 
 
 # ---------------------------------------------------------------------------
@@ -417,13 +425,13 @@ async def _refresh_jobs_snapshot(db_session=None):
                 except Exception:
                     tags = []
                 bid_count = db.query(Bid).filter(Bid.job_id == j.id, Bid.status == "pending").count()
-                expires_hrs = max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None
                 marketplace.append({
                     "id": j.id, "title": j.title, "description": j.description,
                     "category": j.category or "default", "bounty": budget, "currency": "XRP",
                     "poster": j.buyer_address or "", "poster_name": j.buyer_name or "",
                     "deadline": j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
-                    "deadline_hrs": expires_hrs, "tags": tags, "status": "OPEN",
+                    "_expires_at_iso": j.expires_at.isoformat() if j.expires_at else None,
+                    "tags": tags, "status": "OPEN",
                     "bid_count": bid_count, "is_demo": False,
                     "claimable": bool(getattr(j, "claimable", False)),
                 })
@@ -447,7 +455,7 @@ async def _refresh_jobs_snapshot(db_session=None):
                     "tags": tags, "status": j.status, "bid_count": bid_count,
                     "created_at": (j.created_at.isoformat() + "Z") if j.created_at else None,
                     "expires_at": j.expires_at.strftime("%d %b %Y %H:%M UTC") if j.expires_at else "—",
-                    "expires_hrs": max(0, int((j.expires_at.replace(tzinfo=timezone.utc) - now).total_seconds() / 3600)) if j.expires_at else None,
+                    "_expires_at_iso": j.expires_at.isoformat() if j.expires_at else None,
                     "required_nft_issuer": j.required_nft_issuer or None,
                     "required_domain": j.required_domain or None,
                     "required_vc_issuer_did": j.required_vc_issuer_did or None,
@@ -485,10 +493,9 @@ async def _db_recovery_loop():
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            global _db_available
-            _db_available = True
-            logger.info("✅ DB connection recovered — starting hourly window task")
-            asyncio.create_task(_hourly_db_window())
+            _on_db_success()
+            logger.info("✅ DB connection recovered — ensuring hourly window task")
+            _ensure_hourly_window()
             await _refresh_jobs_snapshot()
             return
         except Exception as e:
@@ -499,10 +506,28 @@ async def _db_recovery_loop():
 # ---------------------------------------------------------------------------
 # Unified hourly DB window — single task; all DB work happens here once per hour
 # ---------------------------------------------------------------------------
+_hourly_window_task: asyncio.Task = None
+
+
+def _ensure_hourly_window():
+    global _hourly_window_task
+    if _hourly_window_task is None or _hourly_window_task.done():
+        _hourly_window_task = asyncio.create_task(_hourly_db_window())
+
+
 async def _hourly_db_window():
     await asyncio.sleep(60)  # let app finish booting
     while True:
-        if _db_available:
+        # Self-check DB at start of each tick — don't rely solely on flag
+        do_work = False
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            _on_db_success()
+            do_work = True
+        except Exception:
+            _on_db_failure()
+        if do_work:
             await _refresh_jobs_snapshot()
             await _flush_tool_stats()
             await _poll_expired_escrows_once()
@@ -1160,7 +1185,7 @@ def get_db():
     try:
         yield db
         _on_db_success()
-    except Exception:
+    except (SAOperationalError, SAInterfaceError, SADBAPIError):
         _on_db_failure()
         raise
     finally:
@@ -7196,6 +7221,22 @@ async def marketplace_jobs(
 
     now = datetime.now(timezone.utc)
     real_jobs = list(snapshot["marketplace_jobs"])
+    # Filter expired jobs and compute time-relative fields at request time
+    def _enrich_marketplace_job(j):
+        j = dict(j)
+        iso = j.pop("_expires_at_iso", None)
+        if iso:
+            try:
+                exp = datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+                if exp < now:
+                    return None  # expired — exclude
+                j["deadline_hrs"] = max(0, int((exp - now).total_seconds() / 3600))
+            except Exception:
+                j["deadline_hrs"] = None
+        else:
+            j["deadline_hrs"] = None
+        return j
+    real_jobs = [r for j in real_jobs if (r := _enrich_marketplace_job(j)) is not None]
     # Apply filters in Python
     if category != "all":
         real_jobs = [j for j in real_jobs if j.get("category") == category]
@@ -7328,6 +7369,22 @@ async def list_jobs(
         return JSONResponse({"error": "job list temporarily unavailable"}, status_code=503)
 
     jobs = list(snapshot["open_jobs"])
+    # Filter expired jobs and compute expires_hrs at request time
+    def _enrich_open_job(j):
+        j = dict(j)
+        iso = j.pop("_expires_at_iso", None)
+        if iso:
+            try:
+                exp = datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+                if exp < now:
+                    return None  # expired — exclude
+                j["expires_hrs"] = max(0, int((exp - now).total_seconds() / 3600))
+            except Exception:
+                j["expires_hrs"] = None
+        else:
+            j["expires_hrs"] = None
+        return j
+    jobs = [r for j in jobs if (r := _enrich_open_job(j)) is not None]
     if category != "all":
         jobs = [j for j in jobs if j.get("category") == category]
     if min_budget > 0:
@@ -7419,6 +7476,8 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     if job.status != "open":
         raise HTTPException(status_code=409, detail=f"Job '{job_id}' is not open for bids (status: {job.status}).")
+    if job.expires_at and job.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail=f"Job '{job_id}' has expired and is no longer accepting bids.")
 
     worker_address = (body.get("worker_address") or "").strip()
     proposed_xrp   = body.get("proposed_xrp")
@@ -7462,6 +7521,7 @@ async def submit_bid(job_id: str, body: dict, db: Session = Depends(get_db)):
     )
     db.add(bid)
     db.commit()
+    _cache_invalidate_jobs()
 
     has_email    = bool(bid.worker_email)
     has_callback = bool(bid.callback_url)
@@ -9917,7 +9977,7 @@ async def _poll_enterprise_subscriptions_once():
                                 <p>To renew for another year, send <strong>199 RLUSD</strong> on the XRP Ledger to:</p>
                                 <p><strong>Wallet:</strong> <code>{ENTERPRISE_WALLET}</code><br>
                                 <strong>Memo:</strong> <code>{acct.id}</code></p>
-                                <p>Your transaction hash will be your receipt. We'll extend your subscription automatically within 5 minutes of payment.</p>
+                                <p>Your transaction hash will be your receipt. We'll extend your subscription automatically within about an hour of payment.</p>
                                 <p>— AgentTrust</p>
                             """,
                         })
@@ -9928,6 +9988,40 @@ async def _poll_enterprise_subscriptions_once():
                 db2.close()
     except Exception as e:
         logger.warning(f"Enterprise subscription poller error: {e}")
+
+
+async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
+    """Escrow object is gone on-chain. Scan account_tx to find final status."""
+    try:
+        marker = None
+        while True:
+            params = {"account": owner, "limit": 200, "ledger_index_min": -1}
+            if marker:
+                params["marker"] = marker
+            async with httpx.AsyncClient(timeout=15) as hc:
+                r = await hc.post(XRPL_URL, json={"method": "account_tx", "params": [params]})
+            data = r.json().get("result", {})
+            for tx_envelope in data.get("transactions", []):
+                tx = tx_envelope.get("tx", tx_envelope)
+                if tx.get("OfferSequence") == sequence:
+                    tx_type = tx.get("TransactionType")
+                    meta_result = tx_envelope.get("meta", {}).get("TransactionResult", "")
+                    if tx_type == "EscrowFinish" and meta_result == "tesSUCCESS":
+                        vault.status = "RELEASED"
+                        db.commit()
+                        logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
+                        return
+                    elif tx_type == "EscrowCancel" and meta_result == "tesSUCCESS":
+                        vault.status = "CANCELLED"
+                        db.commit()
+                        logger.info(f"Resolved {vault.escrow_id} → CANCELLED (EscrowCancel found)")
+                        return
+            marker = data.get("marker")
+            if not marker:
+                break
+        logger.warning(f"Could not resolve {vault.escrow_id}: escrow gone but no final tx found. Leaving LOCKED.")
+    except Exception as e:
+        logger.warning(f"_resolve_gone_escrow failed for {vault.escrow_id}: {e}")
 
 
 async def _poll_expired_escrows_once():
@@ -9951,22 +10045,37 @@ async def _poll_expired_escrows_once():
             if stale:
                 db.commit()
 
-            # LOCKED but no on-chain tx hash — verify on-chain before abandoning
+            # LOCKED but no on-chain tx hash — verify on-chain before abandoning (>24h old only)
+            stale_locked_cutoff = now - timedelta(hours=24)
             orphaned = db.query(EscrowVault).filter(
                 EscrowVault.status == "LOCKED",
+                EscrowVault.created_at < stale_locked_cutoff,
                 or_(EscrowVault.escrow_tx_hash == None, EscrowVault.escrow_tx_hash == ""),
             ).all()
             for vault in orphaned:
-                # Check on-chain: if an escrow object exists for this buyer/amount, it's live
+                # Check on-chain for both buyer and worker/destination accounts
                 try:
                     amount_drops = str(int((vault.amount_xrp or 0) * 1_000_000))
-                    async with httpx.AsyncClient(timeout=10) as client:
-                        r = await client.post(XRPL_URL, json={
-                            "method": "account_objects",
-                            "params": [{"account": vault.buyer_address, "type": "escrow", "ledger_index": "validated"}],
-                        })
-                    objects = r.json().get("result", {}).get("account_objects", [])
-                    live = any(o.get("Amount") == amount_drops for o in objects)
+                    accounts_to_check = list({vault.buyer_address, vault.worker_address} - {None, ""})
+                    live = False
+                    for acct in accounts_to_check:
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            r = await client.post(XRPL_URL, json={
+                                "method": "account_objects",
+                                "params": [{"account": acct, "type": "escrow", "ledger_index": "validated"}],
+                            })
+                        objects = r.json().get("result", {}).get("account_objects", [])
+                        for o in objects:
+                            amt = o.get("Amount")
+                            # IOU Amount is a dict — never matches XRP drops string → skip (don't abandon)
+                            if isinstance(amt, dict):
+                                live = True
+                                break
+                            if amt == amount_drops:
+                                live = True
+                                break
+                        if live:
+                            break
                     if live:
                         logger.info(f"Skipping ABANDONED for {vault.escrow_id}: escrow object found on-chain")
                         continue
@@ -9975,53 +10084,75 @@ async def _poll_expired_escrows_once():
                     continue
                 age_hours = (now - vault.created_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
                 vault.status = "ABANDONED"
-                logger.info(f"ABANDONED escrow {vault.escrow_id}: age={age_hours:.1f}h, reason=LOCKED with no on-chain tx hash and no escrow object found")
+                logger.info(f"ABANDONED escrow {vault.escrow_id}: age={age_hours:.1f}h, reason=LOCKED >24h with no on-chain tx hash and no escrow object found")
             if orphaned:
                 db.commit()
 
-            # Cancel expired LOCKED escrows with a known sequence
+            # Cancel expired LOCKED escrows — fetch real owner/sequence from EscrowCreate tx
             expired = db.query(EscrowVault).filter(
                 EscrowVault.status == "LOCKED",
                 EscrowVault.cancel_after_ts != None,
                 EscrowVault.cancel_after_ts < now,
-                EscrowVault.escrow_sequence != None,
             ).all()
             for vault in expired:
                 try:
+                    # Step 1: get real owner and sequence from the EscrowCreate tx
+                    owner = vault.buyer_address
+                    sequence = vault.escrow_sequence
+                    if vault.escrow_tx_hash:
+                        try:
+                            async with httpx.AsyncClient(timeout=10) as hc:
+                                r = await hc.post(XRPL_URL, json={
+                                    "method": "tx",
+                                    "params": [{"transaction": vault.escrow_tx_hash, "binary": False}],
+                                })
+                            tx_data = r.json().get("result", {})
+                            owner = tx_data.get("Account", owner)
+                            sequence = tx_data.get("Sequence", sequence)
+                        except Exception as e:
+                            logger.warning(f"Could not fetch EscrowCreate tx for {vault.escrow_id}: {e}")
+
+                    if sequence is None:
+                        logger.warning(f"No sequence for {vault.escrow_id}, skipping cancel")
+                        continue
+
+                    # Step 2: verify escrow exists on-chain before submitting
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as hc:
+                            r = await hc.post(XRPL_URL, json={
+                                "method": "ledger_entry",
+                                "params": [{"escrow": {"owner": owner, "seq": sequence}, "ledger_index": "validated"}],
+                            })
+                        result_data = r.json().get("result", {})
+                        if result_data.get("node"):
+                            escrow_exists = True
+                        elif result_data.get("error") == "entryNotFound":
+                            escrow_exists = False
+                        else:
+                            logger.warning(f"Ambiguous ledger_entry for {vault.escrow_id}: {result_data.get('error')}, skipping")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"ledger_entry check failed for {vault.escrow_id}: {e}, skipping")
+                        continue
+
+                    if not escrow_exists:
+                        await _resolve_gone_escrow(vault, owner, sequence, db)
+                        continue
+
+                    # Step 3: submit EscrowCancel with correct owner/sequence
                     client = AsyncJsonRpcClient(XRPL_URL)
                     cancel_tx = EscrowCancel(
                         account=referee_wallet.address,
-                        owner=vault.buyer_address,
-                        offer_sequence=vault.escrow_sequence,
+                        owner=owner,
+                        offer_sequence=sequence,
                     )
                     result = await async_submit_and_wait(cancel_tx, client, referee_wallet)
                     engine_result = result.result.get("meta", {}).get("TransactionResult", "") or result.result.get("engine_result", "")
                     tx_hash = result.result.get("hash", "")
 
                     if engine_result in ("tecNO_TARGET", "tecNO_ENTRY"):
-                        # Escrow object already gone — find the final tx to set correct status
-                        new_status = "CANCELLED"
-                        try:
-                            async with httpx.AsyncClient(timeout=10) as hclient:
-                                atx = await hclient.post(XRPL_URL, json={
-                                    "method": "account_tx",
-                                    "params": [{"account": vault.buyer_address, "limit": 50, "ledger_index_min": -1}],
-                                })
-                            txns = atx.json().get("result", {}).get("transactions", [])
-                            for entry in txns:
-                                t = entry.get("tx", {})
-                                if t.get("Sequence") == vault.escrow_sequence or t.get("OfferSequence") == vault.escrow_sequence:
-                                    if t.get("TransactionType") == "EscrowFinish":
-                                        new_status = "RELEASED"
-                                    elif t.get("TransactionType") == "EscrowCancel":
-                                        new_status = "CANCELLED"
-                                    break
-                        except Exception:
-                            pass
-                        vault.status = new_status
-                        db.commit()
-                        logger.info(f"tecNO_TARGET on EscrowCancel for {vault.escrow_id}: resolved status={new_status}")
-                    else:
+                        await _resolve_gone_escrow(vault, owner, sequence, db)
+                    elif engine_result == "tesSUCCESS":
                         vault.status = "CANCELLED"
                         vault.delivery_status = "CANCELLED"
                         db.commit()
@@ -10042,8 +10173,15 @@ async def _poll_expired_escrows_once():
                                 })
                             except Exception:
                                 pass
+                    else:
+                        logger.warning(f"EscrowCancel for {vault.escrow_id} returned {engine_result}")
                 except Exception as e:
-                    logger.warning(f"Failed to cancel expired escrow {vault.escrow_id}: {e}")
+                    err_str = str(e)
+                    if "tecNO_TARGET" in err_str or "tecNO_ENTRY" in err_str:
+                        await _resolve_gone_escrow(vault, owner if 'owner' in dir() else vault.buyer_address,
+                                                   sequence if 'sequence' in dir() else vault.escrow_sequence, db)
+                    else:
+                        logger.warning(f"Failed to cancel expired escrow {vault.escrow_id}: {e}")
         finally:
             db.close()
     except Exception as e:
