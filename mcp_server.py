@@ -282,6 +282,36 @@ async def create_escrow_vault(
         title="Metadata (JSON string)",
         description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.) without storing them on AgentTrust's side. Example: '{\"invoice_id\": \"INV-2026-0042\", \"po_number\": \"PO-9981\"}'.",
     )] = None,
+    criteria: Annotated[Optional[list], Field(
+        title="Structured Criteria",
+        description=(
+            "Optional list of evaluation criteria for the AI referee. "
+            "Each item is either a plain string (treated as a judgment criterion) or a dict with fields: "
+            "id (optional), type ('judgment'|'evidence'|'code'), description (required), "
+            "and for 'code' type: gate ('sha256_of'|'exact_match'|'regex'|'json_schema'|'http_status'|'xrpl_tx') plus gate-specific fields. "
+            "Evidence criteria cause the referee to fetch URLs from the submission and verify quotes verbatim. "
+            "Code criteria run deterministic gate checks before the AI is called. "
+            "INCONCLUSIVE verdicts do NOT consume submission attempts. "
+            "Example: [{\"type\":\"judgment\",\"description\":\"Code compiles\"},{\"type\":\"evidence\",\"description\":\"PR link shows merged status\"}]"
+        ),
+    )] = None,
+    deliverable_type: Annotated[str, Field(
+        title="Deliverable Type",
+        description="Type of deliverable: 'work' (default, general text/files), 'code' (software), 'data' (dataset/analysis), 'nft' (NFT token).",
+        enum=["work", "code", "data", "nft"],
+    )] = "work",
+    release_mode: Annotated[str, Field(
+        title="Release Mode",
+        description=(
+            "'auto' (default): payment releases immediately on PASS. "
+            "'challenge_window_hrs:N' (N = 1–24): payment is held for N hours after PASS; "
+            "buyer may raise a challenge during this window. Payment auto-releases at deadline if no challenge."
+        ),
+    )] = "auto",
+    require_consensus_vault: Annotated[bool, Field(
+        title="Require Dual-Model Consensus",
+        description="Require both Gemini Flash AND Gemini Pro to agree on EVERY evaluation for this vault. Fee: $0.25 per evaluation. Different from the per-submission require_consensus param on evaluate_escrow_work.",
+    )] = False,
 ) -> dict:
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
@@ -291,17 +321,19 @@ async def create_escrow_vault(
     verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
     relevant proof-gate params below.
 
-    Two release modes:
-    - AI audit (default): worker submits text/files; AI referee scores against task_description.
-    - Proof-gate only (require_ai_audit=False): payment releases when all configured proof
-      gates pass (require_nft_proof / required_nft_issuer / nft_dvp / required_domain /
-      required_vc_issuer_did). No AI call. Requires at least one proof gate.
+    Three release modes:
+    - AI audit (default): worker submits text/files; AI referee scores against task_description or criteria.
+    - Proof-gate only (require_ai_audit=False): payment releases when all configured proof gates pass. No AI call.
+    - Challenge window (release_mode='challenge_window_hrs:N'): PASS holds for N hours; buyer can challenge.
+
+    Structured criteria (recommended for complex work):
+    - Pass criteria as a list of strings or typed dicts ({type, description, [gate]}).
+    - Types: 'judgment' (AI decides), 'evidence' (verify URL content), 'code' (deterministic gate).
+    - INCONCLUSIVE verdicts do NOT consume submission attempts.
 
     White-label / headless integration:
-    - Pass callback_url to receive webhook POSTs on all state changes. AgentTrust operates
-      as a silent settlement rail; your platform handles all user-facing surfaces.
-    - Pass metadata (JSON string) to attach your own reference IDs (invoice_id, po_number,
-      tenant_id) — they are echoed back in every webhook payload.
+    - Pass callback_url to receive webhook POSTs on all state changes.
+    - Pass metadata (JSON string) to attach your own reference IDs.
 
     Typical flow after job board negotiation:
       1. award_job() returns the worker's address and agreed price
@@ -326,11 +358,13 @@ async def create_escrow_vault(
         "max_submissions":  max_submissions,
         "require_ai_audit": require_ai_audit,
         "proof_policy":     proof_policy,
+        "deliverable_type": deliverable_type,
+        "release_mode":     release_mode,
     }
     if fee_hash:
         body["fee_hash"] = fee_hash
-    if require_consensus:
-        body["require_consensus"] = True
+    if require_consensus or require_consensus_vault:
+        body["require_consensus_vault"] = True
     if require_nft_proof:
         body["require_nft_proof"] = True
     if required_nft_issuer:
@@ -347,6 +381,8 @@ async def create_escrow_vault(
         body["buyer_callback_url"] = callback_url
     if metadata:
         body["metadata"] = metadata
+    if criteria:
+        body["criteria"] = criteria
     if currency.upper() == "RLUSD" and amount_rlusd:
         body["amount_rlusd"] = amount_rlusd
     else:
@@ -446,6 +482,14 @@ async def evaluate_escrow_work(
     verified on the ledger. Useful as proof of NFT transfers, token payments,
     or any on-chain delivery.
 
+    Evaluation pipeline (when the vault has structured criteria):
+    1. Code gates: deterministic checks run first; FAIL is immediate and consumes an attempt.
+    2. Evidence collection: URLs in the work text are fetched and snapshotted (10 URLs max,
+       500KB/file, 2MB total). Evidence criteria require a verbatim quote from fetched content.
+    3. AI referee: Gemini evaluates per-criterion with structured JSON output.
+    4. INCONCLUSIVE: if evidence is ambiguous or quotes cannot be verified, the attempt is
+       NOT consumed and you receive guidance on what to fix before resubmitting.
+
     Response shape on PASS:
 
         {
@@ -453,8 +497,7 @@ async def evaluate_escrow_work(
           "status":           "approved",
           "score":            0-100,
           "summary":          "explanation",
-          "criteria_met":     ["all criteria that passed"],
-          "criteria_failed":  [],
+          "criteria_results": [{"criterion_id": "c1", "verdict": "PASS", ...}],
           "auto_finish_queued": True,
           "model_used":       "gemini-2.5-flash"
         }
@@ -466,10 +509,18 @@ async def evaluate_escrow_work(
           "status":            "rejected",
           "score":             0-100,
           "summary":           "explanation",
-          "criteria_met":      ["criteria that passed"],
-          "criteria_failed":   ["specific unmet criterion — exact reason"],
+          "criteria_results":  [{"criterion_id": "c1", "verdict": "FAIL", "reasoning": "..."}],
           "attempts_remaining": 2,
           "model_used":        "gemini-2.5-flash"
+        }
+
+    Response shape on INCONCLUSIVE (attempt NOT consumed):
+
+        {
+          "status":   "inconclusive",
+          "verdict":  {...},
+          "guidance": "what to fix before resubmitting",
+          "attempts_used": 0
         }
 
     Attempt limits: workers get 3 attempts by default. Buyers can raise this via
@@ -478,8 +529,7 @@ async def evaluate_escrow_work(
     this tool returns error "submission_limit_reached". Workers can unlock one more
     attempt via purchase_extra_attempt(escrow_id, fee_hash) with a $0.05 fee.
 
-    On FAIL: read criteria_failed for specific, actionable feedback. Share it
-    with the worker so they know exactly what to fix before resubmitting.
+    On FAIL: read criteria_results (or criteria_failed) for actionable feedback.
     Resubmit by calling evaluate_escrow_work again with the same escrow_id.
 
     On PASS for NFT DvP vaults (nft_dvp=True): the vault enters PASS_AWAITING_NFT
@@ -2128,6 +2178,19 @@ async def hire_and_pay(
         title="Delegate Agent Address (XLS-75)",
         description="XLS-75 delegated agent XRPL address. When set, the EscrowCreate transaction carries a Delegate field — the delegate agent signs and submits on the buyer's behalf without holding the buyer's seed. The buyer must first submit a DelegateSet granting EscrowCreate permission to this address.",
     )] = None,
+    criteria: Annotated[Optional[list], Field(
+        title="Structured Criteria",
+        description="Optional list of evaluation criteria. Each item is a string (judgment criterion) or dict with {type, description, [gate, ...]}. Types: 'judgment', 'evidence' (URL verification), 'code' (deterministic gate). INCONCLUSIVE verdicts do NOT consume attempts.",
+    )] = None,
+    deliverable_type: Annotated[str, Field(
+        title="Deliverable Type",
+        description="Type of deliverable: 'work' (default), 'code', 'data', 'nft'.",
+        enum=["work", "code", "data", "nft"],
+    )] = "work",
+    release_mode: Annotated[str, Field(
+        title="Release Mode",
+        description="'auto' (default): immediate release on PASS. 'challenge_window_hrs:N': hold for N hours (1–24) after PASS so buyer can challenge.",
+    )] = "auto",
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -2140,6 +2203,10 @@ async def hire_and_pay(
     verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
     relevant proof-gate params (require_nft_proof, required_nft_issuer, nft_dvp,
     required_domain, required_vc_issuer_did).
+
+    Structured criteria: pass criteria as a list of strings or typed dicts. Types: 'judgment',
+    'evidence' (verifies URLs from submission), 'code' (deterministic gate). INCONCLUSIVE
+    verdicts do NOT consume submission attempts.
 
     White-label / headless integration:
     - Pass callback_url to receive webhook POSTs on all state changes.
@@ -2186,6 +2253,12 @@ async def hire_and_pay(
         vault_body["buyer_callback_url"] = callback_url
     if metadata:
         vault_body["metadata"] = metadata
+    if criteria:
+        vault_body["criteria"] = criteria
+    if deliverable_type != "work":
+        vault_body["deliverable_type"] = deliverable_type
+    if release_mode != "auto":
+        vault_body["release_mode"] = release_mode
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)

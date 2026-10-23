@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 import logging
 
 APP_VERSION = "7.0.0"
+PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import sys
 import hashlib
@@ -49,7 +50,8 @@ from xrpl.utils import xrp_to_drops
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, or_
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, or_, Numeric
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.exc import OperationalError as SAOperationalError, InterfaceError as SAInterfaceError, DBAPIError as SADBAPIError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -1395,6 +1397,18 @@ class EscrowVault(Base):
     backfill_attempts = Column(Integer, default=0,  nullable=True)
     # Worker auth token — v2.8.0
     evaluate_token_hash  = Column(String,  nullable=True)   # SHA-256 of one-time evaluate token
+    # Part B Phase 1 — structured evaluation engine
+    deliverable_type     = Column(String,  default="work")   # 'work' | 'nft' | 'code' | 'data'
+    release_mode         = Column(String,  default="auto")   # 'auto' | 'challenge_window_hrs:N'
+    require_consensus    = Column(Boolean, default=False)
+    criteria_v2          = Column(JSONB,   nullable=True)    # structured criteria array
+    models_used          = Column(ARRAY(String), nullable=True)
+    prompt_version       = Column(String,  nullable=True)
+    verdict_hash         = Column(String,  nullable=True)    # sha256 of full verdict JSON
+    evaluation_verdicts  = Column(JSONB,   nullable=True)    # per-criterion results
+    challenge_deadline   = Column(DateTime(timezone=True), nullable=True)
+    challenge_fee_hash   = Column(String,  nullable=True)
+    challenge_fee_amount = Column(Numeric, nullable=True)
 
 
 class JobPosting(Base):
@@ -2461,6 +2475,18 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancel_tx_hash  TEXT",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS cancelled_at    TIMESTAMPTZ",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS backfill_attempts INT DEFAULT 0",
+        # Part B Phase 1 — structured evaluation engine
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS deliverable_type     VARCHAR DEFAULT 'work'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS release_mode         VARCHAR DEFAULT 'auto'",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS require_consensus     BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS criteria_v2           JSONB",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS models_used           TEXT[]",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS prompt_version        VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS verdict_hash          VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluation_verdicts   JSONB",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_deadline    TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_hash    VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_amount  NUMERIC",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3127,6 +3153,11 @@ class EscrowSetupRequest(BaseModel):
     # Expected fields: po_number, supplier_name, services_description,
     # require_date (bool), require_line_items (bool)
     # Amount/currency are always required when this is set (mirrored from escrow amount)
+    # Part B Phase 1 — structured evaluation
+    criteria:         Optional[list] = None   # list of strings or structured criterion dicts
+    deliverable_type: str = "work"            # 'work' | 'nft' | 'code' | 'data'
+    release_mode:     str = "auto"            # 'auto' | 'challenge_window_hrs:N'
+    require_consensus_vault: bool = False     # require dual-model consensus on every evaluation
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -5221,8 +5252,346 @@ async def verify_eth_signature(req: EthSignatureRequest):
 
 
 # ---------------------------------------------------------------------------
-# 12. AI AUDIT ENGINE
+# 12. AI AUDIT ENGINE — structured evaluation helpers
 # ---------------------------------------------------------------------------
+
+GATE_TYPES = {"sha256_of", "exact_match", "regex", "json_schema", "http_status", "xrpl_tx"}
+_VALID_CRITERION_TYPES = {"code", "evidence", "judgment"}
+_PRIVATE_IP_PREFIXES = (
+    "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.",
+    "172.29.", "172.30.", "172.31.", "192.168.", "127.", "::1", "fc00:", "fd",
+)
+
+
+def _parse_criteria(raw_criteria) -> list:
+    """Normalise raw criteria into a canonical list of dicts."""
+    if raw_criteria is None:
+        raise ValueError("criteria must be provided")
+    if isinstance(raw_criteria, str):
+        raw_criteria = [raw_criteria]
+    if not isinstance(raw_criteria, list) or len(raw_criteria) == 0:
+        raise ValueError("criteria must be a non-empty list")
+    result = []
+    for i, item in enumerate(raw_criteria):
+        cid = f"c{i+1}"
+        if isinstance(item, str):
+            result.append({"id": cid, "type": "judgment", "description": item})
+        elif isinstance(item, dict):
+            if "description" not in item:
+                raise ValueError(f"criterion #{i+1} missing 'description'")
+            ctype = item.get("type", "judgment")
+            if ctype not in _VALID_CRITERION_TYPES:
+                raise ValueError(f"criterion #{i+1} has invalid type '{ctype}'; must be one of {sorted(_VALID_CRITERION_TYPES)}")
+            result.append({**item, "id": item.get("id", cid), "type": ctype})
+        else:
+            raise ValueError(f"criterion #{i+1} must be a string or dict")
+    return result
+
+
+def _parse_criteria_safe(raw_criteria):
+    """Returns parsed criteria or None if raw_criteria is None/empty. Raises HTTPException on invalid input."""
+    if raw_criteria is None:
+        return None
+    try:
+        return _parse_criteria(raw_criteria)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid criteria: {e}")
+
+
+def _execute_code_gates(work: str, criteria: list) -> list:
+    """Run synchronous code gates. Returns list of FAIL verdicts for failed gates (empty = all pass)."""
+    import re as _re
+    failures = []
+    for c in criteria:
+        if c.get("type") != "code":
+            continue
+        gate = c.get("gate")
+        if not gate:
+            continue
+        cid = c["id"]
+        try:
+            if gate == "sha256_of":
+                expected = c.get("expected_hash", "")
+                actual = hashlib.sha256(work.strip().encode()).hexdigest()
+                if actual != expected:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"sha256 mismatch: expected {expected}, got {actual}"})
+            elif gate == "exact_match":
+                expected = c.get("expected_value", "")
+                if work.strip() != expected:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": "work does not exactly match expected value"})
+            elif gate == "regex":
+                pattern = c.get("pattern", "")
+                if not _re.search(pattern, work):
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"work does not match regex: {pattern}"})
+            elif gate == "json_schema":
+                try:
+                    import jsonschema as _jsonschema
+                    _jsonschema.validate(json.loads(work), c.get("schema", {}))
+                except Exception as e:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"JSON schema validation failed: {e}"})
+            elif gate == "http_status":
+                url = c.get("url", "")
+                expected_status = c.get("expected_status", 200)
+                try:
+                    with httpx.Client(timeout=5.0) as _client:
+                        r = _client.head(url)
+                        if r.status_code != expected_status:
+                            failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"HTTP {r.status_code} != {expected_status} for {url}"})
+                except Exception as e:
+                    failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"HTTP check failed: {e}"})
+            elif gate == "xrpl_tx":
+                pass  # async XRPL check; handled in evidence collection if needed
+        except Exception as e:
+            failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"Gate check error: {e}"})
+    return failures
+
+
+async def _fetch_url_content(url: str):
+    """Fetch a URL with SSRF protection and 500KB cap. Returns text or None."""
+    import socket as _socket
+    if not url.startswith("https://"):
+        return None
+    # Convert GitHub blob URLs to raw
+    if "github.com" in url and "/blob/" in url:
+        url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    # SSRF: resolve and block private IPs
+    try:
+        hostname = url.split("/")[2]
+        addrs = _socket.getaddrinfo(hostname, 443)
+        for _, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
+                return None
+    except Exception:
+        return None
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=5.0) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    return None
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_bytes(4096):
+                    total += len(chunk)
+                    if total > 500 * 1024:
+                        chunks.append(chunk[:500*1024 - (total - len(chunk))])
+                        break
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+                return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+async def _collect_evidence(work: str, criteria: list) -> list:
+    """Collect URL evidence for 'evidence' type criteria. Returns list of evidence items."""
+    import re as _re
+    evidence_criteria = [c for c in criteria if c.get("type") == "evidence"]
+    if not evidence_criteria:
+        return []
+    urls = _re.findall(r'https://\S+', work)
+    urls = [u.rstrip(".,;)'\"") for u in urls][:10]
+    items = []
+    total_bytes = 0
+    MAX_TOTAL = 2 * 1024 * 1024
+    MAX_PER_FILE = 500 * 1024
+    for url in urls:
+        if total_bytes >= MAX_TOTAL:
+            break
+        content = await _fetch_url_content(url)
+        if content is None:
+            continue
+        truncated = False
+        if len(content.encode()) > MAX_PER_FILE:
+            content = content.encode()[:MAX_PER_FILE].decode("utf-8", errors="replace")
+            truncated = True
+        total_bytes += len(content.encode())
+        for c in evidence_criteria:
+            items.append({
+                "criterion_id": c["id"],
+                "url": url,
+                "content": content,
+                "truncated": truncated,
+            })
+            break
+    return items
+
+
+def _build_audit_prompt(task: str, work: str, criteria: list, evidence_items: list) -> str:
+    """Build structured Gemini prompt with UNTRUSTED_EVIDENCE delimiters."""
+    lines = [
+        "You are an impartial AI referee evaluating submitted work against defined criteria.",
+        "",
+        f"TASK DESCRIPTION:\n{task}",
+        "",
+        f"<WORK>\n{work}\n</WORK>",
+        "",
+    ]
+    for item in evidence_items:
+        lines.append(f'<UNTRUSTED_EVIDENCE criterion_id="{item["criterion_id"]}" url="{item["url"]}">')
+        lines.append(item["content"])
+        lines.append("</UNTRUSTED_EVIDENCE>")
+        lines.append("")
+    lines.append("CRITERIA TO EVALUATE:")
+    for c in criteria:
+        ctype = c.get("type", "judgment")
+        lines.append(f'  [{c["id"]}] ({ctype}) {c["description"]}')
+    lines.append("")
+    lines.append("INSTRUCTIONS:")
+    lines.append("- For 'code' criteria: already evaluated by automated gates; include in criteria_results with outcome.")
+    lines.append("- For 'evidence' criteria: your evidence_quote MUST be a VERBATIM substring of the UNTRUSTED_EVIDENCE content. If none found, verdict must be INCONCLUSIVE.")
+    lines.append("- For 'judgment' criteria: apply professional judgment. Reasoning is required.")
+    lines.append("- STRICT: only pass work that genuinely meets the stated requirements.")
+    lines.append("- INCONCLUSIVE: use when evidence is ambiguous, missing, or cannot be verified.")
+    lines.append("")
+    lines.append("Return ONLY a JSON object matching this exact schema (no markdown, no preamble):")
+    lines.append(json.dumps({
+        "overall_verdict": "PASS|FAIL|INCONCLUSIVE",
+        "overall_score": "integer 0-100",
+        "overall_reasoning": "string",
+        "criteria_results": [{
+            "criterion_id": "string",
+            "verdict": "PASS|FAIL|INCONCLUSIVE",
+            "score": "integer 0-100",
+            "reasoning": "string",
+            "evidence_quote": "verbatim substring of evidence or null"
+        }]
+    }, indent=2))
+    return "\n".join(lines)
+
+
+def _validate_verdict(verdict: dict, criteria: list, evidence_items: list) -> list:
+    """Validate AI verdict. Returns list of error strings (empty = valid)."""
+    errors = []
+    criteria_results = verdict.get("criteria_results", [])
+    overall = verdict.get("overall_verdict", "")
+    score = verdict.get("overall_score", 50)
+    ev_content: dict = {}
+    for item in evidence_items:
+        ev_content.setdefault(item["criterion_id"], []).append(item["content"])
+    evidence_criteria_ids = {c["id"] for c in criteria if c.get("type") == "evidence"}
+    for cr in criteria_results:
+        cid = cr.get("criterion_id", "")
+        if cid in evidence_criteria_ids:
+            quote = cr.get("evidence_quote")
+            if quote:
+                contents = ev_content.get(cid, [])
+                if contents and not any(quote in c for c in contents):
+                    errors.append(f"evidence_quote for {cid} is not a verbatim substring of fetched evidence")
+    if overall == "PASS" and isinstance(score, (int, float)) and score < 50:
+        errors.append(f"overall_verdict is PASS but overall_score={score} < 50")
+    if overall == "FAIL" and isinstance(score, (int, float)) and score > 50:
+        errors.append(f"overall_verdict is FAIL but overall_score={score} > 50")
+    return errors
+
+
+async def _run_structured_audit(
+    task: str,
+    work: str,
+    criteria: list,
+    evidence_items: list,
+    require_consensus: bool,
+    attempt_count: int,
+) -> dict:
+    """Run structured AI audit with criterion types, evidence, consensus logic."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
+
+    prompt_text = _build_audit_prompt(task, work, criteria, evidence_items)
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "overall_verdict": {"type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+            "overall_score": {"type": "integer"},
+            "overall_reasoning": {"type": "string"},
+            "criteria_results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion_id": {"type": "string"},
+                        "verdict": {"type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
+                        "score": {"type": "integer"},
+                        "reasoning": {"type": "string"},
+                        "evidence_quote": {"type": ["string", "null"]},
+                    },
+                    "required": ["criterion_id", "verdict", "score", "reasoning"],
+                },
+            },
+        },
+        "required": ["overall_verdict", "overall_score", "overall_reasoning", "criteria_results"],
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "seed": 42,
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema,
+            "thinkingConfig": {"thinkingBudget": 2048},
+        },
+    }
+
+    FLASH_MODEL = "gemini-2.5-flash"
+    PRO_MODEL = "gemini-2.5-pro"
+    models_used = []
+
+    async def _call_gemini(model_id: str):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                res = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+            if res.status_code == 200:
+                raw = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return json.loads(raw)
+            logger.warning(f"Gemini {model_id} HTTP {res.status_code}: {res.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Gemini {model_id} error: {e}")
+        return None
+
+    flash_result = await _call_gemini(FLASH_MODEL)
+    if flash_result is None:
+        raise HTTPException(status_code=503, detail="AI referee temporarily unavailable (Flash model failed)")
+    models_used.append(FLASH_MODEL)
+    flash_verdict = flash_result.get("overall_verdict", "INCONCLUSIVE")
+
+    if flash_verdict == "FAIL" and not require_consensus:
+        flash_result["models_used"] = models_used
+        return flash_result
+
+    use_pro = require_consensus or attempt_count >= 2 or flash_verdict == "INCONCLUSIVE"
+    if use_pro:
+        pro_result = await _call_gemini(PRO_MODEL)
+        if pro_result is not None:
+            models_used.append(PRO_MODEL)
+            pro_verdict = pro_result.get("overall_verdict", "INCONCLUSIVE")
+            if flash_verdict == "INCONCLUSIVE":
+                pro_result["models_used"] = models_used
+                return pro_result
+            elif flash_verdict == "PASS" and pro_verdict == "FAIL":
+                pro_result["overall_verdict"] = "FAIL"
+                pro_result["overall_reasoning"] = (
+                    f"Models disagreed (Flash=PASS, Pro=FAIL) — conservative FAIL applied. "
+                    f"Flash: {flash_result.get('overall_reasoning','')} | "
+                    f"Pro: {pro_result.get('overall_reasoning','')}"
+                )
+                pro_result["models_used"] = models_used
+                return pro_result
+            elif flash_verdict == "PASS" and pro_verdict == "PASS":
+                flash_result["models_used"] = models_used
+                return flash_result
+            elif flash_verdict == "FAIL":
+                flash_result["models_used"] = models_used
+                return flash_result
+        elif require_consensus:
+            raise HTTPException(status_code=503, detail="Consensus model (Pro) unavailable — retry later")
+
+    flash_result["models_used"] = models_used
+    return flash_result
+
+
 async def _check_gemini_models():
     """Log which configured Gemini models are available at startup."""
     api_key = os.getenv("GEMINI_API_KEY")
@@ -5738,6 +6107,10 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         require_ai_audit       = req.require_ai_audit,
         template_id            = req.template_id,
         evaluate_token_hash    = evaluate_token_hash,
+        deliverable_type       = req.deliverable_type or "work",
+        release_mode           = req.release_mode or "auto",
+        require_consensus      = bool(req.require_consensus_vault),
+        criteria_v2            = _parse_criteria_safe(req.criteria),
     )
     db.add(vault)
     db.commit()
@@ -6439,6 +6812,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     # When require_ai_audit=False AND at least one proof gate was configured and passed,
     # skip the AI step entirely and treat it as an automatic PASS.
     skip_ai = (not vault.require_ai_audit) and bool(proof_results) and all(r[1] for r in proof_results)
+    is_inconclusive = False
+    evaluation_verdicts_json = None
+    used_models_list = None
     if skip_ai:
         proof_summary = "; ".join(r[2] for r in proof_results if r[1])
         verdict_dict = {
@@ -6453,22 +6829,108 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         model_used = "none (proof-gate release)"
         logger.info(f"✅ AI SKIPPED (proof-gate release) for {req.escrow_id}: {proof_summary}")
     else:
+        # ── STRUCTURED EVALUATION PIPELINE ──
+        if vault.criteria_v2:
+            eval_criteria = vault.criteria_v2
+        else:
+            eval_criteria = [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
+
+        gate_failures = _execute_code_gates(work_with_nft, eval_criteria)
+        if gate_failures:
+            verdict_dict = {
+                "verdict": "FAIL",
+                "score": 0,
+                "summary": f"{len(gate_failures)} automated gate(s) failed.",
+                "details": "; ".join(f["reason"] for f in gate_failures),
+                "criteria_failed": [f["criterion_id"] for f in gate_failures],
+                "criteria_met": [],
+                "gate_failures": gate_failures,
+            }
+            model_used = "code-gate"
+            vault.submission_count = current_count + 1
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            return {
+                "escrow_id": req.escrow_id,
+                "status": "rejected",
+                "verdict": verdict_dict,
+                "model_used": model_used,
+                "attempts_used": vault.submission_count,
+                "attempts_remaining": max(0, (vault.max_submissions or 3) - vault.submission_count),
+            }
+
+        collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
+        use_consensus = bool(vault.require_consensus) or req.require_consensus or (current_count >= 2)
         try:
-            verdict_dict, model_used = await run_ai_audit(
-                task                    = vault.task_description,
-                work                    = work_with_nft,
-                buyer_attachments       = stored_buyer_attachments,
-                worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
-                task_category           = req.task_category,
-                require_consensus       = req.require_consensus,
-                spec_link_snapshots     = stored_spec_snapshots,
-                evidence_link_snapshots = evidence_snapshots,
+            structured_result = await _run_structured_audit(
+                task=vault.task_description or "",
+                work=work_with_nft,
+                criteria=eval_criteria,
+                evidence_items=collected_evidence,
+                require_consensus=use_consensus,
+                attempt_count=current_count,
             )
-        except RefereeUnavailableError:
+        except HTTPException:
+            raise
+        except Exception:
             return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
+
+        used_models_list = structured_result.get("models_used", [])
+        overall_verdict = structured_result.get("overall_verdict", "INCONCLUSIVE")
+        overall_score = structured_result.get("overall_score", 0)
+
+        validation_errors = _validate_verdict(structured_result, eval_criteria, collected_evidence)
+        if validation_errors:
+            logger.warning(f"⚠️ Verdict validation errors for {req.escrow_id}: {validation_errors}")
+            overall_verdict = "INCONCLUSIVE"
+            structured_result["overall_verdict"] = "INCONCLUSIVE"
+            structured_result["validation_errors"] = validation_errors
+
+        if overall_verdict == "INCONCLUSIVE":
+            vault.evaluation_verdicts = structured_result.get("criteria_results")
+            vault.models_used = used_models_list
+            vault.prompt_version = PROMPT_VERSION
+            vh = hashlib.sha256(json.dumps(structured_result, sort_keys=True).encode()).hexdigest()
+            vault.verdict_hash = vh
+            db.commit()
+            guidance = (
+                "The AI referee could not reach a definitive verdict. "
+                "This attempt has NOT been counted. Please review the criteria feedback and resubmit with clearer evidence."
+            )
+            if validation_errors:
+                guidance += f" Validation issues: {'; '.join(validation_errors)}"
+            return JSONResponse({
+                "escrow_id": req.escrow_id,
+                "status": "inconclusive",
+                "verdict": structured_result,
+                "guidance": guidance,
+                "attempts_used": current_count,
+                "attempts_remaining": max(0, (vault.max_submissions or 3) - current_count),
+            }, status_code=200)
+
+        verdict_dict = {
+            "verdict": overall_verdict,
+            "score": overall_score,
+            "summary": structured_result.get("overall_reasoning", ""),
+            "details": structured_result.get("overall_reasoning", ""),
+            "criteria_met": [cr["criterion_id"] for cr in structured_result.get("criteria_results", []) if cr.get("verdict") == "PASS"],
+            "criteria_failed": [cr["criterion_id"] for cr in structured_result.get("criteria_results", []) if cr.get("verdict") == "FAIL"],
+            "criteria_results": structured_result.get("criteria_results", []),
+        }
+        model_used = ", ".join(used_models_list) if used_models_list else "gemini-2.5-flash"
+        evaluation_verdicts_json = structured_result.get("criteria_results")
 
     # Increment submission count only after a verdict is produced (server-side failures don't consume attempts)
     vault.submission_count = current_count + 1
+    if used_models_list:
+        vault.models_used = used_models_list
+    if evaluation_verdicts_json is not None:
+        vault.evaluation_verdicts = evaluation_verdicts_json
+    vault.prompt_version = PROMPT_VERSION
+    if not skip_ai:
+        vh = hashlib.sha256(json.dumps(verdict_dict, sort_keys=True).encode()).hexdigest()
+        vault.verdict_hash = vh
     db.commit()
 
     is_approved          = verdict_dict.get("verdict") == "PASS"
@@ -6528,7 +6990,45 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 ),
             }
 
-        revealed_fulfillment      = plaintext_fulfillment
+        revealed_fulfillment = plaintext_fulfillment
+        # ── CHALLENGE WINDOW: hold payment if release_mode starts with "challenge_window_hrs" ──
+        release_mode_str = vault.release_mode or "auto"
+        if release_mode_str.startswith("challenge_window_hrs"):
+            try:
+                challenge_hrs = int(release_mode_str.split(":")[1])
+                challenge_hrs = max(1, min(challenge_hrs, 24))
+            except (IndexError, ValueError):
+                challenge_hrs = 24
+            vault.status             = "PASS_CHALLENGE_WINDOW"
+            vault.challenge_deadline = datetime.now(timezone.utc) + timedelta(hours=challenge_hrs)
+            vault.delivery_status    = "PASS_CHALLENGE_WINDOW"
+            vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
+            vault.worker_submission = json.dumps({
+                "work":               req.work,
+                "attachments":        [a.dict() for a in (req.worker_attachments or [])],
+                "evidence_links":     req.evidence_links or [],
+                "evidence_snapshots": evidence_snapshots or [],
+                "verdict":            verdict_dict,
+                "delivered_at":       datetime.now(timezone.utc).isoformat(),
+                "escrow_id":          req.escrow_id,
+            })
+            vault.ai_verdict = json.dumps(verdict_dict)
+            vault.model_used = model_used
+            db.commit()
+            logger.info(f"⏳ PASS_CHALLENGE_WINDOW for {req.escrow_id} — deadline: {vault.challenge_deadline}")
+            return {
+                "escrow_id":            req.escrow_id,
+                "status":               "pass_challenge_window",
+                "verdict":              verdict_dict,
+                "model_used":           model_used,
+                "challenge_deadline":   vault.challenge_deadline.isoformat(),
+                "challenge_window_hrs": challenge_hrs,
+                "message": (
+                    f"Work passed evaluation. Payment will release automatically at "
+                    f"{vault.challenge_deadline.isoformat()} unless the buyer raises a challenge before then."
+                ),
+            }
+
         vault.status              = "RELEASED"
         vault.delivery_status     = "RELEASED"
         vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
