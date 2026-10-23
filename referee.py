@@ -528,9 +528,11 @@ async def _hourly_db_window():
         except Exception:
             _on_db_failure()
         if do_work:
+            logger.info(f"hourly window tick: snapshot {len(_jobs_snapshot.get('marketplace_jobs', []))} marketplace jobs, {len(_jobs_snapshot.get('open_jobs', []))} open jobs")
             await _refresh_jobs_snapshot()
             await _flush_tool_stats()
-            await _poll_expired_escrows_once()
+            checked = await _poll_expired_escrows_once()
+            logger.info(f"hourly window tick: escrows checked={checked}")
             if ENTERPRISE_WALLET:
                 await _poll_enterprise_subscriptions_once()
         await asyncio.sleep(3600)
@@ -1185,8 +1187,12 @@ def get_db():
     try:
         yield db
         _on_db_success()
-    except (SAOperationalError, SAInterfaceError, SADBAPIError):
+    except (SAOperationalError, SAInterfaceError):
         _on_db_failure()
+        raise
+    except SADBAPIError as e:
+        if e.connection_invalidated:
+            _on_db_failure()
         raise
     finally:
         db.close()
@@ -7368,6 +7374,7 @@ async def list_jobs(
     if snapshot["stale_since"] is not None and not snapshot["open_jobs"]:
         return JSONResponse({"error": "job list temporarily unavailable"}, status_code=503)
 
+    now = datetime.now(timezone.utc)
     jobs = list(snapshot["open_jobs"])
     # Filter expired jobs and compute expires_hrs at request time
     def _enrich_open_job(j):
@@ -7393,7 +7400,6 @@ async def list_jobs(
         jobs = [j for j in jobs if (j.get("budget_xrp") or 0) <= max_budget]
     jobs = jobs[:limit]
 
-    now = datetime.now(timezone.utc)
     age_s = int((now - snapshot["refreshed_at"]).total_seconds()) if snapshot["refreshed_at"] else None
     return {
         "jobs": jobs,
@@ -10008,11 +10014,13 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                     meta_result = tx_envelope.get("meta", {}).get("TransactionResult", "")
                     if tx_type == "EscrowFinish" and meta_result == "tesSUCCESS":
                         vault.status = "RELEASED"
+                        vault.delivery_status = "RELEASED"
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
                         return
                     elif tx_type == "EscrowCancel" and meta_result == "tesSUCCESS":
                         vault.status = "CANCELLED"
+                        vault.delivery_status = "CANCELLED"
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → CANCELLED (EscrowCancel found)")
                         return
@@ -10025,9 +10033,10 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
 
 
 async def _poll_expired_escrows_once():
-    """Single-run: cancel expired LOCKED escrows on-chain and mark them CANCELLED/ABANDONED in DB."""
+    """Single-run: cancel expired LOCKED escrows on-chain and mark them CANCELLED/ABANDONED in DB. Returns count checked."""
     if not referee_wallet or not _db_available:
-        return
+        return 0
+    checked = 0
     try:
         now = datetime.now(timezone.utc)
         db = next(get_db())
@@ -10182,10 +10191,12 @@ async def _poll_expired_escrows_once():
                                                    sequence if 'sequence' in dir() else vault.escrow_sequence, db)
                     else:
                         logger.warning(f"Failed to cancel expired escrow {vault.escrow_id}: {e}")
+            checked = len(stale) + len(orphaned) + len(expired)
         finally:
             db.close()
     except Exception as e:
         logger.warning(f"Expired escrow poller error: {e}")
+    return checked
 
 
 # Pollers are started in _lifespan via _hourly_db_window — @app.on_event("startup") is ignored
