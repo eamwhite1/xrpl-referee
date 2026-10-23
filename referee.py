@@ -4,6 +4,8 @@ import asyncio
 import httpx
 from decimal import Decimal, InvalidOperation
 import logging
+
+APP_VERSION = "7.0.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import sys
 import hashlib
@@ -124,9 +126,9 @@ async def _lifespan(app):
         _seed_public_issuers()
         # XUMM connectivity check
         await _verify_xumm()
-        # Prime OFAC list on startup in background — DB-seeded copy is already in _ofac_sanctioned_xrpl.
-        # Don't block startup waiting for the network fetch.
-        asyncio.create_task(_refresh_ofac_list())
+        # Prime OFAC list via background loop (6 h interval, 5 min initial delay).
+        # DB-seeded copy is already in _ofac_sanctioned_xrpl — no blocking at startup.
+        asyncio.create_task(_ofac_refresh_loop())
         asyncio.create_task(_check_gemini_models())
         # Single unified hourly DB window — all background DB work runs here sequentially.
         # Replaces separate enterprise + escrow pollers (which were being started as
@@ -524,6 +526,23 @@ def _ensure_hourly_window():
 async def _hourly_db_window():
     await asyncio.sleep(60)  # let app finish booting
     while True:
+        # Memory logging
+        rss = _read_proc_memory()
+        logger.info(f"MEM rss={rss // 1024}KB ofac_entries={len(_ofac_sanctioned_xrpl)} verify_ch={len(_verify_challenges)} x402_ch={len(_x402_challenges)} eth_ch={len(_eth_challenges)}")
+
+        # TTL sweeps for challenge dicts — cap at 5000 entries each
+        _now = datetime.now(timezone.utc)
+        for _d in (_verify_challenges,):
+            for _k in [k for k, v in list(_d.items()) if isinstance(v, tuple) and len(v) > 1 and v[1] < _now]:
+                _d.pop(_k, None)
+            if len(_d) > 5000:
+                for _k in list(_d.keys())[:-5000]:
+                    _d.pop(_k, None)
+        for _d in (_x402_challenges, _eth_challenges):
+            if len(_d) > 5000:
+                for _k in list(_d.keys())[:-5000]:
+                    _d.pop(_k, None)
+
         # Self-check DB at start of each tick — don't rely solely on flag
         do_work = False
         try:
@@ -647,7 +666,7 @@ def serve_ui(request: Request):
 <title>AgentTrust Referee</title></head>
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
-    return {"status": "online", "version": "7.0.0", "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+    return {"status": "online", "version": APP_VERSION, "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
 
 @app.get("/docs", include_in_schema=False)
 def serve_docs():
@@ -702,7 +721,7 @@ def health_check():
     ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
     return {
         "status": "online",
-        "version": "7.0.0",
+        "version": APP_VERSION,
         "protocol_version": "agenttrust/0.1.0",
         "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "timestamp": now,
@@ -768,7 +787,7 @@ def _build_agent_card():
         "name": "AgentTrust",
         "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS.",
         "url": "https://mcp.cryptovault.co.uk/mcp/",
-        "version": "7.0.0",
+        "version": APP_VERSION,
         "provider": {"organization": "Boxclever Media Ltd", "url": "https://www.cryptovault.co.uk"},
         "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": False},
         "defaultInputModes": ["application/json"],
@@ -840,7 +859,7 @@ async def serve_mcp_server_card():
             pass
     return {
         "name":        "AgentTrust Referee",
-        "version":     "7.0.0",
+        "version":     APP_VERSION,
         "description": (
             "Trust-minimized AI task verification with automatic XRP payment release. "
             "Post a task spec and work submission — get PASS/FAIL from an AI referee. "
@@ -1518,121 +1537,158 @@ class KycRecord(Base):
 
 
 # ---------------------------------------------------------------------------
-# OFAC SDN sanctions list — cached in memory, refreshed daily
+# OFAC SDN sanctions list — cached in memory, refreshed every 6 h
 # ---------------------------------------------------------------------------
 _ofac_sanctioned_xrpl: dict = {}  # {xrp_address: entity_name}
 _ofac_last_refresh: datetime = None
+_ofac_refresh_lock = asyncio.Lock()
 _OFAC_PRIMARY_URL  = "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.XML"
 _OFAC_FALLBACK_URL = "https://www.treasury.gov/ofac/downloads/sdn.xml"
 
 
-def _parse_ofac_xml(content: bytes) -> dict:
-    """Parse OFAC SDN XML bytes into {xrp_address: entity_name} for all XRP SDN entries."""
+def _parse_ofac_file(file_path: str) -> dict:
+    """Stream-parse OFAC SDN XML from a temp file using iterparse — O(1) peak memory."""
     import re as _re
     addr_map: dict = {}
+    ns = ''
+    current_name = ''
+    in_id = False
+    id_type_text = ''
+    id_num_text = ''
     try:
-        root = ET.fromstring(content)
-        # Detect namespace from root element (OFAC uses xmlns="http://tempuri.org/sdnList.xsd")
-        ns = ''
-        if root.tag.startswith('{'):
-            ns = root.tag.split('}', 1)[0] + '}'  # e.g. '{http://tempuri.org/sdnList.xsd}'
-        n = lambda tag: f'{ns}{tag}'
+        for event, el in ET.iterparse(file_path, events=("start", "end")):
+            tag = el.tag
+            # Detect namespace once from first element
+            if not ns and tag.startswith('{'):
+                ns = tag.split('}', 1)[0] + '}'
+            local = tag[len(ns):] if ns and tag.startswith(ns) else tag
 
-        entries = root.findall(f'.//{n("sdnEntry")}')
-        logger.info(f"OFAC XML: {len(entries)} sdnEntry elements, ns={ns!r}")
-
-        for entry in entries:
-            # Entity name: lastName for organizations, firstName+lastName for individuals
-            entity_name = ''
-            for name_tag in ('lastName', 'entityName', 'firstName'):
-                el = entry.find(n(name_tag))
-                if el is not None and el.text and el.text.strip():
-                    entity_name = el.text.strip()
-                    break
-
-            # Walk id elements inside idList
-            id_list = entry.find(n('idList'))
-            if id_list is None:
-                continue
-            for id_el in id_list.findall(n('id')):
-                id_type_el  = id_el.find(n('idType'))
-                id_num_el   = id_el.find(n('idNumber'))
-                if id_type_el is None or id_num_el is None:
-                    continue
-                if 'XRP' not in (id_type_el.text or '').upper():
-                    continue
-                addr = (id_num_el.text or '').strip()
-                if addr.startswith('r') and len(addr) >= 25:
-                    addr_map[addr] = entity_name or 'UNKNOWN SDN ENTITY'
-
-        logger.info(f"OFAC XML parsed (ET): {len(addr_map)} XRP addresses")
+            if event == "start":
+                if local == "sdnEntry":
+                    current_name = ''
+                elif local == "id":
+                    in_id = True
+                    id_type_text = ''
+                    id_num_text = ''
+            elif event == "end":
+                if local in ("lastName", "entityName", "firstName") and not current_name:
+                    current_name = (el.text or '').strip()
+                elif local == "idType" and in_id:
+                    id_type_text = (el.text or '').upper()
+                elif local == "idNumber" and in_id:
+                    id_num_text = (el.text or '').strip()
+                elif local == "id" and in_id:
+                    if 'XRP' in id_type_text:
+                        addr = id_num_text
+                        if addr.startswith('r') and len(addr) >= 25:
+                            addr_map[addr] = current_name or 'UNKNOWN SDN ENTITY'
+                    in_id = False
+                elif local == "sdnEntry":
+                    el.clear()  # free memory for processed entry
+        logger.info(f"OFAC iterparse: {len(addr_map)} XRP addresses")
     except Exception as parse_err:
-        logger.warning(f"OFAC ET parse error: {parse_err} — falling back to regex")
-        matches = _re.findall(
-            r'<idType>[^<]*XRP[^<]*</idType>.*?<idNumber>([^<]+)</idNumber>',
-            content.decode('utf-8', errors='replace'), _re.DOTALL | _re.IGNORECASE
-        )
-        for addr in matches:
-            addr = addr.strip()
-            if addr.startswith('r') and len(addr) >= 25:
-                addr_map[addr] = 'UNKNOWN SDN ENTITY'
-        logger.info(f"OFAC regex fallback: {len(addr_map)} XRP addresses")
-
-    # Also run the regex pass to catch any addresses the ET parser missed
-    # (different XML structures, nested elements, etc.)
-    if addr_map:
-        regex_addrs = _re.findall(
-            r'<idType>[^<]*XRP[^<]*</idType>.*?<idNumber>([^<]+)</idNumber>',
-            content.decode('utf-8', errors='replace'), _re.DOTALL | _re.IGNORECASE
-        )
-        for addr in regex_addrs:
-            addr = addr.strip()
-            if addr.startswith('r') and len(addr) >= 25 and addr not in addr_map:
-                addr_map[addr] = 'UNKNOWN SDN ENTITY'
-                logger.info(f"OFAC: regex found additional address not in ET results: {addr}")
-
-    # Cap at 10,000 entries (XRPL-relevant subset is typically much smaller)
-    if len(addr_map) > 10000:
-        logger.warning(f"OFAC: truncating addr_map from {len(addr_map)} to 10000 entries")
-        addr_map = dict(list(addr_map.items())[:10000])
-
+        logger.warning(f"OFAC iterparse error: {parse_err} — falling back to regex")
+        try:
+            with open(file_path, 'r', errors='replace') as f:
+                content_str = f.read()
+            matches = _re.findall(
+                r'<idType>[^<]*XRP[^<]*</idType>.*?<idNumber>([^<]+)</idNumber>',
+                content_str, _re.DOTALL | _re.IGNORECASE
+            )
+            for addr in matches:
+                addr = addr.strip()
+                if addr.startswith('r') and len(addr) >= 25:
+                    addr_map[addr] = 'UNKNOWN SDN ENTITY'
+            logger.info(f"OFAC regex fallback: {len(addr_map)} XRP addresses")
+        except Exception as fe:
+            logger.error(f"OFAC regex fallback also failed: {fe}")
     return addr_map
 
 
+def _read_proc_memory() -> int:
+    """Return RSS in bytes from /proc/self/status, or 0 on error."""
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
 async def _refresh_ofac_list():
-    """Download OFAC SDN XML with redirect-follow and fail-safe cache preservation."""
+    """Download OFAC SDN XML streaming to temp file — never loads full XML into memory."""
     global _ofac_sanctioned_xrpl, _ofac_last_refresh
-    now = datetime.now(timezone.utc)
-    if _ofac_last_refresh and (now - _ofac_last_refresh).total_seconds() < 3600:
-        return  # fresh — retry hourly so failures recover quickly
-    for url in (_OFAC_PRIMARY_URL, _OFAC_FALLBACK_URL):
-        try:
-            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
-                r = await client.get(url, headers={"User-Agent": "AgentTrust-Compliance/1.0"})
-            if r.status_code != 200 or len(r.content) < 1000:
-                logger.error(f"OFAC SDN fetch failed from {url}: status={r.status_code} body_len={len(r.content)}")
-                continue
-            addr_map = _parse_ofac_xml(r.content)
-            if not addr_map:
-                logger.warning(f"OFAC SDN: parsed 0 XRP addresses from {url} — skipping")
-                continue
-            _ofac_sanctioned_xrpl = addr_map
-            _ofac_last_refresh = now
-            logger.info(f"OFAC SDN refresh complete: {len(addr_map)} sanctioned XRP addresses loaded from {url}")
-            # Persist to DB so a restart doesn't run with an empty list
+    async with _ofac_refresh_lock:
+        now = datetime.now(timezone.utc)
+        if _ofac_last_refresh and (now - _ofac_last_refresh).total_seconds() < 3600:
+            return  # already fresh
+        import tempfile, gc
+        for url in (_OFAC_PRIMARY_URL, _OFAC_FALLBACK_URL):
+            tmp_path = None
             try:
-                with Session(engine) as db:
-                    db.execute(text(
-                        "INSERT INTO ofac_cache (fetched_at, address_count, address_list) VALUES (:ts, :cnt, :lst)"
-                    ), {"ts": now, "cnt": len(addr_map), "lst": json.dumps(addr_map)})
-                    db.commit()
-            except Exception as dbe:
-                logger.warning(f"OFAC DB persist failed (non-fatal): {dbe}")
-            return
+                with tempfile.NamedTemporaryFile(suffix='.xml', delete=False) as tmp:
+                    tmp_path = tmp.name
+                async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+                    async with client.stream("GET", url, headers={"User-Agent": "AgentTrust-Compliance/1.0"}) as resp:
+                        if resp.status_code != 200:
+                            logger.error(f"OFAC SDN fetch failed from {url}: status={resp.status_code}")
+                            continue
+                        total = 0
+                        with open(tmp_path, 'wb') as fh:
+                            async for chunk in resp.aiter_bytes(65536):
+                                fh.write(chunk)
+                                total += len(chunk)
+                if total < 1000:
+                    logger.error(f"OFAC SDN: suspiciously small download ({total} bytes) from {url}")
+                    continue
+                addr_map = await asyncio.to_thread(_parse_ofac_file, tmp_path)
+                if not addr_map:
+                    logger.warning(f"OFAC SDN: parsed 0 XRP addresses from {url} — skipping")
+                    continue
+                _ofac_sanctioned_xrpl = addr_map
+                _ofac_last_refresh = now
+                logger.info(f"OFAC SDN refresh complete: {len(addr_map)} sanctioned XRP addresses loaded from {url}")
+                # Persist to DB so a restart doesn't run with an empty list
+                try:
+                    with Session(engine) as db:
+                        db.execute(text(
+                            "INSERT INTO ofac_cache (fetched_at, address_count, address_list) VALUES (:ts, :cnt, :lst)"
+                        ), {"ts": now, "cnt": len(addr_map), "lst": json.dumps(addr_map)})
+                        db.commit()
+                except Exception as dbe:
+                    logger.warning(f"OFAC DB persist failed (non-fatal): {dbe}")
+                # Force GC + release memory to OS
+                gc.collect()
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                logger.error(f"OFAC SDN refresh failed from {url}: {e}")
+            finally:
+                if tmp_path:
+                    try:
+                        import os as _os
+                        _os.unlink(tmp_path)
+                    except Exception:
+                        pass
+        # All URLs failed — keep previous cache, do NOT update _ofac_last_refresh so it retries
+        logger.error("OFAC SDN: all fetch attempts failed — keeping previous cached set")
+
+
+async def _ofac_refresh_loop():
+    """Background loop: refresh OFAC list every 6 hours."""
+    await asyncio.sleep(300)  # 5 min initial delay to let app boot
+    while True:
+        try:
+            await _refresh_ofac_list()
         except Exception as e:
-            logger.error(f"OFAC SDN refresh failed from {url}: {e}")
-    # All URLs failed — keep previous cache, do NOT update _ofac_last_refresh so it retries
-    logger.error("OFAC SDN: all fetch attempts failed — keeping previous cached set")
+            logger.error(f"OFAC refresh loop error: {e}")
+        await asyncio.sleep(6 * 3600)
 
 
 def _load_ofac_from_db():
@@ -1662,8 +1718,7 @@ def _load_ofac_from_db():
 
 
 async def is_ofac_sanctioned(wallet_address: str) -> bool:
-    """Return True if wallet_address is on the OFAC SDN XRP list."""
-    await _refresh_ofac_list()
+    """Return True if wallet_address is on the OFAC SDN XRP list (reads in-memory dict only)."""
     return wallet_address in _ofac_sanctioned_xrpl
 
 
@@ -1692,7 +1747,11 @@ async def _load_xrpscan_well_known():
                 for entry in r.json():
                     addr = entry.get("account")
                     if addr:
-                        _xrpscan_well_known[addr] = entry
+                        # Store only the fields we use — keeps the dict small
+                        _xrpscan_well_known[addr] = {
+                            "name": entry.get("name", ""),
+                            "verified": entry.get("verified", False),
+                        }
         _xrpscan_wk_fetched = True
         logger.info(f"XRPScan well-known loaded: {len(_xrpscan_well_known)} entities")
     except Exception as e:
