@@ -127,6 +127,7 @@ async def _lifespan(app):
         # Prime OFAC list on startup in background — DB-seeded copy is already in _ofac_sanctioned_xrpl.
         # Don't block startup waiting for the network fetch.
         asyncio.create_task(_refresh_ofac_list())
+        asyncio.create_task(_check_gemini_models())
         # Single unified hourly DB window — all background DB work runs here sequentially.
         # Replaces separate enterprise + escrow pollers (which were being started as
         # independent tasks but are now single-run functions called by _hourly_db_window).
@@ -5142,6 +5143,32 @@ async def verify_eth_signature(req: EthSignatureRequest):
 # ---------------------------------------------------------------------------
 # 12. AI AUDIT ENGINE
 # ---------------------------------------------------------------------------
+async def _check_gemini_models():
+    """Log which configured Gemini models are available at startup."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set — AI audits will fail")
+        return
+    configured = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-pro").split(",") if m.strip()]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                headers={"x-goog-api-key": api_key}
+            )
+            if r.is_success:
+                available = {m["name"].split("/")[-1] for m in r.json().get("models", [])}
+                for model in configured:
+                    if model in available:
+                        logger.info(f"✅ Gemini model available: {model}")
+                    else:
+                        logger.warning(f"⚠️ Gemini model NOT found in API: {model}")
+            else:
+                logger.warning(f"Could not check Gemini models: {r.status_code}")
+    except Exception as e:
+        logger.warning(f"Gemini model check failed: {e}")
+
+
 async def run_ai_audit(
     task:                    str,
     work:                    str,
@@ -5156,13 +5183,10 @@ async def run_ai_audit(
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
-    candidates = [
-        "gemini-2.5-flash-preview-05-20",  # fast — primary model for all audits
-        "gemini-2.5-pro-preview-06-05",    # consensus / fallback
-        "gemini-2.0-flash-001",            # secondary fallback
-    ]
+    _gemini_models_env = os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-pro")
+    candidates = [m.strip() for m in _gemini_models_env.split(",") if m.strip()]
     # Premium consensus: Flash as primary, Pro as independent second opinion
-    CONSENSUS_MODEL = "gemini-2.5-pro-preview-06-05"
+    CONSENSUS_MODEL = "gemini-2.5-pro"
 
     domain_context = DOMAIN_PROMPTS.get(task_category, DOMAIN_PROMPTS["default"])
 
@@ -5273,7 +5297,7 @@ async def run_ai_audit(
 
                     if require_consensus:
                         # Premium consensus: Flash as primary, Pro as independent second opinion
-                        model_2 = CONSENSUS_MODEL if CONSENSUS_MODEL != model_id else "gemini-2.0-flash-001"
+                        model_2 = "gemini-2.5-flash" if model_id == "gemini-2.5-pro" else CONSENSUS_MODEL
                         try:
                             url2 = (
                                 f"https://generativelanguage.googleapis.com/v1beta/models/"

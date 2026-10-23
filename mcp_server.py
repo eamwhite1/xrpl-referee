@@ -1321,6 +1321,8 @@ async def check_wallet_sanctions(
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/wallet/sanctions/{wallet_address}")
+        if res.status_code == 400:
+            return {"error": "invalid_address", "message": res.json().get("detail", "Invalid XRPL address")}
         res.raise_for_status()
         return res.json()
 
