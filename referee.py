@@ -4,6 +4,7 @@ import asyncio
 import httpx
 from decimal import Decimal, InvalidOperation
 import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 import sys
 import hashlib
 import secrets
@@ -56,6 +57,10 @@ from sqlalchemy.orm import sessionmaker, Session
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger("RefereeBot")
+
+class RefereeUnavailableError(Exception):
+    """Raised when all AI models are exhausted — map to 503 at the route level."""
+    pass
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -808,18 +813,23 @@ def _agent_json_legacy_unused():
         "defaultOutputModes": ["application/json"],
     }
 
+_server_card_tools_cache: list = []
+
 @app.get("/.well-known/mcp/server-card.json")
 async def serve_mcp_server_card():
     """Smithery server card — lets Smithery skip scanning and use this metadata directly."""
-    # Build tool list dynamically from FastMCP registry to keep count in sync with tools/list
-    _tools_list = []
-    try:
-        from mcp_server import mcp as _mcp_ref
-        _registered = await _mcp_ref.get_tools()
-        for _t in _registered.values():
-            _tools_list.append({"name": _t.name, "description": (_t.description or "").split("\n")[0][:120]})
-    except Exception:
-        pass
+    global _server_card_tools_cache
+    # Build tool list dynamically from FastMCP registry; cache once we get a non-empty result
+    _tools_list = _server_card_tools_cache
+    if not _tools_list:
+        try:
+            from mcp_server import mcp as _mcp_ref
+            _registered = await _mcp_ref.get_tools()
+            if _registered:
+                _tools_list = [{"name": _t.name, "description": (_t.description or "").split("\n")[0][:120]} for _t in _registered.values()]
+                _server_card_tools_cache = _tools_list
+        except Exception:
+            pass
     return {
         "name":        "AgentTrust Referee",
         "version":     "7.0.0",
@@ -1940,7 +1950,7 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
             "level": "kyc_required",
             "usd_value": round(usd_value, 2),
             "error": "kyc_required",
-            "kyc_url": "/kyc/verify",
+            "kyc_url": "https://www.cryptovault.co.uk/kyc/",
             "message": (
                 f"This escrow value (~${usd_value:,.0f} USD) exceeds the ${THRESHOLD_BLOCK_USD:,} USD "
                 f"limit for unverified wallets. Complete identity verification to unlock escrows up to "
@@ -2380,6 +2390,26 @@ def run_migrations():
                 conn.commit()
             except Exception as e:
                 logger.warning(f"Migration skipped ({sql[:60]}...): {e}")
+    # Warn about PENDING vaults with tx_hash (may be LOCKED on-chain — needs manual review)
+    try:
+        pending_with_hash = conn.execute(text(
+            "SELECT escrow_id FROM escrow_vault WHERE status='PENDING' AND escrow_tx_hash IS NOT NULL"
+        )).fetchall()
+        for row in pending_with_hash:
+            logger.warning(f"⚠️ PENDING vault {row[0]} has escrow_tx_hash set — may be LOCKED on-chain. Run scripts/audit_abandoned.py to verify.")
+    except Exception:
+        pass
+
+    # Warn about ABANDONED vaults with tx_hash (may have been incorrectly abandoned)
+    try:
+        abandoned_with_hash = conn.execute(text(
+            "SELECT escrow_id FROM escrow_vault WHERE status='ABANDONED' AND escrow_tx_hash IS NOT NULL"
+        )).fetchall()
+        for row in abandoned_with_hash:
+            logger.warning(f"⚠️ ABANDONED vault {row[0]} has escrow_tx_hash set — check on-chain status with scripts/audit_abandoned.py.")
+    except Exception:
+        pass
+
     logger.info("✅ Database migrations complete.")
 
 
@@ -3109,16 +3139,9 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                 used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == free_wallet).count()
 
             if used < FREE_AUDIT_LIMIT:
-                # Bootstrapped wallets (created via create_agent_wallet) always qualify — no score check.
-                # Non-bootstrapped wallets must meet the minimum trust score.
+                # Only wallets registered through AgentTrust qualify (via create_agent_wallet or register_wallet_free_tier).
+                # Score-only qualification removed — it allowed free credits for any established wallet without ownership proof.
                 qualifies = is_bootstrapped
-                if not qualifies:
-                    try:
-                        score_data = await compute_xrpl_trust_score(free_wallet, db)
-                        score = score_data.get("score", 0)
-                    except Exception:
-                        score = 0
-                    qualifies = score >= FREE_AUDIT_MIN_SCORE
 
                 if qualifies:
                     # Check global daily cap before granting free credit
@@ -3146,8 +3169,8 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                 else:
                     _raise_402(
                         resource,
-                        f"Wallet trust score is below the free-tier minimum ({FREE_AUDIT_MIN_SCORE}). "
-                        f"Wallets created through AgentTrust (create_agent_wallet) bypass this check. "
+                        f"No free credits. Create a wallet via the create_agent_wallet MCP tool (includes 3 free escrows), "
+                        f"or register an existing wallet with ownership proof via register_wallet_free_tier. "
                         f"Otherwise pay $0.10 (XRP/RLUSD to {PROTOCOL_WALLET}, or USDC on Base chain 8453) and include the tx hash as fee_hash.",
                         min_xrp=required_xrp,
                     )
@@ -4879,38 +4902,6 @@ async def batch_wallet_scores(
     }
 
 
-@app.get("/wallet/debug-age/{address}", include_in_schema=False)
-async def debug_wallet_age(address: str):
-    """Debug endpoint: shows raw result from each age-calculation source."""
-    from datetime import datetime, timezone
-    results = {}
-
-    # Source 1: data.ripple.com
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(f"https://data.ripple.com/v2/accounts/{address}",
-                                 headers={"Accept": "application/json"})
-        results["data_ripple_com"] = {"status": r.status_code, "body": r.json()}
-    except Exception as e:
-        results["data_ripple_com"] = {"error": str(e)}
-
-    # Source 2: xrplcluster.com (no-forward, just to see what it returns)
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.post(XRPL_URL, json={
-                "method": "account_tx",
-                "params": [{"account": address, "limit": 1, "forward": True,
-                            "ledger_index_min": 0, "ledger_index_max": -1}]
-            })
-        txs = r.json().get("result", {}).get("transactions", [])
-        results["xrplcluster_forward"] = {"status": r.status_code, "tx_count": len(txs),
-                                          "first_tx": txs[0] if txs else None}
-    except Exception as e:
-        results["xrplcluster_forward"] = {"error": str(e)}
-
-    return results
-
-
 class WalletRatingRequest(BaseModel):
     escrow_id:     str
     rater_address: str
@@ -5166,14 +5157,12 @@ async def run_ai_audit(
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
     candidates = [
-        "gemini-2.5-flash",   # fast — primary model for all audits
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-2.5-pro",     # slower — fallback only (also used as consensus model)
-        "gemini-1.5-pro",
+        "gemini-2.5-flash-preview-05-20",  # fast — primary model for all audits
+        "gemini-2.5-pro-preview-06-05",    # consensus / fallback
+        "gemini-2.0-flash-001",            # secondary fallback
     ]
-    # Premium consensus: Flash for speed, Pro for depth
-    CONSENSUS_MODEL = "gemini-2.5-pro"
+    # Premium consensus: Flash as primary, Pro as independent second opinion
+    CONSENSUS_MODEL = "gemini-2.5-pro-preview-06-05"
 
     domain_context = DOMAIN_PROMPTS.get(task_category, DOMAIN_PROMPTS["default"])
 
@@ -5269,9 +5258,9 @@ async def run_ai_audit(
             try:
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model_id}:generateContent?key={api_key}"
+                    f"{model_id}:generateContent"
                 )
-                res = await client.post(url, json=payload, timeout=25.0)
+                res = await client.post(url, json=payload, timeout=25.0, headers={"x-goog-api-key": api_key})
 
                 if res.status_code == 200:
                     data         = res.json()
@@ -5284,13 +5273,13 @@ async def run_ai_audit(
 
                     if require_consensus:
                         # Premium consensus: Flash as primary, Pro as independent second opinion
-                        model_2 = CONSENSUS_MODEL if CONSENSUS_MODEL != model_id else "gemini-1.5-pro"
+                        model_2 = CONSENSUS_MODEL if CONSENSUS_MODEL != model_id else "gemini-2.0-flash-001"
                         try:
                             url2 = (
                                 f"https://generativelanguage.googleapis.com/v1beta/models/"
-                                f"{model_2}:generateContent?key={api_key}"
+                                f"{model_2}:generateContent"
                             )
-                            res2 = await client.post(url2, json=payload, timeout=60.0)
+                            res2 = await client.post(url2, json=payload, timeout=60.0, headers={"x-goog-api-key": api_key})
                             if res2.status_code == 200:
                                 raw2   = res2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                                 clean2 = raw2.replace("```json", "").replace("```", "").strip()
@@ -5323,7 +5312,7 @@ async def run_ai_audit(
                 logger.warning(f"Model {model_id} failed: {e}")
                 continue
 
-    raise Exception("AI Gateway Failure: all models exhausted.")
+    raise RefereeUnavailableError("AI Gateway Failure: all models exhausted.")
 
 
 # ---------------------------------------------------------------------------
@@ -5360,17 +5349,20 @@ async def standalone_audit(
     if response is not None and fee_result.get("payment_response_header"):
         response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
-    verdict_dict, model_used = await run_ai_audit(
-        task               = req.task,
-        work               = req.work,
-        buyer_attachments  = [],
-        worker_attachments = [
-            {"filename": a.filename, "mime_type": a.mime_type, "data": a.data}
-            for a in (req.attachments or [])
-        ],
-        task_category      = req.task_category,
-        require_consensus  = req.require_consensus,
-    )
+    try:
+        verdict_dict, model_used = await run_ai_audit(
+            task               = req.task,
+            work               = req.work,
+            buyer_attachments  = [],
+            worker_attachments = [
+                {"filename": a.filename, "mime_type": a.mime_type, "data": a.data}
+                for a in (req.attachments or [])
+            ],
+            task_category      = req.task_category,
+            require_consensus  = req.require_consensus,
+        )
+    except RefereeUnavailableError:
+        return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
 
     return {
         "status":          "approved" if verdict_dict.get("verdict") == "PASS" else "rejected",
@@ -5478,7 +5470,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
                 status_code=403,
                 detail={
                     "error": "kyc_required",
-                    "kyc_url": "/kyc/verify",
+                    "kyc_url": "https://www.cryptovault.co.uk/kyc/",
                     "message": threshold["message"],
                 },
             )
@@ -5708,6 +5700,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "worker_email_sent":   bool(req.worker_email),
         "evaluate_token":      evaluate_token,
         "evaluate_token_hint": "Share this token with the worker — they must include it in evaluate_escrow_work(). Store it securely; it is not shown again.",
+        "free_tier":           fee_result.get("free_tier", False),
+        "audits_remaining":    fee_result.get("audits_remaining", None),
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
@@ -6017,10 +6011,11 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
                 detail="XRPL network busy — transaction queue full. Wait a few seconds and retry.",
             )
         if engine not in ("tesSUCCESS", "terQUEUED") and not engine.startswith("tes"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"XRPL rejected transaction: {engine} — {res.get('engine_result_message', '')}",
-            )
+            return JSONResponse({
+                "error": "xrpl_rejected",
+                "engine_result": engine or "unknown",
+                "engine_result_message": res.get("engine_result_message", ""),
+            }, status_code=422)
     except HTTPException:
         raise
     except Exception as e:
@@ -6030,9 +6025,14 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     sequence = res.get("tx_json", {}).get("Sequence")
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
+    vault.status = "LOCKED"
     if not vault.escrow_owner:
         vault.escrow_owner = vault.buyer_address
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        logger.error(f"DB commit failed after successful XRPL submit for {escrow_id}: {e} — tx={tx_hash}")
+        db.rollback()
 
     logger.info(f"✅ Auto-confirmed via submit: escrow={escrow_id} hash={tx_hash[:16] if tx_hash else '?'}... engine={engine}")
 
@@ -6168,10 +6168,6 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             pass
     if total_bytes > 50 * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Total attachment size exceeds 50 MB.")
-
-    # Increment submission count immediately (before audit — counts even failed attempts)
-    vault.submission_count = current_count + 1
-    db.commit()
 
     stored_buyer_attachments = None
     if vault.buyer_attachments:
@@ -6338,16 +6334,23 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         model_used = "none (proof-gate release)"
         logger.info(f"✅ AI SKIPPED (proof-gate release) for {req.escrow_id}: {proof_summary}")
     else:
-        verdict_dict, model_used = await run_ai_audit(
-            task                    = vault.task_description,
-            work                    = work_with_nft,
-            buyer_attachments       = stored_buyer_attachments,
-            worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
-            task_category           = req.task_category,
-            require_consensus       = req.require_consensus,
-            spec_link_snapshots     = stored_spec_snapshots,
-            evidence_link_snapshots = evidence_snapshots,
-        )
+        try:
+            verdict_dict, model_used = await run_ai_audit(
+                task                    = vault.task_description,
+                work                    = work_with_nft,
+                buyer_attachments       = stored_buyer_attachments,
+                worker_attachments      = [a.dict() for a in req.worker_attachments] if req.worker_attachments else None,
+                task_category           = req.task_category,
+                require_consensus       = req.require_consensus,
+                spec_link_snapshots     = stored_spec_snapshots,
+                evidence_link_snapshots = evidence_snapshots,
+            )
+        except RefereeUnavailableError:
+            return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
+
+    # Increment submission count only after a verdict is produced (server-side failures don't consume attempts)
+    vault.submission_count = current_count + 1
+    db.commit()
 
     is_approved          = verdict_dict.get("verdict") == "PASS"
     revealed_fulfillment = None
@@ -8110,53 +8113,6 @@ class NftIssuerWalletUpdate(BaseModel):
     contact_email: str           # must match registered email to authorise
     wallets:       list          # complete new list of wallets (replaces existing)
 
-@app.get("/nft/issuers/debug-seed", include_in_schema=False)
-async def debug_seed():
-    """Manually run the seed and report results — for diagnostics only."""
-    db_url = os.getenv("DATABASE_URL", "NOT SET")
-    db_url_safe = db_url[:40] + "..." if len(db_url) > 40 else db_url
-    results = []
-    errors = []
-    try:
-        db = SessionLocal()
-        try:
-            for entry in _PUBLIC_ISSUERS:
-                try:
-                    exists = db.execute(
-                        text("SELECT id FROM nft_issuer WHERE wallet_address = :w"),
-                        {"w": entry["wallet_address"]}
-                    ).fetchone()
-                    if exists:
-                        results.append({"name": entry["name"], "status": "already exists"})
-                        continue
-                    db.execute(text("""
-                        INSERT INTO nft_issuer
-                            (wallet_address, name, category, description, website, verified, created_at)
-                        VALUES
-                            (:wallet_address, :name, :category, :description, :website, :verified, :created_at)
-                    """), {
-                        "wallet_address": entry["wallet_address"],
-                        "name": entry["name"],
-                        "category": entry["category"],
-                        "description": entry["description"],
-                        "website": entry["website"],
-                        "verified": "public",
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    db.commit()
-                    results.append({"name": entry["name"], "status": "inserted"})
-                except Exception as e:
-                    db.rollback()
-                    errors.append({"name": entry["name"], "error": str(e)})
-            total = db.execute(text("SELECT COUNT(*) FROM nft_issuer")).scalar()
-        finally:
-            db.close()
-    except Exception as e:
-        return {"fatal_error": str(e), "database_url": db_url_safe}
-    return {"seeded": results, "errors": errors, "total_issuers_in_db": total, "database_url": db_url_safe,
-            "columns": [r[0] for r in db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='nft_issuer' ORDER BY ordinal_position")).fetchall()]}
-
-
 @app.get("/nft/issuers")
 async def list_nft_issuers(q: str = None, category: str = None, include_pending: bool = False, db: Session = Depends(get_db)):
     if include_pending:
@@ -8655,6 +8611,8 @@ async def check_sanctions(address: str):
     Returns sanctioned, risk_score, risk_level, entity, category, source.
     Always returns a result — never raises on data unavailability.
     """
+    if not address or not address.startswith("r") or not (25 <= len(address) <= 34):
+        raise HTTPException(status_code=400, detail=f"Invalid XRPL address: {address!r}. Must start with 'r' and be 25-34 characters.")
     sanctioned, detail = await is_wallet_sanctioned(address)
     now = datetime.now(timezone.utc)
     ofac_age_s = (now - _ofac_last_refresh).total_seconds() if _ofac_last_refresh else None
@@ -10048,6 +10006,10 @@ async def _poll_expired_escrows_once():
                 EscrowVault.created_at < stale_cutoff,
             ).all()
             for vault in stale:
+                # Skip vaults with a tx hash — they may have been submitted and are LOCKED on-chain
+                if vault.escrow_tx_hash:
+                    logger.warning(f"PENDING vault {vault.escrow_id} has escrow_tx_hash set — skipping abandon, needs manual review")
+                    continue
                 vault.status = "ABANDONED"
                 age_hours = (now - vault.created_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
                 logger.info(f"ABANDONED escrow {vault.escrow_id}: age={age_hours:.1f}h, reason=stale PENDING (no on-chain tx submitted)")

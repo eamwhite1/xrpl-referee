@@ -360,7 +360,7 @@ async def create_escrow_vault(
             except Exception:
                 data = {}
             return {"error": "payment_required", "message": "Protocol fee required. Pay $0.10 (XRP or RLUSD to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and pass the tx hash as fee_hash.", "detail": data.get("detail", data)}
-        if not res.is_success():
+        if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
@@ -525,7 +525,7 @@ async def evaluate_escrow_work(
             except Exception:
                 detail = res.text[:400]
             return {"error": "forbidden", "message": detail}
-        if not res.is_success():
+        if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
@@ -613,7 +613,7 @@ async def reissue_evaluate_token(
             f"{REFEREE_BASE}/escrow/{escrow_id}/reissue-token",
             json={"wallet_address": wallet_address, "tx_hash": tx_hash},
         )
-        if not res.is_success():
+        if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
@@ -646,7 +646,13 @@ async def get_escrow_info(
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/escrow/{escrow_id}")
-        res.raise_for_status()
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"No escrow found with id {escrow_id}"}
+        if not res.is_success:
+            try:
+                return {"error": "request_failed", "status": res.status_code, "detail": res.json()}
+            except Exception:
+                return {"error": "request_failed", "status": res.status_code, "detail": res.text}
         return res.json()
 
 
@@ -1219,7 +1225,13 @@ async def view_job(
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/jobs/{job_id}")
-        res.raise_for_status()
+        if res.status_code == 404:
+            return {"error": "not_found", "message": f"No job found with id {job_id}"}
+        if not res.is_success:
+            try:
+                return {"error": "request_failed", "status": res.status_code, "detail": res.json()}
+            except Exception:
+                return {"error": "request_failed", "status": res.status_code, "detail": res.text}
         return res.json()
 
 
@@ -1884,6 +1896,8 @@ async def get_dex_quote(
     """
     Get a live XRP to RLUSD conversion quote via the XRPL DEX.
 
+    Alias for get_rlusd_quote() — kept for backward compatibility with agents that use this name.
+
     Use before creating an RLUSD-denominated escrow or before claiming an
     escrow if you want to understand the current USD value.
 
@@ -2380,7 +2394,7 @@ async def register_wallet_free_tier(
             f"{REFEREE_BASE}/wallet/{wallet_address}/register-free-tier",
             json={"tx_hash": tx_hash},
         )
-        if not res.is_success():
+        if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
