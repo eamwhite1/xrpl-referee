@@ -549,12 +549,74 @@ async def _db_recovery_loop():
 # Unified hourly DB window — single task; all DB work happens here once per hour
 # ---------------------------------------------------------------------------
 _hourly_window_task: asyncio.Task = None
+_release_sweep_task: asyncio.Task = None
 
 
 def _ensure_hourly_window():
-    global _hourly_window_task
+    global _hourly_window_task, _release_sweep_task
     if _hourly_window_task is None or _hourly_window_task.done():
         _hourly_window_task = asyncio.create_task(_hourly_db_window())
+    if _release_sweep_task is None or _release_sweep_task.done():
+        _release_sweep_task = asyncio.create_task(_release_sweep_loop())
+
+
+async def _release_sweep_loop():
+    """Runs PASS_CHALLENGE_WINDOW and RELEASING sweeps every 5 minutes."""
+    await asyncio.sleep(30)  # let startup complete
+    while True:
+        try:
+            _now = datetime.now(timezone.utc)
+            try:
+                with SessionLocal() as _db:
+                    expired_cw = _db.query(EscrowVault).filter(
+                        EscrowVault.status == "PASS_CHALLENGE_WINDOW",
+                        EscrowVault.challenge_deadline <= _now,
+                    ).all()
+                    for _v in expired_cw:
+                        _v.status = "RELEASING"
+                        _v.updated_at = _now
+                        logger.info(f"[5min sweep] RELEASING {_v.escrow_id} after challenge window expired")
+                        _send_challenge_window_expired_email(_v)
+                    if expired_cw:
+                        _db.commit()
+                    for _v in expired_cw:
+                        try:
+                            if _v.escrow_sequence and _v.condition and _v.fulfillment:
+                                _fulfillment = decrypt_fulfillment(_v.fulfillment)
+                                asyncio.create_task(auto_finish_escrow(
+                                    _v.escrow_id, _v.escrow_sequence,
+                                    _v.escrow_owner or _v.buyer_address,
+                                    _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
+                                ))
+                        except Exception as _fe:
+                            logger.error(f"[5min sweep] auto_finish queue failed for {_v.escrow_id}: {_fe}")
+            except Exception as _e:
+                logger.error(f"[5min sweep] challenge-window sweep error: {_e}")
+            try:
+                with SessionLocal() as _db:
+                    stuck = _db.query(EscrowVault).filter(
+                        EscrowVault.status == "RELEASING",
+                        EscrowVault.release_tx_hash == None,
+                        EscrowVault.updated_at != None,
+                        EscrowVault.updated_at <= _now - timedelta(minutes=10),
+                    ).all()
+                    for _v in stuck:
+                        try:
+                            if _v.escrow_sequence and _v.condition and _v.fulfillment:
+                                _fulfillment = decrypt_fulfillment(_v.fulfillment)
+                                asyncio.create_task(auto_finish_escrow(
+                                    _v.escrow_id, _v.escrow_sequence,
+                                    _v.escrow_owner or _v.buyer_address,
+                                    _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
+                                ))
+                                logger.warning(f"[5min sweep] retrying auto_finish for stuck {_v.escrow_id}")
+                        except Exception as _se:
+                            logger.error(f"[5min sweep] RELEASING retry error for {_v.escrow_id}: {_se}")
+            except Exception as _e:
+                logger.error(f"[5min sweep] RELEASING sweep error: {_e}")
+        except Exception as _outer:
+            logger.error(f"[5min sweep] outer error: {_outer}")
+        await asyncio.sleep(300)
 
 
 async def _hourly_db_window():
@@ -900,18 +962,11 @@ def robots_txt():
     ])
 
 def _build_agent_card():
-    """Build A2A agent card from live FastMCP tool registry."""
-    skills = []
-    try:
-        from mcp_server import mcp as _mcp_ref
-        for t in _get_mcp_tools(_mcp_ref):
-            skills.append({
-                "id": t["name"],
-                "name": t["name"].replace("_", " ").title(),
-                "description": t["description"],
-            })
-    except Exception as e:
-        logger.warning(f"agent-card tool enumeration failed: {e}")
+    """Build A2A agent card from cached FastMCP tool registry."""
+    skills = [
+        {"id": t["name"], "name": t["name"].replace("_", " ").title(), "description": t["description"]}
+        for t in _server_card_tools_cache
+    ]
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust",
@@ -927,16 +982,20 @@ def _build_agent_card():
     }
 
 @app.get("/.well-known/agent-card.json")
-def serve_agent_card():
+async def serve_agent_card():
     """A2A agent card generated from live FastMCP tool registry."""
+    if not _server_card_tools_cache:
+        await _prime_server_card_cache()
     return _build_agent_card()
 
 @app.get("/.well-known/agent.json")
-def serve_agent_json():
+async def serve_agent_json():
     """A2A agent card (alias for older clients). Also serves static file if present."""
     path = ".well-known/agent.json"
     if os.path.exists(path):
         return FileResponse(path, media_type="application/json")
+    if not _server_card_tools_cache:
+        await _prime_server_card_cache()
     return _build_agent_card()
 
 @app.get("/.well-known/agent.json_legacy", include_in_schema=False)
@@ -973,7 +1032,7 @@ def _agent_json_legacy_unused():
 _server_card_tools_cache: list = []
 
 
-def _get_mcp_tools(mcp_ref) -> list:
+async def _get_mcp_tools(mcp_ref) -> list:
     """Extract tool list from FastMCP regardless of version. Returns [{name, description}]."""
     # Try _tool_manager._tools (attribute-based, works for most versions)
     tool_map = getattr(getattr(mcp_ref, "_tool_manager", None), "_tools", None) or {}
@@ -985,15 +1044,24 @@ def _get_mcp_tools(mcp_ref) -> list:
             first_line = doc.split("\n")[0][:120]
             result.append({"name": tool_name, "description": first_line or tool_name})
         return result
-    # Fallback: try list_tools() handler (FastMCP 2.x)
-    try:
-        import asyncio as _asyncio
-        if not _asyncio.get_event_loop().is_running():
-            tools_result = _asyncio.get_event_loop().run_until_complete(mcp_ref.list_tools())
+    # Prefer async list_tools (FastMCP 2.x)
+    if hasattr(mcp_ref, "list_tools"):
+        try:
+            tools_result = await mcp_ref.list_tools()
             if tools_result:
                 return [{"name": t.name, "description": (t.description or "").split("\n")[0][:120]} for t in tools_result]
-    except Exception:
-        pass
+        except Exception as _e:
+            logger.debug(f"_get_mcp_tools list_tools failed: {_e}")
+    # Fallback: get_tools()
+    if hasattr(mcp_ref, "get_tools"):
+        try:
+            tools_result = await mcp_ref.get_tools()
+            if tools_result:
+                if isinstance(tools_result, dict):
+                    return [{"name": k, "description": (getattr(v, "description", "") or "").split("\n")[0][:120]} for k, v in tools_result.items()]
+                return [{"name": t.name, "description": (t.description or "").split("\n")[0][:120]} for t in tools_result]
+        except Exception as _e:
+            logger.debug(f"_get_mcp_tools get_tools failed: {_e}")
     return []
 
 
@@ -1005,7 +1073,7 @@ async def _prime_server_card_cache():
     await asyncio.sleep(5)  # give FastMCP lifespan time to register tools
     try:
         from mcp_server import mcp as _mcp_ref
-        _registered = _get_mcp_tools(_mcp_ref)
+        _registered = await _get_mcp_tools(_mcp_ref)
         if _registered:
             _server_card_tools_cache = _registered
             logger.info(f"✅ Server-card cache primed: {len(_server_card_tools_cache)} tools")
@@ -1022,7 +1090,7 @@ async def serve_mcp_server_card():
     if not _tools_list:
         try:
             from mcp_server import mcp as _mcp_ref
-            _tools_list = _get_mcp_tools(_mcp_ref)
+            _tools_list = await _get_mcp_tools(_mcp_ref)
             if _tools_list:
                 _server_card_tools_cache = _tools_list
         except Exception:
@@ -5653,6 +5721,36 @@ def _execute_code_gates(work: str, criteria: list) -> list:
     return failures
 
 
+def _validate_criteria_v2(criteria: list):
+    """Validate criteria list at creation time. Raises HTTPException on violation."""
+    import re as _re_std
+    if not criteria:
+        return
+    if len(criteria) > 10:
+        raise HTTPException(status_code=400, detail=f"Too many criteria: {len(criteria)} (max 10)")
+    regex_count = sum(1 for c in criteria if c.get("type") == "code" and c.get("gate") == "regex")
+    if regex_count > 3:
+        raise HTTPException(status_code=400, detail=f"Too many regex criteria: {regex_count} (max 3)")
+    _NESTED_QUANT_RE = _re_std.compile(r'\([^()]*[+*][^()]*\)[+*]|\([^()]*[+*]\)[+*?]')
+    for c in criteria:
+        if c.get("type") == "code" and c.get("gate") == "regex":
+            pattern = c.get("pattern", "")
+            if len(pattern) > 100:
+                raise HTTPException(status_code=400, detail=f"Regex pattern exceeds 100 chars in criterion {c.get('id','?')}")
+            if _NESTED_QUANT_RE.search(pattern):
+                raise HTTPException(status_code=400, detail=f"Regex pattern may cause catastrophic backtracking (nested quantifiers) in criterion {c.get('id','?')}: {pattern!r}")
+            try:
+                import regex as _rgx
+                _rgx.compile(pattern)
+            except ImportError:
+                try:
+                    _re_std.compile(pattern)
+                except _re_std.error as _re_err:
+                    raise HTTPException(status_code=400, detail=f"Invalid regex pattern in criterion {c.get('id','?')}: {_re_err}")
+            except Exception as _re_err:
+                raise HTTPException(status_code=400, detail=f"Invalid regex pattern in criterion {c.get('id','?')}: {_re_err}")
+
+
 async def _fetch_url_content(url: str):
     """Fetch a URL with SSRF protection and 500KB cap. Returns text or None."""
     import socket as _socket
@@ -6649,9 +6747,20 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     _rm = (req.release_mode or "auto").strip()
     if not _RELEASE_MODE_RE.match(_rm):
         raise HTTPException(status_code=400, detail={"error": "invalid_release_mode", "message": "release_mode must be 'auto' or 'challenge_window_hrs:N' where N is 1-24"})
+    if _rm.startswith("challenge_window_hrs:") and getattr(req, "cancel_after_hrs", None):
+        try:
+            _cw_hrs = float(_rm.split(":")[1])
+            _slack_hrs = req.cancel_after_hrs
+            if _cw_hrs + 1.0 > _slack_hrs:
+                raise HTTPException(status_code=400, detail=f"Challenge window ({_cw_hrs}h) + 1h tick slack exceeds cancel_after_hrs ({_slack_hrs}h)")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
-    # Reject unsupported gate types before fee check
+    # Reject unsupported gate types before fee check; validate caps and regex safety
     _criteria_check = _parse_criteria_safe(req.criteria) or []
+    _validate_criteria_v2(_criteria_check)
     for _c in _criteria_check:
         if _c.get("type") == "code" and _c.get("gate") in _UNSUPPORTED_GATES:
             raise HTTPException(status_code=400, detail={"error": "gate_not_supported", "gate": _c.get("gate"), "message": f"Gate '{_c.get('gate')}' is not yet implemented. Use an evidence criterion instead."})
@@ -7268,6 +7377,41 @@ def _is_valid_xrpl_address(addr: str) -> bool:
     return bool(addr and re.match(r'^r[1-9A-HJ-NP-Za-km-z]{24,33}$', addr))
 
 
+def _verify_seller_ownership(seller_address: str, escrow_id: str, buyer_email: str,
+                              api_key_header: Optional[str], sig_header: Optional[str],
+                              db: Session) -> bool:
+    """Verify caller controls seller_address. Raises 401 if proof absent/invalid."""
+    if api_key_header:
+        key_hash = hashlib.sha256(api_key_header.encode()).hexdigest()
+        key_rec = db.query(EnterpriseApiKey).filter(EnterpriseApiKey.key_hash == key_hash, EnterpriseApiKey.revoked == False).first()
+        if key_rec:
+            linked = db.query(LinkedWallet).filter(
+                LinkedWallet.account_id == key_rec.account_id,
+                LinkedWallet.wallet_address == seller_address,
+            ).first()
+            if linked:
+                return True
+    if sig_header:
+        import time as _time
+        try:
+            parts = sig_header.rsplit(":", 1)
+            if len(parts) == 2:
+                sig_b64, ts_str = parts
+                ts = int(ts_str)
+                if abs(_time.time() - ts) > 300:
+                    raise HTTPException(status_code=401, detail="Seller signature expired (must be within 5 minutes)")
+                message = f"agenttrust-request:{escrow_id}:{buyer_email}:{ts}"
+                from xrpl.core.keypairs import verify as xrpl_verify
+                sig_bytes = base64.b64decode(sig_b64)
+                if xrpl_verify(message.encode().hex().upper(), sig_bytes.hex().upper(), seller_address):
+                    return True
+        except HTTPException:
+            raise
+        except Exception as _e:
+            logger.debug(f"Seller sig verification error: {_e}")
+    raise HTTPException(status_code=401, detail="Seller ownership proof required: provide an enterprise API key (x-api-key header) linked to seller_address, or an x-seller-signature header (base64sig:ts)")
+
+
 @app.post("/escrow/request")
 async def request_escrow(req: EscrowRequestBody, request: Request, db: Session = Depends(get_db)):
     """Seller-initiated deal: propose an escrow to a buyer, returns pay_url."""
@@ -7307,7 +7451,18 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
     _rm_req = (getattr(req, 'release_mode', None) or "auto").strip()
     if not _RELEASE_MODE_RE.match(_rm_req):
         raise HTTPException(status_code=400, detail={"error": "invalid_release_mode", "message": "release_mode must be 'auto' or 'challenge_window_hrs:N' where N is 1-24"})
+    if _rm_req.startswith("challenge_window_hrs:") and getattr(req, "cancel_after_hrs", None):
+        try:
+            _cw_hrs_req = float(_rm_req.split(":")[1])
+            _slack_hrs_req = req.cancel_after_hrs
+            if _cw_hrs_req + 1.0 > _slack_hrs_req:
+                raise HTTPException(status_code=400, detail=f"Challenge window ({_cw_hrs_req}h) + 1h tick slack exceeds cancel_after_hrs ({_slack_hrs_req}h)")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
     _criteria_req = _parse_criteria_safe(getattr(req, 'criteria', None)) or []
+    _validate_criteria_v2(_criteria_req)
     for _c in _criteria_req:
         if _c.get("type") == "code" and _c.get("gate") in _UNSUPPORTED_GATES:
             raise HTTPException(status_code=400, detail={"error": "gate_not_supported", "gate": _c.get("gate"), "message": f"Gate '{_c.get('gate')}' is not yet implemented. Use an evidence criterion instead."})
@@ -7387,6 +7542,11 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         initiated_by        = "seller",
         pay_url             = pay_url,
         funding_deadline    = funding_deadline,
+    )
+    # Seller ownership proof — required before any buyer contact details are stored
+    _verify_seller_ownership(
+        req.seller_address, escrow_id, req.buyer_email or "",
+        request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db,
     )
     db.add(vault)
     db.commit()
@@ -7811,6 +7971,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 "confirm_escrow_transaction() with the tx hash before submitting work."
             ),
         )
+
+    # ── TIMING GUARD: reject if < 5 min before CancelAfter ──
+    if vault.cancel_after_ts:
+        _cancel_aware = vault.cancel_after_ts if vault.cancel_after_ts.tzinfo else vault.cancel_after_ts.replace(tzinfo=timezone.utc)
+        _time_left = _cancel_aware - datetime.now(timezone.utc)
+        if _time_left.total_seconds() < 300:
+            raise HTTPException(status_code=409, detail="Escrow expires in less than 5 minutes — too late to submit work and release safely")
 
     # ── SUBMISSION LIMIT CHECK ── (bypassed for remedy attempts)
     current_count = vault.submission_count or 0
@@ -8260,7 +8427,12 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             except (IndexError, ValueError):
                 challenge_hrs = 24
             vault.status             = "PASS_CHALLENGE_WINDOW"
-            vault.challenge_deadline = datetime.now(timezone.utc) + timedelta(hours=challenge_hrs)
+            _raw_deadline = datetime.now(timezone.utc) + timedelta(hours=challenge_hrs)
+            if vault.cancel_after_ts:
+                _cancel_aware = vault.cancel_after_ts if vault.cancel_after_ts.tzinfo else vault.cancel_after_ts.replace(tzinfo=timezone.utc)
+                _max_deadline = _cancel_aware - timedelta(minutes=30)
+                _raw_deadline = min(_raw_deadline, _max_deadline)
+            vault.challenge_deadline = _raw_deadline
             vault.delivery_status    = "PASS_CHALLENGE_WINDOW"
             vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
             vault.worker_submission = json.dumps({
