@@ -40,6 +40,7 @@ from xrpl.asyncio.transaction import submit_and_wait as async_submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Tx, SubmitOnly, AccountInfo, AccountObjects, Fee
 from xrpl.models.transactions import EscrowFinish, EscrowCancel, NFTokenAcceptOffer
+from xrpl.models.transactions.transaction import Memo as XrplMemo
 from xrpl.models.transactions.batch import Batch, BatchSigner, BatchFlag
 from xrpl.models.transactions.transaction import Transaction as XrplTransaction
 from xrpl.asyncio.transaction import autofill
@@ -174,6 +175,7 @@ async def _check_and_increment_free_daily_cap() -> bool:
 
 app = FastAPI(
     title="AgentTrust Protocol Core",
+    version=APP_VERSION,
     docs_url=None,
     description=(
         "Enterprise-grade AI task verification and autonomous payment rail on XRPL. "
@@ -790,6 +792,19 @@ def health_check():
         "ofac_stale": ofac_age_s is None or ofac_age_s > 172800,
     }
 
+@app.get("/llms.txt", include_in_schema=False)
+def serve_llms_txt():
+    """Machine-readable API guide for LLM agents."""
+    from fastapi.responses import PlainTextResponse
+    llms_path = os.path.join(os.path.dirname(__file__), "llms.txt")
+    try:
+        with open(llms_path, "r", encoding="utf-8") as f:
+            return PlainTextResponse(f.read())
+    except FileNotFoundError:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("# AgentTrust llms.txt not found", status_code=404)
+
+
 @app.get("/stats/tools")
 def stats_tools(days: int = 7):
     """Aggregated tool-call counts for the past N days (unauthenticated, read-only)."""
@@ -1359,6 +1374,23 @@ def _check_score_rate_limit(ip: str) -> bool:
     while bucket and now - bucket[0] > SCORE_RATE_WINDOW:
         bucket.popleft()
     if len(bucket) >= SCORE_RATE_LIMIT:
+        return False
+    bucket.append(now)
+    return True
+
+
+_request_rate_buckets: dict[str, deque] = {}
+REQUEST_RATE_LIMIT  = 10   # seller-initiated escrow requests per hour per key
+REQUEST_RATE_WINDOW = 3600  # seconds
+
+
+def _check_rate_limit(key: str) -> bool:
+    """Return True if the key (ip or wallet) is within the request rate limit, False if exceeded."""
+    now = time.time()
+    bucket = _request_rate_buckets.setdefault(key, deque())
+    while bucket and now - bucket[0] > REQUEST_RATE_WINDOW:
+        bucket.popleft()
+    if len(bucket) >= REQUEST_RATE_LIMIT:
         return False
     bucket.append(now)
     return True
@@ -2874,7 +2906,7 @@ def _raise_402(resource: str, error: str, min_xrp: float = None) -> None:
         "x402Version": 1,
         "accepts": [{
             "scheme": "exact",
-            "network": "xrpl-mainnet",
+            "network": XRPL_CAIP2_NETWORK,
             "maxAmountRequired": str(int(required_xrp * 1_000_000)),
             "resource": resource,
             "payTo": PROTOCOL_WALLET,
@@ -3603,6 +3635,22 @@ async def auto_finish_escrow(
     finish_fee = _calc_finish_fee(fulfillment)
     logger.info(f"🔄 AUTO-FINISH starting: {escrow_id} | seq={sequence} | fee={finish_fee} drops")
 
+    # Build verdict Memo if we have a verdict_hash
+    _verdict_memos = None
+    try:
+        _db = db_session_factory()
+        try:
+            _v = _db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+            if _v and _v.verdict_hash:
+                _memo_data = f"{_v.prompt_version or ''}|{','.join(_v.models_used or [])}|{_v.verdict_hash}"
+                _memo_type_hex = "agenttrust/verdict".encode().hex().upper()
+                _memo_data_hex = _memo_data.encode().hex().upper()
+                _verdict_memos = [XrplMemo(memo_type=_memo_type_hex, memo_data=_memo_data_hex)]
+        finally:
+            _db.close()
+    except Exception as _me:
+        logger.warning(f"⚠️ AUTO-FINISH: could not build verdict memo for {escrow_id}: {_me}")
+
     try:
         client    = AsyncJsonRpcClient(XRPL_URL)
         finish_tx = EscrowFinish(
@@ -3612,6 +3660,7 @@ async def auto_finish_escrow(
             fulfillment    = fulfillment.upper(),
             condition      = condition.upper(),
             fee            = finish_fee,
+            memos          = _verdict_memos,
         )
         result   = await async_submit_and_wait(finish_tx, client, referee_wallet)
         tx_hash  = result.result.get("hash", "unknown")
@@ -5666,7 +5715,15 @@ async def _run_structured_audit(
             async with httpx.AsyncClient(timeout=60.0) as client:
                 res = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
             if res.status_code == 200:
-                raw = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                body = res.json()
+                usage = body.get("usageMetadata", {})
+                if usage:
+                    logger.info(
+                        f"Gemini {model_id} tokens: prompt={usage.get('promptTokenCount')} "
+                        f"candidates={usage.get('candidatesTokenCount')} "
+                        f"total={usage.get('totalTokenCount')}"
+                    )
+                raw = body["candidates"][0]["content"]["parts"][0]["text"].strip()
                 return json.loads(raw)
             logger.warning(f"Gemini {model_id} HTTP {res.status_code}: {res.text[:200]}")
         except Exception as e:
@@ -6404,6 +6461,11 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
                 detail="require_ai_audit=False requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did)."
             )
 
+    # Validate XRPL addresses before fee check
+    for _addr_field, _addr_val in [("buyer_address", req.buyer_address), ("worker_address", req.worker_address)]:
+        if _addr_val and not _is_valid_xrpl_address(_addr_val):
+            raise HTTPException(status_code=400, detail={"error": "invalid_address", "field": _addr_field})
+
     # OFAC sanctions check — block sanctioned wallets before accepting any funds
     for addr_to_check in [req.buyer_address, req.worker_address]:
         if addr_to_check:
@@ -7015,10 +7077,18 @@ def _is_valid_xrpl_address(addr: str) -> bool:
 
 
 @app.post("/escrow/request")
-async def request_escrow(req: EscrowRequestBody, db: Session = Depends(get_db)):
+async def request_escrow(req: EscrowRequestBody, request: Request, db: Session = Depends(get_db)):
     """Seller-initiated deal: propose an escrow to a buyer, returns pay_url."""
     if not _db_available:
         raise HTTPException(status_code=503, detail={"error": "database unavailable", "retry_after": 60})
+
+    # Rate limit: 10/h per IP and per seller_address
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    if not _check_rate_limit(f"ip:{client_ip}"):
+        raise HTTPException(status_code=429, detail={"error": "rate_limited", "message": "Too many requests from this IP. Limit: 10 per hour."})
+    if not _check_rate_limit(f"seller:{req.seller_address}"):
+        raise HTTPException(status_code=429, detail={"error": "rate_limited", "message": "Too many escrow requests from this seller address. Limit: 10 per hour."})
 
     # Validate
     if not _is_valid_xrpl_address(req.seller_address):
@@ -7046,6 +7116,20 @@ async def request_escrow(req: EscrowRequestBody, db: Session = Depends(get_db)):
             raise
         except Exception:
             pass
+
+    # Require verified wallet before allowing seller-initiated escrow requests
+    seller_verified = db.query(WalletVerification).filter(
+        WalletVerification.wallet_address == req.seller_address
+    ).first()
+    if not seller_verified:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "wallet_not_verified",
+                "message": "Seller wallet must be verified before initiating escrow requests. "
+                           "Verify at POST /wallet/verify/start.",
+            },
+        )
 
     # Generate IDs
     import uuid
@@ -7467,6 +7551,11 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "counterparty_type":       vault.counterparty_type or "agent",
         "initiated_by":            vault.initiated_by or "buyer",
         "worker_url":              f"{SITE_URL}?worker={vault.escrow_id}",
+        # Audit trail
+        "models_used":             vault.models_used,
+        "prompt_version":          vault.prompt_version,
+        "verdict_hash":            vault.verdict_hash,
+        "evaluation_verdicts":     vault.evaluation_verdicts,
     }
 
 
@@ -7734,6 +7823,13 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             vault.submission_count = current_count + 1
             vault.ai_verdict = json.dumps(verdict_dict)
             vault.model_used = model_used
+            vault.models_used = ["code-gate"]
+            vault.prompt_version = PROMPT_VERSION
+            vault.evaluation_verdicts = [
+                {"criterion_id": f["criterion_id"], "verdict": "FAIL", "reasoning": f["reason"]}
+                for f in gate_failures
+            ]
+            vault.verdict_hash = hashlib.sha256(json.dumps(verdict_dict, sort_keys=True).encode()).hexdigest()
             db.commit()
             return {
                 "escrow_id": req.escrow_id,
@@ -9030,6 +9126,10 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
                         f"https://livenet.xrpl.org/transactions/{vault.cancel_tx_hash}"
                         if vault.cancel_tx_hash else None
                     ),
+                    "models_used":         vault.models_used,
+                    "prompt_version":      vault.prompt_version,
+                    "verdict_hash":        vault.verdict_hash,
+                    "evaluation_verdicts": vault.evaluation_verdicts,
                 }
         except Exception:
             pass
