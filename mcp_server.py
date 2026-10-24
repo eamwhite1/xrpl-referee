@@ -2377,7 +2377,7 @@ async def hire_and_pay(
     if fee_hash:
         vault_body["fee_hash"] = fee_hash
     if require_consensus:
-        vault_body["require_consensus"] = True
+        vault_body["require_consensus_vault"] = True
     if require_nft_proof:
         vault_body["require_nft_proof"] = True
     if required_nft_issuer:
