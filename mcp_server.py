@@ -24,7 +24,10 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 from typing import Annotated, Optional
 
-APP_VERSION = "7.0.0"
+try:
+    from referee import APP_VERSION
+except ImportError:
+    APP_VERSION = "7.0.0"
 
 mcp = FastMCP(
     name="AgentTrust Referee",
