@@ -592,9 +592,9 @@ async def _hourly_db_window():
             await _flush_tool_stats()
             checked = await _poll_expired_escrows_once()
             logger.info(f"hourly window tick: escrows checked={checked}")
-            # Auto-release PASS_CHALLENGE_WINDOW vaults whose deadline has passed
+            _now_hw = datetime.now(timezone.utc)
+            # Sweep 1: auto-release PASS_CHALLENGE_WINDOW vaults whose deadline has passed
             try:
-                _now_hw = datetime.now(timezone.utc)
                 with SessionLocal() as _hw_db:
                     expired_cw = _hw_db.query(EscrowVault).filter(
                         EscrowVault.status == "PASS_CHALLENGE_WINDOW",
@@ -602,6 +602,7 @@ async def _hourly_db_window():
                     ).all()
                     for _v in expired_cw:
                         _v.status = "RELEASING"
+                        _v.updated_at = _now_hw
                         logger.info(f"RELEASING {_v.escrow_id} after challenge window expired — queuing auto_finish")
                         _send_challenge_window_expired_email(_v)
                     if expired_cw:
@@ -619,10 +620,15 @@ async def _hourly_db_window():
                                 logger.error(f"Cannot auto-finish {_v.escrow_id}: missing escrow_sequence/condition/fulfillment — manual intervention needed")
                         except Exception as _fe:
                             logger.error(f"auto_finish queue failed for {_v.escrow_id}: {_fe}")
-                    # RELEASING sweeper: retry vaults stuck > 10 min with no release_tx_hash
+            except Exception as _hw_err:
+                logger.error(f"hourly window challenge-window sweep error: {_hw_err}")
+            # Sweep 2: RELEASING sweeper — retry vaults stuck > 10 min with no release_tx_hash
+            try:
+                with SessionLocal() as _hw_db:
                     stuck_releasing = _hw_db.query(EscrowVault).filter(
                         EscrowVault.status == "RELEASING",
                         EscrowVault.release_tx_hash == None,
+                        EscrowVault.updated_at != None,
                         EscrowVault.updated_at <= _now_hw - timedelta(minutes=10),
                     ).all()
                     for _v in stuck_releasing:
@@ -639,7 +645,11 @@ async def _hourly_db_window():
                                 logger.error(f"RELEASING sweeper: {_v.escrow_id} missing fields — manual intervention needed")
                         except Exception as _se:
                             logger.error(f"RELEASING sweeper error for {_v.escrow_id}: {_se}")
-                    # Expire AWAITING_FUNDING vaults past funding_deadline
+            except Exception as _hw_err:
+                logger.error(f"hourly window RELEASING sweep error: {_hw_err}")
+            # Sweep 3: expire AWAITING_FUNDING vaults past funding_deadline
+            try:
+                with SessionLocal() as _hw_db:
                     expired_requests = _hw_db.query(EscrowVault).filter(
                         EscrowVault.status == "AWAITING_FUNDING",
                         EscrowVault.funding_deadline != None,
@@ -651,21 +661,24 @@ async def _hourly_db_window():
                         logger.info(f"Escrow request {_v.escrow_id} expired unfunded")
                     if expired_requests:
                         _hw_db.commit()
-                    # Safety net: REMEDY vaults past CancelAfter → CANCELLED
-                    if True:  # always run
-                        expired_remedy = _hw_db.query(EscrowVault).filter(
-                            EscrowVault.status == "REMEDY",
-                            EscrowVault.cancel_after_ts != None,
-                            EscrowVault.cancel_after_ts <= _now_hw,
-                        ).all()
-                        for _v in expired_remedy:
-                            _v.status = "CANCELLED"
-                            _v.cancelled_at = _now_hw
-                            logger.info(f"REMEDY vault {_v.escrow_id} cancelled — CancelAfter passed")
-                        if expired_remedy:
-                            _hw_db.commit()
             except Exception as _hw_err:
-                logger.error(f"hourly window challenge auto-release error: {_hw_err}")
+                logger.error(f"hourly window AWAITING_FUNDING sweep error: {_hw_err}")
+            # Sweep 4: safety net — REMEDY vaults past CancelAfter → CANCELLED
+            try:
+                with SessionLocal() as _hw_db:
+                    expired_remedy = _hw_db.query(EscrowVault).filter(
+                        EscrowVault.status == "REMEDY",
+                        EscrowVault.cancel_after_ts != None,
+                        EscrowVault.cancel_after_ts <= _now_hw,
+                    ).all()
+                    for _v in expired_remedy:
+                        _v.status = "CANCELLED"
+                        _v.cancelled_at = _now_hw
+                        logger.info(f"REMEDY vault {_v.escrow_id} cancelled — CancelAfter passed")
+                    if expired_remedy:
+                        _hw_db.commit()
+            except Exception as _hw_err:
+                logger.error(f"hourly window REMEDY sweep error: {_hw_err}")
             # One-off timestamp/owner correction (runs once per process lifetime)
             backfill_db = next(get_db())
             try:
@@ -891,15 +904,11 @@ def _build_agent_card():
     skills = []
     try:
         from mcp_server import mcp as _mcp_ref
-        tool_map = getattr(getattr(_mcp_ref, "_tool_manager", None), "_tools", None) or {}
-        for tool_name, tool_obj in tool_map.items():
-            fn = getattr(tool_obj, "fn", None)
-            doc = ((fn.__doc__ if fn else None) or "").strip()
-            first_para = doc.split("\n\n")[0].replace("\n", " ").strip()
+        for t in _get_mcp_tools(_mcp_ref):
             skills.append({
-                "id": tool_name,
-                "name": tool_name.replace("_", " ").title(),
-                "description": first_para or tool_name,
+                "id": t["name"],
+                "name": t["name"].replace("_", " ").title(),
+                "description": t["description"],
             })
     except Exception as e:
         logger.warning(f"agent-card tool enumeration failed: {e}")
@@ -964,6 +973,30 @@ def _agent_json_legacy_unused():
 _server_card_tools_cache: list = []
 
 
+def _get_mcp_tools(mcp_ref) -> list:
+    """Extract tool list from FastMCP regardless of version. Returns [{name, description}]."""
+    # Try _tool_manager._tools (attribute-based, works for most versions)
+    tool_map = getattr(getattr(mcp_ref, "_tool_manager", None), "_tools", None) or {}
+    if tool_map:
+        result = []
+        for tool_name, tool_obj in tool_map.items():
+            fn = getattr(tool_obj, "fn", None)
+            doc = ((fn.__doc__ if fn else None) or getattr(tool_obj, "description", "") or "").strip()
+            first_line = doc.split("\n")[0][:120]
+            result.append({"name": tool_name, "description": first_line or tool_name})
+        return result
+    # Fallback: try list_tools() handler (FastMCP 2.x)
+    try:
+        import asyncio as _asyncio
+        if not _asyncio.get_event_loop().is_running():
+            tools_result = _asyncio.get_event_loop().run_until_complete(mcp_ref.list_tools())
+            if tools_result:
+                return [{"name": t.name, "description": (t.description or "").split("\n")[0][:120]} for t in tools_result]
+    except Exception:
+        pass
+    return []
+
+
 async def _prime_server_card_cache():
     """Pre-populate the server-card tool list at startup so first request doesn't show '(loading)'."""
     global _server_card_tools_cache
@@ -972,12 +1005,9 @@ async def _prime_server_card_cache():
     await asyncio.sleep(5)  # give FastMCP lifespan time to register tools
     try:
         from mcp_server import mcp as _mcp_ref
-        _registered = await _mcp_ref.get_tools()
+        _registered = _get_mcp_tools(_mcp_ref)
         if _registered:
-            _server_card_tools_cache = [
-                {"name": _t.name, "description": (_t.description or "").split("\n")[0][:120]}
-                for _t in _registered.values()
-            ]
+            _server_card_tools_cache = _registered
             logger.info(f"✅ Server-card cache primed: {len(_server_card_tools_cache)} tools")
     except Exception as _e:
         logger.warning(f"Server-card cache prime failed: {_e}")
@@ -992,9 +1022,8 @@ async def serve_mcp_server_card():
     if not _tools_list:
         try:
             from mcp_server import mcp as _mcp_ref
-            _registered = await _mcp_ref.get_tools()
-            if _registered:
-                _tools_list = [{"name": _t.name, "description": (_t.description or "").split("\n")[0][:120]} for _t in _registered.values()]
+            _tools_list = _get_mcp_tools(_mcp_ref)
+            if _tools_list:
                 _server_card_tools_cache = _tools_list
         except Exception:
             pass
@@ -1411,6 +1440,7 @@ class PaymentLog(Base):
     amount_xrp   = Column(Float,  nullable=True)
     escrow_id    = Column(String, nullable=True)
     timestamp    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at   = Column(DateTime(timezone=True), server_default="NOW()", nullable=True)
 
 
 class FreeAuditUsage(Base):
@@ -1545,6 +1575,7 @@ class EscrowVault(Base):
     # Submission limits — v7
     submission_count  = Column(Integer, default=0)          # how many times seller has submitted
     max_submissions   = Column(Integer, default=3)          # configurable per-vault
+    inconclusive_count = Column(Integer, default=0, nullable=True)  # free INCONCLUSIVEs; >3 counts as attempt
     # Marketplace — v8
     category          = Column(String,  default="default")  # task category for filtering
     marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
@@ -1572,6 +1603,7 @@ class EscrowVault(Base):
     # Template reference
     template_id          = Column(String,  nullable=True)   # optional: EscrowTemplate.id
     # Release/cancel tx hashes — proof of payment
+    updated_at        = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=True)
     release_tx_hash   = Column(String,              nullable=True)
     released_at       = Column(DateTime(timezone=True), nullable=True)
     cancel_tx_hash    = Column(String,              nullable=True)
@@ -2705,6 +2737,12 @@ def run_migrations():
         "ALTER TABLE escrow_template ADD COLUMN IF NOT EXISTS max_submissions    INTEGER DEFAULT 3",
         # EnterpriseAccount — seller profile
         "ALTER TABLE enterprise_account ADD COLUMN IF NOT EXISTS public_seller_profile BOOLEAN DEFAULT FALSE",
+        # P0-1: updated_at for RELEASING sweeper
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
+        # AuditLog created_at
+        "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+        # P1-2: track free INCONCLUSIVE count to rate-limit injection retries
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS inconclusive_count INTEGER DEFAULT 0",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3776,12 +3814,19 @@ async def auto_finish_escrow(
             if vault:
                 vault.auto_finish_hash = tx_hash
                 vault.release_tx_hash  = tx_hash
-                # Use ledger close time if available (Ripple epoch offset)
-                ledger_close = result.result.get("date")
-                vault.released_at = (
-                    datetime.fromtimestamp(ledger_close + 946684800, tz=timezone.utc)
-                    if ledger_close else datetime.now(timezone.utc)
-                )
+                # Use ledger close time. xrpl-py 5.x (API v2) uses close_time_iso; v1 uses integer date offset.
+                _close_iso = result.result.get("close_time_iso")
+                _close_int = result.result.get("date") or result.result.get("tx_json", {}).get("date")
+                if _close_iso:
+                    try:
+                        from datetime import datetime as _dt
+                        vault.released_at = _dt.fromisoformat(_close_iso.replace("Z", "+00:00"))
+                    except Exception:
+                        vault.released_at = datetime.now(timezone.utc)
+                elif _close_int:
+                    vault.released_at = datetime.fromtimestamp(_close_int + 946684800, tz=timezone.utc)
+                else:
+                    vault.released_at = datetime.now(timezone.utc)
                 if vault.status == "RELEASING":
                     vault.status = "RELEASED"
                 db.commit()
@@ -5584,7 +5629,7 @@ def _execute_code_gates(work: str, criteria: list) -> list:
                 else:
                     try:
                         if _HAS_REGEX_MOD:
-                            _match = _regex_mod.search(pattern, work, timeout=2.0)
+                            _match = _regex_mod.search(pattern, work, timeout=0.5, concurrent=True)
                         else:
                             # Fallback: re module without GIL-safe timeout — reject catastrophic patterns
                             import re as _re_std
@@ -5690,7 +5735,7 @@ def _build_audit_prompt(task: str, work: str, criteria: list, evidence_items: li
     # Strip any occurrence of this tag from work (negligible collision risk)
     safe_work = work.replace(f"<{_tag}>", "").replace(f"</{_tag}>", "")
     # Escape < to prevent tag injection
-    safe_work = safe_work.replace("<", "\x3c")
+    safe_work = safe_work.replace("<", "&lt;")
     lines = [
         "You are an impartial AI referee evaluating submitted work against defined criteria.",
         "",
@@ -5884,6 +5929,12 @@ async def _run_structured_audit(
             models_used.append(PRO_MODEL)
             pro_verdict = pro_result.get("overall_verdict", "INCONCLUSIVE")
             if flash_verdict == "INCONCLUSIVE":
+                # Strict 2-of-2: Flash INCONCLUSIVE means no consensus regardless of Pro
+                pro_result["overall_verdict"] = "INCONCLUSIVE"
+                pro_result["overall_reasoning"] = (
+                    f"Consensus check: Flash=INCONCLUSIVE — result stays INCONCLUSIVE (Pro={pro_verdict} alone is not sufficient). "
+                    f"Flash: {flash_result.get('overall_reasoning','')} | Pro: {pro_result.get('overall_reasoning','')}"
+                )
                 pro_result["models_used"] = models_used
                 return pro_result
             elif flash_verdict == "PASS" and pro_verdict != "PASS":
@@ -7963,7 +8014,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         else:
             eval_criteria = [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
 
-        gate_failures = _execute_code_gates(work_with_nft, eval_criteria)
+        gate_failures = await asyncio.to_thread(_execute_code_gates, work_with_nft, eval_criteria)
         if gate_failures:
             verdict_dict = {
                 "verdict": "FAIL",
@@ -8044,8 +8095,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         validation_errors = _validate_verdict(structured_result, eval_criteria, collected_evidence)
         if validation_errors:
             logger.warning(f"⚠️ Verdict validation errors for {req.escrow_id}: {validation_errors}")
-            overall_verdict = "INCONCLUSIVE"
-            structured_result["overall_verdict"] = "INCONCLUSIVE"
+            # Only downgrade: PASS→INCONCLUSIVE. Never upgrade FAIL to INCONCLUSIVE.
+            if overall_verdict != "FAIL":
+                overall_verdict = "INCONCLUSIVE"
+                structured_result["overall_verdict"] = "INCONCLUSIVE"
             structured_result["validation_errors"] = validation_errors
 
         if overall_verdict == "INCONCLUSIVE":
@@ -8054,20 +8107,29 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             vault.prompt_version = PROMPT_VERSION
             vh = hashlib.sha256(json.dumps(structured_result, sort_keys=True).encode()).hexdigest()
             vault.verdict_hash = vh
+            # Rate-limit free INCONCLUSIVEs: after 3, count as an attempt (prevents injection abuse)
+            _inc_count = (vault.inconclusive_count or 0) + 1
+            vault.inconclusive_count = _inc_count
+            _attempt_consumed = _inc_count > 3
+            if _attempt_consumed:
+                vault.submission_count = current_count + 1
             db.commit()
             guidance = (
                 "The AI referee could not reach a definitive verdict. "
-                "This attempt has NOT been counted. Please review the criteria feedback and resubmit with clearer evidence."
+                + ("This attempt has NOT been counted." if not _attempt_consumed
+                   else "This attempt HAS been counted (inconclusive limit reached).")
+                + " Please review the criteria feedback and resubmit with clearer evidence."
             )
             if validation_errors:
                 guidance += f" Validation issues: {'; '.join(validation_errors)}"
+            _used = vault.submission_count
             return JSONResponse({
                 "escrow_id": req.escrow_id,
                 "status": "inconclusive",
                 "verdict": structured_result,
                 "guidance": guidance,
-                "attempts_used": current_count,
-                "attempts_remaining": max(0, (vault.max_submissions or 3) - current_count),
+                "attempts_used": _used,
+                "attempts_remaining": max(0, (vault.max_submissions or 3) - _used),
             }, status_code=200)
 
         verdict_dict = {
