@@ -2377,7 +2377,8 @@ class EnterpriseAccount(Base):
     status        = Column(String,   default="trial")                # trial | active | expired
     trial_ends_at = Column(DateTime, nullable=True)
     sub_expires_at= Column(DateTime, nullable=True)
-    last_payment_hash = Column(String, nullable=True)
+    last_payment_hash    = Column(String,  nullable=True)
+    public_seller_profile = Column(Boolean, default=False, nullable=False, server_default="false")
     created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -10886,6 +10887,23 @@ async def enterprise_me(account: EnterpriseAccount = Depends(_get_current_accoun
         "trial_ends_at": account.trial_ends_at.isoformat() if account.trial_ends_at else None,
         "sub_expires_at": account.sub_expires_at.isoformat() if account.sub_expires_at else None,
     }
+
+
+@app.get("/enterprise/profile")
+async def enterprise_get_profile(account: EnterpriseAccount = Depends(_get_current_account)):
+    return {"public_seller_profile": bool(account.public_seller_profile)}
+
+
+@app.patch("/enterprise/profile")
+async def enterprise_patch_profile(
+    body: dict,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    if "public_seller_profile" in body:
+        account.public_seller_profile = bool(body["public_seller_profile"])
+        db.commit()
+    return {"public_seller_profile": bool(account.public_seller_profile)}
 
 
 @app.get("/enterprise/subscription/payment-details")
