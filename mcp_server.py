@@ -61,7 +61,7 @@ mcp = FastMCP(
         "Supports proof gates: nft_dvp (atomic NFT swap), require_nft_proof / required_nft_issuer (NFT ownership), "
         "required_domain, required_vc_issuer_did. Buyers can require any of these before PASS releases escrow.\n"
         "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow). "
-        "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25).\n"
+        "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25 one-time vault creation fee).\n"
         "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
         "  evaluate_escrow_work(escrow_id, work, evaluate_token) — submit proof; payment auto-releases on PASS. "
         "The buyer receives evaluate_token when creating the vault and must share it with the worker before submission. "
@@ -296,10 +296,11 @@ async def create_escrow_vault(
             "Optional list of evaluation criteria for the AI referee. "
             "Each item is either a plain string (treated as a judgment criterion) or a dict with fields: "
             "id (optional), type ('judgment'|'evidence'|'code'), description (required), "
-            "and for 'code' type: gate ('sha256_of'|'exact_match'|'regex'|'json_schema'|'http_status'|'xrpl_tx') plus gate-specific fields. "
+            "and for 'code' type: gate ('sha256_of'|'exact_match'|'regex'|'json_schema') plus gate-specific fields. "
+            "(http_status and xrpl_tx gates are coming soon.) "
             "Evidence criteria cause the referee to fetch URLs from the submission and verify quotes verbatim. "
             "Code criteria run deterministic gate checks before the AI is called. "
-            "INCONCLUSIVE verdicts do NOT consume submission attempts. "
+            "INCONCLUSIVE verdicts do not consume an attempt for the first 3 per vault; subsequent INCONCLUSIVEs count as an attempt. "
             "Example: [{\"type\":\"judgment\",\"description\":\"Code compiles\"},{\"type\":\"evidence\",\"description\":\"PR link shows merged status\"}]"
         ),
     )] = None,
@@ -318,7 +319,7 @@ async def create_escrow_vault(
     )] = "auto",
     require_consensus_vault: Annotated[bool, Field(
         title="Require Dual-Model Consensus",
-        description="Require both Gemini Flash AND Gemini Pro to agree on EVERY evaluation for this vault. Fee: $0.25 per evaluation. Different from the per-submission require_consensus param on evaluate_escrow_work.",
+        description="Require both Gemini Flash AND Gemini Pro to agree on every evaluation for this vault. One-time vault creation fee of $0.25. Both models must return PASS or the result is INCONCLUSIVE.",
     )] = False,
     external_ref: Annotated[Optional[str], Field(
         title="External Reference",
@@ -345,12 +346,12 @@ async def create_escrow_vault(
     Three release modes:
     - AI audit (default): worker submits text/files; AI referee scores against task_description or criteria.
     - Proof-gate only (require_ai_audit=False): payment releases when all configured proof gates pass. No AI call.
-    - Challenge window (release_mode='challenge_window_hrs:N'): PASS holds for N hours; buyer can challenge.
+    - Delayed release (release_mode='challenge_window_hrs:N'): PASS holds for N hours then auto-releases. Disputes coming soon.
 
     Structured criteria (recommended for complex work):
     - Pass criteria as a list of strings or typed dicts ({type, description, [gate]}).
-    - Types: 'judgment' (AI decides), 'evidence' (verify URL content), 'code' (deterministic gate).
-    - INCONCLUSIVE verdicts do NOT consume submission attempts.
+    - Types: 'judgment' (AI decides), 'evidence' (verify URL content), 'code' (deterministic gate; supported gates: sha256_of, exact_match, regex, json_schema).
+    - INCONCLUSIVE verdicts do not consume an attempt for the first 3 per vault; subsequent INCONCLUSIVEs count as an attempt.
 
     White-label / headless integration:
     - Pass callback_url to receive webhook POSTs on all state changes.
@@ -717,7 +718,13 @@ async def challenge_escrow_verdict(
 
     The challenge window is set at vault creation via release_mode='challenge_window_hrs:N' (N ≤ 24).
     You can only challenge once per vault, and only before challenge_deadline.
+
+    ⚠️ COMING SOON — disputes are not yet available. Do not pay any fee.
     """
+    return {
+        "status": "not_available",
+        "message": "Challenge window disputes are coming soon — this feature is not yet available. Do not pay any fee.",
+    }
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/{escrow_id}/challenge",
@@ -2312,7 +2319,7 @@ async def hire_and_pay(
     )] = None,
     criteria: Annotated[Optional[list], Field(
         title="Structured Criteria",
-        description="Optional list of evaluation criteria. Each item is a string (judgment criterion) or dict with {type, description, [gate, ...]}. Types: 'judgment', 'evidence' (URL verification), 'code' (deterministic gate). INCONCLUSIVE verdicts do NOT consume attempts.",
+        description="Optional list of evaluation criteria. Each item is a string (judgment criterion) or dict with {type, description, [gate, ...]}. Types: 'judgment', 'evidence' (URL verification), 'code' (deterministic gate: sha256_of, exact_match, regex, json_schema). INCONCLUSIVE verdicts do not consume an attempt for the first 3 per vault; subsequent INCONCLUSIVEs count as an attempt.",
     )] = None,
     deliverable_type: Annotated[str, Field(
         title="Deliverable Type",
@@ -2350,8 +2357,9 @@ async def hire_and_pay(
     required_domain, required_vc_issuer_did).
 
     Structured criteria: pass criteria as a list of strings or typed dicts. Types: 'judgment',
-    'evidence' (verifies URLs from submission), 'code' (deterministic gate). INCONCLUSIVE
-    verdicts do NOT consume submission attempts.
+    'evidence' (verifies URLs from submission), 'code' (deterministic gate: sha256_of, exact_match,
+    regex, json_schema). INCONCLUSIVE verdicts do not consume an attempt for the first 3 per vault;
+    subsequent INCONCLUSIVEs count as an attempt.
 
     White-label / headless integration:
     - Pass callback_url to receive webhook POSTs on all state changes.
