@@ -11203,6 +11203,7 @@ async def enterprise_escrows(
     db: Session = Depends(get_db),
     limit: int = 50,
     offset: int = 0,
+    role: str = "buyer",
 ):
     if not _subscription_active(account):
         raise HTTPException(status_code=402, detail="Subscription required")
@@ -11210,15 +11211,21 @@ async def enterprise_escrows(
     addresses = [w.xrpl_address for w in wallets]
     if not addresses:
         return {"escrows": [], "total": 0}
+    if role == "seller":
+        role_filter = EscrowVault.worker_address.in_(addresses)
+    elif role == "all":
+        role_filter = or_(EscrowVault.buyer_address.in_(addresses), EscrowVault.worker_address.in_(addresses))
+    else:
+        role_filter = EscrowVault.buyer_address.in_(addresses)
     escrows = (
         db.query(EscrowVault)
-        .filter(EscrowVault.buyer_address.in_(addresses))
+        .filter(role_filter)
         .order_by(EscrowVault.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
-    total = db.query(EscrowVault).filter(EscrowVault.buyer_address.in_(addresses)).count()
+    total = db.query(EscrowVault).filter(role_filter).count()
     return {
         "escrows": [
             {
@@ -11234,6 +11241,21 @@ async def enterprise_escrows(
                 "created_at": e.created_at.isoformat() if e.created_at else None,
                 "project_label": e.project_label,
                 "buyer_address": e.buyer_address,
+                "role": role,
+                "attempts_used": e.submission_count,
+                "max_submissions": e.max_submissions,
+                "cancel_after_ts": e.cancel_after_ts.isoformat() if e.cancel_after_ts else None,
+                "release_mode": e.release_mode,
+                "challenge_deadline": e.challenge_deadline.isoformat() if e.challenge_deadline else None,
+                "models_used": e.models_used,
+                "prompt_version": e.prompt_version,
+                "verdict_hash": e.verdict_hash,
+                "evaluation_verdicts": e.evaluation_verdicts,
+                "pay_url": e.pay_url,
+                "initiated_by": e.initiated_by,
+                "external_ref": e.external_ref,
+                "remedy_attempt_used": e.remedy_attempt_used,
+                "release_tx_hash": e.release_tx_hash,
             }
             for e in escrows
         ],
@@ -11247,14 +11269,17 @@ async def enterprise_audit_detail(
     account: EnterpriseAccount = Depends(_get_current_account),
     db: Session = Depends(get_db),
 ):
-    """Full audit record for a single escrow — only accessible if buyer wallet is linked."""
+    """Full audit record for a single escrow — accessible to buyer or worker wallet."""
     if not _subscription_active(account):
         raise HTTPException(status_code=402, detail="Subscription required")
     wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
     addresses = {w.xrpl_address for w in wallets}
     escrow = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
-    if not escrow or escrow.buyer_address not in addresses:
+    if not escrow or (escrow.buyer_address not in addresses and escrow.worker_address not in addresses):
         raise HTTPException(status_code=404, detail="Escrow not found")
+    viewer_role = "buyer" if escrow.buyer_address in addresses else "seller"
+    if escrow.buyer_address in addresses and escrow.worker_address in addresses:
+        viewer_role = "both"
     return {
         "escrow_id": escrow.escrow_id,
         "status": escrow.status,
@@ -11273,6 +11298,20 @@ async def enterprise_audit_detail(
         "created_at": escrow.created_at.isoformat() if escrow.created_at else None,
         "cancel_after_ts": escrow.cancel_after_ts.isoformat() if escrow.cancel_after_ts else None,
         "xrpl_explorer": f"https://livenet.xrpl.org/transactions/{escrow.auto_finish_hash}" if escrow.auto_finish_hash else None,
+        "viewer_role": viewer_role,
+        "attempts_used": escrow.submission_count,
+        "max_submissions": escrow.max_submissions,
+        "release_mode": escrow.release_mode,
+        "challenge_deadline": escrow.challenge_deadline.isoformat() if escrow.challenge_deadline else None,
+        "models_used": escrow.models_used,
+        "prompt_version": escrow.prompt_version,
+        "verdict_hash": escrow.verdict_hash,
+        "evaluation_verdicts": escrow.evaluation_verdicts,
+        "pay_url": escrow.pay_url,
+        "initiated_by": escrow.initiated_by,
+        "external_ref": escrow.external_ref,
+        "remedy_attempt_used": escrow.remedy_attempt_used,
+        "release_tx_hash": escrow.release_tx_hash,
         # Proof gates
         "proof_policy": escrow.proof_policy,
         "required_nft_issuer": escrow.required_nft_issuer,
