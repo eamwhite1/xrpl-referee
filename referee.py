@@ -203,30 +203,34 @@ app = FastAPI(
         "**Enterprise landing page:** https://www.cryptovault.co.uk/enterprise/"
     ),
     lifespan=_lifespan,
-    openapi_extra={
-        "components": {
-            "securitySchemes": {
-                "EvaluateToken": {
-                    "type": "apiKey",
-                    "in": "header",
-                    "name": "X-Evaluate-Token",
-                    "description": "One-time token issued at vault creation (evaluate_token field). Required for POST /evaluate.",
-                },
-                "EnterpriseBearer": {
-                    "type": "http",
-                    "scheme": "bearer",
-                    "description": "JWT bearer token from POST /enterprise/auth/token. Required for /enterprise/* endpoints.",
-                },
-                "X402Payment": {
-                    "type": "apiKey",
-                    "in": "header",
-                    "name": "X-PAYMENT",
-                    "description": "x402 payment header: XRP/RLUSD tx hash or USDC tx hash for paid endpoints (audit, escrow create). Call without payment to receive a 402 with full payment instructions.",
-                },
-            }
-        }
-    },
 )
+
+_openapi_cache: dict = {}
+
+def _custom_openapi():
+    global _openapi_cache
+    if _openapi_cache:
+        return _openapi_cache
+    from fastapi.openapi.utils import get_openapi
+    schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+    schema.setdefault("components", {}).setdefault("securitySchemes", {}).update({
+        "EvaluateToken": {
+            "type": "apiKey", "in": "header", "name": "X-Evaluate-Token",
+            "description": "One-time token issued at vault creation. Required for POST /evaluate.",
+        },
+        "EnterpriseBearer": {
+            "type": "http", "scheme": "bearer",
+            "description": "JWT from POST /enterprise/auth/token. Required for /enterprise/* endpoints.",
+        },
+        "X402Payment": {
+            "type": "apiKey", "in": "header", "name": "X-PAYMENT",
+            "description": "x402 tx hash header for paid endpoints. Omit to receive a 402 with payment instructions.",
+        },
+    })
+    _openapi_cache = schema
+    return schema
+
+app.openapi = _custom_openapi
 
 
 @app.exception_handler(PaymentRequired)
