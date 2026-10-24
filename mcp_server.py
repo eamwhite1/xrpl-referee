@@ -673,26 +673,31 @@ async def challenge_escrow_verdict(
         title="Escrow ID",
         description="The receipt code for the escrow whose PASS verdict you want to dispute.",
     )],
-    criteria_ids: Annotated[list[str], Field(
+    criteria_ids: Annotated[Optional[list[str]], Field(
+        default=None,
         title="Criterion IDs to Dispute",
         description="One or more criterion IDs (from the vault's criteria list) that you believe the work failed. Get these from the evaluation_verdicts in the escrow response.",
-    )],
-    reason: Annotated[str, Field(
+    )] = None,
+    reason: Annotated[Optional[str], Field(
+        default=None,
         title="Reason for Challenge",
         description="Explain specifically why the work does not satisfy the listed criteria. The Pro model will review this alongside the original work.",
-    )],
-    fee_tx_hash: Annotated[str, Field(
+    )] = None,
+    fee_tx_hash: Annotated[Optional[str], Field(
+        default=None,
         title="Challenge Fee Payment Hash",
-        description="64-char hex XRPL transaction hash paying CHALLENGE_FEE_XRP (default 0.5 XRP) to the protocol wallet. Refunded if your challenge is upheld; paid to the worker if rejected.",
-    )],
-    wallet_address: Annotated[str, Field(
+        description="⚠️ Disputes coming soon — do not pay any fee. This parameter is reserved for future use.",
+    )] = None,
+    wallet_address: Annotated[Optional[str], Field(
+        default=None,
         title="Buyer Wallet Address",
         description="Your XRPL wallet address (r...) — must match the buyer on this vault.",
-    )],
-    tx_hash: Annotated[str, Field(
+    )] = None,
+    tx_hash: Annotated[Optional[str], Field(
+        default=None,
         title="Ownership Verification Transaction Hash",
         description="Hash of an XRPL AccountSet tx submitted from wallet_address with a Memo containing the challenge string from get_wallet_verification_challenge(). Proves you own the buyer wallet.",
-    )],
+    )] = None,
 ) -> dict:
     """
     Challenge a PASS verdict during the challenge window.

@@ -1,17 +1,12 @@
 {
   "schema_version": "v1",
-  "name_for_human": "AgentTrust Referee",
-  "name_for_model": "agenttrust_referee",
-  "description_for_human": "Trust-minimized AI task verification. Pay $0.10 (XRP, RLUSD, or USDC), get a structured PASS/FAIL verdict on any work submission. Optional XRPL escrow — funds release automatically on approval.",
-  "description_for_model": "Use this tool to verify whether a worker has completed a task to specification. POST the task requirements and the completed work to /audit with a $0.10 fee hash (XRP, RLUSD, or USDC). Returns structured JSON with verdict (PASS/FAIL), score (0-100), summary, detailed reasoning, and lists of criteria met and failed. For task_category use: creative, code, bug_bounty, legal, supply_chain, data, or default. For full escrow-gated payments use /escrow/generate and /evaluate instead.",
-  "auth": {
-    "type": "none"
-  },
-  "api": {
-    "type": "openapi",
-    "url": "https://mcp.cryptovault.co.uk/openapi.json"
-  },
-  "logo_url": "https://agenttrust.io/logo.png",
-  "contact_email": "hello@agenttrust.io",
-  "legal_info_url": "https://agenttrust.io"
+  "name_for_human": "AgentTrust Escrow",
+  "name_for_model": "agenttrust_escrow",
+  "description_for_human": "Lock XRP or RLUSD in crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports NFT, domain, W3C VC proof gates and dual-model consensus audit. MCP at https://mcp.cryptovault.co.uk/mcp.",
+  "description_for_model": "Trust-minimized escrow for agent-to-agent work on the XRP Ledger. Flow: buyer calls /escrow/generate to lock funds → seller submits proof to /evaluate → AI referee audits against criteria → PASS auto-releases XRP/RLUSD to seller. Proof gates (NFT ownership, XRPL domain, W3C VC, NFT DvP) can gate release before AI audit. Set require_consensus_vault=true for dual-model audit (Gemini Flash + Pro, $0.25 one-time vault fee). INCONCLUSIVE does not consume an attempt for the first 3 per vault; later ones count. Implements x402: call any paid endpoint without payment to receive 402 with X-Payment-Required describing how to pay. MCP server at https://mcp.cryptovault.co.uk/mcp.",
+  "auth": {"type": "none"},
+  "api": {"type": "openapi", "url": "https://mcp.cryptovault.co.uk/openapi.json"},
+  "logo_url": "https://www.cryptovault.co.uk/logo.svg",
+  "contact_email": "hello@cryptovault.co.uk",
+  "legal_info_url": "https://www.cryptovault.co.uk/terms/"
 }
