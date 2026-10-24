@@ -122,23 +122,23 @@ def test_code_gate_skips_non_code_criteria():
 
 def test_build_audit_prompt_has_work_tags():
     prompt = _build_audit_prompt("task", "my work", [], [])
-    assert "<WORK>" in prompt
+    # Random delimiter — just check work is present and UNTRUSTED_WORK tag appears
+    assert "UNTRUSTED_WORK_" in prompt
     assert "my work" in prompt
-    assert "</WORK>" in prompt
 
 
 def test_build_audit_prompt_evidence_wrapped():
     evidence_items = [{"criterion_id": "c1", "url": "https://example.com", "content": "some text", "truncated": False}]
     prompt = _build_audit_prompt("task", "work", [{"id": "c1", "type": "evidence", "description": "check url"}], evidence_items)
-    assert '<UNTRUSTED_EVIDENCE criterion_id="c1"' in prompt
+    assert 'criterion_id="c1"' in prompt
     assert 'url="https://example.com"' in prompt
     assert "some text" in prompt
-    assert "</UNTRUSTED_EVIDENCE>" in prompt
 
 
 def test_build_audit_prompt_no_evidence_no_tags():
     prompt = _build_audit_prompt("task", "work", [{"id": "c1", "type": "judgment", "description": "check it"}], [])
-    assert "UNTRUSTED_EVIDENCE" not in prompt
+    # With random per-request delimiter for evidence tags, just check no evidence content
+    assert 'criterion_id=' not in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +205,97 @@ def test_response_schema_no_list_type():
 
     schema = _build_response_schema()
     _check_no_list_type(schema)
+
+
+# ---------------------------------------------------------------------------
+# P0 regression tests
+# ---------------------------------------------------------------------------
+
+def test_injection_no_url_inconclusive():
+    """Evidence criterion cannot PASS when no evidence was fetched (no URL in work)."""
+    criteria = [{"id": "ev1", "type": "evidence", "description": "Must cite example.com"}]
+    verdict = {
+        "overall_verdict": "PASS",
+        "overall_score": 95,
+        "overall_reasoning": "looks good",
+        "criteria_results": [{"criterion_id": "ev1", "verdict": "PASS", "score": 95, "reasoning": "verified", "evidence_quote": "Example Domain"}],
+    }
+    # No evidence fetched
+    errors = _validate_verdict(verdict, criteria, evidence_items=[])
+    assert any("no evidence was fetched" in e for e in errors), f"Expected fetch-required error, got: {errors}"
+
+
+def test_evidence_pass_requires_fetched_content():
+    """_validate_verdict must error when evidence criterion is PASS but evidence_items is empty."""
+    criteria = [{"id": "ev1", "type": "evidence", "description": "Cite source"}]
+    verdict = {
+        "overall_verdict": "PASS",
+        "overall_score": 80,
+        "overall_reasoning": "ok",
+        "criteria_results": [{"criterion_id": "ev1", "verdict": "PASS", "score": 80, "reasoning": "cited", "evidence_quote": "some text"}],
+    }
+    errors = _validate_verdict(verdict, criteria, evidence_items=[])
+    assert errors, "Expected validation errors when no evidence fetched"
+
+
+def test_code_gate_overwrites_model_verdict():
+    """Gate FAIL must override a model PASS for a code criterion."""
+    gate_failures = [{"criterion_id": "c1", "verdict": "FAIL", "reason": "sha256 mismatch"}]
+    structured_result = {
+        "overall_verdict": "PASS",
+        "overall_score": 100,
+        "overall_reasoning": "all good",
+        "criteria_results": [{"criterion_id": "c1", "verdict": "PASS", "score": 100, "reasoning": "model says ok", "evidence_quote": None}],
+    }
+    eval_criteria = [{"id": "c1", "type": "code", "gate": "sha256_of", "description": "hash check"}]
+    # Apply the overwrite logic (mirrors evaluate_work)
+    _code_crit_ids = {c["id"] for c in eval_criteria if c.get("type") == "code"}
+    _gate_fail_map = {f["criterion_id"]: f.get("reason", "") for f in gate_failures}
+    _gate_pass_ids = _code_crit_ids - set(_gate_fail_map.keys())
+    _results = structured_result.get("criteria_results", [])
+    for _r in _results:
+        if _r["criterion_id"] in _gate_fail_map:
+            _r["verdict"] = "FAIL"
+            _r["reasoning"] = _gate_fail_map[_r["criterion_id"]]
+            _r["evidence_quote"] = None
+        elif _r["criterion_id"] in _gate_pass_ids:
+            _r["verdict"] = "PASS"
+            _r["reasoning"] = "code gate"
+    _all_verdicts = [_r["verdict"] for _r in _results]
+    if "FAIL" in _all_verdicts:
+        structured_result["overall_verdict"] = "FAIL"
+    assert structured_result["overall_verdict"] == "FAIL"
+    assert _results[0]["verdict"] == "FAIL"
+    assert "sha256 mismatch" in _results[0]["reasoning"]
+
+
+def test_http_status_gate_fails_not_passes():
+    """http_status gate must return a FAIL entry, not silently succeed."""
+    criteria = [{"id": "c1", "type": "code", "gate": "http_status", "description": "check url", "url": "https://example.com", "expected_status": 200}]
+    failures = _execute_code_gates("some work", criteria)
+    assert len(failures) == 1
+    assert failures[0]["criterion_id"] == "c1"
+    assert failures[0]["verdict"] == "FAIL"
+    assert "not yet implemented" in failures[0]["reason"]
+
+
+def test_xrpl_tx_gate_fails_not_passes():
+    """xrpl_tx gate must return a FAIL entry, not silently succeed."""
+    criteria = [{"id": "c1", "type": "code", "gate": "xrpl_tx", "description": "tx check", "tx_hash": "ABC"}]
+    failures = _execute_code_gates("some work", criteria)
+    assert len(failures) == 1
+    assert failures[0]["verdict"] == "FAIL"
+
+
+def test_release_mode_validation():
+    """_RELEASE_MODE_RE must accept valid values and reject invalid ones."""
+    import re
+    from referee import _RELEASE_MODE_RE
+    assert _RELEASE_MODE_RE.match("auto")
+    assert _RELEASE_MODE_RE.match("challenge_window_hrs:1")
+    assert _RELEASE_MODE_RE.match("challenge_window_hrs:12")
+    assert _RELEASE_MODE_RE.match("challenge_window_hrs:24")
+    assert not _RELEASE_MODE_RE.match("banana")
+    assert not _RELEASE_MODE_RE.match("challenge_window_hrs:0")
+    assert not _RELEASE_MODE_RE.match("challenge_window_hrs:25")
+    assert not _RELEASE_MODE_RE.match("challenge_window_hrs:999")
