@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 import jwt as pyjwt
 import uuid
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, root_validator
 from dotenv import load_dotenv
 import resend
 
@@ -599,6 +599,7 @@ async def _release_sweep_loop():
                         EscrowVault.release_tx_hash == None,
                         EscrowVault.updated_at != None,
                         EscrowVault.updated_at <= _now - timedelta(minutes=10),
+                        or_(EscrowVault.release_attempts == None, EscrowVault.release_attempts < 5),
                     ).all()
                     for _v in stuck:
                         try:
@@ -692,6 +693,7 @@ async def _hourly_db_window():
                         EscrowVault.release_tx_hash == None,
                         EscrowVault.updated_at != None,
                         EscrowVault.updated_at <= _now_hw - timedelta(minutes=10),
+                        or_(EscrowVault.release_attempts == None, EscrowVault.release_attempts < 5),
                     ).all()
                     for _v in stuck_releasing:
                         try:
@@ -958,7 +960,7 @@ def robots_txt():
         "Allow: /status",
         "Allow: /fees",
         "",
-        "Sitemap: https://mcp.cryptovault.co.uk/openapi.json",
+        "# Sitemap: not available",
     ])
 
 def _build_agent_card():
@@ -1371,6 +1373,8 @@ async def serve_payment_required():
         "accepts":      accepts,
         "docs":         "https://mcp.cryptovault.co.uk/docs",
         "mcp":          "https://mcp.cryptovault.co.uk/mcp",
+        "llms_txt":     "https://mcp.cryptovault.co.uk/llms.txt",
+        "server_card":  "https://mcp.cryptovault.co.uk/.well-known/mcp/server-card.json",
     }
 
 
@@ -1677,6 +1681,7 @@ class EscrowVault(Base):
     cancel_tx_hash    = Column(String,              nullable=True)
     cancelled_at      = Column(DateTime(timezone=True), nullable=True)
     backfill_attempts = Column(Integer, default=0,  nullable=True)
+    release_attempts  = Column(Integer, default=0,  nullable=True)
     # Worker auth token — v2.8.0
     evaluate_token_hash  = Column(String,  nullable=True)   # SHA-256 of one-time evaluate token
     # Part B Phase 1 — structured evaluation engine
@@ -2805,6 +2810,8 @@ def run_migrations():
         "ALTER TABLE escrow_template ADD COLUMN IF NOT EXISTS max_submissions    INTEGER DEFAULT 3",
         # EnterpriseAccount — seller profile
         "ALTER TABLE enterprise_account ADD COLUMN IF NOT EXISTS public_seller_profile BOOLEAN DEFAULT FALSE",
+        # P1-2: release retry counter
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS release_attempts INT DEFAULT 0",
         # P0-1: updated_at for RELEASING sweeper
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
         # AuditLog created_at
@@ -3483,10 +3490,17 @@ class EscrowSetupRequest(BaseModel):
     deliverable_type: str = "work"            # 'work' | 'nft' | 'code' | 'data'
     release_mode:     str = "auto"            # 'auto' | 'challenge_window_hrs:N'
     require_consensus_vault: bool = False     # require dual-model consensus on every evaluation
+    require_consensus:       bool = False     # alias for require_consensus_vault
     # Part D — Bring-your-own-deal
     external_ref:      Optional[str] = None  # e.g. "upwork:123", "github:org/repo#45"
     external_url:      Optional[str] = None  # URL of original listing (must start with https://)
     counterparty_type: Optional[str] = None  # "agent" | "human"
+
+    @root_validator(pre=True)
+    def _alias_require_consensus(cls, values):
+        if values.get('require_consensus') and not values.get('require_consensus_vault'):
+            values['require_consensus_vault'] = True
+        return values
 
 class AuditRequest(BaseModel):
     escrow_id:           str
@@ -3908,6 +3922,16 @@ async def auto_finish_escrow(
             vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
             if vault:
                 vault.auto_finish_error = str(e)[:500]
+                attempts = (vault.release_attempts or 0) + 1
+                vault.release_attempts = attempts
+                err_str = str(e).upper()
+                if "TECNO_TARGET" in err_str or "TECNO_ENTRY" in err_str:
+                    logger.error(f"❌ AUTO-FINISH: escrow {escrow_id} gone from ledger (tecNO_TARGET/tecNO_ENTRY) — marking CANCELLED")
+                    vault.status = "CANCELLED"
+                    vault.cancelled_at = datetime.now(timezone.utc)
+                elif attempts >= 5:
+                    logger.error(f"❌ AUTO-FINISH: {escrow_id} failed {attempts} times — marking RELEASE_FAILED, stopping retries")
+                    vault.status = "RELEASE_FAILED"
                 db.commit()
         finally:
             db.close()
@@ -5731,7 +5755,12 @@ def _validate_criteria_v2(criteria: list):
     regex_count = sum(1 for c in criteria if c.get("type") == "code" and c.get("gate") == "regex")
     if regex_count > 3:
         raise HTTPException(status_code=400, detail=f"Too many regex criteria: {regex_count} (max 3)")
-    _NESTED_QUANT_RE = _re_std.compile(r'\([^()]*[+*][^()]*\)[+*]|\([^()]*[+*]\)[+*?]')
+    _NESTED_QUANT_RE = _re_std.compile(
+        r'(?:\([^()]*[+*][^()]*\)[+*{?]'   # (a+b)+ or (a+b){
+        r'|\([^()]*[+*]\)[+*{?]'            # (a+)+ or (a+){
+        r'|\([^()]*\|[^()]*\)[+*{]'         # (a|b)+ or (a|b){
+        r'|\([^()]*[+*][^()]*\)\{)'         # (a+b){ bounded repeat
+    )
     for c in criteria:
         if c.get("type") == "code" and c.get("gate") == "regex":
             pattern = c.get("pattern", "")
@@ -7217,11 +7246,10 @@ async def challenge_escrow_verdict(escrow_id: str, request: Request, db: Session
     The buyer must first call GET /verify/challenge?wallet=... to get a challenge string,
     submit an AccountSet tx with that string in a Memo, then POST here.
     """
-    # Challenge fee payout via XRPL Payment is not yet implemented.
-    # Return 501 so callers are not charged fees they cannot recover.
+    # Challenges are coming soon. Return 501 so callers are not charged any fee.
     raise HTTPException(
         status_code=501,
-        detail="Challenge endpoint is not yet available. Challenge fee payouts are pending implementation.",
+        detail="Challenges are coming soon — this feature is not yet available. No fee is required.",
     )
 
     try:
@@ -7368,8 +7396,15 @@ class EscrowRequestBody(BaseModel):
     deliverable_type:        str             = "work"
     release_mode:            str             = "auto"
     require_consensus_vault: bool            = False
+    require_consensus:       bool            = False  # alias for require_consensus_vault
     worker_email:            Optional[str]   = None
     buyer_email:             Optional[str]   = None
+
+    @root_validator(pre=True)
+    def _alias_require_consensus(cls, values):
+        if values.get('require_consensus') and not values.get('require_consensus_vault'):
+            values['require_consensus_vault'] = True
+        return values
 
 
 def _is_valid_xrpl_address(addr: str) -> bool:
@@ -7391,25 +7426,31 @@ def _verify_seller_ownership(seller_address: str, escrow_id: str, buyer_email: s
             ).first()
             if linked:
                 return True
+    # Option 2: signed message — header format: x-seller-signature: <hexsig>:<ts>:<public_key_hex>
     if sig_header:
         import time as _time
         try:
-            parts = sig_header.rsplit(":", 1)
-            if len(parts) == 2:
-                sig_b64, ts_str = parts
-                ts = int(ts_str)
-                if abs(_time.time() - ts) > 300:
-                    raise HTTPException(status_code=401, detail="Seller signature expired (must be within 5 minutes)")
-                message = f"agenttrust-request:{escrow_id}:{buyer_email}:{ts}"
-                from xrpl.core.keypairs import verify as xrpl_verify
-                sig_bytes = base64.b64decode(sig_b64)
-                if xrpl_verify(message.encode().hex().upper(), sig_bytes.hex().upper(), seller_address):
-                    return True
+            parts = sig_header.strip().split(":")
+            if len(parts) < 3:
+                raise HTTPException(status_code=401, detail="x-seller-signature must be <hexsig>:<ts>:<public_key_hex>")
+            public_key_hex = parts[-1]
+            ts_str = parts[-2]
+            sig_hex = ":".join(parts[:-2])
+            ts = int(ts_str)
+            if abs(_time.time() - ts) > 300:
+                raise HTTPException(status_code=401, detail="Seller signature expired (must be within 5 minutes)")
+            message = f"agenttrust-request:{escrow_id}:{buyer_email}:{ts}"
+            from xrpl.core.keypairs import derive_classic_address, is_valid_message
+            derived_addr = derive_classic_address(public_key_hex)
+            if derived_addr != seller_address:
+                raise HTTPException(status_code=401, detail="Public key does not match seller_address")
+            if is_valid_message(message.encode(), bytes.fromhex(sig_hex), public_key_hex):
+                return True
         except HTTPException:
             raise
         except Exception as _e:
-            logger.debug(f"Seller sig verification error: {_e}")
-    raise HTTPException(status_code=401, detail="Seller ownership proof required: provide an enterprise API key (x-api-key header) linked to seller_address, or an x-seller-signature header (base64sig:ts)")
+            logger.warning(f"Seller sig verification error: {_e}")
+    raise HTTPException(status_code=401, detail="Seller ownership proof required: provide an enterprise API key (x-api-key header) linked to seller_address, or an x-seller-signature header (<hexsig>:<ts>:<public_key_hex>)")
 
 
 @app.post("/escrow/request")
@@ -11916,6 +11957,7 @@ async def create_template(
 ):
     if not _subscription_active(account):
         raise HTTPException(status_code=402, detail="Subscription required")
+    _validate_criteria_v2(body.get("criteria_v2") or [])
     tmpl = EscrowTemplate(
         id=str(uuid.uuid4()),
         account_id=account.id,
@@ -11972,6 +12014,8 @@ async def update_template(
     tmpl = db.query(EscrowTemplate).filter_by(id=template_id, account_id=account.id).first()
     if not tmpl:
         raise HTTPException(status_code=404, detail="Template not found")
+    if "criteria_v2" in body:
+        _validate_criteria_v2(body.get("criteria_v2") or [])
     for field in ("name","description","category","rubric","min_amount_xrp","max_amount_xrp",
                   "deadline_hours","require_nft_proof","required_nft_issuer","required_domain",
                   "required_vc_issuer_did","require_ai_audit","proof_policy",
