@@ -1435,7 +1435,7 @@ def serve_ai_plugin():
         "api": {"type": "openapi", "url": "https://mcp.cryptovault.co.uk/openapi.json"},
         "logo_url": "https://www.cryptovault.co.uk/logo.png",
         "contact_email": "hello@cryptovault.co.uk",
-        "legal_info_url": "https://www.cryptovault.co.uk",
+        "legal_info_url": "https://www.cryptovault.co.uk/terms/",
     }
 
 # ---------------------------------------------------------------------------
@@ -8799,7 +8799,7 @@ async def _send_nft_accept_email(buyer_email: str, buyer_name: str, escrow_id: s
             await client.post(
                 "https://api.resend.com/emails",
                 headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-                json={"from": "AgentTrust <noreply@agenttrust.io>", "to": [buyer_email], "subject": subject, "html": body},
+                json={"from": "AgentTrust <noreply@cryptovault.co.uk>", "to": [buyer_email], "subject": subject, "html": body},
             )
     except Exception as e:
         logger.warning(f"NFT accept email failed: {e}")
@@ -10824,7 +10824,7 @@ async def _send_issuer_registration_email(issuer):
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post("https://api.resend.com/emails",
                 headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-                json={"from": "AgentTrust <noreply@agenttrust.io>", "to": ["eamwhite1@gmail.com"], "subject": subject, "html": body}
+                json={"from": "AgentTrust <noreply@cryptovault.co.uk>", "to": ["eamwhite1@gmail.com"], "subject": subject, "html": body}
             )
     except Exception as e:
         logger.warning(f"Issuer registration email failed: {e}")
