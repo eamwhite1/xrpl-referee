@@ -132,6 +132,7 @@ async def _lifespan(app):
         # DB-seeded copy is already in _ofac_sanctioned_xrpl — no blocking at startup.
         asyncio.create_task(_ofac_refresh_loop())
         asyncio.create_task(_check_gemini_models())
+        asyncio.create_task(_gemini_schema_selftest())
         # Single unified hourly DB window — all background DB work runs here sequentially.
         # Replaces separate enterprise + escrow pollers (which were being started as
         # independent tasks but are now single-run functions called by _hourly_db_window).
@@ -570,12 +571,25 @@ async def _hourly_db_window():
                         EscrowVault.challenge_deadline <= _now_hw,
                     ).all()
                     for _v in expired_cw:
-                        _v.status = "RELEASED"
-                        _v.released_at = _now_hw
-                        logger.info(f"Auto-released {_v.escrow_id} after challenge window expired")
+                        _v.status = "RELEASING"
+                        logger.info(f"RELEASING {_v.escrow_id} after challenge window expired — queuing auto_finish")
                         _send_challenge_window_expired_email(_v)
                     if expired_cw:
                         _hw_db.commit()
+                    for _v in expired_cw:
+                        if _v.sequence and _v.owner_address and _v.fulfillment_enc and _v.condition:
+                            try:
+                                fulfillment = decrypt_fulfillment(_v.escrow_id, _v.fulfillment_enc)
+                                asyncio.create_task(auto_finish_escrow(
+                                    _v.escrow_id, _v.sequence, _v.owner_address,
+                                    fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
+                                ))
+                            except Exception as _fe:
+                                logger.error(f"auto_finish queue failed for {_v.escrow_id}: {_fe}")
+                        else:
+                            _v.status = "RELEASED"
+                            _v.released_at = _now_hw
+                            _hw_db.commit()
                     # Expire AWAITING_FUNDING vaults past funding_deadline
                     expired_requests = _hw_db.query(EscrowVault).filter(
                         EscrowVault.status == "AWAITING_FUNDING",
@@ -3611,6 +3625,8 @@ async def auto_finish_escrow(
                 vault.auto_finish_hash = tx_hash
                 vault.release_tx_hash  = tx_hash
                 vault.released_at      = datetime.now(timezone.utc)
+                if vault.status == "RELEASING":
+                    vault.status = "RELEASED"
                 db.commit()
         finally:
             db.close()
@@ -5560,21 +5576,12 @@ def _validate_verdict(verdict: dict, criteria: list, evidence_items: list) -> li
     return errors
 
 
-async def _run_structured_audit(
-    task: str,
-    work: str,
-    criteria: list,
-    evidence_items: list,
-    require_consensus: bool,
-    attempt_count: int,
-) -> dict:
-    """Run structured AI audit with criterion types, evidence, consensus logic."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
-
-    prompt_text = _build_audit_prompt(task, work, criteria, evidence_items)
-    response_schema = {
+def _build_response_schema() -> dict:
+    """Return the Gemini responseSchema for structured audit verdicts.
+    All nullable fields use {"type": "string", "nullable": True} — Gemini does
+    NOT accept list-valued "type" arrays (e.g. ["string","null"]).
+    """
+    return {
         "type": "object",
         "properties": {
             "overall_verdict": {"type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
@@ -5589,7 +5596,7 @@ async def _run_structured_audit(
                         "verdict": {"type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"]},
                         "score": {"type": "integer"},
                         "reasoning": {"type": "string"},
-                        "evidence_quote": {"type": ["string", "null"]},
+                        "evidence_quote": {"type": "string", "nullable": True},
                     },
                     "required": ["criterion_id", "verdict", "score", "reasoning"],
                 },
@@ -5597,6 +5604,23 @@ async def _run_structured_audit(
         },
         "required": ["overall_verdict", "overall_score", "overall_reasoning", "criteria_results"],
     }
+
+
+async def _run_structured_audit(
+    task: str,
+    work: str,
+    criteria: list,
+    evidence_items: list,
+    require_consensus: bool,
+    attempt_count: int,
+) -> dict:
+    """Run structured AI audit with criterion types, evidence, consensus logic."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
+
+    prompt_text = _build_audit_prompt(task, work, criteria, evidence_items)
+    response_schema = _build_response_schema()
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
         "generationConfig": {
@@ -5690,6 +5714,33 @@ async def _check_gemini_models():
                 logger.warning(f"Could not check Gemini models: {r.status_code}")
     except Exception as e:
         logger.warning(f"Gemini model check failed: {e}")
+
+
+async def _gemini_schema_selftest():
+    """Fire a minimal structured-output request to verify the responseSchema is accepted."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return
+    try:
+        schema = _build_response_schema()
+        payload = {
+            "contents": [{"parts": [{"text": "Reply with a minimal PASS verdict JSON."}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+                "responseSchema": schema,
+            },
+        }
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+        if r.status_code == 200:
+            logger.info("✅ Gemini responseSchema self-test passed")
+        else:
+            logger.error(f"❌ Gemini responseSchema self-test failed: HTTP {r.status_code} — {r.text[:300]}")
+    except Exception as e:
+        logger.error(f"❌ Gemini responseSchema self-test error: {e}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -5942,6 +5993,7 @@ async def _run_challenge_review(escrow_id: str):
                         "temperature": 0,
                         "seed": 42,
                         "responseMimeType": "application/json",
+                        "responseSchema": _build_response_schema(),
                         "thinkingConfig": {"thinkingBudget": 2048},
                     },
                 }
@@ -5964,18 +6016,34 @@ async def _run_challenge_review(escrow_id: str):
 
         if pro_result is None:
             # Pro unavailable — release escrow to worker, refund challenge fee to buyer
-            vault.status = "RELEASED"
-            vault.released_at = now
-            logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (Pro unavailable)")  # TODO: submit XRPL tx
+            vault.status = "RELEASING"
+            logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (Pro unavailable)")  # TODO: submit XRPL Payment
             db.commit()
+            if vault.sequence and vault.owner_address and vault.fulfillment_enc and vault.condition:
+                try:
+                    fulfillment = decrypt_fulfillment(vault.escrow_id, vault.fulfillment_enc)
+                    asyncio.create_task(auto_finish_escrow(
+                        vault.escrow_id, vault.sequence, vault.owner_address,
+                        fulfillment, vault.condition, vault.worker_address or "", SessionLocal,
+                    ))
+                except Exception as _fe:
+                    logger.error(f"auto_finish queue failed for {escrow_id}: {_fe}")
             _send_challenge_outcome_email(vault, "pro_unavailable")
             return
 
         if pro_verdict == "PASS":
-            vault.status = "RELEASED"
-            vault.released_at = now
-            logger.info(f"CHALLENGE_FEE_PAYOUT: send {vault.challenge_fee_amount} XRP to {vault.worker_address} for escrow {escrow_id} (challenge rejected)")  # TODO: submit XRPL tx
+            vault.status = "RELEASING"
+            logger.info(f"CHALLENGE_FEE_PAYOUT: send {vault.challenge_fee_amount} XRP to {vault.worker_address} for escrow {escrow_id} (challenge rejected)")  # TODO: submit XRPL Payment
             db.commit()
+            if vault.sequence and vault.owner_address and vault.fulfillment_enc and vault.condition:
+                try:
+                    fulfillment = decrypt_fulfillment(vault.escrow_id, vault.fulfillment_enc)
+                    asyncio.create_task(auto_finish_escrow(
+                        vault.escrow_id, vault.sequence, vault.owner_address,
+                        fulfillment, vault.condition, vault.worker_address or "", SessionLocal,
+                    ))
+                except Exception as _fe:
+                    logger.error(f"auto_finish queue failed for {escrow_id}: {_fe}")
             _send_challenge_outcome_email(vault, "rejected")
         else:
             # Pro FAIL — check CancelAfter
@@ -6754,6 +6822,13 @@ async def challenge_escrow_verdict(escrow_id: str, request: Request, db: Session
     The buyer must first call GET /verify/challenge?wallet=... to get a challenge string,
     submit an AccountSet tx with that string in a Memo, then POST here.
     """
+    # Challenge fee payout via XRPL Payment is not yet implemented.
+    # Return 501 so callers are not charged fees they cannot recover.
+    raise HTTPException(
+        status_code=501,
+        detail="Challenge endpoint is not yet available. Challenge fee payouts are pending implementation.",
+    )
+
     try:
         body = await request.json()
     except Exception:

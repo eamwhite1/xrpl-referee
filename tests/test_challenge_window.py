@@ -277,3 +277,34 @@ def test_grok_full_flow():
     assert vault.status == "RELEASED"
     assert vault.remedy_attempt_used is True
     assert vault.released_at is not None
+
+
+def test_challenge_returns_501():
+    """Challenge endpoint must return 501 until fee payout is implemented."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from fastapi.testclient import TestClient
+    from unittest.mock import patch, MagicMock
+
+    with patch("referee.SessionLocal") as mock_sl, \
+         patch("referee.engine"), \
+         patch("referee.Base"), \
+         patch("referee.run_migrations"), \
+         patch("referee._load_ofac_from_db"), \
+         patch("referee._seed_public_issuers"), \
+         patch("referee._verify_xumm", return_value=None), \
+         patch("referee._ofac_refresh_loop", return_value=asyncio.sleep(0)), \
+         patch("referee._check_gemini_models", return_value=asyncio.sleep(0)), \
+         patch("referee._gemini_schema_selftest", return_value=asyncio.sleep(0)), \
+         patch("referee._ensure_hourly_window"), \
+         patch("referee._refresh_jobs_snapshot", return_value=asyncio.sleep(0)):
+        from referee import app
+        client = TestClient(app)
+        resp = client.post("/escrow/test-escrow-123/challenge", json={
+            "criteria_ids": ["c1"],
+            "reason": "work is bad",
+            "fee_tx_hash": "A" * 64,
+            "wallet_address": "rTest",
+            "tx_hash": "B" * 64,
+        })
+        assert resp.status_code == 501

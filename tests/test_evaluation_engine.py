@@ -185,3 +185,23 @@ def test_validate_verdict_ok():
     verdict = {"overall_verdict": "PASS", "overall_score": 90, "criteria_results": []}
     errors = _validate_verdict(verdict, [], [])
     assert errors == []
+
+
+def test_response_schema_no_list_type():
+    """responseSchema must not use list-valued 'type' — Gemini rejects those with 400."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from referee import _build_response_schema
+
+    def _check_no_list_type(obj, path=""):
+        if isinstance(obj, dict):
+            t = obj.get("type")
+            assert not isinstance(t, list), f"List-valued 'type' at {path}: {t!r}"
+            for k, v in obj.items():
+                _check_no_list_type(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                _check_no_list_type(item, f"{path}[{i}]")
+
+    schema = _build_response_schema()
+    _check_no_list_type(schema)
