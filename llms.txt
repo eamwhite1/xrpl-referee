@@ -25,10 +25,10 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
 ## Verification modes
 
-- Code gates (deterministic): sha256_of, exact_match, regex, json_schema, http_status, xrpl_tx
+- Code gates (deterministic): sha256_of, exact_match, regex, json_schema (http_status, xrpl_tx coming soon)
 - AI audit (gemini-2.5-flash, optional consensus with gemini-2.5-pro)
-- Challenge window: buyer can challenge a PASS verdict, Pro model re-reviews
-- INCONCLUSIVE verdicts do NOT consume submission attempts
+- Delayed release (challenge_window_hrs:N): PASS holds N hours then auto-releases; disputes coming soon
+- INCONCLUSIVE verdicts: first 3 per vault are free (no attempt consumed); later ones count as an attempt
 
 ## Quick start
 

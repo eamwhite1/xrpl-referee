@@ -851,7 +851,17 @@ def serve_ui(request: Request):
 <title>AgentTrust Referee</title></head>
 <body>Redirecting to <a href="/playground">playground</a>...</body>
 </html>""", status_code=200)
-    return {"status": "online", "version": APP_VERSION, "service": "AgentTrust Referee", "playground": "/playground", "docs": "/docs"}
+    return {
+        "status": "online",
+        "version": APP_VERSION,
+        "service": "AgentTrust Referee",
+        "playground": "/playground",
+        "docs": "/docs",
+        "mcp": "https://mcp.cryptovault.co.uk/mcp",
+        "llms_txt": "https://mcp.cryptovault.co.uk/llms.txt",
+        "server_card": "https://mcp.cryptovault.co.uk/.well-known/mcp/server-card.json",
+        "fees": "https://mcp.cryptovault.co.uk/fees",
+    }
 
 @app.get("/docs", include_in_schema=False)
 def serve_docs():
@@ -1124,6 +1134,13 @@ async def serve_mcp_server_card():
         "tool_count":  len(_tools_list),
         "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3", "nft", "trust", "identity"],
     }
+
+
+@app.get("/mcp/server-card")
+@app.get("/.well-known/mcp.json")
+async def serve_mcp_server_card_alias():
+    """Aliases for /.well-known/mcp/server-card.json for broader crawler compatibility."""
+    return await serve_mcp_server_card()
 
 
 @app.get("/.well-known/marketplace.json")
@@ -1412,28 +1429,24 @@ def serve_ai_plugin():
         return FileResponse(path, media_type="application/json")
     return {
         "schema_version": "v1",
-        "name_for_human": "AgentTrust Referee",
-        "name_for_model": "agenttrust_referee",
+        "name_for_human": "AgentTrust Escrow",
+        "name_for_model": "agenttrust_escrow",
         "description_for_human": (
-            "Trustless AI task verification with automatic XRPL payment release. "
-            "Post a task spec and a work submission — get a structured PASS/FAIL verdict. "
-            "Optional escrow: lock XRP or RLUSD on-chain, funds release automatically on approval."
+            "Lock XRP or RLUSD in crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. "
+            "Supports NFT, domain, W3C VC proof gates and dual-model consensus audit. MCP at https://mcp.cryptovault.co.uk/mcp."
         ),
         "description_for_model": (
-            "Use this tool to verify whether a seller has completed a task to specification and auto-release escrowed funds. "
-            "This API implements the x402 payment protocol: if you call any paid endpoint without a payment, you will receive "
-            "a 402 response with an X-Payment-Required header containing base64-encoded JSON that tells you exactly how much "
-            "XRP to send, where to send it, and which header to use. Send $0.10 (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on "
-            "the XRPL, then retry with the transaction hash as the X-PAYMENT header (or legacy x-payment-hash header). "
-            "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
-            "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
-            "Set require_consensus_vault=true at /escrow/generate or /escrow/request for a premium dual-model consensus vault ($0.25 fee): Gemini Flash evaluates first, then Gemini Pro independently reviews — both must agree on PASS or the result is INCONCLUSIVE. "
-            "For full escrow-gated payments: POST to /escrow/generate to lock funds, then POST to /evaluate to audit and auto-release. "
-            "Supports XRP and RLUSD. Sellers may include XRPL transaction hashes as proof of on-chain delivery — the referee will verify them on the ledger."
+            "Trust-minimized escrow for agent-to-agent work on the XRP Ledger. "
+            "Flow: buyer calls /escrow/generate to lock funds → seller submits proof to /evaluate → AI referee audits against criteria → PASS auto-releases XRP/RLUSD to seller. "
+            "Proof gates (NFT ownership, XRPL domain, W3C VC, NFT DvP) can gate release before AI audit. "
+            "Set require_consensus_vault=true for dual-model audit (Gemini Flash + Pro, $0.25 one-time vault fee). "
+            "INCONCLUSIVE does not consume an attempt for the first 3 per vault; later ones count. "
+            "Implements x402: call any paid endpoint without payment to receive 402 with X-Payment-Required describing how to pay. "
+            "MCP server at https://mcp.cryptovault.co.uk/mcp."
         ),
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": "https://mcp.cryptovault.co.uk/openapi.json"},
-        "logo_url": "https://www.cryptovault.co.uk/logo.png",
+        "logo_url": "https://www.cryptovault.co.uk/logo.svg",
         "contact_email": "hello@cryptovault.co.uk",
         "legal_info_url": "https://www.cryptovault.co.uk/terms/",
     }
@@ -3046,6 +3059,7 @@ X402_DEFAULT_SOURCE_TAG = 804681468
 X402_CHALLENGE_TTL_SECONDS = 600
 
 _x402_challenges: dict = {}  # invoice_id -> {resource, payTo, asset, issuer, currency, amount, created_at}
+_seller_sig_replay: dict = {}  # sha256(sig_hex) -> expiry_ts (10 min window)
 
 
 def _x402_v2_envelope(resource: str, required_xrp: float) -> tuple[dict, str]:
@@ -3496,6 +3510,9 @@ class EscrowSetupRequest(BaseModel):
     external_url:      Optional[str] = None  # URL of original listing (must start with https://)
     counterparty_type: Optional[str] = None  # "agent" | "human"
 
+    class Config:
+        extra = "forbid"
+
     @root_validator(pre=True)
     def _alias_require_consensus(cls, values):
         if values.get('require_consensus') and not values.get('require_consensus_vault'):
@@ -3926,9 +3943,13 @@ async def auto_finish_escrow(
                 vault.release_attempts = attempts
                 err_str = str(e).upper()
                 if "TECNO_TARGET" in err_str or "TECNO_ENTRY" in err_str:
-                    logger.error(f"❌ AUTO-FINISH: escrow {escrow_id} gone from ledger (tecNO_TARGET/tecNO_ENTRY) — marking CANCELLED")
-                    vault.status = "CANCELLED"
-                    vault.cancelled_at = datetime.now(timezone.utc)
+                    logger.error(f"❌ AUTO-FINISH: escrow {escrow_id} gone from ledger (tecNO_TARGET/tecNO_ENTRY) — scanning tx history")
+                    seq = vault.escrow_sequence
+                    if seq and vault.buyer_address:
+                        await _resolve_gone_escrow(vault, vault.buyer_address, seq, db)
+                    else:
+                        vault.status = "CANCELLED"
+                        vault.cancelled_at = datetime.now(timezone.utc)
                 elif attempts >= 5:
                     logger.error(f"❌ AUTO-FINISH: {escrow_id} failed {attempts} times — marking RELEASE_FAILED, stopping retries")
                     vault.status = "RELEASE_FAILED"
@@ -5755,11 +5776,11 @@ def _validate_criteria_v2(criteria: list):
     regex_count = sum(1 for c in criteria if c.get("type") == "code" and c.get("gate") == "regex")
     if regex_count > 3:
         raise HTTPException(status_code=400, detail=f"Too many regex criteria: {regex_count} (max 3)")
+    # Only reject clearly catastrophic patterns; rely on 0.5s worker-thread timeout for edge cases.
+    # Avoids false positives on (foo|bar)+ and (\w+\.)+com$ which are benign.
     _NESTED_QUANT_RE = _re_std.compile(
-        r'(?:\([^()]*[+*][^()]*\)[+*{?]'   # (a+b)+ or (a+b){
-        r'|\([^()]*[+*]\)[+*{?]'            # (a+)+ or (a+){
-        r'|\([^()]*\|[^()]*\)[+*{]'         # (a|b)+ or (a|b){
-        r'|\([^()]*[+*][^()]*\)\{)'         # (a+b){ bounded repeat
+        r'\((?:[^()|]*[+*][^()|]*)\)[+*]'   # (a+b)+ no alternation — clearly catastrophic
+        r'|\((?:[^()|]*[+*])\)\{[0-9]'      # (a+){N — bounded repeat of quantified group
     )
     for c in criteria:
         if c.get("type") == "code" and c.get("gate") == "regex":
@@ -7400,6 +7421,9 @@ class EscrowRequestBody(BaseModel):
     worker_email:            Optional[str]   = None
     buyer_email:             Optional[str]   = None
 
+    class Config:
+        extra = "forbid"
+
     @root_validator(pre=True)
     def _alias_require_consensus(cls, values):
         if values.get('require_consensus') and not values.get('require_consensus_vault'):
@@ -7412,10 +7436,20 @@ def _is_valid_xrpl_address(addr: str) -> bool:
     return bool(addr and re.match(r'^r[1-9A-HJ-NP-Za-km-z]{24,33}$', addr))
 
 
-def _verify_seller_ownership(seller_address: str, escrow_id: str, buyer_email: str,
+def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp: float,
+                              task_desc: str, buyer_email: str,
                               api_key_header: Optional[str], sig_header: Optional[str],
                               db: Session) -> bool:
-    """Verify caller controls seller_address. Raises 401 if proof absent/invalid."""
+    """Verify caller controls seller_address. Raises 401 if proof absent/invalid.
+
+    Signed message format (client-side, using xrpl-py):
+      import hashlib
+      from xrpl.core.keypairs import sign
+      task_hash = hashlib.sha256(task_desc.encode()).hexdigest()[:16]
+      msg = f"agenttrust-request:{seller_address}:{buyer_address}:{amount_xrp}:{task_hash}:{ts}"
+      sig_hex = sign(msg.encode(), private_key)
+      header = f"{sig_hex}:{ts}:{public_key_hex}"
+    """
     if api_key_header:
         key_hash = hashlib.sha256(api_key_header.encode()).hexdigest()
         key_rec = db.query(EnterpriseApiKey).filter(EnterpriseApiKey.key_hash == key_hash, EnterpriseApiKey.revoked == False).first()
@@ -7439,18 +7473,39 @@ def _verify_seller_ownership(seller_address: str, escrow_id: str, buyer_email: s
             ts = int(ts_str)
             if abs(_time.time() - ts) > 300:
                 raise HTTPException(status_code=401, detail="Seller signature expired (must be within 5 minutes)")
-            message = f"agenttrust-request:{escrow_id}:{buyer_email}:{ts}"
+            import hashlib as _hl
+            task_hash = _hl.sha256((task_desc or "").encode()).hexdigest()[:16]
+            message = f"agenttrust-request:{seller_address}:{buyer_address}:{amount_xrp}:{task_hash}:{ts}"
             from xrpl.core.keypairs import derive_classic_address, is_valid_message
             derived_addr = derive_classic_address(public_key_hex)
             if derived_addr != seller_address:
                 raise HTTPException(status_code=401, detail="Public key does not match seller_address")
             if is_valid_message(message.encode(), bytes.fromhex(sig_hex), public_key_hex):
+                # Replay protection
+                import time as _time2
+                sig_digest = hashlib.sha256(sig_hex.encode()).hexdigest()
+                _now_ts = _time2.time()
+                for _k in [k for k, v in list(_seller_sig_replay.items()) if v < _now_ts]:
+                    del _seller_sig_replay[_k]
+                if sig_digest in _seller_sig_replay:
+                    raise HTTPException(status_code=409, detail="Seller signature already used (replay detected)")
+                _seller_sig_replay[sig_digest] = _now_ts + 600
                 return True
         except HTTPException:
             raise
         except Exception as _e:
             logger.warning(f"Seller sig verification error: {_e}")
-    raise HTTPException(status_code=401, detail="Seller ownership proof required: provide an enterprise API key (x-api-key header) linked to seller_address, or an x-seller-signature header (<hexsig>:<ts>:<public_key_hex>)")
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "Seller ownership proof required. "
+            "Option 1: enterprise API key (x-api-key header) linked to seller_address. "
+            "Option 2: x-seller-signature header (<hexsig>:<ts>:<public_key_hex>) — "
+            "verify wallet first via GET /verify/challenge?wallet=<address> then POST /verify/confirm, "
+            "then sign 'agenttrust-request:{seller_address}:{buyer_address}:{amount_xrp}:{sha256(task)[:16]}:{ts}' "
+            "using xrpl.core.keypairs.sign(msg.encode(), private_key) client-side."
+        )
+    )
 
 
 @app.post("/escrow/request")
@@ -7586,7 +7641,8 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
     )
     # Seller ownership proof — required before any buyer contact details are stored
     _verify_seller_ownership(
-        req.seller_address, escrow_id, req.buyer_email or "",
+        req.seller_address, req.buyer_address or "", float(req.amount_xrp or 0),
+        req.task_description or "", req.buyer_email or "",
         request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db,
     )
     db.add(vault)
