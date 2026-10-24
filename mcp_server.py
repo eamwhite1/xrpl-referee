@@ -286,9 +286,9 @@ async def create_escrow_vault(
         title="Callback URL",
         description="HTTPS endpoint on your server to receive webhook POST notifications on escrow state changes (funded, PASS, FAIL, expired). Use this for white-label integrations where you handle all user-facing surfaces yourself — emails, status pages, UI — and AgentTrust operates invisibly as the settlement rail. Payload: {escrow_id, event, verdict, timestamp, metadata}.",
     )] = None,
-    metadata: Annotated[Optional[str], Field(
-        title="Metadata (JSON string)",
-        description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.) without storing them on AgentTrust's side. Example: '{\"invoice_id\": \"INV-2026-0042\", \"po_number\": \"PO-9981\"}'.",
+    metadata: Annotated[Optional[dict], Field(
+        title="Metadata",
+        description="Optional dict of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.) without storing them on AgentTrust's side. Example: {\"invoice_id\": \"INV-2026-0042\", \"po_number\": \"PO-9981\"}.",
     )] = None,
     criteria: Annotated[Optional[list], Field(
         title="Structured Criteria",
@@ -407,7 +407,7 @@ async def create_escrow_vault(
     if required_vc_type:
         body["required_vc_type"] = required_vc_type
     if callback_url:
-        body["buyer_callback_url"] = callback_url
+        body["callback_url"] = callback_url
     if metadata:
         body["metadata"] = metadata
     if criteria:
@@ -490,10 +490,6 @@ async def evaluate_escrow_work(
         title="Task Category",
         description="Evaluation rubric. One of: default, creative, code, data, data_analysis, bug_bounty, legal, supply_chain.",
     )] = "default",
-    require_consensus: Annotated[bool, Field(
-        title="Require Consensus",
-        description="Require two AI models to agree before returning PASS. Recommended for high-stakes jobs.",
-    )] = False,
     evidence_links: Annotated[list[str] | None, Field(
         title="Evidence Links",
         description="Up to 3 URLs that are fetched and snapshotted at submission time as supporting evidence.",
@@ -589,7 +585,6 @@ async def evaluate_escrow_work(
             "escrow_id":         escrow_id,
             "work":              work,
             "task_category":     task_category,
-            "require_consensus": require_consensus,
             "evidence_links":    evidence_links or [],
         }
         if evaluate_token:
@@ -2582,6 +2577,22 @@ async def request_escrow(
         title="Release Mode",
         description="'auto' (default): immediate release on PASS. 'challenge_window_hrs:N': hold for N hours after PASS so buyer can review.",
     )] = "auto",
+    seller_api_key: Annotated[Optional[str], Field(
+        title="Seller API Key",
+        description="Enterprise API key linked to your wallet (alternative to XRPL signature proof). Pass via x-api-key header at the API level, or supply here.",
+    )] = None,
+    seller_signature: Annotated[Optional[str], Field(
+        title="Seller Signature",
+        description="XRPL signature proving wallet ownership. Format: <hexsig>:<unix_ts>:<public_key_hex>. Sign the message 'agenttrust-request:<seller_addr>:<buyer_addr>:<amount_drops>:<task_hash16>:<ts>' with your private key.",
+    )] = None,
+    seller_public_key: Annotated[Optional[str], Field(
+        title="Seller Public Key",
+        description="Hex-encoded XRPL public key corresponding to the seller_address. Required when using seller_signature.",
+    )] = None,
+    signature_ts: Annotated[Optional[int], Field(
+        title="Signature Timestamp",
+        description="Unix timestamp (seconds) used when constructing the signature. Must be within 300 seconds of server time.",
+    )] = None,
 ) -> dict:
     """
     Seller-initiated deal. Propose an escrow to a specific buyer — returns a
@@ -2618,8 +2629,17 @@ async def request_escrow(
     if external_url:
         body["external_url"] = external_url
 
+    headers = {}
+    if seller_api_key:
+        headers["x-api-key"] = seller_api_key
+    if seller_signature:
+        sig = seller_signature
+        if seller_public_key and signature_ts:
+            sig = f"{seller_signature}:{signature_ts}:{seller_public_key}"
+        headers["x-seller-signature"] = sig
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        res = await client.post(f"{REFEREE_BASE}/escrow/request", json=body)
+        res = await client.post(f"{REFEREE_BASE}/escrow/request", json=body, headers=headers)
         if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])

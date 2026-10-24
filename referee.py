@@ -1721,6 +1721,8 @@ class EscrowVault(Base):
     initiated_by          = Column(String,  default="buyer") # "buyer" | "seller"
     pay_url               = Column(String,  nullable=True)   # for seller-initiated vaults
     funding_deadline      = Column(DateTime(timezone=True), nullable=True)
+    # Webhook integration
+    callback_url          = Column(String,  nullable=True)   # HTTPS endpoint for state-change webhooks
 
 
 class JobPosting(Base):
@@ -2831,6 +2833,8 @@ def run_migrations():
         "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
         # P1-2: track free INCONCLUSIVE count to rate-limit injection retries
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS inconclusive_count INTEGER DEFAULT 0",
+        # Round 5: webhook callback URL
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS callback_url VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3509,6 +3513,9 @@ class EscrowSetupRequest(BaseModel):
     external_ref:      Optional[str] = None  # e.g. "upwork:123", "github:org/repo#45"
     external_url:      Optional[str] = None  # URL of original listing (must start with https://)
     counterparty_type: Optional[str] = None  # "agent" | "human"
+    # Webhook / metadata
+    callback_url:      Optional[str]  = None  # HTTPS endpoint to receive escrow state changes
+    metadata:          Optional[dict] = None  # arbitrary key/value echoed in webhook payloads
 
     class Config:
         extra = "forbid"
@@ -5779,8 +5786,8 @@ def _validate_criteria_v2(criteria: list):
     # Only reject clearly catastrophic patterns; rely on 0.5s worker-thread timeout for edge cases.
     # Avoids false positives on (foo|bar)+ and (\w+\.)+com$ which are benign.
     _NESTED_QUANT_RE = _re_std.compile(
-        r'\((?:[^()|]*[+*][^()|]*)\)[+*]'   # (a+b)+ no alternation — clearly catastrophic
-        r'|\((?:[^()|]*[+*])\)\{[0-9]'      # (a+){N — bounded repeat of quantified group
+        r'\((?:[^()|\\]*[+*][^()|\\]*)\)[+*]'   # (a+b)+ no alternation — clearly catastrophic
+        r'|\((?:[^()|\\]*[+*])\)\{[0-9]'         # (a+){N — bounded repeat of quantified group
     )
     for c in criteria:
         if c.get("type") == "code" and c.get("gate") == "regex":
@@ -7017,6 +7024,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         external_ref           = (req.external_ref or "")[:500] or None,
         external_url           = req.external_url if (req.external_url or "").startswith("https://") else None,
         counterparty_type      = req.counterparty_type if req.counterparty_type in ("agent", "human") else "agent",
+        callback_url           = req.callback_url if (req.callback_url or "").startswith("https://") else None,
     )
     db.add(vault)
     db.commit()
@@ -7420,6 +7428,8 @@ class EscrowRequestBody(BaseModel):
     require_consensus:       bool            = False  # alias for require_consensus_vault
     worker_email:            Optional[str]   = None
     buyer_email:             Optional[str]   = None
+    callback_url:            Optional[str]   = None
+    metadata:                Optional[dict]  = None
 
     class Config:
         extra = "forbid"
@@ -7446,7 +7456,8 @@ def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp
       import hashlib
       from xrpl.core.keypairs import sign
       task_hash = hashlib.sha256(task_desc.encode()).hexdigest()[:16]
-      msg = f"agenttrust-request:{seller_address}:{buyer_address}:{amount_xrp}:{task_hash}:{ts}"
+      amount_drops = int(round(float(amount_xrp) * 1_000_000))
+      msg = f"agenttrust-request:{seller_address}:{buyer_address}:{amount_drops}:{task_hash}:{ts}"
       sig_hex = sign(msg.encode(), private_key)
       header = f"{sig_hex}:{ts}:{public_key_hex}"
     """
@@ -7475,7 +7486,8 @@ def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp
                 raise HTTPException(status_code=401, detail="Seller signature expired (must be within 5 minutes)")
             import hashlib as _hl
             task_hash = _hl.sha256((task_desc or "").encode()).hexdigest()[:16]
-            message = f"agenttrust-request:{seller_address}:{buyer_address}:{amount_xrp}:{task_hash}:{ts}"
+            amount_drops = int(round(float(amount_xrp or 0) * 1_000_000))
+            message = f"agenttrust-request:{seller_address}:{buyer_address}:{amount_drops}:{task_hash}:{ts}"
             from xrpl.core.keypairs import derive_classic_address, is_valid_message
             derived_addr = derive_classic_address(public_key_hex)
             if derived_addr != seller_address:
@@ -7638,11 +7650,12 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         initiated_by        = "seller",
         pay_url             = pay_url,
         funding_deadline    = funding_deadline,
+        callback_url        = req.callback_url if (req.callback_url or "").startswith("https://") else None,
     )
     # Seller ownership proof — required before any buyer contact details are stored
     _verify_seller_ownership(
         req.seller_address, req.buyer_address or "", float(req.amount_xrp or 0),
-        req.task_description or "", req.buyer_email or "",
+        req.task or "", req.buyer_email or "",
         request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db,
     )
     db.add(vault)
@@ -12443,7 +12456,7 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                 r = await hc.post(XRPL_URL, json={"method": "account_tx", "params": [params]})
             data = r.json().get("result", {})
             for tx_envelope in data.get("transactions", []):
-                tx = tx_envelope.get("tx", tx_envelope)
+                tx = tx_envelope.get("tx_json") or tx_envelope.get("tx") or tx_envelope
                 if tx.get("OfferSequence") == sequence and tx.get("Owner") == owner:
                     tx_type = tx.get("TransactionType")
                     meta_result = tx_envelope.get("meta", {}).get("TransactionResult", "")
@@ -12468,7 +12481,9 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
             marker = data.get("marker")
             if not marker:
                 break
-        logger.warning(f"Could not resolve {vault.escrow_id}: escrow gone but no final tx found. Leaving LOCKED.")
+        vault.status = "RELEASE_FAILED"
+        db.commit()
+        logger.error(f"Could not resolve {vault.escrow_id}: escrow gone but no final tx found — marking RELEASE_FAILED.")
     except Exception as e:
         logger.warning(f"_resolve_gone_escrow failed for {vault.escrow_id}: {e}")
 
