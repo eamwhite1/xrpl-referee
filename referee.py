@@ -2423,6 +2423,9 @@ class EscrowTemplate(Base):
     required_vc_issuer_did = Column(String, nullable=True)
     require_ai_audit     = Column(Boolean, default=True)
     proof_policy         = Column(String, default="ALL")
+    require_consensus    = Column(Boolean, default=False)
+    release_mode         = Column(String,  default="auto")   # 'auto' | 'challenge_window_hrs:N'
+    max_submissions      = Column(Integer, default=3)
     created_at           = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -2696,6 +2699,12 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS pay_url            VARCHAR",
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS funding_deadline   TIMESTAMPTZ",
         "ALTER TABLE job_posting  ADD COLUMN IF NOT EXISTS is_demo            BOOLEAN DEFAULT FALSE",
+        # EscrowTemplate — new policy fields
+        "ALTER TABLE escrow_template ADD COLUMN IF NOT EXISTS require_consensus  BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_template ADD COLUMN IF NOT EXISTS release_mode       VARCHAR DEFAULT 'auto'",
+        "ALTER TABLE escrow_template ADD COLUMN IF NOT EXISTS max_submissions    INTEGER DEFAULT 3",
+        # EnterpriseAccount — seller profile
+        "ALTER TABLE enterprise_account ADD COLUMN IF NOT EXISTS public_seller_profile BOOLEAN DEFAULT FALSE",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -11658,6 +11667,9 @@ def _template_dict(t: EscrowTemplate) -> dict:
         "required_vc_issuer_did": t.required_vc_issuer_did,
         "require_ai_audit": t.require_ai_audit,
         "proof_policy": t.proof_policy,
+        "require_consensus": bool(t.require_consensus),
+        "release_mode": t.release_mode or "auto",
+        "max_submissions": t.max_submissions or 3,
         "created_at": t.created_at.isoformat() if t.created_at else None,
     }
 
@@ -11686,6 +11698,9 @@ async def create_template(
         required_vc_issuer_did=body.get("required_vc_issuer_did"),
         require_ai_audit=body.get("require_ai_audit", True),
         proof_policy=body.get("proof_policy", "ALL"),
+        require_consensus=body.get("require_consensus", False),
+        release_mode=body.get("release_mode", "auto"),
+        max_submissions=body.get("max_submissions", 3),
     )
     db.add(tmpl)
     db.commit()
@@ -11725,7 +11740,8 @@ async def update_template(
         raise HTTPException(status_code=404, detail="Template not found")
     for field in ("name","description","category","rubric","min_amount_xrp","max_amount_xrp",
                   "deadline_hours","require_nft_proof","required_nft_issuer","required_domain",
-                  "required_vc_issuer_did","require_ai_audit","proof_policy"):
+                  "required_vc_issuer_did","require_ai_audit","proof_policy",
+                  "require_consensus","release_mode","max_submissions"):
         if field in body:
             setattr(tmpl, field, body[field])
     db.commit()
