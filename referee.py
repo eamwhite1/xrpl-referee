@@ -1072,7 +1072,7 @@ async def get_fees(wallet_address: Optional[str] = None):
         },
         "premium_audit_fee": {
             "usd": PREMIUM_FEE_USD,
-            "description": "Dual-model consensus audit (Gemini Flash + Gemini Pro). Both models must agree on PASS; disagreement returns FAIL with combined feedback. Set require_consensus=true on /audit or /evaluate.",
+            "description": "Dual-model consensus audit (Gemini Flash + Gemini Pro). Both models must agree on PASS; disagreement returns INCONCLUSIVE. Set require_consensus_vault=true at /escrow/generate or /escrow/request.",
             "assets_accepted": [
                 {
                     "asset": "XRP",
@@ -1278,7 +1278,7 @@ def serve_ai_plugin():
             "the XRPL, then retry with the transaction hash as the X-PAYMENT header (or legacy x-payment-hash header). "
             "Returns structured JSON: verdict (PASS/FAIL), score (0-100), summary, details, criteria_met, criteria_failed. "
             "task_category options: creative, code, bug_bounty, legal, supply_chain, data, default. "
-            "Set require_consensus=true for a premium dual-model consensus audit ($0.25 fee): Gemini Flash evaluates first, then Gemini Pro independently reviews — both must agree on PASS or the result is FAIL with combined feedback from both models. "
+            "Set require_consensus_vault=true at /escrow/generate or /escrow/request for a premium dual-model consensus vault ($0.25 fee): Gemini Flash evaluates first, then Gemini Pro independently reviews — both must agree on PASS or the result is INCONCLUSIVE. "
             "For full escrow-gated payments: POST to /escrow/generate to lock funds, then POST to /evaluate to audit and auto-release. "
             "Supports XRP and RLUSD. Sellers may include XRPL transaction hashes as proof of on-chain delivery — the referee will verify them on the ledger."
         ),
@@ -1402,6 +1402,10 @@ _request_rate_buckets: dict[str, deque] = {}
 REQUEST_RATE_LIMIT  = 10   # seller-initiated escrow requests per hour per key
 REQUEST_RATE_WINDOW = 3600  # seconds
 
+_buyer_rate_buckets: dict[str, deque] = {}
+BUYER_RATE_LIMIT  = 5      # max requests targeting the same buyer per 24h
+BUYER_RATE_WINDOW = 86400  # seconds
+
 
 def _check_rate_limit(key: str) -> bool:
     """Return True if the key (ip or wallet) is within the request rate limit, False if exceeded."""
@@ -1413,6 +1417,28 @@ def _check_rate_limit(key: str) -> bool:
         return False
     bucket.append(now)
     return True
+
+
+def _check_buyer_rate_limit(buyer_address: str) -> bool:
+    """Return True if buyer_address has not received too many seller-initiated requests today."""
+    now = time.time()
+    bucket = _buyer_rate_buckets.setdefault(buyer_address, deque())
+    while bucket and now - bucket[0] > BUYER_RATE_WINDOW:
+        bucket.popleft()
+    if len(bucket) >= BUYER_RATE_LIMIT:
+        return False
+    bucket.append(now)
+    return True
+
+
+def _rightmost_public_xff(xff: str) -> str:
+    """Return rightmost non-private IP from X-Forwarded-For (the most trustworthy hop)."""
+    if not xff:
+        return ""
+    for ip in reversed([x.strip() for x in xff.split(",")]):
+        if ip and not any(ip.startswith(p) for p in _PRIVATE_IP_PREFIXES):
+            return ip
+    return ""
 
 
 class BootstrappedWallet(Base):
@@ -5773,6 +5799,7 @@ async def _run_structured_audit(
                     logger.info(
                         f"Gemini {model_id} tokens: prompt={usage.get('promptTokenCount')} "
                         f"candidates={usage.get('candidatesTokenCount')} "
+                        f"thoughts={usage.get('thoughtsTokenCount')} "
                         f"total={usage.get('totalTokenCount')}"
                     )
                 raw = body["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -5801,18 +5828,11 @@ async def _run_structured_audit(
             if flash_verdict == "INCONCLUSIVE":
                 pro_result["models_used"] = models_used
                 return pro_result
-            elif flash_verdict == "PASS" and pro_verdict == "INCONCLUSIVE" and require_consensus:
+            elif flash_verdict == "PASS" and pro_verdict != "PASS":
+                # Strict 2-of-2: any non-PASS from Pro downgrades Flash PASS — never upgrades
                 pro_result["overall_verdict"] = "INCONCLUSIVE"
                 pro_result["overall_reasoning"] = (
-                    f"Consensus required but models did not agree (Flash=PASS, Pro=INCONCLUSIVE). "
-                    f"Flash: {flash_result.get('overall_reasoning', '')}"
-                )
-                pro_result["models_used"] = models_used
-                return pro_result
-            elif flash_verdict == "PASS" and pro_verdict == "FAIL":
-                pro_result["overall_verdict"] = "FAIL"
-                pro_result["overall_reasoning"] = (
-                    f"Models disagreed (Flash=PASS, Pro=FAIL) — conservative FAIL applied. "
+                    f"Consensus check: Flash=PASS but Pro={pro_verdict} — downgraded to INCONCLUSIVE. "
                     f"Flash: {flash_result.get('overall_reasoning','')} | "
                     f"Pro: {pro_result.get('overall_reasoning','')}"
                 )
@@ -6564,12 +6584,14 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             detail=threshold["message"],
         )
 
-    # Tiered creation fee: $0.10 covers 3 attempts; each slot above 3 costs $0.05 extra.
+    # Tiered creation fee: $0.10 standard, $0.25 for consensus vault; each slot above 3 costs $0.05 extra.
+    is_premium = bool(req.require_consensus_vault)
     requested_subs = max(1, min(req.max_submissions, 10))
     extra_slots    = max(0, requested_subs - DEFAULT_MAX_SUBMISSIONS)
-    creation_fee_usd = MIN_FEE_USD + extra_slots * EXTRA_ATTEMPT_FEE_USD
-    creation_fee_xrp = await get_required_fee_xrp()
-    if extra_slots > 0:
+    base_fee_usd   = PREMIUM_FEE_USD if is_premium else MIN_FEE_USD
+    creation_fee_usd = base_fee_usd + extra_slots * EXTRA_ATTEMPT_FEE_USD
+    creation_fee_xrp = await get_required_fee_xrp(premium=is_premium)
+    if extra_slots > 0 or is_premium:
         price = _xrp_price_cache.get("usd") if _xrp_price_cache else None
         creation_fee_xrp = round(creation_fee_usd / price, 6) if price and price > 0 else creation_fee_xrp + extra_slots * extra_attempt_fee_xrp()
 
@@ -7143,13 +7165,20 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
     if not _db_available:
         raise HTTPException(status_code=503, detail={"error": "database unavailable", "retry_after": 60})
 
-    # Rate limit: 10/h per IP and per seller_address
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    # Rate limit: 10/h per IP and per seller_address; 5/day per buyer_address (prevent email spam)
+    # Use CF-Connecting-IP / True-Client-IP (CDN-set, not spoofable) then rightmost public XFF
+    client_ip = (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("True-Client-IP")
+        or _rightmost_public_xff(request.headers.get("X-Forwarded-For", ""))
+        or (request.client.host if request.client else "unknown")
+    )
     if not _check_rate_limit(f"ip:{client_ip}"):
         raise HTTPException(status_code=429, detail={"error": "rate_limited", "message": "Too many requests from this IP. Limit: 10 per hour."})
     if not _check_rate_limit(f"seller:{req.seller_address}"):
         raise HTTPException(status_code=429, detail={"error": "rate_limited", "message": "Too many escrow requests from this seller address. Limit: 10 per hour."})
+    if not _check_buyer_rate_limit(req.buyer_address):
+        raise HTTPException(status_code=429, detail={"error": "rate_limited", "message": "Too many escrow requests to this buyer address. Limit: 5 per day."})
 
     # Validate
     if not _is_valid_xrpl_address(req.seller_address):

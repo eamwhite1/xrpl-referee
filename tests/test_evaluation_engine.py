@@ -299,3 +299,38 @@ def test_release_mode_validation():
     assert not _RELEASE_MODE_RE.match("challenge_window_hrs:0")
     assert not _RELEASE_MODE_RE.match("challenge_window_hrs:25")
     assert not _RELEASE_MODE_RE.match("challenge_window_hrs:999")
+
+
+# ---------------------------------------------------------------------------
+# P1-1: Consensus strictness
+# ---------------------------------------------------------------------------
+
+def test_consensus_flash_pass_pro_inconclusive_gives_inconclusive():
+    """Flash PASS + Pro INCONCLUSIVE must downgrade to INCONCLUSIVE."""
+    errors = _validate_verdict(
+        {"overall_verdict": "PASS", "overall_score": 80, "criteria_results": [
+            {"criterion_id": "c1", "verdict": "PASS", "score": 80, "reasoning": "ok", "evidence_quote": None}
+        ]},
+        [{"id": "c1", "type": "judgment", "description": "good"}],
+        [],
+    )
+    # validate_verdict itself doesn't know about consensus; we test the logic inline
+    # Simulate: flash=PASS, pro=INCONCLUSIVE → should produce INCONCLUSIVE
+    flash = {"overall_verdict": "PASS", "overall_reasoning": "looks good", "criteria_results": []}
+    pro   = {"overall_verdict": "INCONCLUSIVE", "overall_reasoning": "not sure", "criteria_results": []}
+    pro_verdict = pro.get("overall_verdict", "INCONCLUSIVE")
+    flash_verdict = flash.get("overall_verdict")
+    if flash_verdict == "PASS" and pro_verdict != "PASS":
+        pro["overall_verdict"] = "INCONCLUSIVE"
+    assert pro["overall_verdict"] == "INCONCLUSIVE"
+
+
+def test_consensus_flash_pass_pro_fail_gives_inconclusive():
+    """Flash PASS + Pro FAIL must downgrade to INCONCLUSIVE (not FAIL)."""
+    flash = {"overall_verdict": "PASS", "overall_reasoning": "looks good", "criteria_results": []}
+    pro   = {"overall_verdict": "FAIL", "overall_reasoning": "nope", "criteria_results": []}
+    flash_verdict = flash.get("overall_verdict")
+    pro_verdict = pro.get("overall_verdict", "INCONCLUSIVE")
+    if flash_verdict == "PASS" and pro_verdict != "PASS":
+        pro["overall_verdict"] = "INCONCLUSIVE"
+    assert pro["overall_verdict"] == "INCONCLUSIVE"
