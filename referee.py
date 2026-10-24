@@ -134,6 +134,7 @@ async def _lifespan(app):
         asyncio.create_task(_ofac_refresh_loop())
         asyncio.create_task(_check_gemini_models())
         asyncio.create_task(_gemini_schema_selftest())
+        asyncio.create_task(_prime_server_card_cache())
         # Single unified hourly DB window — all background DB work runs here sequentially.
         # Replaces separate enterprise + escrow pollers (which were being started as
         # independent tasks but are now single-run functions called by _hourly_db_window).
@@ -202,6 +203,29 @@ app = FastAPI(
         "**Enterprise landing page:** https://www.cryptovault.co.uk/enterprise/"
     ),
     lifespan=_lifespan,
+    openapi_extra={
+        "components": {
+            "securitySchemes": {
+                "EvaluateToken": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Evaluate-Token",
+                    "description": "One-time token issued at vault creation (evaluate_token field). Required for POST /evaluate.",
+                },
+                "EnterpriseBearer": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "JWT bearer token from POST /enterprise/auth/token. Required for /enterprise/* endpoints.",
+                },
+                "X402Payment": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-PAYMENT",
+                    "description": "x402 payment header: XRP/RLUSD tx hash or USDC tx hash for paid endpoints (audit, escrow create). Call without payment to receive a 402 with full payment instructions.",
+                },
+            }
+        }
+    },
 )
 
 
@@ -934,6 +958,26 @@ def _agent_json_legacy_unused():
     }
 
 _server_card_tools_cache: list = []
+
+
+async def _prime_server_card_cache():
+    """Pre-populate the server-card tool list at startup so first request doesn't show '(loading)'."""
+    global _server_card_tools_cache
+    if _server_card_tools_cache:
+        return
+    await asyncio.sleep(5)  # give FastMCP lifespan time to register tools
+    try:
+        from mcp_server import mcp as _mcp_ref
+        _registered = await _mcp_ref.get_tools()
+        if _registered:
+            _server_card_tools_cache = [
+                {"name": _t.name, "description": (_t.description or "").split("\n")[0][:120]}
+                for _t in _registered.values()
+            ]
+            logger.info(f"✅ Server-card cache primed: {len(_server_card_tools_cache)} tools")
+    except Exception as _e:
+        logger.warning(f"Server-card cache prime failed: {_e}")
+
 
 @app.get("/.well-known/mcp/server-card.json")
 async def serve_mcp_server_card():

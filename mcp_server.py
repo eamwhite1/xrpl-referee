@@ -24,8 +24,11 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 from typing import Annotated, Optional
 
+APP_VERSION = "7.0.0"
+
 mcp = FastMCP(
     name="AgentTrust Referee",
+    version=APP_VERSION,
     instructions=(
         "AgentTrust — trust-minimized escrow for agent work, anywhere. "
         "Lock payment for work found on any platform: hire_and_pay with any XRPL address, or receive a pay_url via request_escrow. "
