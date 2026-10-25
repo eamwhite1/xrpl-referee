@@ -302,7 +302,8 @@ async def mcp_smithery_compat(request, call_next):
         if hdr in response.headers:
             del response.headers[hdr]
 
-    response.headers["X-AgentTrust-Version"] = "0.1.0"
+    response.headers["X-AgentTrust-Version"] = "7.0.1"
+    response.headers["X-AgentTrust-Server"] = "7.0.1"
 
     return response
 
@@ -1007,6 +1008,39 @@ def serve_llms_txt():
         return PlainTextResponse("# AgentTrust llms.txt not found", status_code=404)
 
 
+_stats_cache: dict = {"value": None, "cached_at": 0}
+STATS_CACHE_TTL = 600  # 10 minutes
+
+
+@app.get("/stats")
+async def get_platform_stats():
+    """Platform-wide aggregate statistics. Cached for 10 minutes."""
+    import time
+    now = time.time()
+    if _stats_cache["value"] and now - _stats_cache["cached_at"] < STATS_CACHE_TTL:
+        return _stats_cache["value"]
+    try:
+        with Session(engine) as db:
+            total_escrows = db.execute(text("SELECT COUNT(*) FROM escrows")).scalar() or 0
+            completed_escrows = db.execute(text(
+                "SELECT COUNT(*) FROM escrows WHERE status = 'RELEASED'"
+            )).scalar() or 0
+            total_audits = db.execute(text("SELECT COUNT(*) FROM escrows WHERE verdict IS NOT NULL")).scalar() or 0
+            registered_wallets = db.execute(text("SELECT COUNT(*) FROM wallets")).scalar() or 0
+            result = {
+                "total_escrows": total_escrows,
+                "completed_escrows": completed_escrows,
+                "total_audits": total_audits,
+                "registered_wallets": registered_wallets,
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            }
+    except Exception as e:
+        result = {"error": str(e), "cached_at": datetime.now(timezone.utc).isoformat()}
+    _stats_cache["value"] = result
+    _stats_cache["cached_at"] = now
+    return result
+
+
 @app.get("/stats/tools")
 def stats_tools(days: int = 7):
     """Aggregated tool-call counts for the past N days (unauthenticated, read-only)."""
@@ -1103,7 +1137,7 @@ def _agent_json_legacy_unused():
             {"id": "standalone-audit",  "name": "AI Verdict",                   "description": "POST task+work+fee to /audit. Returns PASS/FAIL with score, summary, criteria.", "endpoint": "/audit",            "method": "POST", "tags": ["audit", "xrpl", "verification", "ai", "escrow"]},
             {"id": "escrow-create",     "name": "Create Escrow Vault",           "description": "Lock XRP or RLUSD in crypto-condition escrow gated by AI verdict. Pass `invoice_requirements` (po_number, supplier_name, services_description, require_date, require_line_items) to require the seller to submit a matching invoice alongside their proof of work — the AI referee verifies every field before releasing payment. Verified invoices are forwarded to the buyer's accounts team via the `accounts_email` field. Pass `delegate_address` to POST /escrow/prepare to get an XLS-75 delegated EscrowCreate tx — the agent signs on the buyer's behalf without holding their seed.",              "endpoint": "/escrow/generate",  "method": "POST"},
             {"id": "escrow-evaluate",   "name": "Submit Work for Escrow Audit",  "description": "Seller submits proof. On PASS the referee auto-releases funds to seller. For NFT DvP vaults (nft_dvp=True), PASS sets status to PASS_AWAITING_NFT — seller registers NFTokenCreateOffer, buyer calls /escrow/{id}/batch-dvp-payload for XLS-56 atomic settlement.", "endpoint": "/evaluate", "method": "POST"},
-            {"id": "batch-dvp",         "name": "XLS-56 Atomic NFT DvP",         "description": "Returns a pre-built Batch (TF_ALL_OR_NOTHING) tx for single-ledger atomic NFT transfer + escrow release. Live on XRPL mainnet.", "endpoint": "/escrow/{id}/batch-dvp-payload", "method": "GET"},
+            {"id": "batch-dvp",         "name": "XLS-56 Atomic NFT DvP",         "description": "Returns a pre-built Batch (TF_ALL_OR_NOTHING) tx for single-ledger atomic NFT transfer + escrow release. XLS-56 amendment is live; AgentTrust Batch DvP is beta/untested on mainnet.", "endpoint": "/escrow/{id}/batch-dvp-payload", "method": "GET"},
         ],
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json"],
@@ -1185,7 +1219,7 @@ async def serve_mcp_server_card():
             "Browse live XRP bounties on the AgentTrust marketplace. Built for autonomous agents. "
             "Supports four trust layers: NFT from trusted issuer, XRPL domain verification, "
             "W3C Verifiable Credential, and XRPL wallet trust score — buyers can require any combination. "
-            "NFT Delivery-vs-Payment (DvP) mode: XLS-56 Batch Transactions (live on XRPL mainnet) — "
+            "NFT Delivery-vs-Payment (DvP) mode: XLS-56 Batch Transactions (beta/untested on mainnet) — "
             "NFT transfer and payment release atomically in a single ledger close via get_batch_dvp_payload(). "
             "XLS-75 delegation: buyers can grant a hot agent key permission to sign EscrowCreate "
             "on their behalf via hire_and_pay(delegate_address=...) without sharing their seed. "
@@ -1375,6 +1409,7 @@ async def get_fees(wallet_address: Optional[str] = None):  # noqa: E501
             "/.well-known/*",
         ],
         "paid_endpoints": ["/audit", "/escrow/generate", "/marketplace/skills (POST)"],
+        "rlusd_escrow_available": await check_rlusd_escrow_supported(),
         "docs": "https://mcp.cryptovault.co.uk/docs",
         "changelog": "https://github.com/eamwhite1/xrpl-referee/blob/main/CHANGELOG.md",
     }
@@ -3723,7 +3758,7 @@ class Attachment(BaseModel):
     data:      str
 
 class EscrowSetupRequest(BaseModel):
-    escrow_id:          str
+    escrow_id:          Optional[str]   = None
     fee_hash:           Optional[str]   = None
     project_label:      Optional[str]   = None
     buyer_name:         str
@@ -7948,15 +7983,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     if currency == "RLUSD":
         if not await check_rlusd_escrow_supported():
             raise HTTPException(
-                status_code=503,
-                detail=(
-                    "RLUSD escrow is not currently available. "
-                    "XLS-85 token escrow is live on XRPL mainnet, but the RLUSD issuer (Ripple) "
-                    "has not yet enabled the lsfAllowTrustLineLocking flag on their issuer account — "
-                    "this is required before RLUSD can be held in escrow. "
-                    "In the meantime, use XRP escrow: the seller can swap to RLUSD via the XRPL DEX after release. "
-                    "This message will disappear automatically once Ripple enables the flag."
-                ),
+                status_code=422,
+                detail={"error": "rlusd_escrow_unavailable", "reason": "issuer has not enabled trust-line locking"},
             )
 
     # For RLUSD escrow, validate both wallets have trustlines
@@ -8163,6 +8191,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "evaluate_token_hint": "Share this token with the worker — they must include it in evaluate_escrow_work(). Store it securely; it is not shown again.",
         "free_tier":           fee_result.get("free_tier", False),
         "audits_remaining":    fee_result.get("audits_remaining", None),
+        "free_escrows_remaining": fee_result.get("audits_remaining", None),
         "worker_url":          _worker_url,
         "worker_instructions": _worker_instructions,
         "metadata":            req.metadata,
