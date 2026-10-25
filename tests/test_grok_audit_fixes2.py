@@ -166,7 +166,9 @@ def test_score_max_constant():
 def test_score_100_is_capped():
     import referee as ref
     src = inspect.getsource(ref.compute_xrpl_trust_score)
-    assert "score_100" in src and "min(100" in src, "score_100 = min(100, total) must be in compute_xrpl_trust_score"
+    assert "score_100" in src, "score_100 must be in compute_xrpl_trust_score"
+    # P2-2 changed formula to round(total*100/SCORE_MAX); either formula is acceptable
+    assert "SCORE_MAX" in src or "min(100" in src, "score_100 must use SCORE_MAX or min(100, total)"
 
 
 # ---------------------------------------------------------------------------
