@@ -346,7 +346,7 @@ async def create_escrow_vault(
     Three release modes:
     - AI audit (default): worker submits text/files; AI referee scores against task_description or criteria.
     - Proof-gate only (require_ai_audit=False): payment releases when all configured proof gates pass. No AI call.
-    - Delayed release (release_mode='challenge_window_hrs:N'): PASS holds for N hours then auto-releases. Disputes coming soon.
+    - Delayed release (release_mode='challenge_window_hrs:N'): PASS holds for N hours then auto-releases. During the window, the buyer can challenge via prepare_challenge_escrow + challenge_escrow_verdict. Challenge fee ~$1 USD in XRP locked to the seller; paid to seller if PASS upheld, refundable if overturned or inconclusive.
 
     Structured criteria (recommended for complex work):
     - Pass criteria as a list of strings or typed dicts ({type, description, [gate]}).
@@ -686,6 +686,9 @@ async def prepare_challenge_escrow(
     After submitting the EscrowCreate, call challenge_escrow_verdict with
     the resulting tx hash and this quote_id.
     """
+    import os as _os
+    if _os.getenv("CHALLENGES_ENABLED", "true").lower() != "true":
+        return {"error": "challenges_disabled"}
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/{escrow_id}/challenge/prepare",
@@ -751,6 +754,9 @@ async def challenge_escrow_verdict(
     The challenge window is set at vault creation via release_mode='challenge_window_hrs:N' (N ≤ 24).
     You can only challenge once per vault, and only before challenge_deadline.
     """
+    import os as _os
+    if _os.getenv("CHALLENGES_ENABLED", "true").lower() != "true":
+        return {"error": "challenges_disabled"}
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/{escrow_id}/challenge",

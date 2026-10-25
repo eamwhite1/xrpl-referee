@@ -27,7 +27,7 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
 - Code gates (deterministic): sha256_of, exact_match, regex, json_schema (http_status, xrpl_tx coming soon)
 - AI audit (gemini-2.5-flash, optional consensus with gemini-2.5-pro)
-- Delayed release (challenge_window_hrs:N): PASS holds N hours; buyer can challenge during window (fee ~$1 USD in XRP, refundable if upheld); auto-releases after deadline
+- Delayed release (challenge_window_hrs:N): PASS holds N hours; buyer can challenge during window. Challenge fee ~$1 USD in XRP, locked in escrow to the seller; paid to the seller if the PASS is upheld, refundable to you after 24 h if overturned or inconclusive. Auto-releases after deadline.
 - INCONCLUSIVE verdicts: first 3 per vault are free (no attempt consumed); later ones count as an attempt
 
 ## Quick start

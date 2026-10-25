@@ -385,7 +385,8 @@ def test_challenge_endpoint_returns_402_not_501():
          patch("referee._gemini_schema_selftest", return_value=asyncio.sleep(0)), \
          patch("referee._ensure_hourly_window"), \
          patch("referee._refresh_jobs_snapshot", return_value=asyncio.sleep(0)), \
-         patch("referee.get_db", return_value=iter([mock_db])):
+         patch("referee.get_db", return_value=iter([mock_db])), \
+         patch("referee.CHALLENGES_ENABLED", True):
         from referee import app
         client = TestClient(app)
         resp = client.post("/escrow/test-escrow-123/challenge", json={
@@ -393,5 +394,5 @@ def test_challenge_endpoint_returns_402_not_501():
             "fee_tx_hash":        "A" * 64,
             "challenger_address": "rBuyer1111",
         })
-        # 402 when vault status is wrong, or 404 if vault not found
-        assert resp.status_code in (402, 404)
+        # 409 when vault status is wrong (or 402/404 in older behavior)
+        assert resp.status_code in (402, 404, 409)
