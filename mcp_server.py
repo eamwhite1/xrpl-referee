@@ -341,6 +341,11 @@ async def create_escrow_vault(
         description="Whether the worker is an agent or a human. 'agent' (default) or 'human'. Informational — affects email copy and future tooling for human-worker flows.",
         enum=["agent", "human"],
     )] = "agent",
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default) or 'testnet'. On testnet no fees are charged, vault IDs are prefixed TN-, and explorer links point to testnet.xrpl.org.",
+        enum=["mainnet", "testnet"],
+    )] = "mainnet",
 ) -> dict:
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
@@ -423,6 +428,8 @@ async def create_escrow_vault(
         body["amount_rlusd"] = amount_rlusd
     else:
         body["amount_xrp"] = amount_xrp
+    if network and network != "mainnet":
+        body["network"] = network
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=body)
@@ -2241,6 +2248,11 @@ async def prepare_escrow(
         title="Currency",
         description='Currency to lock. "XRP" or "RLUSD".',
     )] = "XRP",
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default) or 'testnet'.",
+        enum=["mainnet", "testnet"],
+    )] = "mainnet",
 ) -> dict:
     """
     Build a ready-to-sign XRPL EscrowCreate transaction — no XRPL library required.
@@ -2258,16 +2270,19 @@ async def prepare_escrow(
     Returns:
         transaction (ready-to-sign dict), escrow_id, condition, instructions.
     """
+    body = {
+        "escrow_id":      escrow_id,
+        "buyer_address":  buyer_address,
+        "worker_address": worker_address,
+        "amount_xrp":     amount_xrp,
+        "currency":       currency.upper(),
+    }
+    if network and network != "mainnet":
+        body["network"] = network
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/prepare",
-            json={
-                "escrow_id":      escrow_id,
-                "buyer_address":  buyer_address,
-                "worker_address": worker_address,
-                "amount_xrp":     amount_xrp,
-                "currency":       currency.upper(),
-            },
+            json=body,
         )
         if res.status_code == 404:
             return {"error": "not_found", "message": f"Escrow '{escrow_id}' not found. Call create_escrow_vault() first."}
@@ -2385,6 +2400,11 @@ async def hire_and_pay(
         description="Whether the worker is an 'agent' (default) or 'human'. Affects email copy and worker_url instructions.",
         enum=["agent", "human"],
     )] = "agent",
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default) or 'testnet'. Use 'testnet' for free testing — no real XRP, no fees. Create a testnet wallet first with create_testnet_wallet().",
+        enum=["mainnet", "testnet"],
+    )] = "mainnet",
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
@@ -2460,6 +2480,8 @@ async def hire_and_pay(
         vault_body["external_url"] = external_url
     if counterparty_type and counterparty_type != "agent":
         vault_body["counterparty_type"] = counterparty_type
+    if network and network != "mainnet":
+        vault_body["network"] = network
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         vault_res = await client.post(f"{REFEREE_BASE}/escrow/generate", json=vault_body)
@@ -3699,8 +3721,15 @@ async def create_testnet_wallet() -> dict:
     """Create a fresh XRPL testnet wallet funded via the public faucet.
 
     Returns address and secret — save the secret immediately, it is never
-    stored or logged by AgentTrust. Use this wallet to test the full escrow
-    flow with network="testnet" at no cost.
+    stored or logged by AgentTrust.
+
+    MCP flow for testing:
+      1. wallet = create_testnet_wallet()
+      2. hire_and_pay(task="...", buyer_address=wallet["address"], amount_xrp=5.0,
+                      worker_address="rWorker...", network="testnet")
+      3. evaluate_escrow_work(escrow_id, work, evaluate_token)
+
+    No real XRP is used, no fees are charged, and vault IDs start with TN-.
     """
     import xrpl.core.keypairs as kp
     seed = kp.generate_seed()
@@ -3714,8 +3743,12 @@ async def create_testnet_wallet() -> dict:
                 headers={"Content-Type": "application/json"},
             )
         data = res.json()
-        funded_address = data.get("account", {}).get("address") or address
-        balance = data.get("balance", "unknown")
+        funded_address = (
+            data.get("account", {}).get("classicAddress")
+            or data.get("account", {}).get("address")
+            or address
+        )
+        balance = data.get("amount", data.get("balance", "unknown"))
     except Exception:
         funded_address = address
         balance = "faucet_error"

@@ -524,7 +524,13 @@ async def _refresh_jobs_snapshot(db_session=None):
         async with _jobs_snapshot_lock:
             if _jobs_snapshot["stale_since"] is None:
                 _jobs_snapshot["stale_since"] = datetime.now(timezone.utc)
-        _on_db_failure()
+        # Only flip DB unavailable for connection errors, not schema/programming errors
+        if isinstance(e, (SAOperationalError, SAInterfaceError)):
+            _on_db_failure()
+        elif isinstance(e, SADBAPIError) and getattr(e, 'connection_invalidated', False):
+            _on_db_failure()
+        else:
+            logger.error(f"Job snapshot non-connection error (not flipping DB flag): {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1021,12 +1027,19 @@ async def get_platform_stats():
         return _stats_cache["value"]
     try:
         with Session(engine) as db:
-            total_escrows = db.execute(text("SELECT COUNT(*) FROM escrows")).scalar() or 0
-            completed_escrows = db.execute(text(
-                "SELECT COUNT(*) FROM escrows WHERE status = 'RELEASED'"
+            mainnet_filter = "(network IS NULL OR network = 'mainnet')"
+            total_escrows = db.execute(text(
+                f"SELECT COUNT(*) FROM escrow_vault WHERE {mainnet_filter}"
             )).scalar() or 0
-            total_audits = db.execute(text("SELECT COUNT(*) FROM escrows WHERE verdict IS NOT NULL")).scalar() or 0
-            registered_wallets = db.execute(text("SELECT COUNT(*) FROM wallets")).scalar() or 0
+            completed_escrows = db.execute(text(
+                f"SELECT COUNT(*) FROM escrow_vault WHERE status = 'RELEASED' AND {mainnet_filter}"
+            )).scalar() or 0
+            total_audits = db.execute(text(
+                f"SELECT COUNT(*) FROM escrow_vault WHERE (verdict IS NOT NULL OR ai_verdict IS NOT NULL) AND {mainnet_filter}"
+            )).scalar() or 0
+            registered_wallets = db.execute(text(
+                "SELECT COUNT(*) FROM bootstrapped_wallet"
+            )).scalar() or 0
             result = {
                 "total_escrows": total_escrows,
                 "completed_escrows": completed_escrows,
@@ -1034,11 +1047,11 @@ async def get_platform_stats():
                 "registered_wallets": registered_wallets,
                 "cached_at": datetime.now(timezone.utc).isoformat(),
             }
-    except Exception as e:
-        result = {"error": str(e), "cached_at": datetime.now(timezone.utc).isoformat()}
-    _stats_cache["value"] = result
-    _stats_cache["cached_at"] = now
-    return result
+        _stats_cache["value"] = result
+        _stats_cache["cached_at"] = now
+        return result
+    except Exception:
+        raise HTTPException(status_code=503, detail={"error": "stats unavailable"})
 
 
 @app.get("/stats/tools")
@@ -1251,10 +1264,17 @@ CORE_TOOLS = sorted([
     "audit_task",
 ])
 
-@app.get("/mcp/core")
+@app.get("/mcp/core-tools")
 async def mcp_core_profile():
     """Minimal tool profile for agents that want only the essential payment flow."""
     return {"tools": CORE_TOOLS, "count": len(CORE_TOOLS)}
+
+
+@app.get("/mcp/core")
+async def mcp_core_redirect():
+    """301 redirect to renamed endpoint."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/mcp/core-tools", status_code=301)
 
 
 @app.get("/mcp/server-card")
@@ -1608,8 +1628,8 @@ engine_args = {"pool_pre_ping": True, "pool_recycle": 300}
 if "sqlite" in DATABASE_URL:
     engine_args["connect_args"] = {"check_same_thread": False}
 elif "sqlite" not in DATABASE_URL:
-    engine_args["pool_size"] = 2
-    engine_args["max_overflow"] = 2
+    engine_args["pool_size"] = 5
+    engine_args["max_overflow"] = 5
     engine_args["connect_args"] = {"sslmode": "require", "connect_timeout": 5}
 
 engine       = create_engine(DATABASE_URL, **engine_args)
@@ -3056,6 +3076,8 @@ def run_migrations():
         "ALTER TABLE wallet_verification ADD COLUMN IF NOT EXISTS method VARCHAR",
         # Testnet sandbox: network column on escrow_vault
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS network VARCHAR(16) NOT NULL DEFAULT 'mainnet'",
+        # Marketplace operator flag
+        "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS posted_by_operator BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -5514,8 +5536,11 @@ def _xrpl_url_for_network(network: str) -> str:
 
 def _explorer_url(tx_hash: str, network: str = "mainnet") -> str:
     """Return the XRPL explorer URL for a transaction."""
-    base = "https://testnet.xrpl.org/transactions/" if network == "testnet" else "https://xrpl.org/tx/"
-    return f"{base}{tx_hash}"
+    if not tx_hash:
+        return None
+    if network == "testnet":
+        return f"https://testnet.xrpl.org/transactions/{tx_hash}"
+    return f"https://livenet.xrpl.org/transactions/{tx_hash}"
 
 
 async def _fetch_activity_90d(wallet_address: str, xrpl_url: str) -> int:
@@ -5751,8 +5776,10 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 ), {"w": wallet_address}).fetchone()
                 rating_count = rating_row[0] or 0
                 avg_rating = float(rating_row[1] or 0)
-                if rating_count > 0:
-                    peer_score = min(15, int((avg_rating / 5) * 12) + min(3, rating_count // 3))
+                if rating_count > 0 and avg_rating > 3:
+                    peer_score = min(15, int(((avg_rating - 3) / 2) * 12) + min(3, rating_count // 3))
+                else:
+                    peer_score = 0
                 peer_stats = {"rating_count": rating_count, "avg_rating": round(avg_rating, 2)}
             except Exception:
                 pass
@@ -5869,8 +5896,9 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         }
 
         return {
-            "score": min(100, total),
-            "detail": f"AgentTrust wallet trust score: {min(100,total)}/100",
+            "score": total,
+            "score_100": min(100, total),
+            "detail": f"AgentTrust wallet trust score: {total}/133",
             "signals": signals,
             "signals_list": signals_list,
             "verified_issuer": verified_issuer,
@@ -7247,15 +7275,18 @@ async def _verify_challenge_fee_escrow(tx_hash: str, quote: "ChallengeQuote", va
     if not memo_found:
         return False, f"Missing or incorrect Memo (expected agenttrust-challenge:{escrow_id})", None
 
-    # 10. Tx creation time > vault.pass_at
+    # 10. Tx creation time > vault.pass_at (fall back to updated_at if pass_at not set)
     tx_time_ripple = tx.get("date") or data.get("date")
-    if tx_time_ripple and vault.pass_at:
+    if tx_time_ripple:
         tx_time_dt = datetime.fromtimestamp(tx_time_ripple + RIPPLE_EPOCH, tz=timezone.utc)
-        pass_at = vault.pass_at
-        if pass_at.tzinfo is None:
-            pass_at = pass_at.replace(tzinfo=timezone.utc)
-        if tx_time_dt <= pass_at:
-            return False, "Challenge fee EscrowCreate must be created after vault entered PASS", None
+        _pass_ref = vault.pass_at or getattr(vault, 'challenge_review_started_at', None) or getattr(vault, 'updated_at', None)
+        if _pass_ref:
+            pass_at = _pass_ref
+            if pass_at.tzinfo is None:
+                pass_at = pass_at.replace(tzinfo=timezone.utc)
+            if tx_time_dt <= pass_at:
+                return False, "Challenge fee EscrowCreate must be created after vault entered PASS", None
+        # Quote-expiry check runs regardless of pass_at availability
         expires = quote.expires_at
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
@@ -8106,12 +8137,13 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
 
     # Unactivated buyer check — reject before vault creation
     try:
-        _buyer_client = AsyncJsonRpcClient(XRPL_URL)
+        _buyer_xrpl_url = _xrpl_url_for_network(network) if network == "testnet" else XRPL_URL
+        _buyer_client = AsyncJsonRpcClient(_buyer_xrpl_url)
         _buyer_acct = await _buyer_client.request(AccountInfo(account=req.buyer_address, ledger_index="current"))
         if "account_data" not in _buyer_acct.result:
             raise HTTPException(
                 status_code=422,
-                detail={"error": "buyer_not_activated", "reason": f"Buyer wallet {req.buyer_address} has not been activated on the XRP Ledger. Fund it with at least 10 XRP to activate."},
+                detail={"error": "buyer_not_activated", "reason": f"Buyer wallet {req.buyer_address} has not been activated on the XRP Ledger. Fund it with at least 1 XRP (the base reserve on XRPL) to activate."},
             )
     except HTTPException:
         raise
@@ -9442,10 +9474,11 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "released_at":      vault.released_at.isoformat() if vault.released_at else None,
         "cancel_tx_hash":   vault.cancel_tx_hash,
         "cancelled_at":     vault.cancelled_at.isoformat() if vault.cancelled_at else None,
+        "network":          vault.network or "mainnet",
         "explorer_url": (
-            f"https://livenet.xrpl.org/transactions/{vault.release_tx_hash or vault.auto_finish_hash}"
+            _explorer_url(vault.release_tx_hash or vault.auto_finish_hash, vault.network or "mainnet")
             if (vault.release_tx_hash or vault.auto_finish_hash) else
-            f"https://livenet.xrpl.org/transactions/{vault.cancel_tx_hash}"
+            _explorer_url(vault.cancel_tx_hash, vault.network or "mainnet")
             if vault.cancel_tx_hash else None
         ),
         # Debug fields
@@ -9988,6 +10021,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             except (IndexError, ValueError):
                 challenge_hrs = 24
             vault.status             = "PASS_CHALLENGE_WINDOW"
+            vault.pass_at            = datetime.now(timezone.utc)
             _raw_deadline = datetime.now(timezone.utc) + timedelta(hours=challenge_hrs)
             if vault.cancel_after_ts:
                 _cancel_aware = vault.cancel_after_ts if vault.cancel_after_ts.tzinfo else vault.cancel_after_ts.replace(tzinfo=timezone.utc)
@@ -10164,7 +10198,8 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         # Proof of payment — release_status is "confirmed" if hash known now, else "pending"
         "release_status":       ("confirmed" if finish_hash else "pending") if is_approved else None,
         "release_tx_hash":      finish_hash,
-        "explorer_url":         f"https://livenet.xrpl.org/transactions/{finish_hash}" if finish_hash else None,
+        "network":              vault.network or "mainnet",
+        "explorer_url":         _explorer_url(finish_hash, vault.network or "mainnet"),
         "poll":                 f"/escrow/{req.escrow_id}" if is_approved and not finish_hash else None,
         # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
         "dex_quote_rlusd":      dex_quote,
@@ -11103,9 +11138,9 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
                     "cancel_tx_hash":  vault.cancel_tx_hash,
                     "cancelled_at":    vault.cancelled_at.isoformat() if vault.cancelled_at else None,
                     "explorer_url": (
-                        f"https://livenet.xrpl.org/transactions/{vault.release_tx_hash}"
+                        _explorer_url(vault.release_tx_hash, vault.network or "mainnet")
                         if vault.release_tx_hash else
-                        f"https://livenet.xrpl.org/transactions/{vault.cancel_tx_hash}"
+                        _explorer_url(vault.cancel_tx_hash, vault.network or "mainnet")
                         if vault.cancel_tx_hash else None
                     ),
                     "models_used":         vault.models_used,
@@ -13318,7 +13353,7 @@ async def enterprise_audit_detail(
         "project_label": escrow.project_label,
         "created_at": escrow.created_at.isoformat() if escrow.created_at else None,
         "cancel_after_ts": escrow.cancel_after_ts.isoformat() if escrow.cancel_after_ts else None,
-        "xrpl_explorer": f"https://livenet.xrpl.org/transactions/{escrow.auto_finish_hash}" if escrow.auto_finish_hash else None,
+        "xrpl_explorer": _explorer_url(escrow.auto_finish_hash, escrow.network or "mainnet"),
         "viewer_role": viewer_role,
         "attempts_used": escrow.submission_count,
         "max_submissions": escrow.max_submissions,
@@ -13365,7 +13400,7 @@ async def enterprise_email_receipt(
 
     label = escrow.project_label or f"Escrow {escrow.escrow_id[:8]}"
     amount = escrow.amount_rlusd or escrow.amount_xrp
-    explorer_url = f"https://livenet.xrpl.org/transactions/{escrow.auto_finish_hash}" if escrow.auto_finish_hash else None
+    explorer_url = _explorer_url(escrow.auto_finish_hash, escrow.network or "mainnet")
     explorer_link = f'<a href="{explorer_url}">View on XRPL Explorer</a>' if explorer_url else "—"
 
     verdict_json = ""
@@ -13654,7 +13689,7 @@ async def _poll_enterprise_subscriptions_once():
                                 <p>Hi {account.name or 'there'},</p>
                                 <p>Your AgentTrust Enterprise annual subscription is confirmed. You have full access for the next 12 months.</p>
                                 <p><strong>Receipt:</strong> XRPL transaction <code>{tx_hash}</code><br>
-                                <a href="https://livenet.xrpl.org/transactions/{tx_hash}">View on XRPL Explorer</a></p>
+                                <a href="https://livenet.xrpl.org/transactions/{tx_hash}">View on XRPL Explorer (mainnet)</a></p>
                                 <p>Amount paid: {amount} RLUSD</p>
                                 <p>Subscription valid until: {account.sub_expires_at.strftime('%d %B %Y')}</p>
                                 <p>— AgentTrust</p>
@@ -14131,7 +14166,7 @@ async def _poll_expired_escrows_once():
                                         <p>Hi,</p>
                                         <p>Your AgentTrust escrow <strong>{vault.project_label or vault.escrow_id}</strong> expired on {vault.cancel_after_ts.strftime('%d %B %Y')} with no work submitted.</p>
                                         <p>Funds have been returned to your wallet automatically.</p>
-                                        <p><strong>Cancel tx:</strong> <a href="https://livenet.xrpl.org/transactions/{tx_hash}">{tx_hash}</a></p>
+                                        <p><strong>Cancel tx:</strong> <a href="{_explorer_url(tx_hash, getattr(vault, 'network', 'mainnet') or 'mainnet')}">{tx_hash}</a></p>
                                         <p>— AgentTrust</p>
                                     """,
                                 })
