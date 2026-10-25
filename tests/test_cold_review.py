@@ -25,7 +25,7 @@ def test_rlusd_unavailable_returns_422():
                     detail={"error": "rlusd_escrow_unavailable", "reason": "issuer has not enabled trust-line locking"},
                 )
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.get_event_loop().run_until_complete(_check())
+        asyncio.run(_check())
     assert exc_info.value.status_code == 422
     assert exc_info.value.detail["error"] == "rlusd_escrow_unavailable"
     assert "trust-line locking" in exc_info.value.detail["reason"]
@@ -187,7 +187,7 @@ def test_hire_and_pay_free_escrows_remaining_alias():
                 return None
 
     from unittest.mock import MagicMock
-    result = asyncio.get_event_loop().run_until_complete(_run())
+    result = asyncio.run(_run())
     if result and isinstance(result, dict):
         assert "free_escrows_remaining" in result
 
