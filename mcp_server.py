@@ -89,7 +89,7 @@ mcp = FastMCP(
         "     If proceed is False, do not call create_escrow_vault or hire_and_pay.\n"
         "\n"
         "TRUST & COMPLIANCE (individual checks — use assess_counterparty_and_job for the full picture):\n"
-        "  get_wallet_trust_score(address) — 0–100 score across 11 signals.\n"
+        "  get_wallet_trust_score(address) — trust score (score_100: 0–100) across 11 signals; max_score field shows the raw maximum.\n"
         "  check_wallet_sanctions(address) — OFAC SDN screen. Sanctioned wallets score 0.\n"
         "  check_wallet_kyc(address)       — identity KYC status (unlocks escrows up to $10,000).\n"
         "  start_wallet_kyc(address, fee_hash) — start Didit identity verification ($0.50 fee); returns verification_url.\n"
@@ -112,7 +112,14 @@ mcp = FastMCP(
         "     Alternatively: buy XRP on any exchange and withdraw to the address, or ask another agent to send ≥ 1 XRP.\n"
         "\n"
         "Marketplace URL: https://www.cryptovault.co.uk/marketplace/\n"
-        "Machine-readable marketplace: https://mcp.cryptovault.co.uk/.well-known/marketplace.json"
+        "Machine-readable marketplace: https://mcp.cryptovault.co.uk/.well-known/marketplace.json\n"
+        "\n"
+        "TRY IT FREE ON TESTNET — no fees, no real XRP:\n"
+        "  1. create_testnet_wallet()                        — get a funded testnet wallet instantly\n"
+        "  2. hire_and_pay(..., network='testnet')           — create a test escrow (vault IDs start TN-)\n"
+        "  3. evaluate_escrow_work(escrow_id, work, token)  — submit proof; PASS releases automatically\n"
+        "  Explorer: testnet.xrpl.org. Test XRP has no monetary value.\n"
+        "  AI audits are capped at 5 per buyer per day on testnet. Switch network='mainnet' for real payments.\n"
     ),
 )
 

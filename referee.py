@@ -1018,6 +1018,16 @@ _stats_cache: dict = {"value": None, "cached_at": 0}
 STATS_CACHE_TTL = 600  # 10 minutes
 SCORE_MAX = 133  # sum of all signal max_points
 
+_referee_submit_locks: dict = {}  # network -> asyncio.Lock
+
+
+def _get_submit_lock(network: str) -> asyncio.Lock:
+    """Return the per-network submission lock for referee signing (prevents tefPAST_SEQ)."""
+    net = network or "mainnet"
+    if net not in _referee_submit_locks:
+        _referee_submit_locks[net] = asyncio.Lock()
+    return _referee_submit_locks[net]
+
 
 @app.get("/stats")
 async def get_platform_stats():
@@ -1109,6 +1119,7 @@ def _build_agent_card():
         "defaultOutputModes": ["application/json"],
         "authentication": {"schemes": ["none"]},
         "skills": skills,
+        "testnet": {"supported": True, "note": "Pass network='testnet' to hire_and_pay or create_escrow_vault for free testing. No fees. Explorer: testnet.xrpl.org."},
     }
 
 @app.get("/.well-known/agent-card.json")
@@ -1251,6 +1262,10 @@ async def serve_mcp_server_card():
         "tools":       _tools_list or [{"name": "(loading)", "description": "Tool list loading from MCP registry."}],
         "tool_count":  len(_tools_list),
         "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3", "nft", "trust", "identity"],
+        "testnet": {
+            "supported": True,
+            "note": "Pass network='testnet' to hire_and_pay or create_escrow_vault. Vault IDs start TN-. Explorer: testnet.xrpl.org. No fees on testnet.",
+        },
     }
 
 
@@ -4319,7 +4334,8 @@ async def auto_finish_escrow(
             fee            = finish_fee,
             memos          = _verdict_memos,
         )
-        result   = await async_submit_and_wait(finish_tx, client, _af_wallet)
+        async with _get_submit_lock(_af_network):
+            result   = await async_submit_and_wait(finish_tx, client, _af_wallet)
         tx_hash  = result.result.get("hash", "unknown")
         logger.info(f"✅ AUTO-FINISH SUCCESS: {escrow_id} | hash={tx_hash[:16]}... | worker={worker_addr}")
 
@@ -4351,7 +4367,15 @@ async def auto_finish_escrow(
                     db.commit()
                     import asyncio as _asyncio
                     _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
-                    _asyncio.create_task(_asyncio.to_thread(_send_release_rating_emails, _rating_vault))
+                    _rating_snapshot = {
+                        "escrow_id": _rating_vault.escrow_id,
+                        "project_label": _rating_vault.project_label,
+                        "buyer_email": getattr(_rating_vault, "buyer_email", None),
+                        "buyer_address": _rating_vault.buyer_address,
+                        "worker_email": getattr(_rating_vault, "worker_email", None),
+                        "worker_address": _rating_vault.worker_address,
+                    }
+                    _asyncio.create_task(_asyncio.to_thread(_send_release_rating_emails, _rating_snapshot))
                 else:
                     db.commit()
         finally:
@@ -5929,8 +5953,9 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
 
         return {
             "score": total,
-            "score_100": min(100, total),
-            "detail": f"AgentTrust wallet trust score: {total}/133",
+            "score_100": round(total * 100 / SCORE_MAX),
+            "max_score": SCORE_MAX,
+            "detail": f"AgentTrust wallet trust score: {total}/{SCORE_MAX}",
             "signals": signals,
             "signals_list": signals_list,
             "verified_issuer": verified_issuer,
@@ -7169,18 +7194,30 @@ def _send_challenge_window_expired_email(vault):
 
 
 def _send_release_rating_emails(vault) -> None:
-    """Send 1-click rating request emails to buyer and worker after escrow RELEASED. Fire-and-forget."""
+    """Send 1-click rating request emails to buyer and worker after escrow RELEASED.
+    Accepts a plain dict snapshot to avoid DetachedInstanceError. Fire-and-forget."""
     if not RESEND_API_KEY:
         return
-    label = vault.project_label or vault.escrow_id[:8]
+    # Support both dict snapshots and legacy vault objects
+    def _get(key, default=None):
+        if isinstance(vault, dict):
+            return vault.get(key, default)
+        return getattr(vault, key, default)
 
-    if vault.buyer_email and vault.worker_address:
+    escrow_id    = _get("escrow_id", "")
+    label        = _get("project_label") or escrow_id[:8]
+    buyer_email  = _get("buyer_email")
+    buyer_addr   = _get("buyer_address")
+    worker_email = _get("worker_email")
+    worker_addr  = _get("worker_address")
+
+    if buyer_email and worker_addr:
         try:
-            token = _make_rating_token(vault.escrow_id, vault.buyer_address or "buyer", vault.worker_address, "buyer")
+            token = _make_rating_token(escrow_id, buyer_addr or "buyer", worker_addr, "buyer")
             link  = f"{SITE_URL}/rate?token={token}"
             resend.Emails.send({
                 "from":    RESEND_FROM,
-                "to":      vault.buyer_email,
+                "to":      buyer_email,
                 "subject": f"How did your worker do? Rate \"{label}\"",
                 "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>{_email_styles()}</style></head>
 <body><div class="card">
@@ -7188,7 +7225,7 @@ def _send_release_rating_emails(vault) -> None:
   <h1>Leave a rating</h1>
   <p>Your escrow <strong>{label}</strong> is complete and payment has been released.</p>
   <p>It takes 30 seconds — please rate your experience with the worker
-     (<code style="font-size:.85rem">{vault.worker_address}</code>):</p>
+     (<code style="font-size:.85rem">{worker_addr}</code>):</p>
   <a href="{link}" class="btn">★ Leave a rating</a>
   <div class="footer">
     This link expires in 7 days and is unique to you.<br><br>
@@ -7196,17 +7233,17 @@ def _send_release_rating_emails(vault) -> None:
   </div>
 </div></body></html>""",
             })
-            logger.info(f"📧 Buyer rating email sent for {vault.escrow_id}")
+            logger.info(f"📧 Buyer rating email sent for {escrow_id}")
         except Exception as e:
-            logger.warning(f"⚠️ Buyer rating email failed for {vault.escrow_id}: {e}")
+            logger.warning(f"⚠️ Buyer rating email failed for {escrow_id}: {e}")
 
-    if vault.worker_email and vault.buyer_address:
+    if worker_email and buyer_addr:
         try:
-            token = _make_rating_token(vault.escrow_id, vault.worker_address or "worker", vault.buyer_address, "seller")
+            token = _make_rating_token(escrow_id, worker_addr or "worker", buyer_addr, "seller")
             link  = f"{SITE_URL}/rate?token={token}"
             resend.Emails.send({
                 "from":    RESEND_FROM,
-                "to":      vault.worker_email,
+                "to":      worker_email,
                 "subject": f"Payment received — rate your buyer for \"{label}\"",
                 "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>{_email_styles()}</style></head>
 <body><div class="card">
@@ -7214,7 +7251,7 @@ def _send_release_rating_emails(vault) -> None:
   <h1>Payment released</h1>
   <p>Payment for <strong>{label}</strong> has been sent to your wallet.</p>
   <p>Please take a moment to rate your buyer
-     (<code style="font-size:.85rem">{vault.buyer_address}</code>):</p>
+     (<code style="font-size:.85rem">{buyer_addr}</code>):</p>
   <a href="{link}" class="btn">★ Leave a rating</a>
   <div class="footer">
     This link expires in 7 days and is unique to you.<br><br>
@@ -7222,9 +7259,9 @@ def _send_release_rating_emails(vault) -> None:
   </div>
 </div></body></html>""",
             })
-            logger.info(f"📧 Worker rating email sent for {vault.escrow_id}")
+            logger.info(f"📧 Worker rating email sent for {escrow_id}")
         except Exception as e:
-            logger.warning(f"⚠️ Worker rating email failed for {vault.escrow_id}: {e}")
+            logger.warning(f"⚠️ Worker rating email failed for {escrow_id}: {e}")
 
 
 async def _verify_challenge_fee_escrow(tx_hash: str, quote: "ChallengeQuote", vault: EscrowVault, escrow_id: str = "") -> tuple:
@@ -7431,7 +7468,8 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                 fee=finish_fee,
                 memos=_fee_memos if _fee_memos else None,
             )
-            response = await async_submit_and_wait(finish_tx, xrpl_client, _fin_wallet)
+            async with _get_submit_lock(_fin_network):
+                response = await async_submit_and_wait(finish_tx, xrpl_client, _fin_wallet)
             result = getattr(response, "result", {})
             _meta = result.get("meta") or result.get("metaData") or {}
             _tx_result = _meta.get("TransactionResult", "") if isinstance(_meta, dict) else ""
@@ -7497,7 +7535,8 @@ async def _cancel_challenge_fee_escrow(escrow_id_or_vault) -> None:
                 fee="12",
             )
             xrpl_client = AsyncJsonRpcClient(_xrpl_url_for_network(_can_network))
-            response = await async_submit_and_wait(cancel_tx, xrpl_client, _can_wallet)
+            async with _get_submit_lock(_can_network):
+                response = await async_submit_and_wait(cancel_tx, xrpl_client, _can_wallet)
             result = getattr(response, "result", {})
             _meta = result.get("meta") or result.get("metaData") or {}
             _tx_result = _meta.get("TransactionResult", "") if isinstance(_meta, dict) else ""
@@ -10238,7 +10277,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "release_status":       ("confirmed" if finish_hash else "pending") if is_approved else None,
         "release_tx_hash":      finish_hash,
         "network":              vault.network or "mainnet",
-        "explorer_url":         _explorer_url(finish_hash, vault.network or "mainnet"),
+        "explorer_url": (
+            _explorer_url(finish_hash, vault.network or "mainnet")
+            if finish_hash else
+            _explorer_url(vault.escrow_tx_hash, vault.network or "mainnet")
+        ),
         "poll":                 f"/escrow/{req.escrow_id}" if is_approved and not finish_hash else None,
         # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
         "dex_quote_rlusd":      dex_quote,
@@ -14027,7 +14070,15 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
                         import asyncio as _asyncio
                         _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
-                        _asyncio.create_task(_asyncio.to_thread(_send_release_rating_emails, _rating_vault))
+                        _rating_snapshot2 = {
+                            "escrow_id": _rating_vault.escrow_id,
+                            "project_label": _rating_vault.project_label,
+                            "buyer_email": getattr(_rating_vault, "buyer_email", None),
+                            "buyer_address": _rating_vault.buyer_address,
+                            "worker_email": getattr(_rating_vault, "worker_email", None),
+                            "worker_address": _rating_vault.worker_address,
+                        }
+                        _asyncio.create_task(_asyncio.to_thread(_send_release_rating_emails, _rating_snapshot2))
                         return
                     elif tx_type == "EscrowCancel" and meta_result == "tesSUCCESS":
                         prev = vault.status
@@ -14094,9 +14145,10 @@ async def _poll_expired_escrows_once():
                     amount_drops = str(int((vault.amount_xrp or 0) * 1_000_000))
                     accounts_to_check = list({vault.buyer_address, vault.worker_address} - {None, ""})
                     live = False
+                    _orphan_url = _xrpl_url_for_network(vault.network or "mainnet")
                     for acct in accounts_to_check:
                         async with httpx.AsyncClient(timeout=10) as client:
-                            r = await client.post(XRPL_URL, json={
+                            r = await client.post(_orphan_url, json={
                                 "method": "account_objects",
                                 "params": [{"account": acct, "type": "escrow", "ledger_index": "validated"}],
                             })
@@ -14135,10 +14187,12 @@ async def _poll_expired_escrows_once():
                     # Step 1: get real owner and sequence from the EscrowCreate tx
                     owner = vault.buyer_address
                     sequence = vault.escrow_sequence
+                    _exp_network = vault.network or "mainnet"
+                    _exp_url = _xrpl_url_for_network(_exp_network)
                     if vault.escrow_tx_hash:
                         try:
                             async with httpx.AsyncClient(timeout=10) as hc:
-                                r = await hc.post(XRPL_URL, json={
+                                r = await hc.post(_exp_url, json={
                                     "method": "tx",
                                     "params": [{"transaction": vault.escrow_tx_hash, "binary": False}],
                                 })
@@ -14155,7 +14209,7 @@ async def _poll_expired_escrows_once():
                     # Step 2: verify escrow exists on-chain before submitting
                     try:
                         async with httpx.AsyncClient(timeout=10) as hc:
-                            r = await hc.post(XRPL_URL, json={
+                            r = await hc.post(_exp_url, json={
                                 "method": "ledger_entry",
                                 "params": [{"escrow": {"owner": owner, "seq": sequence}, "ledger_index": "validated"}],
                             })
@@ -14176,13 +14230,15 @@ async def _poll_expired_escrows_once():
                         continue
 
                     # Step 3: submit EscrowCancel with correct owner/sequence
-                    client = AsyncJsonRpcClient(XRPL_URL)
+                    _exp_wallet = _referee_wallet_for_network(_exp_network)
+                    client = AsyncJsonRpcClient(_exp_url)
                     cancel_tx = EscrowCancel(
-                        account=referee_wallet.address,
+                        account=_exp_wallet.address,
                         owner=owner,
                         offer_sequence=sequence,
                     )
-                    result = await async_submit_and_wait(cancel_tx, client, referee_wallet)
+                    async with _get_submit_lock(_exp_network):
+                        result = await async_submit_and_wait(cancel_tx, client, _exp_wallet)
                     engine_result = result.result.get("meta", {}).get("TransactionResult", "") or result.result.get("engine_result", "")
                     tx_hash = result.result.get("hash", "")
 
