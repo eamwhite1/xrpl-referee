@@ -65,7 +65,7 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
 ## Settlement
 
-- Asset: XRP (or RLUSD) on XRPL
+- Asset: XRP on XRPL (RLUSD escrow pending XRPL token-escrow support)
 - Escrow is held by the XRPL ledger, not AgentTrust
 - Funds release automatically on PASS — no manual claim
 - CancelAfter: buyer can reclaim after expiry if work not approved
