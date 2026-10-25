@@ -1551,7 +1551,9 @@ else:
         DATABASE_URL += "?sslmode=require"
 
 engine_args = {"pool_pre_ping": True, "pool_recycle": 300}
-if "sqlite" not in DATABASE_URL:
+if "sqlite" in DATABASE_URL:
+    engine_args["connect_args"] = {"check_same_thread": False}
+elif "sqlite" not in DATABASE_URL:
     engine_args["pool_size"] = 2
     engine_args["max_overflow"] = 2
     engine_args["connect_args"] = {"sslmode": "require", "connect_timeout": 5}
@@ -3144,6 +3146,7 @@ RESEND_FROM             = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
 WEBHOOK_SIGNING_SECRET  = os.getenv("WEBHOOK_SIGNING_SECRET", "")
 DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
+RATING_LINK_TTL_S    = 7 * 24 * 3600  # 7 days
 
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
@@ -3183,6 +3186,44 @@ async def _telegram_notify(text: str) -> None:
             )
     except Exception as e:
         logger.warning(f"⚠️ Telegram notify failed: {e}")
+
+# ---------------------------------------------------------------------------
+# RATING MAGIC LINK TOKENS (HMAC-SHA256, 7-day TTL)
+# ---------------------------------------------------------------------------
+
+def _make_rating_token(escrow_id: str, rater_address: str, rated_address: str, role: str) -> str:
+    """Return a URL-safe base64 HMAC-SHA256 signed token for the rating magic link."""
+    secret = os.getenv("JWT_SECRET", "")
+    expires = int(time.time()) + RATING_LINK_TTL_S
+    payload = f"{escrow_id}:{rater_address}:{rated_address}:{role}:{expires}"
+    sig = _hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+
+
+def _verify_rating_token(token: str) -> Optional[dict]:
+    """Return {escrow_id, rater_address, rated_address, role} or None if invalid/expired."""
+    secret = os.getenv("JWT_SECRET", "")
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        # Split off the 64-char hex sig from the right
+        payload, sig = decoded.rsplit(":", 1)
+        expected = _hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(sig, expected):
+            return None
+        fields = payload.split(":")
+        # Fixed structure from right: ...escrow_id:rater:rated:role:expires
+        expires    = int(fields[-1])
+        role       = fields[-2]
+        rated_address  = fields[-3]
+        rater_address  = fields[-4]
+        escrow_id  = ":".join(fields[:-4])
+        if time.time() > expires:
+            return None
+        return {"escrow_id": escrow_id, "rater_address": rater_address,
+                "rated_address": rated_address, "role": role}
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # FULFILLMENT KEY ENCRYPTION (AES-256-GCM)
@@ -4185,9 +4226,11 @@ async def auto_finish_escrow(
                     prev = vault.status
                     vault.status = "RELEASED"
                     _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.release_tx_hash)
+                    _rating_vault = vault
                     db.commit()
                     import asyncio as _asyncio
                     _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
+                    _asyncio.create_task(_asyncio.to_thread(_send_release_rating_emails, _rating_vault))
                 else:
                     db.commit()
         finally:
@@ -6030,6 +6073,76 @@ async def get_wallet_ratings(address: str, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# 11f-2. MAGIC-LINK RATING ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.get("/rate/verify")
+async def verify_rating_link(token: str, db: Session = Depends(get_db)):
+    """Validate a magic rating link. Returns escrow info for the rating page. No auth required."""
+    info = _verify_rating_token(token)
+    if not info:
+        raise HTTPException(status_code=400, detail="Invalid or expired rating link")
+    row = db.execute(
+        text("SELECT status, project_label, buyer_address, worker_address FROM escrow_vault WHERE escrow_id = :eid"),
+        {"eid": info["escrow_id"]},
+    ).fetchone()
+    if not row or row[0] != "RELEASED":
+        raise HTTPException(status_code=400, detail="Escrow not found or not yet released")
+    existing = db.execute(
+        text("SELECT 1 FROM wallet_rating WHERE escrow_id = :eid AND rater_address = :r"),
+        {"eid": info["escrow_id"], "r": info["rater_address"]},
+    ).fetchone()
+    label = row[1] or info["escrow_id"][:8]
+    return {
+        "escrow_id":      info["escrow_id"],
+        "rater_address":  info["rater_address"],
+        "rated_address":  info["rated_address"],
+        "role":           info["role"],
+        "project_label":  label,
+        "already_rated":  existing is not None,
+    }
+
+
+@app.post("/rate/submit")
+async def submit_rating_via_link(token: str, rating: int, comment: Optional[str] = None, db: Session = Depends(get_db)):
+    """Submit a 1–5 star rating via magic link token. No wallet signature required."""
+    if not (1 <= rating <= 5):
+        raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
+    if comment and len(comment) > 280:
+        raise HTTPException(status_code=422, detail="comment must be 280 characters or fewer")
+    info = _verify_rating_token(token)
+    if not info:
+        raise HTTPException(status_code=400, detail="Invalid or expired rating link")
+    row = db.execute(
+        text("SELECT status, buyer_address, worker_address FROM escrow_vault WHERE escrow_id = :eid"),
+        {"eid": info["escrow_id"]},
+    ).fetchone()
+    if not row or row[0] != "RELEASED":
+        raise HTTPException(status_code=400, detail="Escrow not found or not yet released")
+    buyer_addr, worker_addr = row[1], row[2]
+    # Derive rater_role from who is rating whom
+    if info["rater_address"] == buyer_addr and info["rated_address"] == worker_addr:
+        rater_role = "buyer"
+    elif info["rater_address"] == worker_addr and info["rated_address"] == buyer_addr:
+        rater_role = "seller"
+    else:
+        rater_role = info["role"]
+    try:
+        db.execute(
+            text("""INSERT INTO wallet_rating (rated_address, rater_address, escrow_id, rating, comment, rater_role, created_at)
+                    VALUES (:rated, :rater, :escrow_id, :rating, :comment, :role, :now)"""),
+            {"rated": info["rated_address"], "rater": info["rater_address"],
+             "escrow_id": info["escrow_id"], "rating": rating,
+             "comment": comment, "role": rater_role,
+             "now": datetime.now(timezone.utc).isoformat()},
+        )
+        db.commit()
+    except Exception:
+        raise HTTPException(status_code=409, detail="You have already rated this escrow")
+    return {"status": "ok", "rating": rating}
+
+
+# ---------------------------------------------------------------------------
 # 11g. ETH SIGNATURE CHALLENGE
 # ---------------------------------------------------------------------------
 _eth_challenges: dict = {}  # address -> {challenge, expires_at}
@@ -6787,6 +6900,65 @@ def _send_challenge_window_expired_email(vault):
         logger.info(f"📧 Challenge window expired email sent to {recipient} for {vault.escrow_id}")
     except Exception as e:
         logger.error(f"❌ Challenge window expired email failed for {vault.escrow_id}: {e}")
+
+
+def _send_release_rating_emails(vault) -> None:
+    """Send 1-click rating request emails to buyer and worker after escrow RELEASED. Fire-and-forget."""
+    if not RESEND_API_KEY:
+        return
+    label = vault.project_label or vault.escrow_id[:8]
+
+    if vault.buyer_email and vault.worker_address:
+        try:
+            token = _make_rating_token(vault.escrow_id, vault.buyer_address or "buyer", vault.worker_address, "buyer")
+            link  = f"{SITE_URL}/rate?token={token}"
+            resend.Emails.send({
+                "from":    RESEND_FROM,
+                "to":      vault.buyer_email,
+                "subject": f"How did your worker do? Rate \"{label}\"",
+                "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>{_email_styles()}</style></head>
+<body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Leave a rating</h1>
+  <p>Your escrow <strong>{label}</strong> is complete and payment has been released.</p>
+  <p>It takes 30 seconds — please rate your experience with the worker
+     (<code style="font-size:.85rem">{vault.worker_address}</code>):</p>
+  <a href="{link}" class="btn">★ Leave a rating</a>
+  <div class="footer">
+    This link expires in 7 days and is unique to you.<br><br>
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+            })
+            logger.info(f"📧 Buyer rating email sent for {vault.escrow_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Buyer rating email failed for {vault.escrow_id}: {e}")
+
+    if vault.worker_email and vault.buyer_address:
+        try:
+            token = _make_rating_token(vault.escrow_id, vault.worker_address or "worker", vault.buyer_address, "seller")
+            link  = f"{SITE_URL}/rate?token={token}"
+            resend.Emails.send({
+                "from":    RESEND_FROM,
+                "to":      vault.worker_email,
+                "subject": f"Payment received — rate your buyer for \"{label}\"",
+                "html": f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>{_email_styles()}</style></head>
+<body><div class="card">
+  <div class="logo">AgentTrust<span>.</span></div>
+  <h1>Payment released</h1>
+  <p>Payment for <strong>{label}</strong> has been sent to your wallet.</p>
+  <p>Please take a moment to rate your buyer
+     (<code style="font-size:.85rem">{vault.buyer_address}</code>):</p>
+  <a href="{link}" class="btn">★ Leave a rating</a>
+  <div class="footer">
+    This link expires in 7 days and is unique to you.<br><br>
+    AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
+  </div>
+</div></body></html>""",
+            })
+            logger.info(f"📧 Worker rating email sent for {vault.escrow_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Worker rating email failed for {vault.escrow_id}: {e}")
 
 
 async def _verify_challenge_fee_escrow(tx_hash: str, quote: "ChallengeQuote", vault: EscrowVault, escrow_id: str = "") -> tuple:
@@ -13528,10 +13700,12 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         vault.release_tx_hash = tx_envelope.get("hash") or tx.get("hash")
                         vault.released_at     = ts
                         _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.release_tx_hash)
+                        _rating_vault = vault
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
                         import asyncio as _asyncio
                         _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
+                        _asyncio.create_task(_asyncio.to_thread(_send_release_rating_emails, _rating_vault))
                         return
                     elif tx_type == "EscrowCancel" and meta_result == "tesSUCCESS":
                         prev = vault.status
