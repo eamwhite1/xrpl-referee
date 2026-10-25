@@ -1930,7 +1930,22 @@ async def rate_wallet(
     )],
     comment: Annotated[Optional[str], Field(
         title="Comment",
-        description="Optional short comment about the counterparty.",
+        description="Optional short comment about the counterparty (max 280 chars).",
+        default=None,
+    )] = None,
+    rater_signature: Annotated[Optional[str], Field(
+        title="Rater Signature",
+        description="Hex signature over 'agenttrust-rate:{escrow_id}:{rated}:{rating}:{ts}' from rater_address private key.",
+        default=None,
+    )] = None,
+    rater_public_key: Annotated[Optional[str], Field(
+        title="Rater Public Key",
+        description="Hex public key whose derived address == rater_address.",
+        default=None,
+    )] = None,
+    signature_ts: Annotated[Optional[int], Field(
+        title="Signature Timestamp",
+        description="Unix timestamp used when signing (must be within 5 min of now).",
         default=None,
     )] = None,
 ) -> dict:
@@ -1940,8 +1955,8 @@ async def rate_wallet(
     Peer ratings feed directly into the counterparty's AgentTrust Wallet Trust Score
     (up to 15 pts). One rating per escrow per rater. Ratings are permanent and public.
 
-    Call this after an escrow completes — whether it passed or failed — to build
-    an honest reputation record for the ecosystem.
+    Proof required: provide rater_signature + rater_public_key + signature_ts (signed locally
+    with xrpl.core.keypairs.sign), or use an enterprise x-api-key linked to rater_address.
     """
     payload = {
         "escrow_id": escrow_id,
@@ -1951,10 +1966,14 @@ async def rate_wallet(
     }
     if comment:
         payload["comment"] = comment
+    headers = {}
+    if rater_signature and rater_public_key and signature_ts:
+        headers["x-rater-signature"] = f"{rater_signature}:{signature_ts}:{rater_public_key}"
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/wallet/{wallet_address}/rate",
             json=payload,
+            headers=headers,
         )
         res.raise_for_status()
         return res.json()
