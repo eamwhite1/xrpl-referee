@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "AgentTrust Referee",
-    "description": "A trust-minimized AI verdict engine for the agent economy. POST a task spec and proof of work, pay $0.10 (XRP, RLUSD, or USDC), receive a structured PASS/FAIL verdict. Optionally use the full escrow protocol via /escrow/generate to lock and release XRPL funds automatically on approval.",
+    "description": "AI task verification and autonomous payment rail on XRPL. Each escrow records the verdict hash, timestamp, and XRPL transaction hashes. Pass your compliance policy as task_description or invoice_requirements; the AI evaluator checks work against your specific requirements.",
     "version": "7.0.0",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
@@ -15,13 +15,13 @@
   "servers": [
     {
       "url": "https://mcp.cryptovault.co.uk",
-      "description": "Production — XRPL Mainnet"
+      "description": "Production \u2014 XRPL Mainnet"
     }
   ],
   "paths": {
     "/audit": {
       "post": {
-        "summary": "Standalone AI verdict — no escrow required",
+        "summary": "Standalone AI verdict \u2014 no escrow required",
         "description": "The simplest integration. Pay $0.10 (XRP, RLUSD, or USDC), get a structured AI verdict on whether work meets spec. No vault, no receipt code, no XRPL escrow needed. Use /escrow/generate if you want funds locked and released automatically.",
         "operationId": "standaloneAudit",
         "parameters": [
@@ -30,7 +30,9 @@
             "in": "header",
             "description": "XRPL/Base transaction hash of your $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR",
             "required": false,
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -39,7 +41,10 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["task", "work"],
+                "required": [
+                  "task",
+                  "work"
+                ],
                 "properties": {
                   "task": {
                     "type": "string",
@@ -68,21 +73,58 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "status":           { "type": "string", "enum": ["approved", "rejected"] },
-                    "verdict":          { "type": "string", "enum": ["PASS", "FAIL"] },
-                    "score":            { "type": "number", "description": "0.0–1.0 confidence score" },
-                    "summary":          { "type": "string", "description": "One-sentence verdict summary" },
-                    "details":          { "type": "string", "description": "Full reasoning from the AI" },
-                    "criteria_met":     { "type": "array", "items": { "type": "string" } },
-                    "criteria_failed":  { "type": "array", "items": { "type": "string" } },
-                    "model_used":       { "type": "string" }
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "verdict": {
+                      "type": "string",
+                      "enum": [
+                        "PASS",
+                        "FAIL"
+                      ]
+                    },
+                    "score": {
+                      "type": "number",
+                      "description": "0.0\u20131.0 confidence score"
+                    },
+                    "summary": {
+                      "type": "string",
+                      "description": "One-sentence verdict summary"
+                    },
+                    "details": {
+                      "type": "string",
+                      "description": "Full reasoning from the AI"
+                    },
+                    "criteria_met": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "criteria_failed": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "model_used": {
+                      "type": "string"
+                    }
                   }
                 }
               }
             }
           },
-          "402": { "description": "Payment required — fee hash missing or invalid" },
-          "403": { "description": "Forbidden — payment hash already used (anti-replay)" }
+          "402": {
+            "description": "Payment required \u2014 fee hash missing or invalid"
+          },
+          "403": {
+            "description": "Forbidden \u2014 payment hash already used (anti-replay)"
+          }
         }
       }
     },
@@ -97,17 +139,49 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["escrow_id", "fee_hash", "buyer_name", "buyer_address", "task_description", "worker_address", "amount_xrp"],
+                "required": [
+                  "escrow_id",
+                  "fee_hash",
+                  "buyer_name",
+                  "buyer_address",
+                  "task_description",
+                  "worker_address",
+                  "amount_xrp"
+                ],
                 "properties": {
-                  "escrow_id":        { "type": "string", "description": "Unique receipt code e.g. AT-7X9K-2MQ4" },
-                  "fee_hash":         { "type": "string", "description": "XRPL/Base tx hash of $0.10 protocol fee" },
-                  "project_label":    { "type": "string", "description": "Human-readable job label e.g. Job-01" },
-                  "buyer_name":       { "type": "string" },
-                  "buyer_address":    { "type": "string", "description": "Buyer's XRPL wallet address" },
-                  "task_description": { "type": "string" },
-                  "worker_address":   { "type": "string", "description": "Worker's XRPL wallet — receives funds on approval" },
-                  "amount_xrp":       { "type": "number" },
-                  "cancel_after_hrs": { "type": "integer", "default": 168 }
+                  "escrow_id": {
+                    "type": "string",
+                    "description": "Unique receipt code e.g. AT-7X9K-2MQ4"
+                  },
+                  "fee_hash": {
+                    "type": "string",
+                    "description": "XRPL/Base tx hash of $0.10 protocol fee"
+                  },
+                  "project_label": {
+                    "type": "string",
+                    "description": "Human-readable job label e.g. Job-01"
+                  },
+                  "buyer_name": {
+                    "type": "string"
+                  },
+                  "buyer_address": {
+                    "type": "string",
+                    "description": "Buyer's XRPL wallet address"
+                  },
+                  "task_description": {
+                    "type": "string"
+                  },
+                  "worker_address": {
+                    "type": "string",
+                    "description": "Worker's XRPL wallet \u2014 receives funds on approval"
+                  },
+                  "amount_xrp": {
+                    "type": "number"
+                  },
+                  "cancel_after_hrs": {
+                    "type": "integer",
+                    "default": 168
+                  }
                 }
               }
             }
@@ -121,10 +195,19 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "escrow_id":           { "type": "string" },
-                    "condition":           { "type": "string", "description": "SHA-256 crypto-condition for EscrowCreate tx" },
-                    "cancel_after_ripple": { "type": "integer" },
-                    "cancel_after_human":  { "type": "string" }
+                    "escrow_id": {
+                      "type": "string"
+                    },
+                    "condition": {
+                      "type": "string",
+                      "description": "SHA-256 crypto-condition for EscrowCreate tx"
+                    },
+                    "cancel_after_ripple": {
+                      "type": "integer"
+                    },
+                    "cancel_after_human": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -144,10 +227,19 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["escrow_id", "work"],
+                "required": [
+                  "escrow_id",
+                  "work"
+                ],
                 "properties": {
-                  "escrow_id": { "type": "string", "description": "Receipt code from /escrow/generate" },
-                  "work":      { "type": "string", "description": "Completed work or proof of completion" }
+                  "escrow_id": {
+                    "type": "string",
+                    "description": "Receipt code from /escrow/generate"
+                  },
+                  "work": {
+                    "type": "string",
+                    "description": "Completed work or proof of completion"
+                  }
                 }
               }
             }
@@ -161,13 +253,33 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "status":          { "type": "string", "enum": ["approved", "rejected"] },
-                    "fulfillment":     { "type": "string", "description": "Fulfillment hex — submit in EscrowFinish (PASS only)" },
-                    "condition":       { "type": "string", "description": "Condition hex — required in EscrowFinish" },
-                    "buyer_address":   { "type": "string" },
-                    "escrow_sequence": { "type": "integer" },
-                    "amount_xrp":      { "type": "number" },
-                    "verdict":         { "type": "object" }
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "fulfillment": {
+                      "type": "string",
+                      "description": "Fulfillment hex \u2014 submit in EscrowFinish (PASS only)"
+                    },
+                    "condition": {
+                      "type": "string",
+                      "description": "Condition hex \u2014 required in EscrowFinish"
+                    },
+                    "buyer_address": {
+                      "type": "string"
+                    },
+                    "escrow_sequence": {
+                      "type": "integer"
+                    },
+                    "amount_xrp": {
+                      "type": "number"
+                    },
+                    "verdict": {
+                      "type": "object"
+                    }
                   }
                 }
               }
@@ -179,14 +291,16 @@
     "/kyc/verify": {
       "post": {
         "summary": "Register Xaman KYC for a wallet",
-        "description": "Checks whether a wallet has completed Xaman identity verification and caches the result. Call this after completing KYC in the Xaman app. Once verified, the wallet can create escrows up to $10,000 (vs. the default $3,000 cap). AgentTrust never stores identity documents — only the pass/fail status from the Xaman platform.",
+        "description": "Checks whether a wallet has completed Xaman identity verification and caches the result. Call this after completing KYC in the Xaman app. Once verified, the wallet can create escrows up to $10,000 (vs. the default $3,000 cap). AgentTrust never stores identity documents \u2014 only the pass/fail status from the Xaman platform.",
         "operationId": "kycVerify",
         "parameters": [
           {
             "name": "wallet_address",
             "in": "query",
             "required": true,
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "The XRPL wallet address to check and register KYC status for."
           }
         ],
@@ -198,11 +312,22 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "wallet_address": { "type": "string" },
-                    "kyc_verified":   { "type": "boolean" },
-                    "method":         { "type": "string", "example": "xaman" },
-                    "message":        { "type": "string" },
-                    "xaman_kyc_url":  { "type": "string" }
+                    "wallet_address": {
+                      "type": "string"
+                    },
+                    "kyc_verified": {
+                      "type": "boolean"
+                    },
+                    "method": {
+                      "type": "string",
+                      "example": "xaman"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "xaman_kyc_url": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -221,7 +346,9 @@
             "name": "wallet_address",
             "in": "path",
             "required": true,
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "The XRPL wallet address to check."
           }
         ],
@@ -233,10 +360,19 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "wallet_address": { "type": "string" },
-                    "kyc_verified":   { "type": "boolean" },
-                    "method":         { "type": "string" },
-                    "verified_at":    { "type": "string", "format": "date-time" }
+                    "wallet_address": {
+                      "type": "string"
+                    },
+                    "kyc_verified": {
+                      "type": "boolean"
+                    },
+                    "method": {
+                      "type": "string"
+                    },
+                    "verified_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
                   }
                 }
               }
@@ -257,9 +393,15 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "status":    { "type": "string" },
-                    "version":   { "type": "string" },
-                    "timestamp": { "type": "string" }
+                    "status": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "timestamp": {
+                      "type": "string"
+                    }
                   }
                 }
               }

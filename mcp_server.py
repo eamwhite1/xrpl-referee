@@ -89,7 +89,7 @@ mcp = FastMCP(
         "     If proceed is False, do not call create_escrow_vault or hire_and_pay.\n"
         "\n"
         "TRUST & COMPLIANCE (individual checks — use assess_counterparty_and_job for the full picture):\n"
-        "  get_wallet_trust_score(address) — trust score (score_100: 0–100) across 11 signals; max_score field shows the raw maximum.\n"
+        "  get_wallet_trust_score(address) — returns raw points (max 133) and score_100 (0–100 normalised) across 11 signals.\n"
         "  check_wallet_sanctions(address) — OFAC SDN screen. Sanctioned wallets score 0.\n"
         "  check_wallet_kyc(address)       — identity KYC status (unlocks escrows up to $10,000).\n"
         "  start_wallet_kyc(address, fee_hash) — start Didit identity verification ($0.50 fee); returns verification_url.\n"
@@ -1649,12 +1649,12 @@ async def get_wallet_trust_score(
     )],
 ) -> dict:
     """
-    Open reputation layer for XRPL agents — returns a 0–100 trust score for any wallet.
+    Open reputation layer for XRPL agents — returns raw points (max 133) plus score_100 (0–100 normalised) for any wallet.
 
     Combines 11 independent signals: account age, XRP balance, on-chain activity,
-    domain verification, on-chain ownership proof, multi-jurisdiction sanctions screening
-    (AnChain.ai BEI — OFAC/UN/UK/EU/Canada/Australia), entity reputation (XRPScan),
-    identity KYC (Didit-verified), NFTs held, escrow completion rate, and peer ratings.
+    domain verification, on-chain ownership proof, OFAC SDN screening,
+    entity reputation (XRPScan), identity KYC (Didit-verified), NFTs held,
+    escrow completion rate, and peer ratings.
 
     Free to query. Rate limit: 20 calls per hour per IP.
     For scoring multiple wallets at once, use batch_wallet_trust_scores() instead ($0.10 per batch of up to 50).
