@@ -33,6 +33,13 @@ mcp = FastMCP(
     name="AgentTrust Referee",
     version=APP_VERSION,
     instructions=(
+        "## CORE FLOW\n"
+        "1. get_wallet_setup_guide() — secure wallet setup (seed stays local)\n"
+        "2. get_fees() — live fee schedule before any paid call\n"
+        "3. assess_counterparty_and_job(worker_address, job_type, amount_xrp) — pre-flight check; stop if proceed=False\n"
+        "4. hire_and_pay(task, buyer_address, amount_xrp, worker_address) — lock payment in XRPL escrow\n"
+        "5. evaluate_escrow_work(escrow_id, work, evaluate_token) — submit proof; PASS auto-releases payment\n"
+        "\n"
         "AgentTrust — trust-minimized escrow for agent work, anywhere. "
         "Lock payment for work found on any platform: hire_and_pay with any XRPL address, or receive a pay_url via request_escrow. "
         "No marketplace required. Marketplace is optional.\n"
@@ -95,7 +102,7 @@ mcp = FastMCP(
         "     Key lives in Privy's secure enclave; your agent never handles the seed.\n"
         "     Human buyers: one-click wallet creation at app.cryptovault.co.uk → Wallets → 'Create wallet with Privy'.\n"
         "     Full guide: https://www.cryptovault.co.uk/privy-wallet/ | call get_wallet_setup_guide() for SDK code.\n"
-        "  QUICK START (recommended): create_agent_wallet() — generates a keypair, registers your wallet, and includes 3 free escrows.\n"
+        "  DEV ONLY (throwaway wallets): create_agent_wallet() — generates a demo keypair for testing only. Never use for real funds.\n"
         "     Store the returned seed securely in your .env. Free tier credit is applied automatically.\n"
         "  FUNDING (onramp only — Coinbase is not the settlement layer):\n"
         "     fund_xrpl_wallet_via_coinbase(address) — buys XRP on Coinbase and withdraws it to your XRPL address.\n"
@@ -1651,7 +1658,7 @@ async def get_wallet_trust_score(
 
 @mcp.tool(annotations=ToolAnnotations(
     title="Batch Wallet Trust Scores",
-    readOnlyHint=True,
+    readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
     openWorldHint=True,
@@ -1689,7 +1696,7 @@ async def batch_wallet_trust_scores(
 
 @mcp.tool(annotations=ToolAnnotations(
     title="Check Wallet KYC Status",
-    readOnlyHint=False,
+    readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=True,
@@ -2514,6 +2521,7 @@ async def hire_and_pay(
         ),
         "free_tier": {"used": bool(free_tier_used), "free_escrows_remaining": audits_remaining} if free_tier_used else {"used": False},
         "audits_remaining": audits_remaining,
+        "free_escrows_remaining": audits_remaining,
         "worker_url": vault_data.get("worker_url"),
         "worker_instructions": vault_data.get("worker_instructions"),
     }
@@ -2523,7 +2531,13 @@ async def hire_and_pay(
 # Submit signed escrow transaction (buyer flow, step 2 of 2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Submit Escrow Transaction",
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
     """
     Submit a locally-signed EscrowCreate transaction blob and activate the vault
@@ -2688,7 +2702,13 @@ async def request_escrow(
 # Wallet Bootstrap
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Create Agent Wallet",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+))
 async def create_agent_wallet() -> dict:
     """
     Convenience tool: generate a new XRPL keypair and return the seed.
@@ -2814,7 +2834,13 @@ async def register_wallet_free_tier(
 # Wallet setup guide (recommended production approach)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get Wallet Setup Guide",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+))
 async def get_wallet_setup_guide() -> dict:
     """
     Returns the recommended production wallet setup for XRPL agents.
@@ -2953,7 +2979,13 @@ async def get_wallet_setup_guide() -> dict:
 # Coinbase wallet bootstrap (USDC/fiat → XRP → XRPL)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Fund XRPL Wallet via Coinbase",
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 async def fund_xrpl_wallet_via_coinbase(
     xrpl_address: str,
     usd_amount: float = 3.0,
@@ -3364,7 +3396,13 @@ async def assess_counterparty_and_job(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Explain AgentTrust Trust Model",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+))
 async def explain_agenttrust_trust_model() -> dict:
     """
     Returns the AgentTrust trust model: what is guaranteed, where trust remains,
@@ -3375,12 +3413,12 @@ async def explain_agenttrust_trust_model() -> dict:
         "guaranteed": [
             "Funds never touch AgentTrust's wallet — XRP/RLUSD sit in native XRPL crypto-condition escrow. We cannot move them.",
             "Worker wallet address is locked at vault creation — payment cannot be rerouted.",
-            "The fulfillment key is derived from your job spec — only a valid submission unlocks it.",
+            "The fulfillment key is a random 32-byte preimage, AES-256-GCM encrypted at rest — only a valid submission unlocks it.",
             "Every wallet is screened against the OFAC SDN sanctions list at vault creation.",
             "Fulfillment keys are encrypted AES-256-GCM at rest; raw key reconstructed in-memory only at release.",
         ],
         "remaining_trust": [
-            "AI verdict (Gemini) can be wrong and is final — no human appeals process.",
+            "AI verdict (Gemini) can be wrong — buyers have a 14-day challenge window via challenge_escrow_verdict().",
             "The XRPL NFT Issuer Registry is operated by AgentTrust — a public mirror spec is open for anyone to run.",
             "API availability depends on AgentTrust infrastructure — use proof gates for zero-dependency release.",
         ],
@@ -3413,7 +3451,7 @@ async def explain_agenttrust_trust_model() -> dict:
             "summary": "AgentTrust is designed for enterprise deployment from the ground up.",
             "audit_trail": "Every escrow verdict, timestamp, and transaction hash is permanently recorded on the XRPL — tamper-proof, independently verifiable, no AgentTrust involvement needed to read it.",
             "your_policy": "Pass task_description or invoice_requirements with your compliance rulebook or corporate policy — the AI evaluator checks work against your requirements before payment releases.",
-            "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no disputes, no chargebacks, no manual intervention.",
+            "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no chargebacks, no manual intervention. 14-day challenge window via challenge_escrow_verdict().",
             "ci_quality_gates": "GitHub Action gates every pull request with dual-model AI audit (Gemini Flash + Gemini Pro consensus). Fails pipeline if diff scores below your threshold. $0.10/audit.",
             "compliance": "OFAC SDN screening on every wallet. Travel Rule compliance warnings above $1,000. Invoice verification with AP automation via accounts_email.",
             "enterprise_page": "https://www.cryptovault.co.uk/enterprise/",
@@ -3422,7 +3460,13 @@ async def explain_agenttrust_trust_model() -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Recommend Release Conditions",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+))
 async def recommend_release_conditions(job_type: str) -> dict:
     """
     Given a job or deliverable type, returns recommended escrow release conditions —
@@ -3552,12 +3596,18 @@ async def recommend_release_conditions(job_type: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    title="Get Batch DvP Payload",
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 async def get_batch_dvp_payload(
     escrow_id: Annotated[str, Field(description="The escrow vault ID for an NFT DvP job in PASS_AWAITING_NFT state.")],
 ) -> dict:
     """
-    XLS-56 Atomic NFT DvP — live on XRPL mainnet.
+    XLS-56 Atomic NFT DvP — beta/untested on mainnet.
 
     Returns a pre-built Batch transaction (TF_ALL_OR_NOTHING) the buyer signs once
     to atomically accept the seller's NFT transfer and release the escrow payment in a
