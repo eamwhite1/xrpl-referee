@@ -102,3 +102,12 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
     callback_configured: bool  # true if a callback_url was set; the URL itself is never returned
     metadata: dict | null      # arbitrary key/value set at vault creation — PUBLICLY READABLE, do not store secrets here
+
+## Peer Ratings
+
+    POST /wallet/{address}/rate — leave a 1-5 star rating after a RELEASED escrow
+    Proof required: either
+      (A) x-rater-signature: <hexsig>:<ts>:<pubkey> — sign "agenttrust-rate:{escrow_id}:{rated}:{rating}:{ts}" with xrpl.core.keypairs.sign(); rater wallet must have a WalletVerification record
+      (B) enterprise x-api-key whose account has rater_address as a verified LinkedWallet
+    Comments: max 280 chars
+    GET /wallet/{address}/ratings — public: rating, rater_role, escrow_id, created_at (no comments)

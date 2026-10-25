@@ -121,6 +121,7 @@ async def _lifespan(app):
         try:
             Base.metadata.create_all(bind=engine)
             run_migrations()
+            _backfill_wallet_verifications()
             _load_ofac_from_db()
             _db_available = True
             logger.info("✅ Database ready")
@@ -2993,6 +2994,8 @@ def run_migrations():
             fee_tx_hash         VARCHAR UNIQUE
         )""",
         "CREATE INDEX IF NOT EXISTS challenge_quote_escrow_idx ON challenge_quote (escrow_id)",
+        # Unified wallet verification: ensure method column exists
+        "ALTER TABLE wallet_verification ADD COLUMN IF NOT EXISTS method VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3023,6 +3026,48 @@ def run_migrations():
 
     logger.info("✅ Database migrations complete.")
 
+
+def record_wallet_verification(db: Session, address: str, tx_hash: Optional[str], method: str):
+    """Upsert WalletVerification — no-op if already present for this address."""
+    try:
+        existing = db.query(WalletVerification).filter(WalletVerification.wallet_address == address).first()
+        if existing:
+            return existing
+        record = WalletVerification(wallet_address=address, tx_hash=tx_hash, method=method)
+        db.add(record)
+        db.commit()
+        return record
+    except Exception as _e:
+        logger.warning(f"record_wallet_verification failed for {address}: {_e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def _backfill_wallet_verifications():
+    """Idempotent: create WalletVerification rows for verified LinkedWallets that have none."""
+    try:
+        with SessionLocal() as db:
+            verified_wallets = db.query(LinkedWallet).filter(LinkedWallet.verified == True).all()
+            inserted = 0
+            for lw in verified_wallets:
+                existing = db.query(WalletVerification).filter(
+                    WalletVerification.wallet_address == lw.xrpl_address
+                ).first()
+                if not existing:
+                    db.add(WalletVerification(
+                        wallet_address=lw.xrpl_address,
+                        tx_hash=None,
+                        method="enterprise_backfill",
+                    ))
+                    inserted += 1
+            if inserted:
+                db.commit()
+                logger.info(f"✅ Backfilled {inserted} WalletVerification row(s) from LinkedWallet.verified")
+    except Exception as _e:
+        logger.warning(f"_backfill_wallet_verifications failed: {_e}")
 
 
 # ---------------------------------------------------------------------------
@@ -3243,6 +3288,7 @@ X402_CHALLENGE_TTL_SECONDS = 600
 
 _x402_challenges: dict = {}  # invoice_id -> {resource, payTo, asset, issuer, currency, amount, created_at}
 _seller_sig_replay: dict = {}  # sha256(sig_hex) -> expiry_ts (10 min window)
+_rater_sig_replay:  dict = {}  # sha256(sig_hex) -> expiry_ts (10 min window)
 
 
 def _x402_v2_envelope(resource: str, required_xrp: float) -> tuple[dict, str]:
@@ -5488,6 +5534,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         # Wallet ownership verification (on-chain AccountSet proof)
         wallet_sig_score = 0
         wallet_sig_verified = False
+        verification_tx_hash = None
         if db:
             try:
                 vrow = db.query(WalletVerification).filter(
@@ -5496,6 +5543,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 if vrow:
                     wallet_sig_verified = True
                     wallet_sig_score = 8
+                    verification_tx_hash = vrow.tx_hash
             except Exception:
                 pass
 
@@ -5547,6 +5595,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             "has_domain":            has_domain,
             "nft_count":             nft_count,
             "wallet_sig_verified":   wallet_sig_verified,
+            "verification_tx_hash":  verification_tx_hash,
             "sanctions_clear":       sanctions_clear,
             "risk_score":            sanctions_detail.get("risk_score") if sanctions_detail else None,
             "risk_level":            sanctions_detail.get("risk_level") if sanctions_detail else None,
@@ -5702,6 +5751,12 @@ class WalletRatingRequest(BaseModel):
     rating:        int   # 1–5
     comment:       Optional[str] = None
 
+    @validator('comment')
+    def validate_comment(cls, v):
+        if v is not None and len(v) > 280:
+            raise ValueError('comment must be 280 characters or fewer')
+        return v
+
 
 _bootstrap_rate: dict[str, list] = {}  # ip -> [timestamp, ...]
 _BOOTSTRAP_LIMIT  = 3    # max wallet creations per IP
@@ -5839,14 +5894,83 @@ async def register_wallet_free_tier(address: str, body: dict, request: Request, 
 
 
 @app.post("/wallet/{address}/rate")
-async def rate_wallet(address: str, req: WalletRatingRequest, db: Session = Depends(get_db)):
+async def rate_wallet(address: str, req: WalletRatingRequest, request: Request, db: Session = Depends(get_db)):
     """
     Submit a 1–5 star peer rating for a wallet after a completed escrow.
-    Auth: the escrow_id must exist and be in RELEASED status, and rater_address
-    must be either the buyer or worker on that escrow (one rating per role per escrow).
+    Auth: caller must prove control of rater_address via either:
+      (A) x-rater-signature: <hexsig>:<ts>:<pubkey> over "agenttrust-rate:{escrow_id}:{rated}:{rating}:{ts}"
+      (B) enterprise x-api-key whose account has rater_address as a verified LinkedWallet.
     """
     if not (1 <= req.rating <= 5):
         raise HTTPException(status_code=400, detail="Rating must be between 1 and 5.")
+
+    # --- Authentication ---
+    rater_authed = False
+    api_key_header = request.headers.get("x-api-key")
+    sig_header = request.headers.get("x-rater-signature")
+
+    if api_key_header:
+        key_hash = hashlib.sha256(api_key_header.encode()).hexdigest()
+        key_rec = db.query(EnterpriseApiKey).filter(
+            EnterpriseApiKey.key_hash == key_hash,
+            EnterpriseApiKey.revoked == False,
+        ).first()
+        if key_rec:
+            linked = db.query(LinkedWallet).filter(
+                LinkedWallet.account_id == key_rec.account_id,
+                LinkedWallet.xrpl_address == req.rater_address,
+                LinkedWallet.verified == True,
+            ).first()
+            if linked:
+                rater_authed = True
+
+    if not rater_authed and sig_header:
+        import time as _time_r
+        try:
+            parts = sig_header.strip().split(":")
+            if len(parts) < 3:
+                raise HTTPException(status_code=401, detail="x-rater-signature must be <hexsig>:<ts>:<pubkey>")
+            public_key_hex = parts[-1]
+            ts_str = parts[-2]
+            sig_hex = ":".join(parts[:-2])
+            ts = int(ts_str)
+            if abs(_time_r.time() - ts) > 300:
+                raise HTTPException(status_code=401, detail="Rater signature expired (must be within 5 minutes)")
+            message = f"agenttrust-rate:{req.escrow_id}:{address}:{req.rating}:{ts}"
+            from xrpl.core.keypairs import derive_classic_address as _dca, is_valid_message as _ivm
+            derived_addr = _dca(public_key_hex)
+            if derived_addr != req.rater_address:
+                raise HTTPException(status_code=401, detail="Public key does not match rater_address")
+            if not _ivm(message.encode(), bytes.fromhex(sig_hex), public_key_hex):
+                raise HTTPException(status_code=401, detail="Rater signature invalid")
+            # Require rater wallet to be verified on-chain
+            vrow = db.query(WalletVerification).filter(
+                WalletVerification.wallet_address == req.rater_address
+            ).first()
+            if not vrow:
+                raise HTTPException(status_code=401, detail="rater wallet not verified — call /verify/challenge then /verify/confirm first")
+            # Replay protection
+            sig_digest = hashlib.sha256(sig_hex.encode()).hexdigest()
+            _now_ts = _time_r.time()
+            for _k in [k for k, v in list(_rater_sig_replay.items()) if v < _now_ts]:
+                del _rater_sig_replay[_k]
+            if sig_digest in _rater_sig_replay:
+                raise HTTPException(status_code=409, detail="Rater signature already used (replay detected)")
+            _rater_sig_replay[sig_digest] = _now_ts + 600
+            rater_authed = True
+        except HTTPException:
+            raise
+        except Exception as _re:
+            logger.warning(f"Rater sig verification error: {_re}")
+
+    if not rater_authed:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "rater_proof_required",
+                "detail": "Provide x-rater-signature or an enterprise x-api-key with rater_address as a verified linked wallet",
+            },
+        )
 
     escrow = db.execute(
         text("SELECT buyer_address, worker_address, status FROM escrow_vault WHERE escrow_id = :id"),
@@ -5879,6 +6003,30 @@ async def rate_wallet(address: str, req: WalletRatingRequest, db: Session = Depe
         raise HTTPException(status_code=409, detail="You have already rated this wallet for this escrow.")
 
     return {"status": "rated", "rated_address": address, "rating": req.rating, "role": rater_role}
+
+
+@app.get("/wallet/{address}/ratings")
+async def get_wallet_ratings(address: str, db: Session = Depends(get_db)):
+    """Public endpoint: return ratings involving this wallet (as rater or rated). No comments returned."""
+    rows = db.execute(
+        text("""
+            SELECT rating, rater_role, escrow_id, created_at
+            FROM wallet_rating
+            WHERE rated_address = :addr OR rater_address = :addr
+            ORDER BY created_at DESC
+            LIMIT 50
+        """),
+        {"addr": address},
+    ).fetchall()
+    return [
+        {
+            "rating":     r[0],
+            "rater_role": r[1],
+            "escrow_id":  r[2],
+            "created_at": r[3].isoformat() if r[3] else None,
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -11657,21 +11805,8 @@ async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session 
     if not found:
         raise HTTPException(400, "Transaction Memo does not contain the expected challenge string. Check that MemoData is set correctly (no extra characters).")
 
-    # Persist the verification
-    try:
-        Base.metadata.create_all(engine, tables=[WalletVerification.__table__])
-    except Exception:
-        pass
-    try:
-        existing = db.query(WalletVerification).filter(WalletVerification.wallet_address == wallet).first()
-        if existing:
-            existing.verified_at = datetime.now(timezone.utc)
-            existing.tx_hash = tx_hash
-        else:
-            db.add(WalletVerification(wallet_address=wallet, tx_hash=tx_hash))
-        db.commit()
-    except Exception as e:
-        logger.warning(f"Could not persist WalletVerification: {e}")
+    # Persist the verification (unified helper — also used by enterprise paths)
+    record_wallet_verification(db, wallet, tx_hash, method="xrpl_memo")
 
     # Optionally mark an issuer entry as verified too
     if req.issuer_id:
@@ -12423,6 +12558,12 @@ async def enterprise_verify_wallet(
                 if wallet.verify_challenge and wallet.verify_challenge in decoded:
                     wallet.verified = True
                     db.commit()
+                    matched_tx_hash = (
+                        entry.get("hash")
+                        or tx.get("hash")
+                        or entry.get("tx_json", {}).get("hash")
+                    )
+                    record_wallet_verification(db, wallet.xrpl_address, matched_tx_hash, method="enterprise_accountset")
                     return {"verified": True}
             except Exception:
                 continue
@@ -12497,9 +12638,38 @@ async def enterprise_verify_privy_wallet(
     if not engine_result.startswith("tes"):
         raise HTTPException(status_code=502, detail=f"XRPL submit failed: {engine_result} — {submit_result.get('engine_result_message', '')}")
 
+    submitted_hash = (submit_result.get("tx_json") or {}).get("hash") or submit_result.get("hash")
+
+    # Wait for ledger validation (provisional tes* ≠ validated)
+    validated = False
+    final_hash = submitted_hash
+    for _ in range(10):
+        await asyncio.sleep(2)
+        try:
+            async with httpx.AsyncClient(timeout=10) as _c:
+                check_resp = await _c.post(XRPL_URL, json={
+                    "method": "tx",
+                    "params": [{"transaction": submitted_hash}],
+                })
+            check = check_resp.json().get("result", {})
+            check_meta = check.get("meta") or check.get("tx_json", {}).get("meta") or {}
+            if check.get("validated") and (
+                check_meta.get("TransactionResult") == "tesSUCCESS"
+                if isinstance(check_meta, dict) else False
+            ):
+                validated = True
+                final_hash = check.get("hash") or check.get("tx_json", {}).get("hash") or submitted_hash
+                break
+        except Exception:
+            pass
+
+    if not validated:
+        return {"verified": False, "status": "pending", "tx_hash": submitted_hash}
+
     wallet.verified = True
     db.commit()
-    return {"verified": True, "status": "verified", "tx_hash": submit_result.get("tx_json", {}).get("hash")}
+    record_wallet_verification(db, wallet.xrpl_address, final_hash, method="privy_accountset")
+    return {"verified": True, "status": "verified", "tx_hash": final_hash}
 
 
 @app.post("/enterprise/wallets/{wallet_id}/delegate")
