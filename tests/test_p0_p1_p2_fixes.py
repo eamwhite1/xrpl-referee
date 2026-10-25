@@ -103,18 +103,17 @@ def test_escrow_request_body_none_callback_accepted():
 # ---------------------------------------------------------------------------
 
 def test_oversize_metadata_rejected_on_model():
-    """metadata dict that serializes > 4096 bytes should cause a 422 at the endpoint level."""
+    """metadata dict that serializes > 4096 bytes should be rejected by the model validator."""
     import referee as ref
-    # The Pydantic model itself doesn't cap metadata size — the endpoint does.
-    # Just verify the model accepts large dicts (the endpoint will reject at 4 KB).
-    big = ref.EscrowRequestBody(
-        seller_address="rSeller1",
-        buyer_address="rBuyer1",
-        amount_xrp=5.0,
-        task="do work",
-        metadata={"key": "x" * 5000},
-    )
-    assert big.metadata is not None
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError, match="4 KB"):
+        ref.EscrowRequestBody(
+            seller_address="rSeller1",
+            buyer_address="rBuyer1",
+            amount_xrp=5.0,
+            task="do work",
+            metadata={"key": "x" * 5000},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +201,10 @@ async def test_fire_vault_webhook_sends_signed_payload(monkeypatch):
     assert captured["url"] == "https://receiver.example.com/hook"
     sig_header = captured["headers"].get("X-AgentTrust-Signature", "")
     assert sig_header.startswith("sha256=")
-    expected = "sha256=" + hmac.new(b"test-secret-key", captured["content"], hashlib.sha256).hexdigest()
+    # Signing format is "{ts}.{body}" — extract ts from X-AgentTrust-Timestamp header
+    ts_header = captured["headers"].get("X-AgentTrust-Timestamp", "")
+    msg = f"{ts_header}.{captured['content'].decode()}".encode()
+    expected = "sha256=" + hmac.new(b"test-secret-key", msg, hashlib.sha256).hexdigest()
     assert sig_header == expected
 
 
