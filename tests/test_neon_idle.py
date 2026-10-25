@@ -197,12 +197,13 @@ async def test_tec_no_target_resolves_cancelled():
     mock_vault.status = "LOCKED"
     mock_db = MagicMock()
 
-    # account_tx returns an EscrowCancel matching OfferSequence=12345
+    # account_tx returns API v2 shape: tx_json + top-level hash
     mock_response = MagicMock()
     mock_response.json.return_value = {
         "result": {
             "transactions": [{
-                "tx": {"TransactionType": "EscrowCancel", "OfferSequence": 12345},
+                "hash": "AABBCC001122",
+                "tx_json": {"TransactionType": "EscrowCancel", "OfferSequence": 12345, "Owner": "rOwner123"},
                 "meta": {"TransactionResult": "tesSUCCESS"},
             }],
         }
@@ -218,6 +219,82 @@ async def test_tec_no_target_resolves_cancelled():
 
     assert mock_vault.status == "CANCELLED"
     assert mock_vault.delivery_status == "CANCELLED"
+    mock_db.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test 4b: _resolve_gone_escrow — API v1 shape resolves CANCELLED
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_v1_shape_resolves_cancelled():
+    import referee
+
+    mock_vault = MagicMock()
+    mock_vault.escrow_id = "AT-TEST-0002"
+    mock_vault.status = "LOCKED"
+    mock_db = MagicMock()
+
+    # API v1 shape: hash inside tx dict
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "result": {
+            "transactions": [{
+                "tx": {
+                    "hash": "DDEEFF334455",
+                    "TransactionType": "EscrowCancel",
+                    "OfferSequence": 99999,
+                    "Owner": "rOwner123",
+                },
+                "meta": {"TransactionResult": "tesSUCCESS"},
+            }],
+        }
+    }
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await referee._resolve_gone_escrow(mock_vault, "rOwner123", 99999, mock_db)
+
+    assert mock_vault.status == "CANCELLED"
+    mock_db.commit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test 4c: _resolve_gone_escrow — no match → RELEASE_FAILED
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_no_match_returns_release_failed():
+    import referee
+
+    mock_vault = MagicMock()
+    mock_vault.escrow_id = "AT-TEST-0003"
+    mock_vault.status = "LOCKED"
+    mock_db = MagicMock()
+
+    # AccountTx returns unrelated transactions — none match sequence 77777
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "result": {
+            "transactions": [{
+                "hash": "FFFF0000",
+                "tx_json": {"TransactionType": "Payment", "Owner": "rOwner123"},
+                "meta": {"TransactionResult": "tesSUCCESS"},
+            }],
+        }
+    }
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await referee._resolve_gone_escrow(mock_vault, "rOwner123", 77777, mock_db)
+
+    assert mock_vault.status == "RELEASE_FAILED"
     mock_db.commit.assert_called_once()
 
 

@@ -3,6 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import hashlib
+import json
 import time
 import pytest
 from datetime import datetime, timezone, timedelta
@@ -66,18 +67,38 @@ async def test_run_structured_audit_flash_inconclusive_pro_pass():
     """Strict 2-of-2: Flash=INCONCLUSIVE + Pro=PASS must stay INCONCLUSIVE."""
     import referee as ref
 
+    def make_gemini_response(payload):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}],
+        }
+        return mock_resp
+
     flash_payload = {"overall_verdict": "INCONCLUSIVE", "overall_reasoning": "insufficient", "criteria_results": [], "score": 40}
     pro_payload   = {"overall_verdict": "PASS",          "overall_reasoning": "looks good",   "criteria_results": [], "score": 85}
 
-    with patch.object(ref, "_call_gemini_structured", new_callable=AsyncMock) as mock_gemini:
-        mock_gemini.side_effect = [flash_payload, pro_payload]
-        result = await ref._run_structured_audit(
-            task="write a hello world function",
-            work="def hello(): print('hello world')",
-            criteria=[],
-            require_consensus=True,
-            escrow_id="test-escrow-123",
-        )
+    call_count = [0]
+    async def fake_post(url, **kwargs):
+        r = call_count[0]
+        call_count[0] += 1
+        return make_gemini_response(flash_payload if r == 0 else pro_payload)
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = fake_post
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+            result = await ref._run_structured_audit(
+                task="write a hello world function",
+                work="def hello(): print('hello world')",
+                criteria=[],
+                evidence_items=[],
+                require_consensus=True,
+                attempt_count=1,
+            )
 
     assert result["overall_verdict"] == "INCONCLUSIVE"
     assert "Flash=INCONCLUSIVE" in result.get("overall_reasoning", "")
