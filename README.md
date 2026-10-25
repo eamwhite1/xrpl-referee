@@ -1,6 +1,7 @@
 # AgentTrust Referee
 
 [![AgentTrust MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee/badges/score.svg)](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee)
+[![smithery badge](https://smithery.ai/badge/xrpl/agent-trust)](https://smithery.ai/servers/xrpl/agent-trust)
 
 **40+-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
 

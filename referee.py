@@ -1238,6 +1238,25 @@ async def serve_mcp_server_card():
     }
 
 
+CORE_TOOLS = sorted([
+    "get_wallet_setup_guide",
+    "get_fees",
+    "assess_counterparty_and_job",
+    "hire_and_pay",
+    "evaluate_escrow_work",
+    "get_wallet_trust_score",
+    "list_marketplace_jobs",
+    "claim_job",
+    "submit_bid",
+    "audit_task",
+])
+
+@app.get("/mcp/core")
+async def mcp_core_profile():
+    """Minimal tool profile for agents that want only the essential payment flow."""
+    return {"tools": CORE_TOOLS, "count": len(CORE_TOOLS)}
+
+
 @app.get("/mcp/server-card")
 @app.get("/.well-known/mcp.json")
 async def serve_mcp_server_card_alias():
@@ -1917,6 +1936,7 @@ class JobPosting(Base):
     required_vc_type       = Column(String,  nullable=True)
     proof_policy           = Column(String,  default="ALL")
     is_demo                = Column(Boolean, default=False)  # operator-seeded demo jobs
+    posted_by_operator     = Column(Boolean, default=False, nullable=False, server_default="false")
 
 
 class Bid(Base):
@@ -3110,9 +3130,12 @@ def _backfill_wallet_verifications():
 # ---------------------------------------------------------------------------
 # 5. CONFIGURATION
 # ---------------------------------------------------------------------------
-XRPL_URL        = os.getenv("XRPL_URL", "https://xrplcluster.com")
+XRPL_URL         = os.getenv("XRPL_URL", "https://xrplcluster.com")
+XRPL_TESTNET_URL = os.getenv("XRPL_TESTNET_URL", "https://testnet.xrpl-labs.com")
+XRPL_TESTNET_SEED = os.getenv("XRPL_TESTNET_SEED")
 BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
 PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+OPERATOR_WALLETS: set = set(filter(None, os.getenv("OPERATOR_WALLETS", PROTOCOL_WALLET).split(",")))
 MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 PREMIUM_FEE_USD    = 0.25   # consensus (dual-model) audit fee
@@ -3817,6 +3840,8 @@ class EscrowSetupRequest(BaseModel):
     # Webhook / metadata
     callback_url:      Optional[str]  = None  # HTTPS endpoint to receive escrow state changes
     metadata:          Optional[dict] = None  # arbitrary key/value echoed in webhook payloads
+    # Network selection — mainnet (default) or testnet
+    network:           Optional[str]  = "mainnet"  # "mainnet" | "testnet"
 
     @validator('callback_url')
     def validate_callback_url(cls, v):
@@ -7921,6 +7946,24 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             except Exception:
                 pass  # screening unavailable — don't block, log and continue
 
+    # Testnet stub — not yet fully routed
+    if getattr(req, "network", "mainnet") == "testnet":
+        raise HTTPException(status_code=501, detail={"error": "testnet_not_implemented", "reason": "Testnet escrow support is coming soon. Use mainnet for now."})
+
+    # Unactivated buyer check — reject before vault creation
+    try:
+        _buyer_client = AsyncJsonRpcClient(XRPL_URL)
+        _buyer_acct = await _buyer_client.request(AccountInfo(account=req.buyer_address, ledger_index="current"))
+        if "account_data" not in _buyer_acct.result:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "buyer_not_activated", "reason": f"Buyer wallet {req.buyer_address} has not been activated on the XRP Ledger. Fund it with at least 10 XRP to activate."},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # XRPL unavailable — don't block, proceed
+
     # Regulatory threshold check — warn at $1k (Travel Rule), block at $3k (KYC required), $10k (hard cap)
     threshold = await check_value_threshold(
         req.amount_xrp, req.amount_rlusd,
@@ -8629,6 +8672,7 @@ class EscrowRequestBody(BaseModel):
     buyer_email:             Optional[str]   = None
     callback_url:            Optional[str]   = None
     metadata:                Optional[dict]  = None
+    network:                 Optional[str]   = "mainnet"  # "mainnet" | "testnet"
 
     @validator('callback_url')
     def validate_callback_url(cls, v):
