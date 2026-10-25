@@ -121,3 +121,11 @@ Test the full escrow flow with no real XRP:
     3. evaluate_escrow_work(escrow_id, work, evaluate_token) — real AI audit (5/day limit)
     4. Vault IDs start with "TN-"; explorer links point to testnet.xrpl.org
     Note: test XRP has no monetary value. AI audits capped at 5 per buyer per day on testnet.
+
+## Challenges
+Buyers can optionally hold payment 1–24 h after a PASS verdict and challenge it for a Gemini Pro re-review. Set release_mode="challenge_window_hrs:N" (N=1–24) at vault creation. Fee: $1.00 in XRP (min 0.2 XRP), paid in a separate XRPL escrow. Outcomes: PASS_UPHELD (seller keeps fee + payment), PASS_OVERTURNED (fee back to buyer; seller may remedy if ≥2 h remain), REVIEW_INCONCLUSIVE (seller keeps payment, fee back to buyer). No human arbitration. See https://www.cryptovault.co.uk/challenges/.
+
+## Try it free
+- Testnet: create_testnet_wallet() then hire_and_pay(..., network='testnet'). No fees. Full flow including challenges. AI audits capped at 5/day.
+- Mainnet: 3 free escrows via create_agent_wallet or register_wallet_free_tier (trust score ≥ 25).
+- Pro trial: 30-day free trial on first Google sign-in at https://app.cryptovault.co.uk/dashboard/. $199/year after.

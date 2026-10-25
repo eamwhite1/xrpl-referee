@@ -120,6 +120,10 @@ mcp = FastMCP(
         "  3. evaluate_escrow_work(escrow_id, work, token)  — submit proof; PASS releases automatically\n"
         "  Explorer: testnet.xrpl.org. Test XRP has no monetary value.\n"
         "  AI audits are capped at 5 per buyer per day on testnet. Switch network='mainnet' for real payments.\n"
+        "\n"
+        "CHALLENGE WINDOW (optional, buyers only):\n"
+        "  Use release_mode='challenge_window_hrs:N' (N=1–24) to hold payment after PASS.\n"
+        "  Buyer can then challenge via prepare_challenge_escrow / challenge_escrow_verdict for $1.00 in XRP.\n"
     ),
 )
 
@@ -769,7 +773,9 @@ async def challenge_escrow_verdict(
 
     Outcomes:
     - PASS_UPHELD (challenge rejected): escrow releases to worker, fee released to worker.
-    - PASS_OVERTURNED (challenge upheld, CancelAfter ≥ 24h): vault enters REMEDY status, fee is REFUNDABLE.
+    - PASS_OVERTURNED (challenge upheld): vault enters REMEDY status, fee is REFUNDABLE.
+      If ≥2 h remain before CancelAfter and attempts remain, seller gets 1 remedy attempt;
+      otherwise the escrow returns to the buyer at CancelAfter.
     - REVIEW_INCONCLUSIVE (Pro unavailable): escrow releases to worker, fee is REFUNDABLE.
 
     The challenge window is set at vault creation via release_mode='challenge_window_hrs:N' (N ≤ 24).
@@ -3448,7 +3454,7 @@ async def explain_agenttrust_trust_model() -> dict:
             "Fulfillment keys are encrypted AES-256-GCM at rest; raw key reconstructed in-memory only at release.",
         ],
         "remaining_trust": [
-            "AI verdict (Gemini) can be wrong — buyers have a 14-day challenge window via challenge_escrow_verdict().",
+            "AI verdict (Gemini) can be wrong — buyers can use an optional 1–24 h challenge window via challenge_escrow_verdict().",
             "The XRPL NFT Issuer Registry is operated by AgentTrust — a public mirror spec is open for anyone to run.",
             "API availability depends on AgentTrust infrastructure — use proof gates for zero-dependency release.",
         ],
@@ -3481,7 +3487,7 @@ async def explain_agenttrust_trust_model() -> dict:
             "summary": "AgentTrust is designed for enterprise deployment from the ground up.",
             "audit_trail": "Each escrow records the verdict hash, timestamp and XRPL transaction hashes on the public XRP Ledger. Anyone can verify the outcome independently without involving AgentTrust.",
             "your_policy": "Pass task_description or invoice_requirements with your compliance rulebook or corporate policy — the AI evaluator checks work against your requirements before payment releases.",
-            "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no chargebacks, no manual intervention. 14-day challenge window via challenge_escrow_verdict().",
+            "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no chargebacks, no manual intervention. Optional 1–24 h challenge window via challenge_escrow_verdict().",
             "ci_quality_gates": "GitHub Action gates every pull request with dual-model AI audit (Gemini Flash + Gemini Pro consensus). Fails pipeline if diff scores below your threshold. $0.10/audit.",
             "compliance": "OFAC SDN screening on every wallet. Travel Rule compliance warnings above $1,000. Invoice verification with AP automation via accounts_email.",
             "enterprise_page": "https://www.cryptovault.co.uk/enterprise/",
