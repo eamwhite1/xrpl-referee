@@ -2319,8 +2319,8 @@ async def hire_and_pay(
     )],
     escrow_id: Annotated[str, Field(
         title="Escrow ID",
-        description="Unique receipt code for this escrow, e.g. AT-7X9K-2MQ4. Must be unique.",
-    )],
+        description="Unique receipt code for this escrow, e.g. AT-7X9K-2MQ4. Must be unique. Leave blank to auto-generate.",
+    )] = "",
     fee_hash: Annotated[str, Field(
         title="Protocol Fee Hash",
         description="64-char hex hash of your $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR (XRP or RLUSD on XRPL) or USDC on Base (chain 8453, 0x-prefixed tx hash). Omit to use free tier (wallets created via create_agent_wallet get 3 free escrows).",
@@ -2496,10 +2496,11 @@ async def hire_and_pay(
             return {"error": "vault_creation_failed", "message": vault_res.text[:300]}
 
         vault_data = vault_res.json()
+        actual_escrow_id = vault_data.get("escrow_id") or escrow_id
 
         # Step 2: prepare the ready-to-sign transaction
         prep_body: dict = {
-            "escrow_id":      escrow_id,
+            "escrow_id":      actual_escrow_id,
             "buyer_address":  buyer_address,
             "worker_address": worker_address,
             "amount_xrp":     amount_xrp,
@@ -2527,7 +2528,7 @@ async def hire_and_pay(
     free_tier_used = vault_data.get("free_tier", False)
     audits_remaining = vault_data.get("audits_remaining")
     return {
-        "escrow_id":          escrow_id,
+        "escrow_id":          actual_escrow_id,
         "condition":          vault_data.get("condition"),
         "cancel_after_human": vault_data.get("cancel_after_human"),
         "transaction":        prep_data.get("transaction"),
