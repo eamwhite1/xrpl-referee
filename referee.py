@@ -10,6 +10,7 @@ PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import sys
 import hashlib
+import hmac as _hmac
 import secrets
 import json
 import base64
@@ -3067,8 +3068,9 @@ RLUSD_ESCROW_CACHE_TTL = 3600  # seconds
 GITCOIN_API_KEY  = None  # Removed — Gitcoin Passport no longer used
 GITCOIN_SCORER_ID = None
 
-RESEND_API_KEY       = os.getenv("RESEND_API_KEY")
-RESEND_FROM          = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
+RESEND_API_KEY          = os.getenv("RESEND_API_KEY")
+RESEND_FROM             = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
+WEBHOOK_SIGNING_SECRET  = os.getenv("WEBHOOK_SIGNING_SECRET", "")
 DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
 
@@ -3665,6 +3667,16 @@ class EscrowSetupRequest(BaseModel):
     callback_url:      Optional[str]  = None  # HTTPS endpoint to receive escrow state changes
     metadata:          Optional[dict] = None  # arbitrary key/value echoed in webhook payloads
 
+    @validator('callback_url')
+    def validate_callback_url(cls, v):
+        if v is None:
+            return v
+        if not v.startswith('https://'):
+            raise ValueError('callback_url must start with https://')
+        if len(v) > 2048:
+            raise ValueError('callback_url must be 2048 chars or fewer')
+        return v
+
     class Config:
         extra = "forbid"
 
@@ -4084,9 +4096,10 @@ async def auto_finish_escrow(
                 if vault.status == "RELEASING":
                     prev = vault.status
                     vault.status = "RELEASED"
+                    _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.release_tx_hash)
                     db.commit()
                     import asyncio as _asyncio
-                    _asyncio.create_task(_fire_vault_webhook(vault, prev, vault.release_tx_hash))
+                    _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 else:
                     db.commit()
         finally:
@@ -4111,16 +4124,18 @@ async def auto_finish_escrow(
                         prev = vault.status
                         vault.status = "CANCELLED"
                         vault.cancelled_at = datetime.now(timezone.utc)
+                        _wh_payload, _wh_url = _build_webhook_payload(vault, prev)
                         db.commit()
                         import asyncio as _asyncio
-                        _asyncio.create_task(_fire_vault_webhook(vault, prev))
+                        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 elif attempts >= 5:
                     logger.error(f"❌ AUTO-FINISH: {escrow_id} failed {attempts} times — marking RELEASE_FAILED, stopping retries")
                     prev = vault.status
                     vault.status = "RELEASE_FAILED"
+                    _wh_payload, _wh_url = _build_webhook_payload(vault, prev)
                     db.commit()
                     import asyncio as _asyncio
-                    _asyncio.create_task(_fire_vault_webhook(vault, prev))
+                    _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 else:
                     db.commit()
         finally:
@@ -4560,22 +4575,8 @@ async def fire_bid_awarded_webhook(
         logger.error(f"❌ Award webhook failed for bid {bid_id} → {callback_url}: {e}")
 
 
-async def _fire_vault_webhook(vault, previous_status: str, tx_hash: str = None):
-    """POST vault status-change notification to vault.callback_url (fire-and-forget, SSRF-protected)."""
-    if not vault.callback_url:
-        return
-    import socket as _socket
-    url = vault.callback_url
-    try:
-        hostname = url.split("/")[2]
-        addrs = _socket.getaddrinfo(hostname, 443)
-        for _, _, _, _, sockaddr in addrs:
-            ip = sockaddr[0]
-            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
-                logger.warning(f"Vault webhook SSRF blocked for {vault.escrow_id}: {url}")
-                return
-    except Exception:
-        return
+def _build_webhook_payload(vault, previous_status: str, tx_hash: str = None) -> tuple:
+    """Build (payload_dict, callback_url) from an ORM vault before commit/close."""
     metadata = None
     try:
         if vault.metadata_json:
@@ -4587,16 +4588,41 @@ async def _fire_vault_webhook(vault, previous_status: str, tx_hash: str = None):
         "escrow_id":       vault.escrow_id,
         "status":          vault.status,
         "previous_status": previous_status,
-        "tx_hash":         tx_hash,
+        "tx_hash":         tx_hash or vault.release_tx_hash or vault.cancel_tx_hash,
         "metadata":        metadata,
         "ts":              int(datetime.now(timezone.utc).timestamp()),
     }
+    return payload, vault.callback_url
+
+
+async def _fire_vault_webhook(payload: dict, callback_url: str):
+    """POST pre-built status-change notification to callback_url (fire-and-forget, SSRF-protected, HMAC-signed)."""
+    if not callback_url:
+        return
+    import socket as _socket
+    url = callback_url
+    try:
+        hostname = url.split("/")[2]
+        addrs = _socket.getaddrinfo(hostname, 443)
+        for _, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
+                logger.warning(f"Vault webhook SSRF blocked for {payload.get('escrow_id')}: {url}")
+                return
+    except Exception:
+        return
+    body_bytes = json.dumps(payload).encode()
+    ts = str(int(time.time()))
+    headers = {"Content-Type": "application/json", "X-AgentTrust-Timestamp": ts}
+    if WEBHOOK_SIGNING_SECRET:
+        sig = _hmac.new(WEBHOOK_SIGNING_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
+        headers["X-AgentTrust-Signature"] = f"sha256={sig}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(url, json=payload)
-            logger.info(f"📡 Vault webhook delivered to {url} (HTTP {r.status_code}) for {vault.escrow_id}")
+            r = await client.post(url, content=body_bytes, headers=headers)
+            logger.info(f"📡 Vault webhook delivered to {url} (HTTP {r.status_code}) for {payload.get('escrow_id')}")
     except Exception as e:
-        logger.warning(f"Vault webhook failed for {vault.escrow_id} → {url}: {e}")
+        logger.warning(f"Vault webhook failed for {payload.get('escrow_id')} → {url}: {e}")
 
 
 async def send_bid_awarded_email(
@@ -6894,15 +6920,17 @@ async def _run_challenge_review(escrow_id: str):
             vault.challenge_fee_state = "REFUNDABLE"
             if cancel_after and time_remaining >= 86400:
                 vault.status = "REMEDY"
+                _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
                 db.commit()
-                asyncio.create_task(_fire_vault_webhook(vault, prev_status))
+                asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 _send_challenge_outcome_email(vault, "upheld_remedy")
                 _send_remedy_available_email(vault)
             else:
                 vault.status = "CANCELLED"
                 vault.cancelled_at = now
+                _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
                 db.commit()
-                asyncio.create_task(_fire_vault_webhook(vault, prev_status))
+                asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 _send_challenge_outcome_email(vault, "upheld_cancel")
 
         else:  # REVIEW_INCONCLUSIVE
@@ -7502,11 +7530,13 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         external_ref           = (req.external_ref or "")[:500] or None,
         external_url           = req.external_url if (req.external_url or "").startswith("https://") else None,
         counterparty_type      = req.counterparty_type if req.counterparty_type in ("agent", "human") else "agent",
-        callback_url           = req.callback_url if (req.callback_url or "").startswith("https://") else None,
-        metadata_json          = json.dumps(req.metadata) if req.metadata else None,
+        callback_url           = req.callback_url,
     )
-    if req.callback_url and not req.callback_url.startswith("https://"):
-        raise HTTPException(status_code=400, detail="callback_url must start with https://")
+    if req.metadata:
+        serialized = json.dumps(req.metadata)
+        if len(serialized) > 4096:
+            raise HTTPException(status_code=422, detail="metadata must be 4 KB or smaller")
+        vault.metadata_json = serialized
     db.add(vault)
     db.commit()
 
@@ -7592,6 +7622,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "audits_remaining":    fee_result.get("audits_remaining", None),
         "worker_url":          _worker_url,
         "worker_instructions": _worker_instructions,
+        "metadata":            req.metadata,
+        "callback_configured": bool(req.callback_url),
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
@@ -7967,6 +7999,16 @@ class EscrowRequestBody(BaseModel):
     callback_url:            Optional[str]   = None
     metadata:                Optional[dict]  = None
 
+    @validator('callback_url')
+    def validate_callback_url(cls, v):
+        if v is None:
+            return v
+        if not v.startswith('https://'):
+            raise ValueError('callback_url must start with https://')
+        if len(v) > 2048:
+            raise ValueError('callback_url must be 2048 chars or fewer')
+        return v
+
     class Config:
         extra = "forbid"
 
@@ -8187,8 +8229,13 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         initiated_by        = "seller",
         pay_url             = pay_url,
         funding_deadline    = funding_deadline,
-        callback_url        = req.callback_url if (req.callback_url or "").startswith("https://") else None,
+        callback_url        = req.callback_url,
     )
+    if req.metadata:
+        serialized = json.dumps(req.metadata)
+        if len(serialized) > 4096:
+            raise HTTPException(status_code=422, detail="metadata must be 4 KB or smaller")
+        vault.metadata_json = serialized
     # Seller ownership proof — required before any buyer contact details are stored
     _verify_seller_ownership(
         req.seller_address, req.buyer_address or "", float(req.amount_xrp or 0),
@@ -8225,6 +8272,8 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         "worker_instructions": worker_instructions,
         "evaluate_token":     evaluate_token,
         "evaluate_token_hint": "Store this token and share it with the buyer to pass to the worker after funding.",
+        "metadata":            req.metadata,
+        "callback_configured": bool(req.callback_url),
     }
 
 
@@ -8464,6 +8513,7 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     # Set from actual EscrowCreate Account field; backfill will correct if this is wrong
     tx_account = res.get("tx_json", {}).get("Account") or res.get("Account")
     vault.escrow_owner = tx_account or vault.buyer_address
+    _wh_payload, _wh_url = _build_webhook_payload(vault, "PENDING", tx_hash)
     try:
         db.commit()
     except Exception as e:
@@ -8472,7 +8522,7 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
 
     logger.info(f"✅ Auto-confirmed via submit: escrow={escrow_id} hash={tx_hash[:16] if tx_hash else '?'}... engine={engine}")
     import asyncio as _asyncio
-    _asyncio.create_task(_fire_vault_webhook(vault, "PENDING", tx_hash))
+    _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
 
     return {
         "status":    "submitted_and_confirmed",
@@ -8571,6 +8621,9 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "prompt_version":          vault.prompt_version,
         "verdict_hash":            vault.verdict_hash,
         "evaluation_verdicts":     vault.evaluation_verdicts,
+        # Webhook / metadata (callback_url never returned — it may contain tokens)
+        "callback_configured":     bool(vault.callback_url),
+        "metadata":                json.loads(vault.metadata_json) if vault.metadata_json else None,
     }
 
 
@@ -9047,8 +9100,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             })
             vault.ai_verdict = json.dumps(verdict_dict)
             vault.model_used = model_used
+            _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
             db.commit()
-            asyncio.create_task(_fire_vault_webhook(vault, prev_status))
+            asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
             logger.info(f"✅ REMEDY PASS for {req.escrow_id} — releasing immediately")
             escrow_owner = vault.escrow_owner or vault.buyer_address
             if vault.escrow_sequence and vault.worker_address and referee_wallet and escrow_owner:
@@ -9097,10 +9151,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             })
             vault.ai_verdict = json.dumps(verdict_dict)
             vault.model_used = model_used
+            _wh_payload, _wh_url = _build_webhook_payload(vault, "LOCKED")
             db.commit()
             logger.info(f"⏳ PASS_CHALLENGE_WINDOW for {req.escrow_id} — deadline: {vault.challenge_deadline}")
             import asyncio as _asyncio
-            _asyncio.create_task(_fire_vault_webhook(vault, "LOCKED"))
+            _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
             _send_challenge_window_opened_email(vault)
             return {
                 "escrow_id":            req.escrow_id,
@@ -9187,8 +9242,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
 
     vault.ai_verdict = json.dumps(verdict_dict)
     vault.model_used = model_used
+    _wh_payload, _wh_url = _build_webhook_payload(vault, _prev_status)
     db.commit()
-    asyncio.create_task(_fire_vault_webhook(vault, _prev_status))
+    asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
 
     # Webhook for agent flows
     if req.callback_url:
@@ -13013,10 +13069,11 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         vault.delivery_status = "RELEASED"
                         vault.release_tx_hash = tx_envelope.get("hash") or tx.get("hash")
                         vault.released_at     = ts
+                        _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.release_tx_hash)
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
                         import asyncio as _asyncio
-                        _asyncio.create_task(_fire_vault_webhook(vault, prev, vault.release_tx_hash))
+                        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                         return
                     elif tx_type == "EscrowCancel" and meta_result == "tesSUCCESS":
                         prev = vault.status
@@ -13024,20 +13081,22 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         vault.delivery_status = "CANCELLED"
                         vault.cancel_tx_hash  = tx_envelope.get("hash") or tx.get("hash")
                         vault.cancelled_at    = ts
+                        _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.cancel_tx_hash)
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → CANCELLED (EscrowCancel found)")
                         import asyncio as _asyncio
-                        _asyncio.create_task(_fire_vault_webhook(vault, prev, vault.cancel_tx_hash))
+                        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                         return
             marker = data.get("marker")
             if not marker:
                 break
         prev = vault.status
         vault.status = "RELEASE_FAILED"
+        _wh_payload, _wh_url = _build_webhook_payload(vault, prev)
         db.commit()
         logger.error(f"Could not resolve {vault.escrow_id}: escrow gone but no final tx found — marking RELEASE_FAILED.")
         import asyncio as _asyncio
-        _asyncio.create_task(_fire_vault_webhook(vault, prev))
+        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
     except Exception as e:
         logger.warning(f"_resolve_gone_escrow failed for {vault.escrow_id}: {e}")
 

@@ -90,3 +90,15 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 ## MCP endpoint
 
     https://mcp.cryptovault.co.uk/mcp
+
+## Webhooks
+
+    callback_url (optional, https:// only, max 2048 chars) — set at vault creation on /escrow/generate or /escrow/request
+    Each status change fires a POST to callback_url with body: {event, escrow_id, status, previous_status, tx_hash, metadata, ts}
+    Signed with HMAC-SHA256: verify X-AgentTrust-Signature (sha256=<hex>) against body using your WEBHOOK_SIGNING_SECRET
+    Also check X-AgentTrust-Timestamp to reject stale deliveries
+
+## GET /escrow/{id} — public fields
+
+    callback_configured: bool  # true if a callback_url was set; the URL itself is never returned
+    metadata: dict | null      # arbitrary key/value set at vault creation — PUBLICLY READABLE, do not store secrets here
