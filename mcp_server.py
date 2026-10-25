@@ -2403,7 +2403,7 @@ async def hire_and_pay(
     if required_vc_issuer_did:
         vault_body["required_vc_issuer_did"] = required_vc_issuer_did
     if callback_url:
-        vault_body["buyer_callback_url"] = callback_url
+        vault_body["callback_url"] = callback_url
     if metadata:
         vault_body["metadata"] = metadata
     if criteria:

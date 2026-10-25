@@ -2,6 +2,7 @@
 Tests for Part B Phase 2: challenge window, remedy attempt, auto-release.
 All Gemini calls are mocked.
 """
+import asyncio
 import json
 import pytest
 from datetime import datetime, timezone, timedelta
