@@ -132,6 +132,7 @@ async def _lifespan(app):
         _seed_public_issuers()
         # XUMM connectivity check
         await _verify_xumm()
+        logger.info("Sanctions source: OFAC SDN XML")
         # Prime OFAC list via background loop (6 h interval, 5 min initial delay).
         # DB-seeded copy is already in _ofac_sanctioned_xrpl — no blocking at startup.
         asyncio.create_task(_ofac_refresh_loop())
@@ -998,6 +999,7 @@ def health_check():
         "ofac_last_refresh": _ofac_last_refresh.isoformat() if _ofac_last_refresh else None,
         "ofac_addresses_loaded": len(_ofac_sanctioned_xrpl),
         "ofac_stale": ofac_age_s is None or ofac_age_s > 172800,
+        "sanctions_source": "ofac_sdn_xml",
     }
 
 @app.get("/llms.txt", include_in_schema=False)
@@ -2084,7 +2086,7 @@ class SanctionsLog(Base):
     risk_score     = Column(Float, nullable=True)
     risk_level     = Column(String, nullable=True)   # low / medium / high / severe
     entity_label   = Column(String, nullable=True)   # e.g. "Binance", "WannaCry"
-    source         = Column(String, nullable=False)  # anchain_bei | ofac_xml
+    source         = Column(String, nullable=False)  # ofac_sdn_xml (legacy rows may say anchain_bei)
     escrow_id      = Column(String, nullable=True)   # linked escrow if applicable
     raw_response   = Column(Text, nullable=True)     # JSON blob from screening provider
 
@@ -2286,12 +2288,6 @@ async def is_ofac_sanctioned(wallet_address: str) -> bool:
     return wallet_address in _ofac_sanctioned_xrpl
 
 
-# ---------------------------------------------------------------------------
-# AnChain.ai BEI API — AI-powered wallet risk scoring + multi-jurisdiction sanctions
-# Free for XRPL developers (XRPL Foundation grant). Set ANCHAIN_API_KEY in env.
-# Covers: OFAC, UN, UK, EU, Canada, Australia sanctions + entity/risk graph scoring.
-# Falls back to OFAC XML if BEI key is absent or call fails.
-# ---------------------------------------------------------------------------
 # XRPScan — entity labels, account flags, activation lineage (no API key required)
 # ---------------------------------------------------------------------------
 XRPSCAN_BASE = "https://api.xrpscan.com/api/v1"
@@ -2422,71 +2418,24 @@ def _verify_didit_webhook_signature(payload: bytes, headers: dict) -> bool:
     except Exception:
         return False
 
-# ---------------------------------------------------------------------------
-ANCHAIN_API_KEY = os.getenv("ANCHAIN_API_KEY", "")
-ANCHAIN_BASE    = "https://bei.anchainai.com/api"
-
-async def _check_bei_risk(wallet_address: str) -> Optional[dict]:
-    """
-    Query AnChain.ai BEI for risk score, sanctions status, and entity label.
-    Returns dict with keys: sanctioned, risk_score, risk_level, entity, category.
-    Returns None if BEI key not set or call fails (fallback to OFAC XML).
-    """
-    if not ANCHAIN_API_KEY:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(
-                f"{ANCHAIN_BASE}/address_risk_score",
-                params={"proto": "xrp", "address": wallet_address, "apikey": ANCHAIN_API_KEY},
-            )
-        if r.status_code != 200:
-            return None
-        data = r.json().get("data", {}).get(wallet_address, {})
-        category = data.get("self", {}).get("detail", {}).get("category", "")
-        entity   = data.get("self", {}).get("detail", {}).get("entity", "")
-        risk     = data.get("risk", {})
-        sanctioned = (
-            "sanction" in (category or "").lower()
-            or "ofac" in (entity or "").lower()
-            or "sdn"   in (entity or "").lower()
-        )
-        return {
-            "sanctioned":  sanctioned,
-            "risk_score":  risk.get("score"),
-            "risk_level":  risk.get("level", "unknown"),
-            "entity":      entity or None,
-            "category":    category or None,
-            "source":      "anchain_bei",
-        }
-    except Exception as e:
-        logger.debug(f"BEI risk check failed for {wallet_address}: {e}")
-        return None
-
-
 async def is_wallet_sanctioned(
     wallet_address: str,
     escrow_id: str | None = None,
 ) -> tuple[bool, dict]:
     """
-    Primary sanctions check. Uses AnChain.ai BEI if key is set (multi-jurisdiction);
-    falls back to OFAC SDN XML. Returns (is_sanctioned, detail_dict).
+    Primary sanctions check against OFAC SDN XML. Returns (is_sanctioned, detail_dict).
     Every call is written to the SanctionsLog table for compliance audit purposes.
     """
-    bei = await _check_bei_risk(wallet_address)
-    if bei is not None:
-        detail = bei
-    else:
-        sanctioned = await is_ofac_sanctioned(wallet_address)
-        entity_name = _ofac_sanctioned_xrpl.get(wallet_address) if sanctioned else None
-        detail = {
-            "sanctioned": sanctioned,
-            "risk_score": 100 if sanctioned else None,
-            "risk_level": "high" if sanctioned else "unknown",
-            "entity": entity_name,
-            "category": "SDN" if sanctioned else None,
-            "source": "ofac_sdn_xml",
-        }
+    sanctioned = await is_ofac_sanctioned(wallet_address)
+    entity_name = _ofac_sanctioned_xrpl.get(wallet_address) if sanctioned else None
+    detail = {
+        "sanctioned": sanctioned,
+        "risk_score": 100 if sanctioned else None,
+        "risk_level": "high" if sanctioned else "unknown",
+        "entity": entity_name,
+        "category": "SDN" if sanctioned else None,
+        "source": "ofac_sdn_xml",
+    }
 
     # Write audit record
     try:
@@ -5854,7 +5803,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             except Exception:
                 pass
 
-        # Multi-jurisdiction sanctions check — BEI primary, OFAC XML fallback
+        # OFAC SDN sanctions check
         # Hard zero if sanctioned; +7 pts if clean
         sanctions_clear = None
         sanctions_score = 0
@@ -12369,7 +12318,7 @@ async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session 
 async def check_sanctions(address: str):
     """
     Screen an XRPL wallet address against the OFAC SDN sanctions list.
-    Primary: AnChain.ai BEI when configured; fallback: US Treasury OFAC SDN XML (refreshed every 24 h).
+    Screens against US Treasury OFAC SDN XML (refreshed every 24 h).
     Returns sanctioned, risk_score, risk_level, entity, category, source.
     Always returns a result — never raises on data unavailability.
     """

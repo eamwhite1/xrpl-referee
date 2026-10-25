@@ -3479,7 +3479,7 @@ async def explain_agenttrust_trust_model() -> dict:
         "skip_ai_audit": "Set require_ai_audit=false with at least one proof gate to release on proof alone. Returns HTTP 400 if no proof gate is configured.",
         "enterprise": {
             "summary": "AgentTrust is designed for enterprise deployment from the ground up.",
-            "audit_trail": "Every escrow verdict, timestamp, and transaction hash is permanently recorded on the XRPL — tamper-proof, independently verifiable, no AgentTrust involvement needed to read it.",
+            "audit_trail": "Each escrow records the verdict hash, timestamp and XRPL transaction hashes on the public XRP Ledger. Anyone can verify the outcome independently without involving AgentTrust.",
             "your_policy": "Pass task_description or invoice_requirements with your compliance rulebook or corporate policy — the AI evaluator checks work against your requirements before payment releases.",
             "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no chargebacks, no manual intervention. 14-day challenge window via challenge_escrow_verdict().",
             "ci_quality_gates": "GitHub Action gates every pull request with dual-model AI audit (Gemini Flash + Gemini Pro consensus). Fails pipeline if diff scores below your threshold. $0.10/audit.",
