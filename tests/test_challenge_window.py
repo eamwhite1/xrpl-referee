@@ -280,8 +280,8 @@ def test_grok_full_flow():
     assert vault.released_at is not None
 
 
-def test_challenge_returns_501():
-    """Challenge endpoint must return 501 until fee payout is implemented."""
+def test_challenge_requires_quote():
+    """Challenge endpoint v2 requires quote_id, fee_tx_hash, challenger_address."""
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from fastapi.testclient import TestClient
@@ -301,11 +301,11 @@ def test_challenge_returns_501():
          patch("referee._refresh_jobs_snapshot", return_value=asyncio.sleep(0)):
         from referee import app
         client = TestClient(app)
+        # Sending old-style body (missing quote_id) → 422 validation error
         resp = client.post("/escrow/test-escrow-123/challenge", json={
             "criteria_ids": ["c1"],
             "reason": "work is bad",
             "fee_tx_hash": "A" * 64,
             "wallet_address": "rTest",
-            "tx_hash": "B" * 64,
         })
-        assert resp.status_code == 501
+        assert resp.status_code == 422

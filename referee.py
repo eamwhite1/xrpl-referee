@@ -10,6 +10,7 @@ PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
 import sys
 import hashlib
+import hmac as _hmac
 import secrets
 import json
 import base64
@@ -615,6 +616,49 @@ async def _release_sweep_loop():
                             logger.error(f"[5min sweep] RELEASING retry error for {_v.escrow_id}: {_se}")
             except Exception as _e:
                 logger.error(f"[5min sweep] RELEASING sweep error: {_e}")
+            # Sweep 3: re-queue stuck CHALLENGED reviews (started > 10 min ago, not completed)
+            try:
+                _stale_cutoff = _now - timedelta(minutes=10)
+                with SessionLocal() as _db:
+                    stuck_chal = _db.query(EscrowVault).filter(
+                        EscrowVault.status == "CHALLENGED",
+                        EscrowVault.challenge_review_started_at != None,
+                        EscrowVault.challenge_review_started_at <= _stale_cutoff,
+                        EscrowVault.challenge_reviewed_at == None,
+                    ).all()
+                    for _v in stuck_chal:
+                        asyncio.create_task(_run_challenge_review(_v.escrow_id))
+                        logger.warning(f"[5min sweep] re-queuing stuck challenge review for {_v.escrow_id}")
+            except Exception as _e:
+                logger.error(f"[5min sweep] stuck challenge review sweep error: {_e}")
+            # Sweep 4: retry _finish_challenge_fee_escrow for PASS_UPHELD where fee not finished
+            try:
+                with SessionLocal() as _db:
+                    needs_finish = _db.query(EscrowVault).filter(
+                        EscrowVault.challenge_outcome == "PASS_UPHELD",
+                        EscrowVault.challenge_fee_state == "FINISHED",
+                        EscrowVault.challenge_fee_finish_hash == None,
+                        or_(EscrowVault.challenge_fee_finish_attempts == None, EscrowVault.challenge_fee_finish_attempts < 5),
+                    ).all()
+                    for _v in needs_finish:
+                        asyncio.create_task(_finish_challenge_fee_escrow(_v))
+                        logger.info(f"[5min sweep] retrying _finish_challenge_fee_escrow for {_v.escrow_id}")
+            except Exception as _e:
+                logger.error(f"[5min sweep] fee finish retry sweep error: {_e}")
+            # Sweep 5: auto-cancel REFUNDABLE challenge fee escrows past CancelAfter
+            try:
+                with SessionLocal() as _db:
+                    refundable = _db.query(EscrowVault).filter(
+                        EscrowVault.challenge_fee_state == "REFUNDABLE",
+                        EscrowVault.challenge_fee_cancel_after != None,
+                        EscrowVault.challenge_fee_cancel_after <= _now,
+                        EscrowVault.challenge_fee_cancel_hash == None,
+                    ).all()
+                    for _v in refundable:
+                        asyncio.create_task(_cancel_challenge_fee_escrow(_v))
+                        logger.info(f"[5min sweep] auto-cancelling REFUNDABLE challenge fee for {_v.escrow_id}")
+            except Exception as _e:
+                logger.error(f"[5min sweep] refundable cancel sweep error: {_e}")
         except Exception as _outer:
             logger.error(f"[5min sweep] outer error: {_outer}")
         await asyncio.sleep(300)
@@ -1280,6 +1324,22 @@ async def get_fees(wallet_address: Optional[str] = None):
             "kyc_guide": "https://www.cryptovault.co.uk/kyc/",
             "kyc_fee_usd": 0.50,
         },
+        "challenge_fee": {
+            "usd": CHALLENGE_FEE_USD,
+            "floor_drops": CHALLENGE_FEE_FLOOR_DROPS,
+            "fallback_drops": CHALLENGE_FEE_FALLBACK_DROPS,
+            "ttl_seconds": CHALLENGE_QUOTE_TTL_S,
+            "cancel_after_seconds": CHALLENGE_FEE_CANCEL_AFTER_S,
+            "description": (
+                "Buyer dispute fee — paid as a crypto-condition EscrowCreate to the worker address. "
+                "Fee is price-pegged ($1.00 USD in XRP). "
+                "Call POST /escrow/{id}/challenge/prepare to get a quote with the exact amount and unsigned EscrowCreate tx. "
+                "On PASS_UPHELD (challenge rejected): fee releases to worker. "
+                "On PASS_OVERTURNED or REVIEW_INCONCLUSIVE: fee is REFUNDABLE and can be cancelled after the CancelAfter window."
+            ),
+            "prepare_url": "/escrow/{id}/challenge/prepare",
+            "submit_url":  "/escrow/{id}/challenge",
+        },
         "free_endpoints": [
             "/fees", "/status", "/health",
             "/marketplace/jobs", "/jobs (GET)", "/jobs/{id}",
@@ -1724,6 +1784,41 @@ class EscrowVault(Base):
     # Webhook integration
     callback_url          = Column(String,  nullable=True)   # HTTPS endpoint for state-change webhooks
     metadata_json         = Column(Text,    nullable=True)   # arbitrary buyer metadata, stored as JSON
+    # Challenges v2
+    challenge_outcome          = Column(String,   nullable=True)  # PASS_UPHELD | PASS_OVERTURNED | REVIEW_INCONCLUSIVE
+    challenge_verdict          = Column(Text,     nullable=True)  # JSON string of full verdict
+    challenge_verdict_hash     = Column(String,   nullable=True)
+    challenge_models_used      = Column(Text,     nullable=True)  # comma-separated model names
+    challenge_review_started_at = Column(DateTime(timezone=True), nullable=True)
+    challenge_reviewed_at      = Column(DateTime(timezone=True), nullable=True)
+    challenge_review_attempts  = Column(Integer,  default=0)
+    pass_at                    = Column(DateTime(timezone=True), nullable=True)
+    pass_evidence_snapshot     = Column(Text,     nullable=True)  # JSON snapshot of work at PASS
+    challenge_quote_id         = Column(String,   nullable=True)
+    challenge_fee_owner        = Column(String,   nullable=True)  # challenger address
+    challenge_fee_seq          = Column(Integer,  nullable=True)  # EscrowCreate sequence
+    challenge_fee_drops        = Column(Integer,  nullable=True)
+    challenge_fee_condition    = Column(Text,     nullable=True)
+    challenge_fee_cancel_after = Column(DateTime(timezone=True), nullable=True)
+    challenge_fee_state        = Column(String,   nullable=True)  # ISSUED|LOCKED|FINISHED|REFUNDABLE|CANCELLED
+    challenge_fee_finish_hash  = Column(String,   nullable=True)
+    challenge_fee_finish_attempts = Column(Integer, default=0)
+    challenge_fee_cancel_hash  = Column(String,   nullable=True)
+
+
+class ChallengeQuote(Base):
+    __tablename__ = "challenge_quote"
+    id                 = Column(String,   primary_key=True, default=lambda: str(uuid.uuid4()))
+    escrow_id          = Column(String,   index=True, nullable=False)
+    payer_address      = Column(String,   nullable=False)
+    fee_drops          = Column(Integer,  nullable=False)
+    condition          = Column(Text,     nullable=False)
+    fulfillment_enc    = Column(Text,     nullable=False)
+    cancel_after_ripple = Column(Integer, nullable=False)
+    created_at         = Column(DateTime(timezone=True), server_default="NOW()")
+    expires_at         = Column(DateTime(timezone=True), nullable=False)
+    used_at            = Column(DateTime(timezone=True), nullable=True)
+    fee_tx_hash        = Column(String,   unique=True, nullable=True)
 
 
 class JobPosting(Base):
@@ -2838,6 +2933,40 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS callback_url VARCHAR",
         # Round 6: buyer metadata blob
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS metadata_json TEXT",
+        # Challenges v2
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_outcome              VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_verdict              TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_verdict_hash         VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_models_used          TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_review_started_at    TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_reviewed_at          TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_review_attempts      INTEGER DEFAULT 0",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS pass_at                        TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS pass_evidence_snapshot         TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_quote_id             VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_owner            VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_seq              BIGINT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_drops            BIGINT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_condition        TEXT",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_cancel_after     TIMESTAMPTZ",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_state            VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_finish_hash      VARCHAR",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_finish_attempts  INTEGER DEFAULT 0",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS challenge_fee_cancel_hash      VARCHAR",
+        """CREATE TABLE IF NOT EXISTS challenge_quote (
+            id                  VARCHAR PRIMARY KEY,
+            escrow_id           VARCHAR NOT NULL,
+            payer_address       VARCHAR NOT NULL,
+            fee_drops           BIGINT  NOT NULL,
+            condition           TEXT    NOT NULL,
+            fulfillment_enc     TEXT    NOT NULL,
+            cancel_after_ripple BIGINT  NOT NULL,
+            created_at          TIMESTAMPTZ DEFAULT NOW(),
+            expires_at          TIMESTAMPTZ NOT NULL,
+            used_at             TIMESTAMPTZ,
+            fee_tx_hash         VARCHAR UNIQUE
+        )""",
+        "CREATE INDEX IF NOT EXISTS challenge_quote_escrow_idx ON challenge_quote (escrow_id)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -2880,7 +3009,11 @@ MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dy
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
 PREMIUM_FEE_USD    = 0.25   # consensus (dual-model) audit fee
 PREMIUM_FEE_XRP    = 0.25   # fallback if price oracle is unavailable
-CHALLENGE_FEE_XRP  = float(os.getenv("CHALLENGE_FEE_XRP", "0.5"))  # buyer pays to dispute a PASS verdict
+CHALLENGE_FEE_USD           = 1.00
+CHALLENGE_FEE_FLOOR_DROPS   = 200_000
+CHALLENGE_FEE_FALLBACK_DROPS = 1_000_000
+CHALLENGE_FEE_CANCEL_AFTER_S = 86_400
+CHALLENGE_QUOTE_TTL_S        = 1_800
 
 async def get_required_fee_xrp(premium: bool = False) -> float:
     """Return the XRP amount equivalent to the required fee at the current market price."""
@@ -2893,6 +3026,19 @@ async def get_required_fee_xrp(premium: bool = False) -> float:
     except Exception:
         pass
     return fallback
+
+
+async def get_challenge_fee_drops() -> int:
+    """Return the challenge fee in drops at the current market price, floored at CHALLENGE_FEE_FLOOR_DROPS."""
+    try:
+        price = await _get_xrp_price_usd()
+        if price and price > 0:
+            drops = int((CHALLENGE_FEE_USD / price) * 1_000_000)
+            return max(drops, CHALLENGE_FEE_FLOOR_DROPS)
+    except Exception:
+        pass
+    return CHALLENGE_FEE_FALLBACK_DROPS
+
 
 # Base chain USDC payment constants
 BASE_WALLET_ADDRESS = os.getenv("BASE_WALLET_ADDRESS", "")        # our receiving address on Base
@@ -2922,8 +3068,9 @@ RLUSD_ESCROW_CACHE_TTL = 3600  # seconds
 GITCOIN_API_KEY  = None  # Removed — Gitcoin Passport no longer used
 GITCOIN_SCORER_ID = None
 
-RESEND_API_KEY       = os.getenv("RESEND_API_KEY")
-RESEND_FROM          = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
+RESEND_API_KEY          = os.getenv("RESEND_API_KEY")
+RESEND_FROM             = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
+WEBHOOK_SIGNING_SECRET  = os.getenv("WEBHOOK_SIGNING_SECRET", "")
 DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
 
@@ -3520,6 +3667,16 @@ class EscrowSetupRequest(BaseModel):
     callback_url:      Optional[str]  = None  # HTTPS endpoint to receive escrow state changes
     metadata:          Optional[dict] = None  # arbitrary key/value echoed in webhook payloads
 
+    @validator('callback_url')
+    def validate_callback_url(cls, v):
+        if v is None:
+            return v
+        if not v.startswith('https://'):
+            raise ValueError('callback_url must start with https://')
+        if len(v) > 2048:
+            raise ValueError('callback_url must be 2048 chars or fewer')
+        return v
+
     class Config:
         extra = "forbid"
 
@@ -3939,9 +4096,10 @@ async def auto_finish_escrow(
                 if vault.status == "RELEASING":
                     prev = vault.status
                     vault.status = "RELEASED"
+                    _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.release_tx_hash)
                     db.commit()
                     import asyncio as _asyncio
-                    _asyncio.create_task(_fire_vault_webhook(vault, prev, vault.release_tx_hash))
+                    _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 else:
                     db.commit()
         finally:
@@ -3966,16 +4124,18 @@ async def auto_finish_escrow(
                         prev = vault.status
                         vault.status = "CANCELLED"
                         vault.cancelled_at = datetime.now(timezone.utc)
+                        _wh_payload, _wh_url = _build_webhook_payload(vault, prev)
                         db.commit()
                         import asyncio as _asyncio
-                        _asyncio.create_task(_fire_vault_webhook(vault, prev))
+                        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 elif attempts >= 5:
                     logger.error(f"❌ AUTO-FINISH: {escrow_id} failed {attempts} times — marking RELEASE_FAILED, stopping retries")
                     prev = vault.status
                     vault.status = "RELEASE_FAILED"
+                    _wh_payload, _wh_url = _build_webhook_payload(vault, prev)
                     db.commit()
                     import asyncio as _asyncio
-                    _asyncio.create_task(_fire_vault_webhook(vault, prev))
+                    _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 else:
                     db.commit()
         finally:
@@ -4415,22 +4575,8 @@ async def fire_bid_awarded_webhook(
         logger.error(f"❌ Award webhook failed for bid {bid_id} → {callback_url}: {e}")
 
 
-async def _fire_vault_webhook(vault, previous_status: str, tx_hash: str = None):
-    """POST vault status-change notification to vault.callback_url (fire-and-forget, SSRF-protected)."""
-    if not vault.callback_url:
-        return
-    import socket as _socket
-    url = vault.callback_url
-    try:
-        hostname = url.split("/")[2]
-        addrs = _socket.getaddrinfo(hostname, 443)
-        for _, _, _, _, sockaddr in addrs:
-            ip = sockaddr[0]
-            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
-                logger.warning(f"Vault webhook SSRF blocked for {vault.escrow_id}: {url}")
-                return
-    except Exception:
-        return
+def _build_webhook_payload(vault, previous_status: str, tx_hash: str = None) -> tuple:
+    """Build (payload_dict, callback_url) from an ORM vault before commit/close."""
     metadata = None
     try:
         if vault.metadata_json:
@@ -4442,16 +4588,41 @@ async def _fire_vault_webhook(vault, previous_status: str, tx_hash: str = None):
         "escrow_id":       vault.escrow_id,
         "status":          vault.status,
         "previous_status": previous_status,
-        "tx_hash":         tx_hash,
+        "tx_hash":         tx_hash or vault.release_tx_hash or vault.cancel_tx_hash,
         "metadata":        metadata,
         "ts":              int(datetime.now(timezone.utc).timestamp()),
     }
+    return payload, vault.callback_url
+
+
+async def _fire_vault_webhook(payload: dict, callback_url: str):
+    """POST pre-built status-change notification to callback_url (fire-and-forget, SSRF-protected, HMAC-signed)."""
+    if not callback_url:
+        return
+    import socket as _socket
+    url = callback_url
+    try:
+        hostname = url.split("/")[2]
+        addrs = _socket.getaddrinfo(hostname, 443)
+        for _, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
+                logger.warning(f"Vault webhook SSRF blocked for {payload.get('escrow_id')}: {url}")
+                return
+    except Exception:
+        return
+    body_bytes = json.dumps(payload).encode()
+    ts = str(int(time.time()))
+    headers = {"Content-Type": "application/json", "X-AgentTrust-Timestamp": ts}
+    if WEBHOOK_SIGNING_SECRET:
+        sig = _hmac.new(WEBHOOK_SIGNING_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
+        headers["X-AgentTrust-Signature"] = f"sha256={sig}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(url, json=payload)
-            logger.info(f"📡 Vault webhook delivered to {url} (HTTP {r.status_code}) for {vault.escrow_id}")
+            r = await client.post(url, content=body_bytes, headers=headers)
+            logger.info(f"📡 Vault webhook delivered to {url} (HTTP {r.status_code}) for {payload.get('escrow_id')}")
     except Exception as e:
-        logger.warning(f"Vault webhook failed for {vault.escrow_id} → {url}: {e}")
+        logger.warning(f"Vault webhook failed for {payload.get('escrow_id')} → {url}: {e}")
 
 
 async def send_bid_awarded_email(
@@ -6249,7 +6420,7 @@ def _send_challenge_window_opened_email(vault):
   <p>If you believe the work does not meet the criteria, you have <strong>{hours} hours</strong>
      to raise a challenge. A senior Pro model will re-review the specific criteria you dispute.</p>
   <div class="detail"><span>Challenge deadline</span><br><strong>{deadline_str}</strong></div>
-  <div class="detail"><span>Challenge fee</span><br><strong>{CHALLENGE_FEE_XRP} XRP</strong> (refunded if your challenge is upheld)</div>
+  <div class="detail"><span>Challenge fee</span><br><strong>~$1.00 USD in XRP</strong> — call /fees for the live amount. Refundable if your challenge is upheld.</div>
   <p style="font-size:.85rem;color:#5c5c6e;">
     If you do not challenge before the deadline, payment will release automatically to the worker.
   </p>
@@ -6427,10 +6598,203 @@ def _send_challenge_window_expired_email(vault):
         logger.error(f"❌ Challenge window expired email failed for {vault.escrow_id}: {e}")
 
 
+async def _verify_challenge_fee_escrow(tx_hash: str, quote: "ChallengeQuote", vault: EscrowVault) -> tuple:
+    """
+    Strict verifier for the challenge-fee EscrowCreate.
+    Returns (True, None) on success, (False, error_msg) on failure.
+    Destination must be vault.worker_address — referee never custodies.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash, "api_version": 2}]})
+        data = res.json().get("result", {})
+    except Exception as e:
+        return False, f"XRPL lookup failed: {e}"
+
+    if data.get("status") == "error":
+        return False, f"Tx not found: {data.get('error_message', 'unknown')}"
+    if not data.get("validated"):
+        return False, "Transaction not yet validated"
+
+    meta = data.get("meta") or {}
+    if isinstance(meta, dict) and meta.get("TransactionResult") != "tesSUCCESS":
+        return False, f"Transaction failed: {meta.get('TransactionResult')}"
+
+    tx = data.get("tx_json") or data
+    if tx.get("TransactionType") != "EscrowCreate":
+        return False, "Transaction is not an EscrowCreate"
+    if tx.get("Account", "").strip() != quote.payer_address.strip():
+        return False, f"Account mismatch: expected {quote.payer_address}, got {tx.get('Account')}"
+
+    dest = tx.get("Destination", "").strip()
+    expected_dest = (vault.worker_address or "").strip()
+    if dest != expected_dest:
+        return False, f"Destination mismatch: expected {expected_dest}, got {dest}"
+
+    amount = tx.get("Amount")
+    try:
+        if isinstance(amount, dict):
+            return False, "Challenge fee must be XRP, not IOU"
+        if int(amount or 0) < quote.fee_drops:
+            return False, f"Amount too low: got {amount} drops, need {quote.fee_drops}"
+    except (TypeError, ValueError):
+        return False, f"Invalid Amount field: {amount}"
+
+    condition = tx.get("Condition", "")
+    if condition.upper() != quote.condition.upper():
+        return False, f"Condition mismatch"
+
+    return True, None
+
+
+async def _finish_challenge_fee_escrow(vault: EscrowVault) -> None:
+    """
+    Idempotently finish the challenge-fee escrow — sends the fee to the worker
+    on PASS_UPHELD. Must not be called on REFUNDABLE/CANCELLED vaults.
+    """
+    if vault.challenge_fee_finish_hash:
+        return  # already finished
+
+    if vault.challenge_fee_finish_attempts and vault.challenge_fee_finish_attempts >= 5:
+        logger.error(f"_finish_challenge_fee_escrow: max attempts reached for {vault.escrow_id}")
+        return
+
+    if not vault.challenge_fee_condition or not vault.challenge_quote_id:
+        logger.error(f"_finish_challenge_fee_escrow: missing condition/quote_id for {vault.escrow_id}")
+        return
+
+    db = SessionLocal()
+    try:
+        quote = db.query(ChallengeQuote).filter(ChallengeQuote.id == vault.challenge_quote_id).first()
+        if not quote:
+            logger.error(f"_finish_challenge_fee_escrow: quote {vault.challenge_quote_id} not found for {vault.escrow_id}")
+            return
+
+        # Check cancel_after not passed
+        now = datetime.now(timezone.utc)
+        cancel_after_ts = vault.challenge_fee_cancel_after
+        if cancel_after_ts:
+            if cancel_after_ts.tzinfo is None:
+                cancel_after_ts = cancel_after_ts.replace(tzinfo=timezone.utc)
+            if now >= cancel_after_ts:
+                # Past CancelAfter — can't finish; mark REFUNDABLE
+                v2 = db.query(EscrowVault).filter(EscrowVault.escrow_id == vault.escrow_id).first()
+                if v2 and v2.challenge_fee_state not in ("REFUNDABLE", "CANCELLED", "FINISHED"):
+                    v2.challenge_fee_state = "REFUNDABLE"
+                    db.commit()
+                return
+
+        try:
+            fulfillment_plain = decrypt_fulfillment(quote.fulfillment_enc)
+        except Exception as e:
+            logger.error(f"_finish_challenge_fee_escrow: decrypt failed for {vault.escrow_id}: {e}")
+            return
+
+        enterprise_wallet_seed = os.getenv("ENTERPRISE_WALLET")
+        if not enterprise_wallet_seed:
+            logger.error(f"_finish_challenge_fee_escrow: ENTERPRISE_WALLET not set, cannot submit EscrowFinish for {vault.escrow_id}")
+            return
+
+        try:
+            from xrpl.wallet import Wallet as XrplWallet
+            ew = XrplWallet.from_seed(enterprise_wallet_seed)
+        except Exception as e:
+            logger.error(f"_finish_challenge_fee_escrow: wallet load failed: {e}")
+            return
+
+        # Increment attempt before submitting
+        v2 = db.query(EscrowVault).filter(EscrowVault.escrow_id == vault.escrow_id).first()
+        if not v2:
+            return
+        v2.challenge_fee_finish_attempts = (v2.challenge_fee_finish_attempts or 0) + 1
+        db.commit()
+
+        try:
+            xrpl_client = AsyncJsonRpcClient(XRPL_URL)
+            finish_tx = EscrowFinish(
+                account=ew.classic_address,
+                owner=quote.payer_address,
+                offer_sequence=vault.challenge_fee_seq,
+                condition=vault.challenge_fee_condition,
+                fulfillment=fulfillment_plain,
+            )
+            response = await async_submit_and_wait(finish_tx, xrpl_client, ew)
+            tx_hash = getattr(response, "result", {}).get("hash") or getattr(response, "result", {}).get("tx_json", {}).get("hash")
+            if tx_hash:
+                v2 = db.query(EscrowVault).filter(EscrowVault.escrow_id == vault.escrow_id).first()
+                if v2:
+                    v2.challenge_fee_finish_hash = tx_hash
+                    v2.challenge_fee_state = "FINISHED"
+                    db.commit()
+                logger.info(f"✅ Challenge fee finished for {vault.escrow_id}: {tx_hash}")
+            else:
+                logger.warning(f"_finish_challenge_fee_escrow: no hash in response for {vault.escrow_id}")
+        except Exception as e:
+            logger.error(f"_finish_challenge_fee_escrow: submit failed for {vault.escrow_id}: {e}")
+    except Exception as e:
+        logger.error(f"_finish_challenge_fee_escrow outer error for {vault.escrow_id}: {e}", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+async def _cancel_challenge_fee_escrow(vault: EscrowVault) -> None:
+    """Cancel a REFUNDABLE challenge fee escrow after its CancelAfter window passes."""
+    if vault.challenge_fee_cancel_hash:
+        return  # already cancelled
+
+    db = SessionLocal()
+    try:
+        enterprise_wallet_seed = os.getenv("ENTERPRISE_WALLET")
+        if not enterprise_wallet_seed:
+            logger.error(f"_cancel_challenge_fee_escrow: ENTERPRISE_WALLET not set for {vault.escrow_id}")
+            return
+
+        try:
+            from xrpl.wallet import Wallet as XrplWallet
+            ew = XrplWallet.from_seed(enterprise_wallet_seed)
+        except Exception as e:
+            logger.error(f"_cancel_challenge_fee_escrow: wallet load failed: {e}")
+            return
+
+        quote = db.query(ChallengeQuote).filter(ChallengeQuote.id == vault.challenge_quote_id).first()
+        if not quote:
+            logger.error(f"_cancel_challenge_fee_escrow: quote not found for {vault.escrow_id}")
+            return
+
+        cancel_tx = EscrowCancel(
+            account=ew.classic_address,
+            owner=quote.payer_address,
+            offer_sequence=vault.challenge_fee_seq,
+        )
+        xrpl_client = AsyncJsonRpcClient(XRPL_URL)
+        response = await async_submit_and_wait(cancel_tx, xrpl_client, ew)
+        tx_hash = getattr(response, "result", {}).get("hash") or getattr(response, "result", {}).get("tx_json", {}).get("hash")
+        if tx_hash:
+            v2 = db.query(EscrowVault).filter(EscrowVault.escrow_id == vault.escrow_id).first()
+            if v2:
+                v2.challenge_fee_cancel_hash = tx_hash
+                v2.challenge_fee_state = "CANCELLED"
+                db.commit()
+            logger.info(f"✅ Challenge fee cancelled for {vault.escrow_id}: {tx_hash}")
+    except Exception as e:
+        logger.error(f"_cancel_challenge_fee_escrow error for {vault.escrow_id}: {e}", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
 async def _run_challenge_review(escrow_id: str):
     """
     Background task: run Pro-only re-review of challenged criteria.
     Opens its own DB session so it doesn't block the HTTP response.
+    Outcomes: PASS_UPHELD | PASS_OVERTURNED | REVIEW_INCONCLUSIVE
     """
     db = SessionLocal()
     try:
@@ -6439,18 +6803,26 @@ async def _run_challenge_review(escrow_id: str):
             logger.warning(f"_run_challenge_review: vault {escrow_id} not found or not CHALLENGED")
             return
 
+        now = datetime.now(timezone.utc)
+        vault.challenge_review_started_at = now
+        vault.challenge_review_attempts = (vault.challenge_review_attempts or 0) + 1
+        db.commit()
+
         # Filter criteria to only those being challenged
         all_criteria = vault.criteria_v2 or [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
         challenged_ids = set(vault.challenge_criteria_ids or [])
-        if challenged_ids:
-            review_criteria = [c for c in all_criteria if c.get("id") in challenged_ids]
-            if not review_criteria:
-                review_criteria = all_criteria
-        else:
+        review_criteria = [c for c in all_criteria if c.get("id") in challenged_ids] if challenged_ids else all_criteria
+        if not review_criteria:
             review_criteria = all_criteria
 
         work = ""
-        if vault.worker_submission:
+        if vault.pass_evidence_snapshot:
+            try:
+                snap = json.loads(vault.pass_evidence_snapshot)
+                work = snap.get("work", "")
+            except Exception:
+                pass
+        if not work and vault.worker_submission:
             try:
                 sub = json.loads(vault.worker_submission)
                 work = sub.get("work", "")
@@ -6459,7 +6831,7 @@ async def _run_challenge_review(escrow_id: str):
 
         api_key = os.getenv("GEMINI_API_KEY")
         pro_result = None
-        pro_verdict = "FAIL"
+        pro_verdict = "INCONCLUSIVE"
         if api_key:
             try:
                 prompt_text = _build_audit_prompt(
@@ -6475,17 +6847,24 @@ async def _run_challenge_review(escrow_id: str):
                         "seed": 42,
                         "responseMimeType": "application/json",
                         "responseSchema": _build_response_schema(),
-                        "thinkingConfig": {"thinkingBudget": 2048},
+                        "thinkingConfig": {"thinkingBudget": 8192},
                     },
                 }
                 url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-                async with httpx.AsyncClient(timeout=90.0) as client:
+                async with httpx.AsyncClient(timeout=150.0) as client:
                     res = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
                 if res.status_code == 200:
                     raw = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                     pro_result = json.loads(raw)
-                    pro_verdict = pro_result.get("overall_verdict", "FAIL")
-                    logger.info(f"_run_challenge_review: Pro verdict={pro_verdict} for {escrow_id}")
+                    raw_verdict = pro_result.get("overall_verdict", "INCONCLUSIVE")
+                    # Map to challenge outcomes
+                    if raw_verdict == "PASS":
+                        pro_verdict = "PASS_UPHELD"
+                    elif raw_verdict in ("FAIL", "INCONCLUSIVE"):
+                        pro_verdict = "PASS_OVERTURNED" if raw_verdict == "FAIL" else "REVIEW_INCONCLUSIVE"
+                    else:
+                        pro_verdict = "REVIEW_INCONCLUSIVE"
+                    logger.info(f"_run_challenge_review: Pro verdict={raw_verdict} → {pro_verdict} for {escrow_id}")
                 else:
                     logger.warning(f"_run_challenge_review: Pro HTTP {res.status_code} for {escrow_id}")
                     pro_result = None
@@ -6493,7 +6872,12 @@ async def _run_challenge_review(escrow_id: str):
                 logger.error(f"_run_challenge_review: Pro error for {escrow_id}: {e}")
                 pro_result = None
 
+        if pro_result is None:
+            pro_verdict = "REVIEW_INCONCLUSIVE"
+
         now = datetime.now(timezone.utc)
+        verdict_json_str = json.dumps(pro_result) if pro_result else None
+        verdict_hash = hashlib.sha256(verdict_json_str.encode()).hexdigest() if verdict_json_str else None
 
         def _queue_auto_finish(v):
             try:
@@ -6509,47 +6893,54 @@ async def _run_challenge_review(escrow_id: str):
             except Exception as _fe:
                 logger.error(f"auto_finish queue failed for {v.escrow_id}: {_fe}")
 
-        if pro_result is None:
-            # Pro unavailable — release escrow to worker, refund challenge fee to buyer
-            vault.status = "RELEASING"
-            logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (Pro unavailable)")  # TODO: submit XRPL Payment
-            db.commit()
-            _queue_auto_finish(vault)
-            _send_challenge_outcome_email(vault, "pro_unavailable")
-            return
+        vault.challenge_outcome = pro_verdict
+        vault.challenge_verdict = verdict_json_str
+        vault.challenge_verdict_hash = verdict_hash
+        vault.challenge_models_used = "gemini-2.5-pro"
+        vault.challenge_reviewed_at = now
 
-        if pro_verdict == "PASS":
+        prev_status = vault.status
+
+        if pro_verdict == "PASS_UPHELD":
+            # Challenge rejected — release escrow to worker, finish fee escrow to worker
             vault.status = "RELEASING"
-            logger.info(f"CHALLENGE_FEE_PAYOUT: send {vault.challenge_fee_amount} XRP to {vault.worker_address} for escrow {escrow_id} (challenge rejected)")  # TODO: submit XRPL Payment
+            vault.challenge_fee_state = "FINISHED"  # will be finalized by _finish_challenge_fee_escrow
             db.commit()
             _queue_auto_finish(vault)
+            asyncio.create_task(_finish_challenge_fee_escrow(vault))
             _send_challenge_outcome_email(vault, "rejected")
-        else:
-            # Pro FAIL — check CancelAfter
+
+        elif pro_verdict == "PASS_OVERTURNED":
+            # Challenge upheld — check CancelAfter for REMEDY vs CANCELLED
             cancel_after = vault.cancel_after_ts
             if cancel_after:
-                # cancel_after_ts may be naive; ensure tz-aware for comparison
                 if cancel_after.tzinfo is None:
                     cancel_after = cancel_after.replace(tzinfo=timezone.utc)
             time_remaining = (cancel_after - now).total_seconds() if cancel_after else 0
-            if cancel_after and time_remaining >= 86400:  # >= 24h
-                prev = vault.status
+            vault.challenge_fee_state = "REFUNDABLE"
+            if cancel_after and time_remaining >= 86400:
                 vault.status = "REMEDY"
-                logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (challenge upheld → REMEDY)")  # TODO: submit XRPL tx
+                _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
                 db.commit()
-                import asyncio as _asyncio
-                _asyncio.create_task(_fire_vault_webhook(vault, prev))
+                asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 _send_challenge_outcome_email(vault, "upheld_remedy")
                 _send_remedy_available_email(vault)
             else:
-                prev = vault.status
                 vault.status = "CANCELLED"
                 vault.cancelled_at = now
-                logger.info(f"CHALLENGE_FEE_PAYOUT: refund {vault.challenge_fee_amount} XRP to {vault.buyer_address} for escrow {escrow_id} (challenge upheld → CANCELLED, CancelAfter < 24h)")  # TODO: submit XRPL tx
+                _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
                 db.commit()
-                import asyncio as _asyncio
-                _asyncio.create_task(_fire_vault_webhook(vault, prev))
+                asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 _send_challenge_outcome_email(vault, "upheld_cancel")
+
+        else:  # REVIEW_INCONCLUSIVE
+            # Benefit of doubt → release to worker, fee is REFUNDABLE
+            vault.status = "RELEASING"
+            vault.challenge_fee_state = "REFUNDABLE"
+            db.commit()
+            _queue_auto_finish(vault)
+            _send_challenge_outcome_email(vault, "pro_unavailable")
+
     except Exception as e:
         logger.error(f"_run_challenge_review error for {escrow_id}: {e}", exc_info=True)
         try:
@@ -6836,6 +7227,59 @@ async def create_xumm_payload(req: XummPayloadRequest, db: Session = Depends(get
     return {"nextUrl": result["nextUrl"], "uuid": result["uuid"]}
 
 
+class ChallengeFeePayloadRequest(BaseModel):
+    escrow_id:   str
+    quote_id:    str
+    user_token:  Optional[str] = None
+
+
+@app.post("/xumm/challenge-fee-payload")
+async def create_challenge_fee_payload(req: ChallengeFeePayloadRequest, db: Session = Depends(get_db)):
+    """
+    Create a Xaman (XUMM) payload for signing the challenge-fee EscrowCreate.
+    Requires a valid unexpired quote from POST /escrow/{id}/challenge/prepare.
+    """
+    quote = db.query(ChallengeQuote).filter(ChallengeQuote.id == req.quote_id).first()
+    if not quote or quote.escrow_id != req.escrow_id:
+        raise HTTPException(status_code=404, detail="Quote not found for this escrow.")
+    if quote.used_at is not None:
+        raise HTTPException(status_code=409, detail="This quote has already been used.")
+    now = datetime.now(timezone.utc)
+    expires = quote.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if now >= expires:
+        raise HTTPException(status_code=410, detail="Quote has expired. Call /challenge/prepare again.")
+
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
+    worker_addr = (vault.worker_address or "") if vault else ""
+    if not worker_addr:
+        raise HTTPException(status_code=400, detail="Vault has no worker_address.")
+
+    txjson = {
+        "TransactionType": "EscrowCreate",
+        "Destination":     worker_addr,
+        "Amount":          str(quote.fee_drops),
+        "Condition":       quote.condition,
+        "CancelAfter":     quote.cancel_after_ripple,
+        "Memos": [{
+            "Memo": {
+                "MemoData": f"agenttrust-challenge:{req.escrow_id}".encode().hex().upper(),
+                "MemoType": "6368616C6C656E6765",
+            }
+        }],
+    }
+    payload_body = {"txjson": txjson}
+    if req.user_token:
+        payload_body["user_token"] = req.user_token
+
+    result = await xumm_create_payload(txjson)
+    result["fee_drops"] = quote.fee_drops
+    result["fee_xrp"]   = round(quote.fee_drops / 1_000_000, 6)
+    result["quote_id"]  = req.quote_id
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
@@ -7086,11 +7530,13 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         external_ref           = (req.external_ref or "")[:500] or None,
         external_url           = req.external_url if (req.external_url or "").startswith("https://") else None,
         counterparty_type      = req.counterparty_type if req.counterparty_type in ("agent", "human") else "agent",
-        callback_url           = req.callback_url if (req.callback_url or "").startswith("https://") else None,
-        metadata_json          = json.dumps(req.metadata) if req.metadata else None,
+        callback_url           = req.callback_url,
     )
-    if req.callback_url and not req.callback_url.startswith("https://"):
-        raise HTTPException(status_code=400, detail="callback_url must start with https://")
+    if req.metadata:
+        serialized = json.dumps(req.metadata)
+        if len(serialized) > 4096:
+            raise HTTPException(status_code=422, detail="metadata must be 4 KB or smaller")
+        vault.metadata_json = serialized
     db.add(vault)
     db.commit()
 
@@ -7176,6 +7622,8 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "audits_remaining":    fee_result.get("audits_remaining", None),
         "worker_url":          _worker_url,
         "worker_instructions": _worker_instructions,
+        "metadata":            req.metadata,
+        "callback_configured": bool(req.callback_url),
     }
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
@@ -7322,141 +7770,196 @@ async def reissue_evaluate_token_endpoint(escrow_id: str, body: dict, db: Sessio
 
 
 # ---------------------------------------------------------------------------
-# Part B Phase 2 — Challenge endpoint
+# Part B Phase 2 — Challenge endpoints (v2: quote-based fee escrow)
 # ---------------------------------------------------------------------------
-@app.post("/escrow/{escrow_id}/challenge")
-async def challenge_escrow_verdict(escrow_id: str, request: Request, db: Session = Depends(get_db)):
+
+class ChallengeQuoteRequest(BaseModel):
+    challenger_address: str
+
+    class Config:
+        extra = "forbid"
+
+
+class ChallengeSubmitRequest(BaseModel):
+    quote_id:           str
+    fee_tx_hash:        str
+    challenger_address: str
+    criteria_ids:       Optional[list] = None
+    reason:             Optional[str]  = None
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/escrow/{escrow_id}/challenge/prepare")
+async def prepare_challenge(escrow_id: str, req: ChallengeQuoteRequest, db: Session = Depends(get_db)):
     """
-    Buyer disputes a PASS verdict during the challenge window.
-
-    Body: {
-        criteria_ids: [str],   -- criterion IDs being disputed
-        reason: str,           -- explanation of why the work fails those criteria
-        fee_tx_hash: str,      -- 64-char hex XRPL tx hash of CHALLENGE_FEE_XRP payment
-        wallet_address: str,   -- buyer's wallet address
-        tx_hash: str           -- XRPL AccountSet tx containing the verification challenge memo
-    }
-
-    The buyer must first call GET /verify/challenge?wallet=... to get a challenge string,
-    submit an AccountSet tx with that string in a Memo, then POST here.
+    Step 1: get a fee quote and unsigned EscrowCreate for a challenge.
+    Vault must be in PASS_CHALLENGE_WINDOW.
+    Returns: quote_id, fee_drops, fee_xrp, condition, unsigned EscrowCreate tx, expires_at.
     """
-    # Challenges are coming soon. Return 501 so callers are not charged any fee.
-    raise HTTPException(
-        status_code=501,
-        detail="Challenges are coming soon — this feature is not yet available. No fee is required.",
-    )
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body.")
-
-    criteria_ids  = body.get("criteria_ids") or []
-    reason        = (body.get("reason") or "").strip()
-    fee_tx_hash   = (body.get("fee_tx_hash") or "").strip().upper()
-    wallet_address = (body.get("wallet_address") or "").strip()
-    ownership_tx  = (body.get("tx_hash") or "").strip().upper()
-
-    if not criteria_ids:
-        raise HTTPException(status_code=400, detail="criteria_ids must be a non-empty list of criterion IDs to dispute.")
-    if not reason:
-        raise HTTPException(status_code=400, detail="reason is required.")
-    if not fee_tx_hash or len(fee_tx_hash) != 64:
-        raise HTTPException(status_code=400, detail="fee_tx_hash must be a 64-char XRPL transaction hash.")
-    if not wallet_address or not wallet_address.startswith("r"):
-        raise HTTPException(status_code=400, detail="wallet_address (r...) is required.")
-    if not ownership_tx or len(ownership_tx) != 64:
-        raise HTTPException(status_code=400, detail="tx_hash (XRPL AccountSet with memo) is required for ownership proof.")
+    aesgcm = _get_aesgcm()
+    if not aesgcm:
+        raise HTTPException(status_code=503, detail="Fulfillment encryption not configured — contact support.")
 
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
     if vault.status != "PASS_CHALLENGE_WINDOW":
-        raise HTTPException(status_code=409, detail=f"Escrow is not in PASS_CHALLENGE_WINDOW status (current: {vault.status}).")
+        raise HTTPException(status_code=400, detail=f"Challenge is only available when escrow is in PASS_CHALLENGE_WINDOW status (current: {vault.status}).")
 
     now = datetime.now(timezone.utc)
     if vault.challenge_deadline:
-        deadline = vault.challenge_deadline
-        if deadline.tzinfo is None:
-            deadline = deadline.replace(tzinfo=timezone.utc)
-        if now >= deadline:
+        dl = vault.challenge_deadline
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        if now >= dl:
             raise HTTPException(status_code=403, detail="Challenge window has closed.")
 
     if vault.challenged_at is not None:
         raise HTTPException(status_code=409, detail="A challenge has already been submitted for this escrow.")
 
-    # Verify buyer wallet ownership
-    if vault.buyer_address and vault.buyer_address != wallet_address:
-        raise HTTPException(status_code=403, detail="wallet_address does not match the buyer on this vault.")
+    # Generate crypto-condition
+    fulfillment_bytes = secrets.token_bytes(32)
+    fulfillment_hex   = fulfillment_bytes.hex().upper()
+    fulfillment_enc   = encrypt_fulfillment(fulfillment_hex)
+    from hashlib import sha256 as _sha256
+    condition_hex = "A0258020" + _sha256(fulfillment_bytes).hexdigest().upper() + "810120"
 
-    if wallet_address not in _verify_challenges:
-        raise HTTPException(status_code=400, detail="No pending verification challenge for this wallet. Call GET /verify/challenge?wallet=... first.")
-    challenge_str, ch_expires = _verify_challenges[wallet_address]
-    if now > ch_expires:
-        del _verify_challenges[wallet_address]
-        raise HTTPException(status_code=400, detail="Verification challenge expired. Request a new one via GET /verify/challenge.")
+    fee_drops = await get_challenge_fee_drops()
+    fee_xrp   = round(fee_drops / 1_000_000, 6)
 
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": ownership_tx}]})
-        tx_data = tx_res.json().get("result", {})
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+    cancel_after_ripple = int(now.timestamp()) + CHALLENGE_FEE_CANCEL_AFTER_S - RIPPLE_EPOCH
+    expires_at = now + timedelta(seconds=CHALLENGE_QUOTE_TTL_S)
 
-    if tx_data.get("status") == "error" or not tx_data:
-        raise HTTPException(status_code=400, detail="Ownership transaction not found on ledger.")
-    if not tx_data.get("validated"):
-        raise HTTPException(status_code=400, detail="Ownership transaction is not yet validated.")
-    meta = tx_data.get("meta") or {}
-    if (meta.get("TransactionResult") if isinstance(meta, dict) else "") != "tesSUCCESS":
-        raise HTTPException(status_code=400, detail="Ownership transaction did not succeed on-chain.")
-    tx_json = tx_data.get("tx_json") or tx_data.get("tx") or tx_data
-    account = tx_data.get("Account") or tx_json.get("Account")
-    if account != wallet_address:
-        raise HTTPException(status_code=403, detail=f"Transaction account ({account}) does not match wallet_address.")
-    memos = tx_json.get("Memos") or tx_data.get("Memos") or []
-    expected_hex = challenge_str.encode().hex().upper()
-    if not any(m.get("Memo", {}).get("MemoData", "").upper() == expected_hex for m in memos):
-        raise HTTPException(status_code=403, detail="Transaction Memo does not contain the expected challenge string.")
-    del _verify_challenges[wallet_address]
+    worker_addr = vault.worker_address or ""
+    if not worker_addr:
+        raise HTTPException(status_code=400, detail="Vault has no worker_address — cannot issue challenge quote.")
 
-    # Validate criteria_ids reference actual criteria
-    all_criteria = vault.criteria_v2 or []
-    if all_criteria:
-        valid_ids = {c.get("id") for c in all_criteria}
-        invalid = [cid for cid in criteria_ids if cid not in valid_ids]
-        if invalid:
-            raise HTTPException(status_code=400, detail=f"Unknown criterion IDs: {invalid}. Valid IDs: {sorted(valid_ids)}")
+    unsigned_tx = {
+        "TransactionType": "EscrowCreate",
+        "Account":         req.challenger_address,
+        "Destination":     worker_addr,
+        "Amount":          str(fee_drops),
+        "Condition":       condition_hex,
+        "CancelAfter":     cancel_after_ripple,
+        "Memos": [{
+            "Memo": {
+                "MemoData": f"agenttrust-challenge:{escrow_id}".encode().hex().upper(),
+                "MemoType": "6368616C6C656E6765",
+            }
+        }],
+    }
 
-    # Verify challenge fee payment
-    try:
-        await verify_fee_payment(
-            fee_hash=fee_tx_hash,
-            escrow_id=escrow_id,
-            db=db,
-            min_xrp=CHALLENGE_FEE_XRP,
-            resource="/escrow/challenge",
-            allow_free_tier=False,
+    quote = ChallengeQuote(
+        id=str(uuid.uuid4()),
+        escrow_id=escrow_id,
+        payer_address=req.challenger_address,
+        fee_drops=fee_drops,
+        condition=condition_hex,
+        fulfillment_enc=fulfillment_enc,
+        cancel_after_ripple=cancel_after_ripple,
+        expires_at=expires_at,
+    )
+    db.add(quote)
+    db.commit()
+
+    return {
+        "quote_id":       quote.id,
+        "fee_drops":      fee_drops,
+        "fee_xrp":        fee_xrp,
+        "condition":      condition_hex,
+        "destination":    worker_addr,
+        "cancel_after":   (datetime.fromtimestamp(cancel_after_ripple + RIPPLE_EPOCH, tz=timezone.utc)).isoformat(),
+        "expires_at":     expires_at.isoformat(),
+        "unsigned_tx":    unsigned_tx,
+        "note":           "Sign and submit this EscrowCreate tx, then POST /escrow/{id}/challenge with the tx hash.",
+    }
+
+
+@app.post("/escrow/{escrow_id}/challenge")
+async def submit_challenge(escrow_id: str, req: ChallengeSubmitRequest, db: Session = Depends(get_db)):
+    """
+    Step 2: submit a challenge after paying the fee.
+    Body: { quote_id, fee_tx_hash, challenger_address, criteria_ids?, reason? }
+    """
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail=f"Escrow '{escrow_id}' not found.")
+    if vault.status != "PASS_CHALLENGE_WINDOW":
+        raise HTTPException(
+            status_code=402,
+            detail=f"Challenge window active. POST /escrow/{escrow_id}/challenge/prepare to get a fee quote.",
         )
-    except (HTTPException, PaymentRequired) as e:
-        raise HTTPException(status_code=402, detail=f"Challenge fee verification failed: {getattr(e, 'detail', str(e))}")
 
-    vault.status                = "CHALLENGED"
-    vault.challenged_at         = now
-    vault.challenge_criteria_ids = list(criteria_ids)
-    vault.challenge_reason      = reason
-    vault.challenge_fee_hash    = fee_tx_hash
-    vault.challenge_fee_amount  = CHALLENGE_FEE_XRP
+    now = datetime.now(timezone.utc)
+    if vault.challenge_deadline:
+        dl = vault.challenge_deadline
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        if now >= dl:
+            raise HTTPException(status_code=403, detail="Challenge window has closed.")
+
+    if vault.challenged_at is not None:
+        raise HTTPException(status_code=409, detail="A challenge has already been submitted for this escrow.")
+
+    if vault.buyer_address and vault.buyer_address != req.challenger_address:
+        raise HTTPException(status_code=403, detail="challenger_address does not match the buyer on this vault.")
+
+    quote = db.query(ChallengeQuote).filter(ChallengeQuote.id == req.quote_id).first()
+    if not quote or quote.escrow_id != escrow_id:
+        raise HTTPException(status_code=404, detail="Quote not found for this escrow.")
+    if quote.used_at is not None:
+        raise HTTPException(status_code=409, detail="This quote has already been used.")
+    expires = quote.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if now >= expires:
+        raise HTTPException(status_code=410, detail="Quote has expired. Call /challenge/prepare again.")
+
+    fee_tx = req.fee_tx_hash.strip().upper()
+    if len(fee_tx) != 64:
+        raise HTTPException(status_code=400, detail="fee_tx_hash must be a 64-char XRPL transaction hash.")
+
+    ok, err = await _verify_challenge_fee_escrow(fee_tx, quote, vault)
+    if not ok:
+        raise HTTPException(status_code=402, detail=f"Challenge fee verification failed: {err}")
+
+    # Atomically set CHALLENGED
+    criteria_ids = list(req.criteria_ids or [])
+    reason = (req.reason or "").strip()
+
+    quote.used_at     = now
+    quote.fee_tx_hash = fee_tx
+
+    vault.status                   = "CHALLENGED"
+    vault.challenged_at            = now
+    vault.challenge_criteria_ids   = criteria_ids or None
+    vault.challenge_reason         = reason or None
+    vault.challenge_fee_hash       = fee_tx
+    vault.challenge_quote_id       = quote.id
+    vault.challenge_fee_owner      = req.challenger_address
+    vault.challenge_fee_drops      = quote.fee_drops
+    vault.challenge_fee_condition  = quote.condition
+    vault.challenge_fee_cancel_after = datetime.fromtimestamp(
+        quote.cancel_after_ripple + RIPPLE_EPOCH, tz=timezone.utc
+    )
+    vault.challenge_fee_state      = "LOCKED"
+
+    # Snapshot work evidence at challenge time
+    if vault.worker_submission and not vault.pass_evidence_snapshot:
+        vault.pass_evidence_snapshot = vault.worker_submission
+
     db.commit()
 
     asyncio.create_task(_run_challenge_review(escrow_id))
     _send_challenge_submitted_email(vault)
-    logger.info(f"🔍 Challenge submitted for {escrow_id} by {wallet_address} — criteria: {criteria_ids}")
+    logger.info(f"🔍 Challenge submitted for {escrow_id} by {req.challenger_address}")
     return JSONResponse({
-        "status": "CHALLENGED",
-        "escrow_id": escrow_id,
-        "message": "Challenge submitted. A senior Pro model review is now in progress. You will be notified of the outcome.",
-        "criteria_ids": criteria_ids,
+        "status":        "CHALLENGED",
+        "escrow_id":     escrow_id,
+        "message":       "Challenge accepted. A senior Pro model review is now underway.",
+        "criteria_ids":  criteria_ids,
         "challenged_at": now.isoformat(),
     }, status_code=202)
 
@@ -7495,6 +7998,16 @@ class EscrowRequestBody(BaseModel):
     buyer_email:             Optional[str]   = None
     callback_url:            Optional[str]   = None
     metadata:                Optional[dict]  = None
+
+    @validator('callback_url')
+    def validate_callback_url(cls, v):
+        if v is None:
+            return v
+        if not v.startswith('https://'):
+            raise ValueError('callback_url must start with https://')
+        if len(v) > 2048:
+            raise ValueError('callback_url must be 2048 chars or fewer')
+        return v
 
     class Config:
         extra = "forbid"
@@ -7716,8 +8229,13 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         initiated_by        = "seller",
         pay_url             = pay_url,
         funding_deadline    = funding_deadline,
-        callback_url        = req.callback_url if (req.callback_url or "").startswith("https://") else None,
+        callback_url        = req.callback_url,
     )
+    if req.metadata:
+        serialized = json.dumps(req.metadata)
+        if len(serialized) > 4096:
+            raise HTTPException(status_code=422, detail="metadata must be 4 KB or smaller")
+        vault.metadata_json = serialized
     # Seller ownership proof — required before any buyer contact details are stored
     _verify_seller_ownership(
         req.seller_address, req.buyer_address or "", float(req.amount_xrp or 0),
@@ -7754,6 +8272,8 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         "worker_instructions": worker_instructions,
         "evaluate_token":     evaluate_token,
         "evaluate_token_hint": "Store this token and share it with the buyer to pass to the worker after funding.",
+        "metadata":            req.metadata,
+        "callback_configured": bool(req.callback_url),
     }
 
 
@@ -7993,6 +8513,7 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     # Set from actual EscrowCreate Account field; backfill will correct if this is wrong
     tx_account = res.get("tx_json", {}).get("Account") or res.get("Account")
     vault.escrow_owner = tx_account or vault.buyer_address
+    _wh_payload, _wh_url = _build_webhook_payload(vault, "PENDING", tx_hash)
     try:
         db.commit()
     except Exception as e:
@@ -8001,7 +8522,7 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
 
     logger.info(f"✅ Auto-confirmed via submit: escrow={escrow_id} hash={tx_hash[:16] if tx_hash else '?'}... engine={engine}")
     import asyncio as _asyncio
-    _asyncio.create_task(_fire_vault_webhook(vault, "PENDING", tx_hash))
+    _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
 
     return {
         "status":    "submitted_and_confirmed",
@@ -8100,6 +8621,9 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "prompt_version":          vault.prompt_version,
         "verdict_hash":            vault.verdict_hash,
         "evaluation_verdicts":     vault.evaluation_verdicts,
+        # Webhook / metadata (callback_url never returned — it may contain tokens)
+        "callback_configured":     bool(vault.callback_url),
+        "metadata":                json.loads(vault.metadata_json) if vault.metadata_json else None,
     }
 
 
@@ -8576,8 +9100,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             })
             vault.ai_verdict = json.dumps(verdict_dict)
             vault.model_used = model_used
+            _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
             db.commit()
-            asyncio.create_task(_fire_vault_webhook(vault, prev_status))
+            asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
             logger.info(f"✅ REMEDY PASS for {req.escrow_id} — releasing immediately")
             escrow_owner = vault.escrow_owner or vault.buyer_address
             if vault.escrow_sequence and vault.worker_address and referee_wallet and escrow_owner:
@@ -8626,10 +9151,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             })
             vault.ai_verdict = json.dumps(verdict_dict)
             vault.model_used = model_used
+            _wh_payload, _wh_url = _build_webhook_payload(vault, "LOCKED")
             db.commit()
             logger.info(f"⏳ PASS_CHALLENGE_WINDOW for {req.escrow_id} — deadline: {vault.challenge_deadline}")
             import asyncio as _asyncio
-            _asyncio.create_task(_fire_vault_webhook(vault, "LOCKED"))
+            _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
             _send_challenge_window_opened_email(vault)
             return {
                 "escrow_id":            req.escrow_id,
@@ -8716,8 +9242,9 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
 
     vault.ai_verdict = json.dumps(verdict_dict)
     vault.model_used = model_used
+    _wh_payload, _wh_url = _build_webhook_payload(vault, _prev_status)
     db.commit()
-    asyncio.create_task(_fire_vault_webhook(vault, _prev_status))
+    asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
 
     # Webhook for agent flows
     if req.callback_url:
@@ -12542,10 +13069,11 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         vault.delivery_status = "RELEASED"
                         vault.release_tx_hash = tx_envelope.get("hash") or tx.get("hash")
                         vault.released_at     = ts
+                        _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.release_tx_hash)
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → RELEASED (EscrowFinish found)")
                         import asyncio as _asyncio
-                        _asyncio.create_task(_fire_vault_webhook(vault, prev, vault.release_tx_hash))
+                        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                         return
                     elif tx_type == "EscrowCancel" and meta_result == "tesSUCCESS":
                         prev = vault.status
@@ -12553,20 +13081,22 @@ async def _resolve_gone_escrow(vault, owner: str, sequence: int, db):
                         vault.delivery_status = "CANCELLED"
                         vault.cancel_tx_hash  = tx_envelope.get("hash") or tx.get("hash")
                         vault.cancelled_at    = ts
+                        _wh_payload, _wh_url = _build_webhook_payload(vault, prev, vault.cancel_tx_hash)
                         db.commit()
                         logger.info(f"Resolved {vault.escrow_id} → CANCELLED (EscrowCancel found)")
                         import asyncio as _asyncio
-                        _asyncio.create_task(_fire_vault_webhook(vault, prev, vault.cancel_tx_hash))
+                        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                         return
             marker = data.get("marker")
             if not marker:
                 break
         prev = vault.status
         vault.status = "RELEASE_FAILED"
+        _wh_payload, _wh_url = _build_webhook_payload(vault, prev)
         db.commit()
         logger.error(f"Could not resolve {vault.escrow_id}: escrow gone but no final tx found — marking RELEASE_FAILED.")
         import asyncio as _asyncio
-        _asyncio.create_task(_fire_vault_webhook(vault, prev))
+        _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
     except Exception as e:
         logger.warning(f"_resolve_gone_escrow failed for {vault.escrow_id}: {e}")
 
