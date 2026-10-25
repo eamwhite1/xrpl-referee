@@ -317,9 +317,11 @@ The Referee never holds funds. It only issues or withholds the cryptographic key
 
 ---
 
-## Try it Free on XRPL Testnet
+## Try it free
 
-No fees, no real XRP required. AI audits capped at 5 per buyer per day on testnet.
+- **Testnet sandbox**: `create_testnet_wallet()` → `hire_and_pay(..., network='testnet')` — full flow, no fees, test XRP has no value.
+- **Mainnet**: 3 free escrows via `create_agent_wallet` or `register_wallet_free_tier` (trust score ≥ 25).
+- **Pro trial**: 30-day free trial at https://app.cryptovault.co.uk/dashboard/ — sign in with Google.
 
 ```python
 # 1. Get a funded testnet wallet instantly
@@ -333,6 +335,12 @@ evaluate_escrow_work(escrow_id, work, evaluate_token)
 ```
 
 Explorer: [testnet.xrpl.org](https://testnet.xrpl.org). Test XRP has no monetary value. Switch to `network="mainnet"` when ready for real payments.
+
+---
+
+## Challenge a PASS verdict
+
+Set `release_mode="challenge_window_hrs:N"` (N=1–24) to hold payment after PASS. Buyer pays ~$1 in XRP for a Gemini Pro re-review. See [/challenges/](https://www.cryptovault.co.uk/challenges/).
 
 ---
 
@@ -362,18 +370,6 @@ Every audit costs **$0.10** (XRP, RLUSD on XRPL, or USDC on Base) paid to `rmcSr
 - **Signing (human flow):** Xaman
 - **Database:** PostgreSQL (Render)
 - **Hosting:** Render
-
----
-
-## Try it free
-
-- **Testnet sandbox**: `create_testnet_wallet()` → `hire_and_pay(..., network='testnet')` — full flow, no fees, test XRP has no value.
-- **Mainnet**: 3 free escrows via `create_agent_wallet` or `register_wallet_free_tier` (trust score ≥ 25).
-- **Pro trial**: 30-day free trial at https://app.cryptovault.co.uk/dashboard/ — sign in with Google.
-
-## Challenge a PASS verdict
-
-Set `release_mode="challenge_window_hrs:N"` (N=1–24) to hold payment after PASS. Buyer pays ~$1 in XRP for a Gemini Pro re-review. See [/challenges/](https://www.cryptovault.co.uk/challenges/).
 
 ---
 

@@ -3298,6 +3298,44 @@ def _verify_rating_token(token: str) -> Optional[dict]:
         return None
 
 
+def _make_challenge_token(escrow_id: str, buyer_address: str, expires: int) -> str:
+    """HMAC-SHA256 signed token for private challenge email links. expires = unix timestamp."""
+    secret = os.getenv("JWT_SECRET", "")
+    payload = f"challenge:{escrow_id}:{buyer_address}:{expires}"
+    sig = _hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+
+
+def _verify_challenge_token(token: str, db: Session) -> dict:
+    """Return {escrow_id, buyer_address, expires} or raise HTTPException 401."""
+    secret = os.getenv("JWT_SECRET", "")
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode() + b"==").decode()
+        payload, sig = decoded.rsplit(":", 1)
+        expected = _hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(sig, expected):
+            raise ValueError("bad sig")
+        parts = payload.split(":")
+        # format: challenge:escrow_id:buyer_address:expires (escrow_id may contain hyphens)
+        if parts[0] != "challenge" or len(parts) < 4:
+            raise ValueError("bad format")
+        expires = int(parts[-1])
+        buyer_address = parts[-2]
+        escrow_id = ":".join(parts[1:-2])
+        if time.time() >= expires:
+            raise HTTPException(status_code=401, detail="challenge_token_expired")
+        vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+        if not vault:
+            raise HTTPException(status_code=401, detail="vault_not_found")
+        if vault.buyer_address != buyer_address:
+            raise HTTPException(status_code=401, detail="buyer_mismatch")
+        return {"escrow_id": escrow_id, "buyer_address": buyer_address, "expires": expires}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="invalid_challenge_token")
+
+
 # ---------------------------------------------------------------------------
 # FULFILLMENT KEY ENCRYPTION (AES-256-GCM)
 # ---------------------------------------------------------------------------
@@ -6944,10 +6982,24 @@ async def _gemini_schema_selftest():
 def _send_challenge_window_opened_email(vault):
     hours = vault.release_mode.split(":")[1] if vault.release_mode and ":" in vault.release_mode else "24"
     deadline_str = vault.challenge_deadline.strftime("%A %d %B %Y at %H:%M UTC") if vault.challenge_deadline else "soon"
-    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
     recipient = vault.buyer_email
     if not RESEND_API_KEY or not recipient:
         return
+    # Generate a 48-hour challenge token (token validity > challenge window)
+    token_expires = int(time.time()) + 48 * 3600
+    challenge_token = _make_challenge_token(vault.escrow_id, vault.buyer_address, token_expires)
+    challenge_url = f"{SITE_URL}/challenge/?token={challenge_token}"
+    # Verdict summary for display
+    ai_verdict = vault.ai_verdict or "PASS"
+    score = None
+    if vault.evaluation_verdicts:
+        try:
+            last = vault.evaluation_verdicts[-1] if isinstance(vault.evaluation_verdicts, list) else None
+            if last and isinstance(last, dict):
+                score = last.get("score")
+        except Exception:
+            pass
+    score_str = f" (score: {score}/100)" if score is not None else ""
     try:
         resend.Emails.send({
             "from":    RESEND_FROM,
@@ -6958,15 +7010,16 @@ def _send_challenge_window_opened_email(vault):
   <div class="logo">AgentTrust<span>.</span></div>
   <h1>Work passed — challenge window open</h1>
   <p>The AI referee has reviewed the submission for escrow <strong>{vault.escrow_id}</strong>
-     and returned a <strong>PASS</strong> verdict.</p>
+     and returned a <strong>{ai_verdict}</strong> verdict{score_str}.</p>
   <p>If you believe the work does not meet the criteria, you have <strong>{hours} hours</strong>
      to raise a challenge. A senior Pro model will re-review the specific criteria you dispute.</p>
   <div class="detail"><span>Challenge deadline</span><br><strong>{deadline_str}</strong></div>
-  <div class="detail"><span>Challenge fee</span><br><strong>~$1.00 USD in XRP</strong> — call /fees for the live amount. Refundable if your challenge is upheld.</div>
+  <div class="detail"><span>Challenge fee</span><br><strong>~$1.00 USD in XRP</strong> (live amount at <code>/fees</code>). Refunded if your challenge is upheld.</div>
   <p style="font-size:.85rem;color:#5c5c6e;">
-    If you do not challenge before the deadline, payment will release automatically to the worker.
+    ⚠️ You have 15 minutes after paying the challenge fee to submit your dispute. After {hours} hours payment releases automatically to the worker.
   </p>
-  <a href="{escrow_url}" class="btn">Review &amp; Challenge →</a>
+  <a href="{challenge_url}" class="btn">Challenge this verdict →</a>
+  <p style="font-size:.8rem;color:#888;margin-top:1rem;">This link is private and expires in 48 hours. Do not share it.</p>
   <div class="footer">
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
   </div>
@@ -8858,6 +8911,170 @@ async def submit_challenge(escrow_id: str, req: ChallengeSubmitRequest, db: Sess
     }, status_code=202)
 
 
+# ---------------------------------------------------------------------------
+# Token-gated challenge session endpoints  (/challenge/session*)
+# ---------------------------------------------------------------------------
+
+def _get_challenge_token_from_request(request: Request) -> str:
+    """Extract challenge token from ?token= query param or X-Challenge-Token header."""
+    token = request.query_params.get("token") or request.headers.get("x-challenge-token", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="challenge_token_required")
+    return token
+
+
+@app.get("/challenge/session")
+async def challenge_session_get(request: Request, db: Session = Depends(get_db)):
+    """
+    Return public challenge-window state for the buyer identified by the token.
+    NEVER returns: fulfillment, evaluate_token, buyer/seller email.
+    """
+    token = _get_challenge_token_from_request(request)
+    ctx = _verify_challenge_token(token, db)
+    escrow_id = ctx["escrow_id"]
+
+    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="vault_not_found")
+
+    ai_summary = None
+    ai_score = None
+    if vault.evaluation_verdicts:
+        try:
+            last = vault.evaluation_verdicts[-1] if isinstance(vault.evaluation_verdicts, list) else None
+            if last and isinstance(last, dict):
+                ai_summary = last.get("summary") or last.get("reasoning")
+                ai_score = last.get("score")
+        except Exception:
+            pass
+
+    return {
+        "escrow_id":        vault.escrow_id,
+        "status":           vault.status,
+        "ai_verdict":       vault.ai_verdict,
+        "ai_score":         ai_score,
+        "ai_summary":       ai_summary,
+        "challenge_deadline": vault.challenge_deadline.isoformat() if vault.challenge_deadline else None,
+        "challenge_outcome":  vault.challenge_outcome,
+        "network":          vault.network or "mainnet",
+        "task_description": vault.task_description,
+        "amount_xrp":       vault.amount_xrp,
+        "buyer_address":    vault.buyer_address,
+        "worker_address":   vault.worker_address,
+    }
+
+
+class ChallengeSessionPrepareRequest(BaseModel):
+    challenger_address: str
+    criteria_ids:       Optional[list] = None
+    reason:             Optional[str] = None
+
+
+@app.post("/challenge/session/prepare")
+async def challenge_session_prepare(
+    req: ChallengeSessionPrepareRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Prepare a challenge-fee escrow quote. Token-gated wrapper for /escrow/{id}/challenge/prepare."""
+    token = _get_challenge_token_from_request(request)
+    ctx = _verify_challenge_token(token, db)
+    escrow_id = ctx["escrow_id"]
+
+    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="vault_not_found")
+    if vault.buyer_address != req.challenger_address:
+        raise HTTPException(status_code=403, detail="challenger_address must match the buyer on this escrow")
+
+    inner = ChallengeQuoteRequest(challenger_address=req.challenger_address)
+    return await prepare_challenge(escrow_id, inner, db)
+
+
+@app.post("/challenge/session/xaman")
+async def challenge_session_xaman(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Return a Xaman (XUMM) sign request for the challenge fee payment.
+    Includes Account=buyer_address in txjson; adds NetworkID for testnet.
+    """
+    token = _get_challenge_token_from_request(request)
+    ctx = _verify_challenge_token(token, db)
+    escrow_id = ctx["escrow_id"]
+    buyer_address = ctx["buyer_address"]
+
+    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="vault_not_found")
+    if vault.status not in ("PASS_CHALLENGE_WINDOW", "CHALLENGED"):
+        raise HTTPException(status_code=409, detail="challenge_window_not_open")
+
+    quote = (
+        db.query(ChallengeQuote)
+        .filter_by(escrow_id=escrow_id)
+        .filter(ChallengeQuote.used_at.is_(None))
+        .order_by(ChallengeQuote.created_at.desc())
+        .first()
+    )
+    if not quote:
+        raise HTTPException(status_code=404, detail="no_active_quote — call /challenge/session/prepare first")
+
+    network = vault.network or "mainnet"
+    referee_wallet = _referee_wallet_for_network(network)
+
+    txjson = {
+        "TransactionType": "EscrowCreate",
+        "Account":         buyer_address,
+        "Destination":     referee_wallet,
+        "Amount":          str(quote.fee_drops),
+        "Condition":       quote.condition,
+        "FinishAfter":     quote.finish_after_ripple,
+        "CancelAfter":     quote.cancel_after_ripple,
+    }
+    if network == "testnet":
+        txjson["NetworkID"] = 1
+
+    payload = await xumm_create_payload(txjson)
+    return {"xaman_payload": payload, "fee_drops": quote.fee_drops, "quote_id": quote.id}
+
+
+class ChallengeSessionSubmitRequest(BaseModel):
+    challenger_address: str
+    fee_tx_hash:        str
+    quote_id:           Optional[str]  = None
+    criteria_ids:       Optional[list] = None
+    reason:             Optional[str]  = None
+
+
+@app.post("/challenge/session/submit")
+async def challenge_session_submit(
+    req: ChallengeSessionSubmitRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Submit a challenge after paying the fee. Token-gated wrapper for /escrow/{id}/challenge."""
+    token = _get_challenge_token_from_request(request)
+    ctx = _verify_challenge_token(token, db)
+    escrow_id = ctx["escrow_id"]
+
+    vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="vault_not_found")
+    if vault.buyer_address != req.challenger_address:
+        raise HTTPException(status_code=403, detail="challenger_address must match the buyer on this escrow")
+
+    inner = ChallengeSubmitRequest(
+        quote_id=req.quote_id,
+        fee_tx_hash=req.fee_tx_hash,
+        challenger_address=req.challenger_address,
+        criteria_ids=req.criteria_ids,
+        reason=req.reason,
+    )
+    return await submit_challenge(escrow_id, inner, db)
+
+
 class PrepareEscrowRequest(BaseModel):
     escrow_id:        str
     buyer_address:    str
@@ -8928,7 +9145,7 @@ def _is_valid_xrpl_address(addr: str) -> bool:
 def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp: float,
                               task_desc: str, buyer_email: str,
                               api_key_header: Optional[str], sig_header: Optional[str],
-                              db: Session) -> bool:
+                              db: Session, request: Optional[Request] = None) -> bool:
     """Verify caller controls seller_address. Raises 401 if proof absent/invalid.
 
     Signed message format (client-side, using xrpl-py):
@@ -8986,6 +9203,23 @@ def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp
             raise
         except Exception as _e:
             logger.warning(f"Seller sig verification error: {_e}")
+    # Option 3: valid at_session cookie whose EnterpriseAccount has a verified LinkedWallet == seller_address
+    if request is not None:
+        _cookie = request.cookies.get("at_session")
+        if _cookie:
+            try:
+                _payload = pyjwt.decode(_cookie, JWT_SECRET, algorithms=["HS256"])
+                _account_id = _payload.get("sub") or _payload.get("account_id")
+                if _account_id:
+                    _linked = db.query(LinkedWallet).filter(
+                        LinkedWallet.account_id == _account_id,
+                        LinkedWallet.xrpl_address == seller_address,
+                        LinkedWallet.verified == True,
+                    ).first()
+                    if _linked:
+                        return True
+            except Exception:
+                pass
     raise HTTPException(
         status_code=401,
         detail=(
@@ -8994,7 +9228,8 @@ def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp
             "Option 2: x-seller-signature header (<hexsig>:<ts>:<public_key_hex>) — "
             "verify wallet first via GET /verify/challenge?wallet=<address> then POST /verify/confirm, "
             "then sign 'agenttrust-request:{seller_address}:{buyer_address}:{amount_xrp}:{sha256(task)[:16]}:{ts}' "
-            "using xrpl.core.keypairs.sign(msg.encode(), private_key) client-side."
+            "using xrpl.core.keypairs.sign(msg.encode(), private_key) client-side. "
+            "Option 3: Pro Dashboard session cookie (at_session) with seller_address as a verified linked wallet."
         )
     )
 
@@ -9141,7 +9376,7 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
     _verify_seller_ownership(
         req.seller_address, req.buyer_address or "", float(req.amount_xrp or 0),
         req.task or "", req.buyer_email or "",
-        request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db,
+        request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db, request,
     )
     db.add(vault)
     db.commit()
