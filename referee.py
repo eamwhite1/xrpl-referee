@@ -3219,6 +3219,10 @@ DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
 RATING_LINK_TTL_S    = 7 * 24 * 3600  # 7 days
 
+
+def escrow_status_url(escrow_id: str) -> str:
+    return f"{SITE_URL}/escrow/?id={escrow_id}"
+
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://mcp.cryptovault.co.uk/auth/google/callback")
@@ -4488,7 +4492,7 @@ async def send_worker_receipt_email(
 ):
     if not RESEND_API_KEY or not worker_email:
         return
-    worker_url   = f"{SITE_URL}?worker={escrow_id}"
+    worker_url   = escrow_status_url(escrow_id)
     preview_safe = task_preview[:300] + ("…" if len(task_preview) > 300 else "")
     amount_str   = f"{amount} {currency}"
 
@@ -4942,7 +4946,7 @@ async def send_delivery_email(
 ):
     if not RESEND_API_KEY or not buyer_email:
         return
-    collect_url = f"{SITE_URL}?collect={escrow_id}"
+    collect_url = escrow_status_url(escrow_id)
     score       = verdict.get("score", "—")
     summary     = verdict.get("summary", "Work verified by AI referee.")
     amount_str  = f"{amount} {currency}"
@@ -7094,7 +7098,7 @@ def _send_challenge_submitted_email(vault):
 
 def _send_challenge_outcome_email(vault, outcome: str):
     """outcome: 'rejected' | 'upheld_remedy' | 'upheld_cancel' | 'pro_unavailable'"""
-    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
+    escrow_url = escrow_status_url(vault.escrow_id)
     if not RESEND_API_KEY:
         return
 
@@ -7124,7 +7128,7 @@ def _send_challenge_outcome_email(vault, outcome: str):
         recipient = vault.worker_email
         if recipient:
             criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "disputed criteria"
-            submit_url = f"{SITE_URL}?worker={vault.escrow_id}"
+            submit_url = escrow_status_url(vault.escrow_id)
             try:
                 resend.Emails.send({
                     "from":    RESEND_FROM,
@@ -7215,7 +7219,7 @@ def _send_challenge_window_expired_email(vault):
   <h1>Payment released</h1>
   <p>The challenge window for escrow <strong>{vault.escrow_id}</strong> has closed with no
      challenge from the buyer. Payment has been automatically released to your wallet.</p>
-  <a href="{SITE_URL}?worker={vault.escrow_id}" class="btn">View Escrow →</a>
+  <a href="{escrow_status_url(vault.escrow_id)}" class="btn">View Escrow →</a>
   <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
 </div></body></html>""",
         })
@@ -8506,7 +8510,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
     _referee_base_url = os.getenv("REFEREE_BASE_URL", "https://mcp.cryptovault.co.uk")
-    _worker_url = f"{SITE_URL}?worker={req.escrow_id}"
+    _worker_url = escrow_status_url(req.escrow_id)
     _criteria_summary = [
         c.get("description", c) if isinstance(c, dict) else c
         for c in (_parse_criteria_safe(req.criteria) or [])
@@ -9404,8 +9408,8 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
     evaluate_token_hash = hashlib.sha256(evaluate_token.encode()).hexdigest()
 
     criteria_v2 = _parse_criteria_safe(req.criteria)
-    pay_url     = f"{SITE_URL}?fund={escrow_id}"
-    worker_url  = f"{SITE_URL}?worker={escrow_id}"
+    pay_url     = escrow_status_url(escrow_id)
+    worker_url  = escrow_status_url(escrow_id)
 
     vault = EscrowVault(
         escrow_id           = escrow_id,
@@ -9824,7 +9828,7 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "external_url":            vault.external_url,
         "counterparty_type":       vault.counterparty_type or "agent",
         "initiated_by":            vault.initiated_by or "buyer",
-        "worker_url":              f"{SITE_URL}?worker={vault.escrow_id}",
+        "worker_url":              escrow_status_url(vault.escrow_id),
         "pass_at":                 vault.pass_at.isoformat() if vault.pass_at else None,
         # Audit trail
         "models_used":             vault.models_used,
@@ -10475,7 +10479,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             webhook_payload["delivery"] = {
                 "work":        req.work,
                 "attachments": [{"filename": a.filename, "mime_type": a.mime_type} for a in (req.worker_attachments or [])],
-                "collect_url": f"{SITE_URL}?collect={req.escrow_id}",
+                "collect_url": escrow_status_url(req.escrow_id),
                 "expires_at":  vault.delivery_expires_at.isoformat() if vault.delivery_expires_at else None,
             }
             if dex_quote:
