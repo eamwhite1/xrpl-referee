@@ -657,6 +657,50 @@ async def purchase_extra_attempt(
 
 
 @mcp.tool(annotations=ToolAnnotations(
+    title="Prepare Challenge Escrow",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def prepare_challenge_escrow(
+    escrow_id: Annotated[str, Field(
+        title="Escrow ID",
+        description="The receipt code for the escrow whose PASS verdict you want to dispute.",
+    )],
+    challenger_address: Annotated[str, Field(
+        title="Challenger XRPL Address",
+        description="Your XRPL wallet address (r...) that will sign the fee EscrowCreate.",
+    )],
+) -> dict:
+    """
+    Step 1 of the challenge flow: get a fee quote and unsigned EscrowCreate transaction.
+
+    The challenge fee (~$1.00 USD in XRP) is held as a crypto-condition escrow
+    to the worker address. On PASS_UPHELD the fee releases to the worker; on
+    PASS_OVERTURNED or REVIEW_INCONCLUSIVE the fee is REFUNDABLE via EscrowCancel.
+
+    Returns: quote_id, fee_drops, fee_xrp, condition, destination (worker),
+    unsigned_tx (sign with your wallet and submit), expires_at (quote TTL).
+
+    After submitting the EscrowCreate, call challenge_escrow_verdict with
+    the resulting tx hash and this quote_id.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/escrow/{escrow_id}/challenge/prepare",
+            json={"challenger_address": challenger_address},
+        )
+        if res.is_success:
+            return res.json()
+        try:
+            detail = res.json().get("detail", res.text[:400])
+        except Exception:
+            detail = res.text[:400]
+        return {"error": f"http_{res.status_code}", "message": detail}
+
+
+@mcp.tool(annotations=ToolAnnotations(
     title="Challenge Escrow Verdict",
     readOnlyHint=False,
     destructiveHint=False,
@@ -668,97 +712,63 @@ async def challenge_escrow_verdict(
         title="Escrow ID",
         description="The receipt code for the escrow whose PASS verdict you want to dispute.",
     )],
+    quote_id: Annotated[str, Field(
+        title="Challenge Quote ID",
+        description="The quote ID from prepare_challenge_escrow. Contains the fee amount and condition.",
+    )],
+    fee_tx_hash: Annotated[str, Field(
+        title="Challenge Fee EscrowCreate Hash",
+        description="64-char XRPL tx hash of the EscrowCreate you signed and submitted (from the unsigned_tx in the quote).",
+    )],
+    challenger_address: Annotated[str, Field(
+        title="Challenger XRPL Address",
+        description="Your XRPL wallet address (r...) — must match the buyer on this vault.",
+    )],
     criteria_ids: Annotated[Optional[list[str]], Field(
         default=None,
         title="Criterion IDs to Dispute",
-        description="One or more criterion IDs (from the vault's criteria list) that you believe the work failed. Get these from the evaluation_verdicts in the escrow response.",
+        description="Optional: one or more criterion IDs you believe the work failed. If omitted, the full verdict is reviewed.",
     )] = None,
     reason: Annotated[Optional[str], Field(
         default=None,
         title="Reason for Challenge",
-        description="Explain specifically why the work does not satisfy the listed criteria. The Pro model will review this alongside the original work.",
-    )] = None,
-    fee_tx_hash: Annotated[Optional[str], Field(
-        default=None,
-        title="Challenge Fee Payment Hash",
-        description="⚠️ Disputes coming soon — do not pay any fee. This parameter is reserved for future use.",
-    )] = None,
-    wallet_address: Annotated[Optional[str], Field(
-        default=None,
-        title="Buyer Wallet Address",
-        description="Your XRPL wallet address (r...) — must match the buyer on this vault.",
-    )] = None,
-    tx_hash: Annotated[Optional[str], Field(
-        default=None,
-        title="Ownership Verification Transaction Hash",
-        description="Hash of an XRPL AccountSet tx submitted from wallet_address with a Memo containing the challenge string from get_wallet_verification_challenge(). Proves you own the buyer wallet.",
+        description="Optional: explain specifically why the work does not satisfy the listed criteria.",
     )] = None,
 ) -> dict:
     """
-    Challenge a PASS verdict during the challenge window.
+    Submit a challenge against a PASS verdict during the challenge window.
 
-    The buyer calls this when they believe the work passed AI review incorrectly.
-    A senior Pro model re-reviews only the disputed criteria.
+    Two-step process:
+    1. Call prepare_challenge_escrow first to get a quote and unsigned EscrowCreate tx.
+    2. Sign and submit the EscrowCreate (fee goes to worker address as escrow).
+    3. Call this tool with the resulting tx hash.
 
     Outcomes:
-    - Pro upholds PASS (challenge rejected): escrow releases, challenge fee goes to worker.
-    - Pro rules FAIL (challenge upheld, CancelAfter ≥ 24h): vault enters REMEDY status.
-      Worker gets one extra attempt to fix the specific failed criteria. A PASS on the
-      remedy releases immediately with no further challenge window.
-    - Pro rules FAIL (CancelAfter < 24h): escrow cancelled, both funds and challenge fee
-      returned to buyer.
-    - Pro unavailable: escrow auto-releases, challenge fee refunded to buyer.
-
-    Prerequisites:
-    1. Call get_wallet_verification_challenge(wallet_address=your_buyer_wallet) to get a nonce.
-    2. Submit an XRPL AccountSet transaction from your buyer wallet with the nonce in a Memo field.
-    3. Pay CHALLENGE_FEE_XRP XRP to the protocol wallet (rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR).
-    4. Call this tool with the AccountSet tx hash (tx_hash), fee tx hash (fee_tx_hash),
-       criteria_ids, and reason.
+    - PASS_UPHELD (challenge rejected): escrow releases to worker, fee released to worker.
+    - PASS_OVERTURNED (challenge upheld, CancelAfter ≥ 24h): vault enters REMEDY status, fee is REFUNDABLE.
+    - REVIEW_INCONCLUSIVE (Pro unavailable): escrow releases to worker, fee is REFUNDABLE.
 
     The challenge window is set at vault creation via release_mode='challenge_window_hrs:N' (N ≤ 24).
     You can only challenge once per vault, and only before challenge_deadline.
-
-    ⚠️ COMING SOON — disputes are not yet available. Do not pay any fee.
     """
-    return {
-        "status": "not_available",
-        "message": "Challenge window disputes are coming soon — this feature is not yet available. Do not pay any fee.",
-    }
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/{escrow_id}/challenge",
             json={
-                "criteria_ids":   criteria_ids,
-                "reason":         reason,
-                "fee_tx_hash":    fee_tx_hash,
-                "wallet_address": wallet_address,
-                "tx_hash":        tx_hash,
+                "quote_id":           quote_id,
+                "fee_tx_hash":        fee_tx_hash,
+                "challenger_address": challenger_address,
+                "criteria_ids":       criteria_ids,
+                "reason":             reason,
             },
         )
         if res.status_code == 202:
             return res.json()
-        if res.status_code == 402:
-            return {"error": "payment_required", "message": "Challenge fee verification failed. Pay CHALLENGE_FEE_XRP XRP to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR and pass the tx hash as fee_tx_hash."}
-        if res.status_code == 403:
-            try:
-                detail = res.json().get("detail", res.text[:400])
-            except Exception:
-                detail = res.text[:400]
-            return {"error": "forbidden", "message": detail}
-        if res.status_code == 409:
-            try:
-                detail = res.json().get("detail", res.text[:400])
-            except Exception:
-                detail = res.text[:400]
-            return {"error": "conflict", "message": detail}
-        if not res.is_success:
-            try:
-                detail = res.json().get("detail", res.text[:400])
-            except Exception:
-                detail = res.text[:400]
-            return {"error": f"http_{res.status_code}", "message": detail}
-        return res.json()
+        try:
+            detail = res.json().get("detail", res.text[:400])
+        except Exception:
+            detail = res.text[:400]
+        return {"error": f"http_{res.status_code}", "message": detail}
 
 
 @mcp.tool(annotations=ToolAnnotations(
