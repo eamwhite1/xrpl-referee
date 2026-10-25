@@ -3219,6 +3219,10 @@ DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
 RATING_LINK_TTL_S    = 7 * 24 * 3600  # 7 days
 
+
+def escrow_status_url(escrow_id: str) -> str:
+    return f"{SITE_URL}/escrow/?id={escrow_id}"
+
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://mcp.cryptovault.co.uk/auth/google/callback")
@@ -4488,7 +4492,7 @@ async def send_worker_receipt_email(
 ):
     if not RESEND_API_KEY or not worker_email:
         return
-    worker_url   = f"{SITE_URL}?worker={escrow_id}"
+    worker_url   = escrow_status_url(escrow_id)
     preview_safe = task_preview[:300] + ("…" if len(task_preview) > 300 else "")
     amount_str   = f"{amount} {currency}"
 
@@ -4942,7 +4946,7 @@ async def send_delivery_email(
 ):
     if not RESEND_API_KEY or not buyer_email:
         return
-    collect_url = f"{SITE_URL}?collect={escrow_id}"
+    collect_url = escrow_status_url(escrow_id)
     score       = verdict.get("score", "—")
     summary     = verdict.get("summary", "Work verified by AI referee.")
     amount_str  = f"{amount} {currency}"
@@ -6992,14 +6996,43 @@ def _send_challenge_window_opened_email(vault):
     # Verdict summary for display
     ai_verdict = vault.ai_verdict or "PASS"
     score = None
+    criteria_results = None
+    submission_excerpt = None
     if vault.evaluation_verdicts:
         try:
             last = vault.evaluation_verdicts[-1] if isinstance(vault.evaluation_verdicts, list) else None
             if last and isinstance(last, dict):
                 score = last.get("score")
+                criteria_results = last.get("criteria_results") or last.get("criteria")
+                submission_excerpt = last.get("submission_excerpt") or last.get("excerpt")
         except Exception:
             pass
     score_str = f" (score: {score}/100)" if score is not None else ""
+    hours_int = int(hours) if str(hours).isdigit() else 0
+    hours_plural = f"{hours} hour{'s' if hours_int != 1 else ''}"
+    criteria_html = ""
+    if criteria_results:
+        rows = "".join(
+            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{c.get('name','—')}</td>"
+            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:{'#16a34a' if c.get('passed') else '#dc2626'}'>"
+            f"{'PASS' if c.get('passed') else 'FAIL'}</td>"
+            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{c.get('reasoning','')}</td></tr>"
+            for c in criteria_results
+        )
+        criteria_html = (
+            f"<table style='width:100%;border-collapse:collapse;margin:.75rem 0;font-size:.85rem'>"
+            f"<thead><tr>"
+            f"<th style='text-align:left;padding:.4rem .6rem;font-size:.72rem;font-weight:700;text-transform:uppercase;color:#888;border-bottom:2px solid #eee'>Criterion</th>"
+            f"<th style='text-align:left;padding:.4rem .6rem;font-size:.72rem;font-weight:700;text-transform:uppercase;color:#888;border-bottom:2px solid #eee'>Verdict</th>"
+            f"<th style='text-align:left;padding:.4rem .6rem;font-size:.72rem;font-weight:700;text-transform:uppercase;color:#888;border-bottom:2px solid #eee'>Reasoning</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table>"
+        )
+    excerpt_html = ""
+    if submission_excerpt:
+        excerpt_html = (
+            f"<div class='detail'><span>Submission excerpt</span><br>"
+            f"<em style='font-size:.85rem;color:#5c5c6e'>{str(submission_excerpt)[:300]}…</em></div>"
+        )
     try:
         resend.Emails.send({
             "from":    RESEND_FROM,
@@ -7011,12 +7044,14 @@ def _send_challenge_window_opened_email(vault):
   <h1>Work passed — challenge window open</h1>
   <p>The AI referee has reviewed the submission for escrow <strong>{vault.escrow_id}</strong>
      and returned a <strong>{ai_verdict}</strong> verdict{score_str}.</p>
-  <p>If you believe the work does not meet the criteria, you have <strong>{hours} hours</strong>
+  {criteria_html}
+  {excerpt_html}
+  <p>If you believe the work does not meet the criteria, you have <strong>{hours_plural}</strong>
      to raise a challenge. A senior Pro model will re-review the specific criteria you dispute.</p>
   <div class="detail"><span>Challenge deadline</span><br><strong>{deadline_str}</strong></div>
-  <div class="detail"><span>Challenge fee</span><br><strong>~$1.00 USD in XRP</strong> (live amount at <code>/fees</code>). Refunded if your challenge is upheld.</div>
+  <div class="detail"><span>Challenge fee</span><br><strong>~$1.00 USD in XRP</strong> (live amount at <code>/fees</code>). Refunded if your challenge succeeds; paid to the seller if PASS upheld.</div>
   <p style="font-size:.85rem;color:#5c5c6e;">
-    ⚠️ You have 15 minutes after paying the challenge fee to submit your dispute. After {hours} hours payment releases automatically to the worker.
+    ⚠️ The fee quote is valid for 30 minutes. You cannot start a challenge in the last 15 minutes of the window. After {hours_plural} payment releases automatically to the worker.
   </p>
   <a href="{challenge_url}" class="btn">Challenge this verdict →</a>
   <p style="font-size:.8rem;color:#888;margin-top:1rem;">This link is private and expires in 48 hours. Do not share it.</p>
@@ -7063,7 +7098,7 @@ def _send_challenge_submitted_email(vault):
 
 def _send_challenge_outcome_email(vault, outcome: str):
     """outcome: 'rejected' | 'upheld_remedy' | 'upheld_cancel' | 'pro_unavailable'"""
-    escrow_url = f"{SITE_URL}?escrow={vault.escrow_id}"
+    escrow_url = escrow_status_url(vault.escrow_id)
     if not RESEND_API_KEY:
         return
 
@@ -7093,7 +7128,7 @@ def _send_challenge_outcome_email(vault, outcome: str):
         recipient = vault.worker_email
         if recipient:
             criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "disputed criteria"
-            submit_url = f"{SITE_URL}?worker={vault.escrow_id}"
+            submit_url = escrow_status_url(vault.escrow_id)
             try:
                 resend.Emails.send({
                     "from":    RESEND_FROM,
@@ -7184,7 +7219,7 @@ def _send_challenge_window_expired_email(vault):
   <h1>Payment released</h1>
   <p>The challenge window for escrow <strong>{vault.escrow_id}</strong> has closed with no
      challenge from the buyer. Payment has been automatically released to your wallet.</p>
-  <a href="{SITE_URL}?worker={vault.escrow_id}" class="btn">View Escrow →</a>
+  <a href="{escrow_status_url(vault.escrow_id)}" class="btn">View Escrow →</a>
   <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
 </div></body></html>""",
         })
@@ -7205,7 +7240,7 @@ def _send_release_rating_emails(vault) -> None:
         return getattr(vault, key, default)
 
     escrow_id    = _get("escrow_id", "")
-    label        = _get("project_label") or escrow_id[:8]
+    label        = _get("project_label") or escrow_id
     buyer_email  = _get("buyer_email")
     buyer_addr   = _get("buyer_address")
     worker_email = _get("worker_email")
@@ -8475,7 +8510,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         escrow_amount = str(int(amount_xrp * 1_000_000))
 
     _referee_base_url = os.getenv("REFEREE_BASE_URL", "https://mcp.cryptovault.co.uk")
-    _worker_url = f"{SITE_URL}?worker={req.escrow_id}"
+    _worker_url = escrow_status_url(req.escrow_id)
     _criteria_summary = [
         c.get("description", c) if isinstance(c, dict) else c
         for c in (_parse_criteria_safe(req.criteria) or [])
@@ -8939,44 +8974,67 @@ async def challenge_session_get(request: Request, db: Session = Depends(get_db))
 
     ai_summary = None
     ai_score = None
+    criteria_results = None
+    submission_excerpt = None
     if vault.evaluation_verdicts:
         try:
             last = vault.evaluation_verdicts[-1] if isinstance(vault.evaluation_verdicts, list) else None
             if last and isinstance(last, dict):
                 ai_summary = last.get("summary") or last.get("reasoning")
                 ai_score = last.get("score")
+                criteria_results = last.get("criteria_results") or last.get("criteria")
+                submission_excerpt = last.get("submission_excerpt") or last.get("excerpt")
         except Exception:
             pass
 
+    now_ts = datetime.now(timezone.utc)
+    seconds_left = None
+    can_challenge = False
+    if vault.challenge_deadline:
+        dl = vault.challenge_deadline
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        secs = (dl - now_ts).total_seconds()
+        seconds_left = max(0, int(secs))
+        can_challenge = (
+            vault.status == "PASS_CHALLENGE_WINDOW"
+            and secs > 15 * 60
+            and vault.challenged_at is None
+        )
+
+    network = vault.network or "mainnet"
+    explorer_base = "https://testnet.xrpl.org" if network == "testnet" else "https://livenet.xrpl.org"
+
     return {
-        "escrow_id":        vault.escrow_id,
-        "status":           vault.status,
-        "ai_verdict":       vault.ai_verdict,
-        "ai_score":         ai_score,
-        "ai_summary":       ai_summary,
+        "escrow_id":          vault.escrow_id,
+        "status":             vault.status,
+        "ai_verdict":         vault.ai_verdict,
+        "ai_score":           ai_score,
+        "ai_summary":         ai_summary,
         "challenge_deadline": vault.challenge_deadline.isoformat() if vault.challenge_deadline else None,
         "challenge_outcome":  vault.challenge_outcome,
-        "network":          vault.network or "mainnet",
-        "task_description": vault.task_description,
-        "amount_xrp":       vault.amount_xrp,
-        "buyer_address":    vault.buyer_address,
-        "worker_address":   vault.worker_address,
+        "network":            network,
+        "task_description":   vault.task_description,
+        "amount_xrp":         vault.amount_xrp,
+        "buyer_address":      vault.buyer_address,
+        "worker_address":     vault.worker_address,
+        "seconds_left":       seconds_left,
+        "can_challenge":      can_challenge,
+        "criteria":           criteria_results,
+        "submission_excerpt": submission_excerpt,
+        "explorer_links": {
+            "release": f"{explorer_base}/transactions/{vault.finish_tx_hash}" if getattr(vault, 'finish_tx_hash', None) else None,
+            "cancel":  f"{explorer_base}/transactions/{vault.cancel_tx_hash}" if getattr(vault, 'cancel_tx_hash', None) else None,
+        },
     }
-
-
-class ChallengeSessionPrepareRequest(BaseModel):
-    challenger_address: str
-    criteria_ids:       Optional[list] = None
-    reason:             Optional[str] = None
 
 
 @app.post("/challenge/session/prepare")
 async def challenge_session_prepare(
-    req: ChallengeSessionPrepareRequest,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Prepare a challenge-fee escrow quote. Token-gated wrapper for /escrow/{id}/challenge/prepare."""
+    """Prepare a challenge-fee escrow quote. Token-gated — 401 before body validation."""
     token = _get_challenge_token_from_request(request)
     ctx = _verify_challenge_token(token, db)
     escrow_id = ctx["escrow_id"]
@@ -8984,10 +9042,17 @@ async def challenge_session_prepare(
     vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="vault_not_found")
-    if vault.buyer_address != req.challenger_address:
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    challenger_address = body.get("challenger_address") or vault.buyer_address
+
+    if challenger_address != vault.buyer_address:
         raise HTTPException(status_code=403, detail="challenger_address must match the buyer on this escrow")
 
-    inner = ChallengeQuoteRequest(challenger_address=req.challenger_address)
+    inner = ChallengeQuoteRequest(challenger_address=challenger_address)
     return await prepare_challenge(escrow_id, inner, db)
 
 
@@ -9022,39 +9087,35 @@ async def challenge_session_xaman(
         raise HTTPException(status_code=404, detail="no_active_quote — call /challenge/session/prepare first")
 
     network = vault.network or "mainnet"
-    referee_wallet = _referee_wallet_for_network(network)
 
     txjson = {
         "TransactionType": "EscrowCreate",
         "Account":         buyer_address,
-        "Destination":     referee_wallet,
+        "Destination":     vault.worker_address,
         "Amount":          str(quote.fee_drops),
         "Condition":       quote.condition,
-        "FinishAfter":     quote.finish_after_ripple,
         "CancelAfter":     quote.cancel_after_ripple,
+        "Memos": [{
+            "Memo": {
+                "MemoData": f"agenttrust-challenge:{escrow_id}".encode().hex().upper(),
+                "MemoType": "6368616C6C656E6765",
+            }
+        }],
     }
     if network == "testnet":
         txjson["NetworkID"] = 1
+        txjson["Force_Network"] = "TESTNET"
 
     payload = await xumm_create_payload(txjson)
     return {"xaman_payload": payload, "fee_drops": quote.fee_drops, "quote_id": quote.id}
 
 
-class ChallengeSessionSubmitRequest(BaseModel):
-    challenger_address: str
-    fee_tx_hash:        str
-    quote_id:           Optional[str]  = None
-    criteria_ids:       Optional[list] = None
-    reason:             Optional[str]  = None
-
-
 @app.post("/challenge/session/submit")
 async def challenge_session_submit(
-    req: ChallengeSessionSubmitRequest,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Submit a challenge after paying the fee. Token-gated wrapper for /escrow/{id}/challenge."""
+    """Submit a challenge after paying the fee. Token-gated — 401 before body validation."""
     token = _get_challenge_token_from_request(request)
     ctx = _verify_challenge_token(token, db)
     escrow_id = ctx["escrow_id"]
@@ -9062,15 +9123,28 @@ async def challenge_session_submit(
     vault = db.query(EscrowVault).filter_by(escrow_id=escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="vault_not_found")
-    if vault.buyer_address != req.challenger_address:
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    challenger_address = body.get("challenger_address") or vault.buyer_address
+    fee_tx_hash = body.get("fee_tx_hash", "")
+    quote_id = body.get("quote_id")
+    criteria_ids = body.get("criteria_ids")
+    reason = body.get("reason")
+
+    if not fee_tx_hash:
+        raise HTTPException(status_code=422, detail="fee_tx_hash is required")
+    if challenger_address != vault.buyer_address:
         raise HTTPException(status_code=403, detail="challenger_address must match the buyer on this escrow")
 
     inner = ChallengeSubmitRequest(
-        quote_id=req.quote_id,
-        fee_tx_hash=req.fee_tx_hash,
-        challenger_address=req.challenger_address,
-        criteria_ids=req.criteria_ids,
-        reason=req.reason,
+        quote_id=quote_id,
+        fee_tx_hash=fee_tx_hash,
+        challenger_address=challenger_address,
+        criteria_ids=criteria_ids,
+        reason=reason,
     )
     return await submit_challenge(escrow_id, inner, db)
 
@@ -9163,7 +9237,7 @@ def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp
         if key_rec:
             linked = db.query(LinkedWallet).filter(
                 LinkedWallet.account_id == key_rec.account_id,
-                LinkedWallet.wallet_address == seller_address,
+                LinkedWallet.xrpl_address == seller_address,
             ).first()
             if linked:
                 return True
@@ -9334,8 +9408,8 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
     evaluate_token_hash = hashlib.sha256(evaluate_token.encode()).hexdigest()
 
     criteria_v2 = _parse_criteria_safe(req.criteria)
-    pay_url     = f"{SITE_URL}?fund={escrow_id}"
-    worker_url  = f"{SITE_URL}?worker={escrow_id}"
+    pay_url     = escrow_status_url(escrow_id)
+    worker_url  = escrow_status_url(escrow_id)
 
     vault = EscrowVault(
         escrow_id           = escrow_id,
@@ -9754,7 +9828,7 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "external_url":            vault.external_url,
         "counterparty_type":       vault.counterparty_type or "agent",
         "initiated_by":            vault.initiated_by or "buyer",
-        "worker_url":              f"{SITE_URL}?worker={vault.escrow_id}",
+        "worker_url":              escrow_status_url(vault.escrow_id),
         "pass_at":                 vault.pass_at.isoformat() if vault.pass_at else None,
         # Audit trail
         "models_used":             vault.models_used,
@@ -10405,7 +10479,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             webhook_payload["delivery"] = {
                 "work":        req.work,
                 "attachments": [{"filename": a.filename, "mime_type": a.mime_type} for a in (req.worker_attachments or [])],
-                "collect_url": f"{SITE_URL}?collect={req.escrow_id}",
+                "collect_url": escrow_status_url(req.escrow_id),
                 "expires_at":  vault.delivery_expires_at.isoformat() if vault.delivery_expires_at else None,
             }
             if dex_quote:
