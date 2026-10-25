@@ -317,6 +317,25 @@ The Referee never holds funds. It only issues or withholds the cryptographic key
 
 ---
 
+## Try it Free on XRPL Testnet
+
+No fees, no real XRP required. AI audits capped at 5 per buyer per day on testnet.
+
+```python
+# 1. Get a funded testnet wallet instantly
+create_testnet_wallet()
+
+# 2. Create a test escrow (vault IDs start with TN-)
+hire_and_pay(..., network="testnet")
+
+# 3. Submit proof — PASS releases automatically
+evaluate_escrow_work(escrow_id, work, evaluate_token)
+```
+
+Explorer: [testnet.xrpl.org](https://testnet.xrpl.org). Test XRP has no monetary value. Switch to `network="mainnet"` when ready for real payments.
+
+---
+
 ## Protocol Fee
 
 Every audit costs **$0.10** (XRP, RLUSD on XRPL, or USDC on Base) paid to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. Each transaction hash is single-use (anti-replay). Wallets with trust score ≥ 25 receive 3 free audits.

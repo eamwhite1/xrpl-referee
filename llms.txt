@@ -117,7 +117,7 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 Test the full escrow flow with no real XRP:
 
     1. Create a testnet wallet: create_testnet_wallet()
-    2. Post a job with network="testnet"
-    3. hire_and_pay(..., network="testnet") — no fees, no free-credit use
-    4. evaluate_escrow_work(escrow_id, work, evaluate_token) — real AI audit (5/day limit)
-    5. Vault IDs start with "TN-"; explorer links point to testnet.xrpl.org
+    2. hire_and_pay(..., network="testnet") — no fees, no free-credit use
+    3. evaluate_escrow_work(escrow_id, work, evaluate_token) — real AI audit (5/day limit)
+    4. Vault IDs start with "TN-"; explorer links point to testnet.xrpl.org
+    Note: test XRP has no monetary value. AI audits capped at 5 per buyer per day on testnet.

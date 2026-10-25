@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 import jwt as pyjwt
 import uuid
-from pydantic import BaseModel, validator, root_validator
+from pydantic import BaseModel, Field as PydanticField, validator, root_validator
 from dotenv import load_dotenv
 import resend
 
@@ -182,15 +182,14 @@ app = FastAPI(
     version=APP_VERSION,
     docs_url=None,
     description=(
-        "Enterprise-grade AI task verification and autonomous payment rail on XRPL. "
-        "Every agent action generates a tamper-proof audit trail — cryptographic verdict, timestamp, "
-        "and XRPL transaction hash — before payment clears. Pass your compliance policy as "
-        "`task_description` or `invoice_requirements`; the AI evaluator checks work against "
-        "your specific requirements, not ours.\n\n"
-        "**Enterprise capabilities:** tamper-proof on-chain audit trail, policy-gated payment release, "
-        "collateralised accountability (funds locked before work starts), CI/CD quality gates "
-        "(GitHub Action), OFAC sanctions screening on every wallet, Travel Rule compliance "
-        "warnings above $1,000, and invoice verification with AP automation.\n\n"
+        "AI task verification and autonomous payment rail on XRPL. "
+        "Each escrow records the verdict hash, timestamp, and XRPL transaction hashes. "
+        "Pass your compliance policy as `task_description` or `invoice_requirements`; "
+        "the AI evaluator checks work against your specific requirements.\n\n"
+        "**Capabilities:** policy-gated payment release, collateralised accountability "
+        "(funds locked before work starts), CI/CD quality gates (GitHub Action), "
+        "OFAC SDN screening on every wallet, Travel Rule compliance warnings above $1,000, "
+        "and invoice verification with AP automation.\n\n"
         "**Trust layer stack:** four independent proof mechanisms buyers can require from sellers — "
         "(1) NFT from a trusted issuer, (2) XRPL domain verification, "
         "(3) W3C Verifiable Credential, (4) XRPL wallet trust score "
@@ -1119,7 +1118,7 @@ def _build_agent_card():
         "defaultOutputModes": ["application/json"],
         "authentication": {"schemes": ["none"]},
         "skills": skills,
-        "testnet": {"supported": True, "note": "Pass network='testnet' to hire_and_pay or create_escrow_vault for free testing. No fees. Explorer: testnet.xrpl.org."},
+        "testnet": {"supported": True, "note": "Pass network='testnet' to hire_and_pay or create_escrow_vault for free testing. No fees. Explorer: testnet.xrpl.org. Test XRP has no monetary value. AI audits capped at 5 per buyer per day on testnet."},
     }
 
 @app.get("/.well-known/agent-card.json")
@@ -1264,7 +1263,7 @@ async def serve_mcp_server_card():
         "tags": ["xrpl", "payments", "escrow", "ai-agent", "verification", "bounty", "autonomous", "web3", "nft", "trust", "identity"],
         "testnet": {
             "supported": True,
-            "note": "Pass network='testnet' to hire_and_pay or create_escrow_vault. Vault IDs start TN-. Explorer: testnet.xrpl.org. No fees on testnet.",
+            "note": "Pass network='testnet' to hire_and_pay or create_escrow_vault. Vault IDs start TN-. Explorer: testnet.xrpl.org. No fees on testnet. Test XRP has no monetary value. AI audits capped at 5 per buyer per day on testnet.",
         },
     }
 
@@ -3907,8 +3906,7 @@ class EscrowSetupRequest(BaseModel):
     # Webhook / metadata
     callback_url:      Optional[str]  = None  # HTTPS endpoint to receive escrow state changes
     metadata:          Optional[dict] = None  # arbitrary key/value echoed in webhook payloads
-    # Network selection — mainnet (default) or testnet
-    network:           Optional[str]  = "mainnet"  # "mainnet" | "testnet"
+    network:           Optional[str]  = PydanticField(default="mainnet", description="'mainnet' (default) or 'testnet' — free, no fees, test XRP has no value, vault IDs start with TN-.")
 
     @validator('callback_url')
     def validate_callback_url(cls, v):
@@ -4779,11 +4777,11 @@ async def send_bid_received_email(
     trust_section = ""
     if trust_score is not None:
         if trust_score >= 60:
-            badge_color = "#10b981"; badge_text = f"🟢 Trust: {trust_score}/100"
+            badge_color = "#10b981"; badge_text = f"🟢 Trust: {trust_score}/133"
         elif trust_score >= 30:
-            badge_color = "#f59e0b"; badge_text = f"🟡 Trust: {trust_score}/100"
+            badge_color = "#f59e0b"; badge_text = f"🟡 Trust: {trust_score}/133"
         else:
-            badge_color = "#ef4444"; badge_text = f"🔴 Trust: {trust_score}/100"
+            badge_color = "#ef4444"; badge_text = f"🔴 Trust: {trust_score}/133"
         signals = trust_signals or {}
         age_days = signals.get("age_days", "—")
         balance_xrp = signals.get("balance_xrp", "—")
@@ -5983,7 +5981,7 @@ async def get_wallet_score(address: str, request: Request, db: Session = Depends
 
     Returns a 0–100 trust score across 11 independent signals: account age,
     XRP balance, on-chain activity, domain verification, on-chain ownership proof,
-    multi-jurisdiction sanctions screening (AnChain.ai BEI — OFAC/UN/UK/EU/CA/AU),
+    OFAC SDN screening,
     entity reputation (XRPScan), identity KYC (Didit), NFTs held, AgentTrust escrow
     completion rate, and peer ratings from counterparties.
 
@@ -8945,7 +8943,7 @@ class EscrowRequestBody(BaseModel):
     buyer_email:             Optional[str]   = None
     callback_url:            Optional[str]   = None
     metadata:                Optional[dict]  = None
-    network:                 Optional[str]   = "mainnet"  # "mainnet" | "testnet"
+    network:                 Optional[str]   = PydanticField(default="mainnet", description="'mainnet' (default) or 'testnet' — free, no fees, test XRP has no value, vault IDs start with TN-.")
 
     @validator('callback_url')
     def validate_callback_url(cls, v):
@@ -10132,6 +10130,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 "model_used":           model_used,
                 "challenge_deadline":   vault.challenge_deadline.isoformat(),
                 "challenge_window_hrs": challenge_hrs,
+                "explorer_url":         _explorer_url(vault.escrow_tx_hash, vault.network or "mainnet"),
                 "message": (
                     f"Work passed evaluation. Payment will release automatically at "
                     f"{vault.challenge_deadline.isoformat()} unless the buyer raises a challenge before then."
@@ -12369,9 +12368,8 @@ async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session 
 @app.get("/wallet/sanctions/{address}")
 async def check_sanctions(address: str):
     """
-    Screen an XRPL wallet address against multi-jurisdiction sanctions lists.
-    Primary: AnChain.ai BEI (OFAC + UN + UK + EU + Canada + Australia + AI risk graph).
-    Fallback: US Treasury OFAC SDN XML (refreshed every 24 h).
+    Screen an XRPL wallet address against the OFAC SDN sanctions list.
+    Primary: AnChain.ai BEI when configured; fallback: US Treasury OFAC SDN XML (refreshed every 24 h).
     Returns sanctioned, risk_score, risk_level, entity, category, source.
     Always returns a result — never raises on data unavailability.
     """
