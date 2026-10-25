@@ -3690,3 +3690,39 @@ def post_bounty(
         "Total cost: $0.10 protocol fee + agreed bounty locked in escrow.\n"
         "The referee evaluates work and auto-pays on PASS — no further action needed from you."
     )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True),
+)
+async def create_testnet_wallet() -> dict:
+    """Create a fresh XRPL testnet wallet funded via the public faucet.
+
+    Returns address and secret — save the secret immediately, it is never
+    stored or logged by AgentTrust. Use this wallet to test the full escrow
+    flow with network="testnet" at no cost.
+    """
+    import xrpl.core.keypairs as kp
+    seed = kp.generate_seed()
+    pub, _ = kp.derive_keypair(seed)
+    address = kp.derive_classic_address(pub)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            res = await client.post(
+                "https://faucet.altnet.rippletest.net/accounts",
+                json={"destination": address},
+                headers={"Content-Type": "application/json"},
+            )
+        data = res.json()
+        funded_address = data.get("account", {}).get("address") or address
+        balance = data.get("balance", "unknown")
+    except Exception:
+        funded_address = address
+        balance = "faucet_error"
+    return {
+        "address": funded_address,
+        "secret": seed,
+        "balance_xrp": balance,
+        "network": "testnet",
+        "warning": "Save this secret immediately. AgentTrust never stores testnet secrets.",
+    }

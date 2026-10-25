@@ -1887,6 +1887,7 @@ class EscrowVault(Base):
     challenge_fee_finish_hash  = Column(String,   nullable=True)
     challenge_fee_finish_attempts = Column(Integer, default=0)
     challenge_fee_cancel_hash  = Column(String,   nullable=True)
+    network                    = Column(String(16), default='mainnet', server_default='mainnet')
 
 
 class ChallengeQuote(Base):
@@ -3053,6 +3054,8 @@ def run_migrations():
         "CREATE INDEX IF NOT EXISTS challenge_quote_escrow_idx ON challenge_quote (escrow_id)",
         # Unified wallet verification: ensure method column exists
         "ALTER TABLE wallet_verification ADD COLUMN IF NOT EXISTS method VARCHAR",
+        # Testnet sandbox: network column on escrow_vault
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS network VARCHAR(16) NOT NULL DEFAULT 'mainnet'",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3135,6 +3138,11 @@ XRPL_TESTNET_URL = os.getenv("XRPL_TESTNET_URL", "https://testnet.xrpl-labs.com"
 XRPL_TESTNET_SEED = os.getenv("XRPL_TESTNET_SEED")
 BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
 PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
+
+# Domain toml cache: {domain: {"expires": float, "text": str}}
+_domain_toml_cache: dict = {}
+# Testnet audit rate limit counter: {key: count}
+_testnet_audit_counter: dict = {}
 OPERATOR_WALLETS: set = set(filter(None, os.getenv("OPERATOR_WALLETS", PROTOCOL_WALLET).split(",")))
 MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
@@ -4248,7 +4256,15 @@ async def auto_finish_escrow(
         logger.warning(f"⚠️ AUTO-FINISH: could not build verdict memo for {escrow_id}: {_me}")
 
     try:
-        client    = AsyncJsonRpcClient(XRPL_URL)
+        _af_network = "mainnet"
+        try:
+            _af_db = db_session_factory()
+            _af_vault = _af_db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+            _af_network = getattr(_af_vault, "network", "mainnet") or "mainnet"
+            _af_db.close()
+        except Exception:
+            pass
+        client    = AsyncJsonRpcClient(_xrpl_url_for_network(_af_network))
         finish_tx = EscrowFinish(
             account        = referee_wallet.address,
             owner          = owner,
@@ -5487,6 +5503,87 @@ async def _fetch_nft_count(wallet_address: str) -> int:
         return 0
 
 
+def _xrpl_url_for_network(network: str) -> str:
+    """Return the correct XRPL JSON-RPC URL for the given network."""
+    if network == "testnet":
+        if not XRPL_TESTNET_SEED:
+            raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured"})
+        return XRPL_TESTNET_URL
+    return XRPL_URL
+
+
+def _explorer_url(tx_hash: str, network: str = "mainnet") -> str:
+    """Return the XRPL explorer URL for a transaction."""
+    base = "https://testnet.xrpl.org/transactions/" if network == "testnet" else "https://xrpl.org/tx/"
+    return f"{base}{tx_hash}"
+
+
+async def _fetch_activity_90d(wallet_address: str, xrpl_url: str) -> int:
+    """Count validated transactions in the last 90 days via paginated account_tx."""
+    import time as _time
+    XRPL_EPOCH = 946684800
+    cutoff = _time.time() - 90 * 86400 - XRPL_EPOCH  # XRPL epoch seconds 90 days ago
+    count = 0
+    marker = None
+    deadline = _time.monotonic() + 8.0
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for _ in range(40):  # max 40 pages * 10 = 400 tx
+            if _time.monotonic() >= deadline:
+                break
+            params: dict = {"account": wallet_address, "limit": 10,
+                            "ledger_index_min": -1, "ledger_index_max": -1}
+            if marker:
+                params["marker"] = marker
+            try:
+                res = await client.post(xrpl_url, json={"method": "account_tx", "params": [params]})
+                result = res.json().get("result", {})
+            except Exception:
+                break
+            txs = result.get("transactions", [])
+            if not txs:
+                break
+            all_before = True
+            for entry in txs:
+                tx = entry.get("tx") or entry.get("tx_json") or {}
+                date = tx.get("date") or entry.get("date")
+                if date is None:
+                    continue
+                if date >= cutoff:
+                    count += 1
+                    all_before = False
+            if all_before and marker is not None:
+                break
+            marker = result.get("marker")
+            if not marker:
+                break
+    return count
+
+
+async def _fetch_domain_toml(domain: str, wallet_address: str) -> tuple[bool, bool, str | None]:
+    """
+    Check xrp-ledger.toml for domain verification.
+    Returns (domain_claimed, domain_verified, toml_url).
+    Caches per domain for 1h.
+    """
+    import time as _time
+    toml_url = f"https://{domain}/.well-known/xrp-ledger.toml"
+    cached = _domain_toml_cache.get(domain)
+    if cached and cached["expires"] > _time.time():
+        toml_text = cached["text"]
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(toml_url)
+            toml_text = resp.text if resp.status_code == 200 else ""
+        except Exception:
+            toml_text = ""
+        _domain_toml_cache[domain] = {"expires": _time.time() + 3600, "text": toml_text}
+
+    domain_claimed = True
+    domain_verified = bool(toml_text and wallet_address in toml_text)
+    return domain_claimed, domain_verified, toml_url
+
+
 async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> dict:
     """
     AgentTrust Wallet Trust Score — 11 signals, genuine max 100.
@@ -5519,8 +5616,16 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
 
         current_ledger = info.get("ledger_current_index", 90_000_000)
         balance_xrp = int(acct.get("Balance", 0)) / 1_000_000
-        has_domain  = bool(acct.get("Domain"))
+        domain_hex  = acct.get("Domain", "")
+        has_domain  = bool(domain_hex)
         owner_count = acct.get("OwnerCount", 0)
+        # Decode domain hex to ASCII
+        domain: str | None = None
+        if has_domain:
+            try:
+                domain = bytes.fromhex(domain_hex).decode("ascii", errors="replace").strip()
+            except Exception:
+                domain = None
 
         # Account age via first transaction's date field (XRPL epoch = seconds since
         # Jan 1 2000). Using ledger arithmetic was unreliable because account_info with
@@ -5552,11 +5657,20 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         except Exception:
             pass
 
-        # Fetch NFTs and XRPScan entity data concurrently
+        # Fetch NFTs, XRPScan entity data, domain toml, and activity concurrently
         import asyncio as _asyncio
         nft_task      = _asyncio.create_task(_fetch_nft_count(wallet_address))
         xrpscan_task  = _asyncio.create_task(_get_xrpscan_account(wallet_address))
-        nft_count, xrpscan = await _asyncio.gather(nft_task, xrpscan_task)
+        activity_task = _asyncio.create_task(_fetch_activity_90d(wallet_address, XRPL_URL))
+        async def _no_domain():
+            return (False, False, None)
+        domain_task = _asyncio.create_task(
+            _fetch_domain_toml(domain, wallet_address) if domain else _no_domain()
+        )
+        nft_count, xrpscan, tx_count_90d, domain_toml_result = await _asyncio.gather(
+            nft_task, xrpscan_task, activity_task, domain_task
+        )
+        domain_claimed, domain_verified, domain_toml_url = domain_toml_result
 
         # XRPScan entity + security flags signal
         xrpscan_score   = 0
@@ -5596,26 +5710,35 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 pass
 
         # On-chain signals
-        age_score      = min(20, int(age_days / 30) * 2)       # 2 pts/month, max 20
-        balance_score  = min(15, int(balance_xrp / 10) * 3)    # 3 pts per 10 XRP, max 15
-        activity_score = min(15, int(owner_count / 5) * 2)     # 2 pts per 5 items, max 15
-        domain_score   = 10 if has_domain else 0
-        nft_score      = min(5, nft_count)                      # 1 pt per NFT, max 5
+        age_score      = min(20, int(age_days / 30) * 2)          # 2 pts/month, max 20
+        balance_score  = min(15, int(balance_xrp / 10) * 3)       # 3 pts per 10 XRP, max 15
+        activity_score = min(15, tx_count_90d // 10)               # 1 pt per 10 tx in 90 days, max 15
+        if domain_verified:
+            domain_score = 10
+        elif domain_claimed:
+            domain_score = 3
+        else:
+            domain_score = 0
+        nft_score      = min(5, nft_count)                         # 1 pt per NFT, max 5
 
         # AgentTrust platform signals (from our DB)
         completion_score = 0
         peer_score = 0
         completion_stats = {}
         peer_stats = {}
+        total_escrows = 0
+        passed_escrows = 0
+        avg_rating = 0.0
+        rating_count = 0
 
         if db:
             try:
-                # Escrow completion history
+                # Escrow completion history (mainnet only)
                 total_escrows = db.execute(text(
-                    "SELECT COUNT(*) FROM escrow_vault WHERE worker_address = :w"
+                    "SELECT COUNT(*) FROM escrow_vault WHERE worker_address = :w AND (network IS NULL OR network = 'mainnet')"
                 ), {"w": wallet_address}).scalar() or 0
                 passed_escrows = db.execute(text(
-                    "SELECT COUNT(*) FROM escrow_vault WHERE worker_address = :w AND status = 'RELEASED'"
+                    "SELECT COUNT(*) FROM escrow_vault WHERE worker_address = :w AND status = 'RELEASED' AND (network IS NULL OR network = 'mainnet')"
                 ), {"w": wallet_address}).scalar() or 0
                 if total_escrows > 0:
                     pass_rate = passed_escrows / total_escrows
@@ -5691,11 +5814,32 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
 
         total = age_score + balance_score + activity_score + domain_score + nft_score + completion_score + peer_score + wallet_sig_score + sanctions_score + xrpscan_score + agentrust_kyc_score
 
+        signals_list = [
+            {"label": "Wallet age",                       "value": f"{age_days} days",                                    "points": age_score,           "max_points": 20, "explanation": "2 pts/month, max 20 (10 months)"},
+            {"label": "Balance",                          "value": f"{round(balance_xrp, 2)} XRP",                        "points": balance_score,       "max_points": 15, "explanation": "3 pts per 10 XRP, max 15 (50 XRP)"},
+            {"label": "Activity (90 days)",               "value": f"{tx_count_90d} txs",                                 "points": activity_score,      "max_points": 15, "explanation": "1 pt per 10 transactions in last 90 days"},
+            {"label": "Domain verified",                  "value": domain or "none",                                      "points": domain_score,        "max_points": 10, "explanation": "10 pts if xrp-ledger.toml confirms wallet; 3 pts if domain set only"},
+            {"label": "NFTs",                             "value": str(nft_count),                                        "points": nft_score,           "max_points": 5,  "explanation": "1 pt per NFT held, max 5"},
+            {"label": "Escrow history",                   "value": f"{passed_escrows}/{total_escrows}",                   "points": completion_score,    "max_points": 20, "explanation": "Up to 20 pts from pass rate and volume"},
+            {"label": "Peer ratings",                     "value": f"{avg_rating:.1f}/5 ({rating_count} ratings)",        "points": peer_score,          "max_points": 15, "explanation": "Up to 15 pts from avg star rating from counterparties"},
+            {"label": "Wallet signature verified",        "value": "yes" if wallet_sig_verified else "no",                "points": wallet_sig_score,    "max_points": 8,  "explanation": "8 pts for on-chain AccountSet ownership proof"},
+            {"label": "Sanctions clear",                  "value": "yes" if sanctions_clear else "no",                    "points": sanctions_score,     "max_points": 7,  "explanation": "7 pts if no sanctions match; 0 if flagged (score zeroed)"},
+            {"label": "Identity (KYC)",                   "value": "verified" if agentrust_kyc_verified else "none",      "points": agentrust_kyc_score, "max_points": 10, "explanation": "10 pts for Didit identity verification"},
+            {"label": "XRPScan entity + security flags",  "value": xrpscan_entity or "unknown",                          "points": xrpscan_score,       "max_points": 8,  "explanation": "5 pts verified entity, up to 3 pts security hardening"},
+            {"label": "Ledger objects owned",             "value": str(owner_count),                                      "points": 0,                   "max_points": 0,  "explanation": "Info only — not scored"},
+        ]
+
         signals = {
             "age_days":              age_days,
             "balance_xrp":           round(balance_xrp, 2),
             "owner_count":           owner_count,
+            "ledger_objects_owned":  owner_count,
+            "tx_count_90d":          tx_count_90d,
             "has_domain":            has_domain,
+            "domain":                domain,
+            "domain_claimed":        domain_claimed,
+            "domain_verified":       domain_verified,
+            "domain_toml_url":       domain_toml_url,
             "nft_count":             nft_count,
             "wallet_sig_verified":   wallet_sig_verified,
             "verification_tx_hash":  verification_tx_hash,
@@ -5719,6 +5863,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
                 "entity_reputation":      xrpscan_score,
                 "identity_kyc":           agentrust_kyc_score,
             },
+            "signals_list": signals_list,
             **completion_stats,
             **peer_stats,
         }
@@ -5727,6 +5872,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
             "score": min(100, total),
             "detail": f"AgentTrust wallet trust score: {min(100,total)}/100",
             "signals": signals,
+            "signals_list": signals_list,
             "verified_issuer": verified_issuer,
         }
     except Exception as e:
@@ -7946,9 +8092,17 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             except Exception:
                 pass  # screening unavailable — don't block, log and continue
 
-    # Testnet stub — not yet fully routed
-    if getattr(req, "network", "mainnet") == "testnet":
-        raise HTTPException(status_code=501, detail={"error": "testnet_not_implemented", "reason": "Testnet escrow support is coming soon. Use mainnet for now."})
+    # Testnet: validate config is available
+    network = getattr(req, "network", "mainnet") or "mainnet"
+    if network == "testnet":
+        if not XRPL_TESTNET_SEED:
+            raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured on this instance"})
+        # Auto-generate TN- prefixed escrow_id for testnet
+        if not req.escrow_id:
+            import uuid as _uuid
+            req.escrow_id = f"TN-{_uuid.uuid4().hex[:4].upper()}-{_uuid.uuid4().hex[:4].upper()}"
+            while db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first():
+                req.escrow_id = f"TN-{_uuid.uuid4().hex[:4].upper()}-{_uuid.uuid4().hex[:4].upper()}"
 
     # Unactivated buyer check — reject before vault creation
     try:
@@ -7986,20 +8140,24 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
             detail=threshold["message"],
         )
 
-    # Tiered creation fee: $0.10 standard, $0.25 for consensus vault; each slot above 3 costs $0.05 extra.
-    is_premium = bool(req.require_consensus_vault)
-    requested_subs = max(1, min(req.max_submissions, 10))
-    extra_slots    = max(0, requested_subs - DEFAULT_MAX_SUBMISSIONS)
-    base_fee_usd   = PREMIUM_FEE_USD if is_premium else MIN_FEE_USD
-    creation_fee_usd = base_fee_usd + extra_slots * EXTRA_ATTEMPT_FEE_USD
-    creation_fee_xrp = await get_required_fee_xrp(premium=is_premium)
-    if extra_slots > 0 or is_premium:
-        price = _xrp_price_cache.get("usd") if _xrp_price_cache else None
-        creation_fee_xrp = round(creation_fee_usd / price, 6) if price and price > 0 else creation_fee_xrp + extra_slots * extra_attempt_fee_xrp()
+    # Testnet: skip all fee and free-credit logic
+    if network == "testnet":
+        fee_result = {"free_tier": False, "audits_remaining": None}
+    else:
+        # Tiered creation fee: $0.10 standard, $0.25 for consensus vault; each slot above 3 costs $0.05 extra.
+        is_premium = bool(req.require_consensus_vault)
+        requested_subs = max(1, min(req.max_submissions, 10))
+        extra_slots    = max(0, requested_subs - DEFAULT_MAX_SUBMISSIONS)
+        base_fee_usd   = PREMIUM_FEE_USD if is_premium else MIN_FEE_USD
+        creation_fee_usd = base_fee_usd + extra_slots * EXTRA_ATTEMPT_FEE_USD
+        creation_fee_xrp = await get_required_fee_xrp(premium=is_premium)
+        if extra_slots > 0 or is_premium:
+            price = _xrp_price_cache.get("usd") if _xrp_price_cache else None
+            creation_fee_xrp = round(creation_fee_usd / price, 6) if price and price > 0 else creation_fee_xrp + extra_slots * extra_attempt_fee_xrp()
 
-    fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, min_xrp=creation_fee_xrp, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature, buyer_address=req.buyer_address)
-    if response is not None and fee_result.get("payment_response_header"):
-        response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
+        fee_result = await verify_fee_payment(fee_hash=req.fee_hash, escrow_id=req.escrow_id, db=db, min_xrp=creation_fee_xrp, resource="/escrow/generate", reviewer_token=x_reviewer_token, payment_signature=payment_signature, buyer_address=req.buyer_address)
+        if response is not None and fee_result.get("payment_response_header"):
+            response.headers["PAYMENT-RESPONSE"] = fee_result["payment_response_header"]
 
     # Validate currency + amount
     currency = req.currency.upper()
@@ -8145,6 +8303,7 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         external_url           = req.external_url if (req.external_url or "").startswith("https://") else None,
         counterparty_type      = req.counterparty_type if req.counterparty_type in ("agent", "human") else "agent",
         callback_url           = req.callback_url,
+        network                = network,
     )
     if req.metadata:
         serialized = json.dumps(req.metadata)
@@ -8155,8 +8314,9 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
     db.commit()
 
     # Debit free tier credit AFTER vault is successfully created — prevents burning credits on failed vaults
+    # Skip for testnet vaults
     _free_tier_wallet = fee_result.get("_free_tier_wallet")
-    if _free_tier_wallet:
+    if _free_tier_wallet and network != "testnet":
         db.add(FreeAuditUsage(wallet_address=_free_tier_wallet, escrow_id=req.escrow_id, resource="/escrow/generate"))
         db.commit()
 
@@ -8239,7 +8399,10 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         "worker_instructions": _worker_instructions,
         "metadata":            req.metadata,
         "callback_configured": bool(req.callback_url),
+        "network":             network,
     }
+    if network == "testnet":
+        response_body["testnet_note"] = "This is a testnet escrow. No real XRP is used. Explorer links point to testnet.xrpl.org."
     if threshold.get("level") == "warn":
         response_body["compliance_warning"] = threshold["compliance_warning"]
     if currency == "XRP" and amount_xrp and amount_xrp < 1.0:
@@ -8263,7 +8426,8 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
 
     sequence = None
     try:
-        client  = AsyncJsonRpcClient(XRPL_URL)
+        _confirm_network = getattr(vault, "network", "mainnet") or "mainnet"
+        client  = AsyncJsonRpcClient(_xrpl_url_for_network(_confirm_network))
         tx_res  = await client.request(Tx(transaction=tx_hash))
         if not tx_res.is_successful():
             raise HTTPException(status_code=400, detail=f"Transaction {tx_hash} not found on the XRPL ledger.")
@@ -9045,7 +9209,8 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
         )
 
     try:
-        client     = AsyncJsonRpcClient(XRPL_URL)
+        _xrpl_url = _xrpl_url_for_network(getattr(vault, "network", "mainnet") or "mainnet")
+        client     = AsyncJsonRpcClient(_xrpl_url)
         acct_res   = await client.request(AccountInfo(account=req.buyer_address, ledger_index="current"))
         if "account_data" not in acct_res.result:
             raise HTTPException(
@@ -9164,7 +9329,8 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
 
     try:
         from xrpl.models.transactions import Transaction
-        client  = AsyncJsonRpcClient(XRPL_URL)
+        _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
+        client  = AsyncJsonRpcClient(_xrpl_url_for_network(_vault_network))
         result  = await client.request(SubmitOnly(tx_blob=tx_blob))
         res     = result.result
         engine  = res.get("engine_result", "")
@@ -9596,8 +9762,17 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 "attempts_remaining": max(0, (vault.max_submissions or 3) - vault.submission_count),
             }
 
+        # B6: Testnet AI audit rate limit — 5/buyer/day, flash only, no consensus upgrade
+        _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
+        if _vault_network == "testnet":
+            _today_key = f"testnet_audit_{vault.buyer_address}_{datetime.utcnow().date()}"
+            _audit_count = _testnet_audit_counter.get(_today_key, 0)
+            if _audit_count >= 5:
+                raise HTTPException(status_code=429, detail={"error": "testnet_audit_limit", "reason": "5 AI audits per buyer per day on testnet"})
+            _testnet_audit_counter[_today_key] = _audit_count + 1
+
         collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
-        use_consensus = bool(vault.require_consensus)
+        use_consensus = bool(vault.require_consensus) and _vault_network != "testnet"
         try:
             structured_result = await _run_structured_audit(
                 task=vault.task_description or "",
