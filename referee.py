@@ -1016,6 +1016,7 @@ def serve_llms_txt():
 
 _stats_cache: dict = {"value": None, "cached_at": 0}
 STATS_CACHE_TTL = 600  # 10 minutes
+SCORE_MAX = 133  # sum of all signal max_points
 
 
 @app.get("/stats")
@@ -1035,7 +1036,7 @@ async def get_platform_stats():
                 f"SELECT COUNT(*) FROM escrow_vault WHERE status = 'RELEASED' AND {mainnet_filter}"
             )).scalar() or 0
             total_audits = db.execute(text(
-                f"SELECT COUNT(*) FROM escrow_vault WHERE (verdict IS NOT NULL OR ai_verdict IS NOT NULL) AND {mainnet_filter}"
+                f"SELECT COUNT(*) FROM escrow_vault WHERE ai_verdict IS NOT NULL AND {mainnet_filter}"
             )).scalar() or 0
             registered_wallets = db.execute(text(
                 "SELECT COUNT(*) FROM bootstrapped_wallet"
@@ -1051,6 +1052,7 @@ async def get_platform_stats():
         _stats_cache["cached_at"] = now
         return result
     except Exception:
+        logger.exception("GET /stats failed")
         raise HTTPException(status_code=503, detail={"error": "stats unavailable"})
 
 
@@ -1068,8 +1070,9 @@ def stats_tools(days: int = 7):
                 {"day": str(r.day), "tool": r.tool, "ok_count": r.ok_count, "err_count": r.err_count}
                 for r in rows
             ]}
-    except Exception as e:
-        return {"days": days, "stats": [], "error": str(e)}
+    except Exception:
+        logger.exception("GET /stats/tools failed")
+        return {"days": days, "stats": [], "error": "stats unavailable"}
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
@@ -1267,7 +1270,24 @@ CORE_TOOLS = sorted([
 @app.get("/mcp/core-tools")
 async def mcp_core_profile():
     """Minimal tool profile for agents that want only the essential payment flow."""
-    return {"tools": CORE_TOOLS, "count": len(CORE_TOOLS)}
+    # Build enriched list from live MCP registry if available
+    all_tools: list = _server_card_tools_cache
+    if not all_tools:
+        try:
+            from mcp_server import mcp as _mcp_ref
+            all_tools = await _get_mcp_tools(_mcp_ref)
+        except Exception:
+            pass
+    tool_map = {t["name"]: t for t in all_tools} if all_tools else {}
+    enriched = []
+    for name in CORE_TOOLS:
+        entry = tool_map.get(name, {"name": name})
+        enriched.append(entry)
+    return {
+        "tools": enriched,
+        "count": len(enriched),
+        "full_schema_url": "/mcp",
+    }
 
 
 @app.get("/mcp/core")
@@ -3240,6 +3260,8 @@ GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", "https://mcp.cryptovault.co.uk/auth/google/callback")
 JWT_SECRET           = os.getenv("JWT_SECRET", secrets.token_hex(32))
+if len(JWT_SECRET.encode()) < 32:
+    logger.warning("⚠️ JWT_SECRET is shorter than 32 bytes — set a longer secret in Render environment variables")
 DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
 ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
 SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
@@ -4286,9 +4308,10 @@ async def auto_finish_escrow(
             _af_db.close()
         except Exception:
             pass
+        _af_wallet = _referee_wallet_for_network(_af_network)
         client    = AsyncJsonRpcClient(_xrpl_url_for_network(_af_network))
         finish_tx = EscrowFinish(
-            account        = referee_wallet.address,
+            account        = _af_wallet.address,
             owner          = owner,
             offer_sequence = sequence,
             fulfillment    = fulfillment.upper(),
@@ -4296,7 +4319,7 @@ async def auto_finish_escrow(
             fee            = finish_fee,
             memos          = _verdict_memos,
         )
-        result   = await async_submit_and_wait(finish_tx, client, referee_wallet)
+        result   = await async_submit_and_wait(finish_tx, client, _af_wallet)
         tx_hash  = result.result.get("hash", "unknown")
         logger.info(f"✅ AUTO-FINISH SUCCESS: {escrow_id} | hash={tx_hash[:16]}... | worker={worker_addr}")
 
@@ -5532,6 +5555,15 @@ def _xrpl_url_for_network(network: str) -> str:
             raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured"})
         return XRPL_TESTNET_URL
     return XRPL_URL
+
+
+def _referee_wallet_for_network(network: str):
+    """Return the correct referee signing wallet for the given network."""
+    if network == "testnet":
+        if not XRPL_TESTNET_SEED:
+            raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured"})
+        return Wallet.from_seed(XRPL_TESTNET_SEED)
+    return referee_wallet
 
 
 def _explorer_url(tx_hash: str, network: str = "mainnet") -> str:
@@ -7201,9 +7233,11 @@ async def _verify_challenge_fee_escrow(tx_hash: str, quote: "ChallengeQuote", va
     Returns (True, None, info_dict) on success, (False, error_msg, None) on failure.
     Destination must be vault.worker_address — referee never custodies.
     """
+    _chal_network = getattr(vault, "network", None) or "mainnet"
+    _chal_url = _xrpl_url_for_network(_chal_network)
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash, "api_version": 2}]})
+            res = await client.post(_chal_url, json={"method": "tx", "params": [{"transaction": tx_hash, "api_version": 2}]})
         data = res.json().get("result", {})
     except Exception as e:
         return False, f"XRPL lookup failed: {e}", None
@@ -7377,8 +7411,10 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
         db.commit()
 
         try:
+            _fin_network = getattr(vault, "network", None) or "mainnet"
+            _fin_wallet = _referee_wallet_for_network(_fin_network)
             finish_fee = _calc_finish_fee(fulfillment_plain)
-            xrpl_client = AsyncJsonRpcClient(XRPL_URL)
+            xrpl_client = AsyncJsonRpcClient(_xrpl_url_for_network(_fin_network))
             # Build memos
             _fee_memos = []
             if vault.challenge_verdict_hash:
@@ -7387,7 +7423,7 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                     memo_data=f"{vault.challenge_outcome}|gemini-2.5-pro|{vault.challenge_verdict_hash}".encode().hex().upper()
                 ))
             finish_tx = EscrowFinish(
-                account=referee_wallet.classic_address,
+                account=_fin_wallet.classic_address,
                 owner=vault.challenge_fee_owner,
                 offer_sequence=vault.challenge_fee_seq,
                 condition=vault.challenge_fee_condition,
@@ -7395,7 +7431,7 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                 fee=finish_fee,
                 memos=_fee_memos if _fee_memos else None,
             )
-            response = await async_submit_and_wait(finish_tx, xrpl_client, referee_wallet)
+            response = await async_submit_and_wait(finish_tx, xrpl_client, _fin_wallet)
             result = getattr(response, "result", {})
             _meta = result.get("meta") or result.get("metaData") or {}
             _tx_result = _meta.get("TransactionResult", "") if isinstance(_meta, dict) else ""
@@ -7452,14 +7488,16 @@ async def _cancel_challenge_fee_escrow(escrow_id_or_vault) -> None:
             return
 
         try:
+            _can_network = getattr(vault, "network", None) or "mainnet"
+            _can_wallet = _referee_wallet_for_network(_can_network)
             cancel_tx = EscrowCancel(
-                account=referee_wallet.classic_address,
+                account=_can_wallet.classic_address,
                 owner=vault.challenge_fee_owner,
                 offer_sequence=vault.challenge_fee_seq,
                 fee="12",
             )
-            xrpl_client = AsyncJsonRpcClient(XRPL_URL)
-            response = await async_submit_and_wait(cancel_tx, xrpl_client, referee_wallet)
+            xrpl_client = AsyncJsonRpcClient(_xrpl_url_for_network(_can_network))
+            response = await async_submit_and_wait(cancel_tx, xrpl_client, _can_wallet)
             result = getattr(response, "result", {})
             _meta = result.get("meta") or result.get("metaData") or {}
             _tx_result = _meta.get("TransactionResult", "") if isinstance(_meta, dict) else ""
@@ -9496,6 +9534,7 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "counterparty_type":       vault.counterparty_type or "agent",
         "initiated_by":            vault.initiated_by or "buyer",
         "worker_url":              f"{SITE_URL}?worker={vault.escrow_id}",
+        "pass_at":                 vault.pass_at.isoformat() if vault.pass_at else None,
         # Audit trail
         "models_used":             vault.models_used,
         "prompt_version":          vault.prompt_version,
