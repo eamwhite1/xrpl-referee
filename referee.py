@@ -14727,6 +14727,72 @@ async def _poll_expired_escrows_once():
 
 
 # ---------------------------------------------------------------------------
+# TESTNET WALLET — free funded wallet (20 creates / ip-hash / day)
+# ---------------------------------------------------------------------------
+_testnet_wallet_counter: dict = {}
+
+@app.post("/testnet/wallet", tags=["testnet"])
+async def testnet_wallet(request: Request):
+    """Create a free XRPL testnet wallet funded via the public faucet.
+
+    Returns address and seed — the seed is shown once and never stored or logged.
+    Rate-limited to 20 wallets per IP-hash per day.
+    """
+    import hashlib as _hl
+    import xrpl.core.keypairs as _kp
+
+    raw_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown").split(",")[0].strip()
+    ip_hash = _hl.sha256(raw_ip.encode()).hexdigest()[:16]
+    day_key = f"wallet_{ip_hash}_{datetime.utcnow().date()}"
+    count = _testnet_wallet_counter.get(day_key, 0)
+    if count >= 20:
+        raise HTTPException(status_code=429, detail={"error": "wallet_limit_reached", "reason": "20 testnet wallets per IP per day"})
+    _testnet_wallet_counter[day_key] = count + 1
+
+    seed = _kp.generate_seed()
+    pub, _ = _kp.derive_keypair(seed)
+    address = _kp.derive_classic_address(pub)
+
+    balance: object = "faucet_unavailable"
+    funded_address = address
+    faucet_error = None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as _fc:
+            fr = await _fc.post(
+                "https://faucet.altnet.rippletest.net/accounts",
+                json={"destination": address},
+                headers={"Content-Type": "application/json"},
+            )
+        data = fr.json()
+        funded_address = (
+            data.get("account", {}).get("classicAddress")
+            or data.get("account", {}).get("address")
+            or address
+        )
+        balance = data.get("amount", data.get("balance", "unknown"))
+    except Exception as _e:
+        faucet_error = str(_e)
+
+    result = {
+        "address": funded_address,
+        "seed": seed,
+        "balance_xrp": balance,
+        "network": "testnet",
+        "warning": "Save this seed immediately. AgentTrust never stores testnet seeds.",
+        "next_step": (
+            f"Call POST /escrow/generate with network='testnet' and buyer_address='{funded_address}' "
+            "to create a testnet escrow — no real XRP, no fees."
+        ),
+    }
+    if faucet_error:
+        result["faucet_error"] = (
+            f"Faucet request failed ({faucet_error}). "
+            "Fund manually at https://faucet.altnet.rippletest.net/accounts"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # TESTNET DEMO — one-call end-to-end flow (10 runs / ip-hash / day)
 # ---------------------------------------------------------------------------
 _testnet_demo_counter: dict = {}
@@ -14807,10 +14873,13 @@ async def testnet_demo(request: Request):
         vault_data = gen_res.json()
         evaluate_token = vault_data.get("evaluate_token")
 
-        # Step 2: prepare unsigned EscrowCreate tx
-        prep_res = await _client.post(f"/escrow/{demo_escrow_id}/prepare", json={
+        # Step 2: prepare unsigned EscrowCreate tx (route is /escrow/prepare, not /escrow/{id}/prepare)
+        prep_res = await _client.post("/escrow/prepare", json={
+            "escrow_id":     demo_escrow_id,
             "buyer_address": buyer_addr,
-            "network": "testnet",
+            "worker_address": worker_addr,
+            "amount_xrp":    2.0,
+            "network":       "testnet",
         })
         if not prep_res.is_success:
             raise HTTPException(status_code=502, detail={"error": "prepare_failed", "reason": prep_res.text[:200]})
@@ -14856,17 +14925,28 @@ async def testnet_demo(request: Request):
         else:
             verdict_data = eval_res.json()
 
+    verdict   = verdict_data.get("verdict", "UNKNOWN") if isinstance(verdict_data, dict) else "UNKNOWN"
+    score     = verdict_data.get("score") if isinstance(verdict_data, dict) else None
+    summary   = verdict_data.get("summary", "") if isinstance(verdict_data, dict) else str(verdict_data)
+
     return {
-        "demo": True,
-        "escrow_id":    demo_escrow_id,
-        "buyer_addr":   buyer_addr,
-        "worker_addr":  worker_addr,
-        "task":         _demo_task,
-        "work":         _demo_work,
-        "escrow_tx":    tx_hash,
-        "verdict":      verdict_data,
-        "network":      "testnet",
-        "note":         "All wallets and XRP are test-only. No real value was transferred.",
+        "demo":            True,
+        "escrow_id":       demo_escrow_id,
+        "evaluate_token":  evaluate_token or "",
+        "verdict":         verdict,
+        "score":           score,
+        "summary":         summary,
+        "next_call":       (
+            f"submitWork({{ escrowId: '{demo_escrow_id}', work: '...', "
+            f"evaluateToken: '{evaluate_token or ''}' }})"
+        ),
+        "buyer_addr":      buyer_addr,
+        "worker_addr":     worker_addr,
+        "task":            _demo_task,
+        "work":            _demo_work,
+        "escrow_tx":       tx_hash,
+        "network":         "testnet",
+        "note":            "All wallets and XRP are test-only. No real value was transferred.",
     }
 
 
