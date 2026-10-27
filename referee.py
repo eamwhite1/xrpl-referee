@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response, Cookie, Body
+from fastapi import FastAPI, Header, HTTPException, Depends, Request, Response, Cookie, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 import jwt as pyjwt
@@ -1944,6 +1944,9 @@ class EscrowVault(Base):
     challenge_fee_finish_attempts = Column(Integer, default=0)
     challenge_fee_cancel_hash  = Column(String,   nullable=True)
     network                    = Column(String(16), default='mainnet', server_default='mainnet')
+    # Internal traffic tagging — item 9
+    is_internal                = Column(Boolean, default=False, nullable=True)
+    source_tag                 = Column(String(32), nullable=True)  # 'demo' | 'internal' | None
 
 
 class ChallengeQuote(Base):
@@ -3061,6 +3064,9 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS network VARCHAR(16) NOT NULL DEFAULT 'mainnet'",
         # Marketplace operator flag
         "ALTER TABLE job_posting ADD COLUMN IF NOT EXISTS posted_by_operator BOOLEAN NOT NULL DEFAULT FALSE",
+        # Internal traffic tagging — item 9
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS is_internal BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS source_tag VARCHAR(32)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3236,6 +3242,14 @@ _LIFETIME_ACCESS_EMAILS = set(
     e.strip().lower()
     for e in os.getenv("LIFETIME_ACCESS_EMAILS", "").split(",")
     if e.strip()
+)
+
+# Internal traffic tagging — wallets/IPs operated by AgentTrust team
+_INTERNAL_WALLETS: set[str] = set(
+    w.strip() for w in os.getenv("INTERNAL_WALLETS", "").split(",") if w.strip()
+)
+_INTERNAL_IP_HASHES: set[str] = set(
+    h.strip() for h in os.getenv("INTERNAL_IP_HASHES", "").split(",") if h.strip()
 )
 
 if RESEND_API_KEY:
@@ -5556,11 +5570,15 @@ async def verify_vc(req: VCVerifyRequest):
 # ---------------------------------------------------------------------------
 # 11f. XRPL WALLET TRUST SCORE
 # ---------------------------------------------------------------------------
-async def _fetch_nft_count(wallet_address: str) -> int:
+async def _fetch_nft_count(wallet_address: str, network: str = "mainnet") -> int:
     """Fetch NFT count from XRPL for use in trust score."""
     try:
+        _url = _xrpl_url_for_network(network)
+    except Exception:
+        _url = XRPL_URL
+    try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.post(XRPL_URL, json={
+            r = await client.post(_url, json={
                 "method": "account_nfts",
                 "params": [{"account": wallet_address, "limit": 10}]
             })
@@ -5662,7 +5680,7 @@ async def _fetch_domain_toml(domain: str, wallet_address: str) -> tuple[bool, bo
     return domain_claimed, domain_verified, toml_url
 
 
-async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> dict:
+async def compute_xrpl_trust_score(wallet_address: str, db: Session = None, network: str = "mainnet") -> dict:
     """
     AgentTrust Wallet Trust Score — 11 signals, genuine max 100.
 
@@ -5679,9 +5697,10 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
       Entity reputation        — up to 8 pts (XRPScan: verified entity +5, security flags +1 each)
       Identity KYC             — 10 pts (Didit identity verification; human-only signal, unlocks $10k escrow cap)
     """
+    _xrpl_rpc = _xrpl_url_for_network(network or "mainnet")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            info_res = await client.post(XRPL_URL, json={
+            info_res = await client.post(_xrpl_rpc, json={
                 "method": "account_info",
                 "params": [{"account": wallet_address, "ledger_index": "validated"}]
             })
@@ -5715,7 +5734,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
         age_days = 0
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                tx_res = await client.post(XRPL_URL, json={
+                tx_res = await client.post(_xrpl_rpc, json={
                     "method": "account_tx",
                     "params": [{"account": wallet_address, "limit": 1, "forward": True,
                                 "ledger_index_min": 0, "ledger_index_max": -1}]
@@ -5737,9 +5756,9 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None) -> d
 
         # Fetch NFTs, XRPScan entity data, domain toml, and activity concurrently
         import asyncio as _asyncio
-        nft_task      = _asyncio.create_task(_fetch_nft_count(wallet_address))
+        nft_task      = _asyncio.create_task(_fetch_nft_count(wallet_address, network or "mainnet"))
         xrpscan_task  = _asyncio.create_task(_get_xrpscan_account(wallet_address))
-        activity_task = _asyncio.create_task(_fetch_activity_90d(wallet_address, XRPL_URL))
+        activity_task = _asyncio.create_task(_fetch_activity_90d(wallet_address, _xrpl_rpc))
         async def _no_domain():
             return (False, False, None)
         domain_task = _asyncio.create_task(
@@ -5974,7 +5993,7 @@ async def _score_bid_wallet(bid_id: str, wallet_address: str, session_factory):
 
 
 @app.get("/wallet/score/{address}")
-async def get_wallet_score(address: str, request: Request, db: Session = Depends(get_db)):
+async def get_wallet_score(address: str, request: Request, db: Session = Depends(get_db), network: str = Query("mainnet")):
     """
     Open reputation layer for XRPL agents and wallets.
 
@@ -5988,7 +6007,8 @@ async def get_wallet_score(address: str, request: Request, db: Session = Depends
     For bulk / programmatic use, POST /wallet/scores (fee: $0.10 per batch of up to 50).
     """
     ip = request.client.host if request.client else "unknown"
-    if not _check_score_rate_limit(ip):
+    rate_key = f"{address}:{ip}"
+    if not _check_score_rate_limit(rate_key):
         raise HTTPException(
             status_code=429,
             detail={
@@ -5998,7 +6018,8 @@ async def get_wallet_score(address: str, request: Request, db: Session = Depends
                 "bulk_docs": "https://mcp.cryptovault.co.uk/docs#/wallet/batch_wallet_scores",
             }
         )
-    result = await compute_xrpl_trust_score(address, db=db)
+    result = await compute_xrpl_trust_score(address, db=db, network=network)
+    result["network"] = network
     return result
 
 
@@ -6592,6 +6613,16 @@ def _execute_code_gates(work: str, criteria: list) -> list:
     return failures
 
 
+_CODE_GATE_VALID = {"sha256_of", "exact_match", "regex", "json_schema"}
+_CODE_GATE_REJECTED = {"http_status", "xrpl_tx"}  # always FAIL — reject at creation
+_CODE_GATE_REQUIRED_FIELDS = {
+    "exact_match": "expected_value",
+    "sha256_of":   "expected_hash",
+    "regex":       "pattern",
+    "json_schema": "schema",
+}
+
+
 def _validate_criteria_v2(criteria: list):
     """Validate criteria list at creation time. Raises HTTPException on violation."""
     import re as _re_std
@@ -6609,12 +6640,38 @@ def _validate_criteria_v2(criteria: list):
         r'|\((?:[^()|\\]*[+*])\)\{[0-9]'         # (a+){N — bounded repeat of quantified group
     )
     for c in criteria:
-        if c.get("type") == "code" and c.get("gate") == "regex":
+        if c.get("type") != "code":
+            continue
+        cid = c.get("id", "?")
+        gate = c.get("gate")
+        if not gate:
+            raise HTTPException(status_code=400, detail=f"criterion {cid}: code type requires 'gate' field (one of: {', '.join(sorted(_CODE_GATE_VALID))})")
+        if gate in _CODE_GATE_REJECTED:
+            raise HTTPException(status_code=400, detail=f"criterion {cid}: gate '{gate}' is not supported (always fails) — use one of: {', '.join(sorted(_CODE_GATE_VALID))}")
+        if gate not in _CODE_GATE_VALID:
+            raise HTTPException(status_code=400, detail=f"criterion {cid}: unknown gate '{gate}' — must be one of: {', '.join(sorted(_CODE_GATE_VALID))}")
+        required_field = _CODE_GATE_REQUIRED_FIELDS.get(gate)
+        if required_field and required_field not in c:
+            # Check for known wrong-name fields and give a helpful hint
+            wrong_fields = [k for k in c if k not in {"id", "type", "gate", "description", required_field}
+                            and k not in _CODE_GATE_REQUIRED_FIELDS.values()]
+            hint = ""
+            if wrong_fields:
+                hint = f"; unknown field '{wrong_fields[0]}' in {cid}; {gate} uses '{required_field}'"
+            raise HTTPException(status_code=400, detail=f"criterion {cid}: gate '{gate}' requires field '{required_field}'{hint}")
+        if gate == "sha256_of":
+            val = c.get("expected_hash", "")
+            if not (len(val) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in val)):
+                raise HTTPException(status_code=400, detail=f"criterion {cid}: expected_hash must be a 64-char hex string (SHA-256)")
+        if gate == "json_schema":
+            if not isinstance(c.get("schema"), dict):
+                raise HTTPException(status_code=400, detail=f"criterion {cid}: schema must be a JSON object")
+        if gate == "regex":
             pattern = c.get("pattern", "")
             if len(pattern) > 100:
-                raise HTTPException(status_code=400, detail=f"Regex pattern exceeds 100 chars in criterion {c.get('id','?')}")
+                raise HTTPException(status_code=400, detail=f"Regex pattern exceeds 100 chars in criterion {cid}")
             if _NESTED_QUANT_RE.search(pattern):
-                raise HTTPException(status_code=400, detail=f"Regex pattern may cause catastrophic backtracking (nested quantifiers) in criterion {c.get('id','?')}: {pattern!r}")
+                raise HTTPException(status_code=400, detail=f"Regex pattern may cause catastrophic backtracking (nested quantifiers) in criterion {cid}: {pattern!r}")
             try:
                 import regex as _rgx
                 _rgx.compile(pattern)
@@ -6622,9 +6679,9 @@ def _validate_criteria_v2(criteria: list):
                 try:
                     _re_std.compile(pattern)
                 except _re_std.error as _re_err:
-                    raise HTTPException(status_code=400, detail=f"Invalid regex pattern in criterion {c.get('id','?')}: {_re_err}")
+                    raise HTTPException(status_code=400, detail=f"Invalid regex pattern in criterion {cid}: {_re_err}")
             except Exception as _re_err:
-                raise HTTPException(status_code=400, detail=f"Invalid regex pattern in criterion {c.get('id','?')}: {_re_err}")
+                raise HTTPException(status_code=400, detail=f"Invalid regex pattern in criterion {cid}: {_re_err}")
 
 
 async def _fetch_url_content(url: str):
@@ -7154,7 +7211,7 @@ def _send_challenge_outcome_email(vault, outcome: str):
     You have <strong>1 remedy attempt</strong>. Fix the issues above and resubmit.
     A PASS on the remedy releases payment immediately — no further challenge window.
   </p>
-  <a href="{submit_url}" class="btn">Submit Remedy →</a>
+  <a href="{submit_url}" class="btn">View escrow →</a>
   <div class="footer">AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a></div>
 </div></body></html>""",
                 })
@@ -9115,7 +9172,7 @@ async def challenge_session_xaman(
     }
     xaman_options: dict = {"expire": 5}
     if network == "testnet":
-        xaman_options["network"] = "TESTNET"
+        xaman_options["force_network"] = "TESTNET"
 
     payload = await xumm_create_payload(txjson, options=xaman_options)
     return {"xaman_payload": payload, "fee_drops": quote.fee_drops, "quote_id": quote.id}
@@ -10511,7 +10568,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 await client.post(req.callback_url, json=webhook_payload, timeout=10.0)
             logger.info(f"📡 Webhook delivered to {req.callback_url}")
         except Exception as e:
-            logger.warning(f"⚠️ Webhook failed: {e}")
+            logger.warning(f"⚠️ Webhook failed delivery to {req.callback_url}: {e}")
 
     auto_finish_queued = is_approved and bool(vault.escrow_sequence)
     # Only expose fulfillment when auto-finish did NOT run (manual EscrowFinish needed)
@@ -10533,10 +10590,17 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         }
 
     finish_hash = (vault.release_tx_hash or getattr(vault, 'auto_finish_hash', None)) if is_approved else None
+    _used_count = vault.submission_count or 0
+    _max_subs   = vault.max_submissions or 3
     return {
         "escrow_id":            req.escrow_id,
         "status":               "approved" if is_approved else "rejected",
-        "verdict":              verdict_dict,
+        # Stable top-level shortcuts (mirrors verdict_dict for easy access)
+        "verdict":              verdict_dict.get("verdict"),
+        "score":                verdict_dict.get("score"),
+        "summary":              verdict_dict.get("details"),
+        "criteria_results":     verdict_dict.get("criteria_results"),
+        "verdict_detail":       verdict_dict,
         "model_used":           model_used,
         "fulfillment":          revealed_fulfillment if expose_fulfillment else None,
         "condition":            vault.condition if is_approved else None,
@@ -10547,10 +10611,16 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "amount_rlusd":         vault.amount_rlusd,
         "currency":             vault.currency,
         "auto_finish_queued":   auto_finish_queued,
+        # Attempt tracking
+        "attempts_used":        _used_count,
+        "attempts_remaining":   max(0, _max_subs - _used_count),
         # Proof of payment — release_status is "confirmed" if hash known now, else "pending"
         "release_status":       ("confirmed" if finish_hash else "pending") if is_approved else None,
         "release_tx_hash":      finish_hash,
         "network":              vault.network or "mainnet",
+        "escrow_tx_url":        _explorer_url(vault.escrow_tx_hash, vault.network or "mainnet"),
+        "release_explorer_url": _explorer_url(finish_hash, vault.network or "mainnet") if finish_hash else None,
+        # Legacy alias kept for backwards compat
         "explorer_url": (
             _explorer_url(finish_hash, vault.network or "mainnet")
             if finish_hash else
@@ -14752,13 +14822,14 @@ async def testnet_demo(request: Request):
 
     # Step 3: sign and submit EscrowCreate
     from xrpl.models.transactions import EscrowCreate as _EscrowCreate
+    from xrpl.transaction import sign as _xrpl_sign
 
     _tn_client = AsyncJsonRpcClient(XRPL_TESTNET_URL)
     _buyer_wallet = Wallet.from_seed(buyer_seed)
     try:
         _tx_obj = _EscrowCreate.from_dict(unsigned_tx)
         _filled_tx = await autofill(_tx_obj, _tn_client)
-        _signed_tx = _buyer_wallet.sign(_filled_tx)
+        _signed_tx = _xrpl_sign(_filled_tx, _buyer_wallet)
         _submit_res = await async_submit_and_wait(_signed_tx, _tn_client, _buyer_wallet)
         tx_hash = _submit_res.result.get("tx_json", {}).get("hash") or _submit_res.result.get("hash")
         engine = _submit_res.result.get("engine_result", "unknown")
