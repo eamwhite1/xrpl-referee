@@ -1,5 +1,9 @@
 # AgentTrust
 
+## NEW? Start free — no real XRP needed
+  create_testnet_wallet()  → free testnet wallet, 100 test XRP
+  try_testnet_demo()       → full escrow demo in one call
+
 AgentTrust is a trust-minimized payment and verification rail for agent work, built on XRPL.
 
 ## Primary use: Bring your own deal

@@ -35,7 +35,7 @@ mcp = FastMCP(
     version=APP_VERSION,
     instructions=(
         "## NEW HERE? START FOR FREE — no real XRP needed\n"
-        "  create_testnet_wallet() → get a free testnet wallet funded with 1,000 test XRP\n"
+        "  create_testnet_wallet() → get a free testnet wallet funded with 100 test XRP\n"
         "  try_testnet_demo()      → run a complete escrow flow (create, audit, release) in one call\n"
         "  Full testnet guide:     https://www.cryptovault.co.uk/testnet/\n"
         "\n"
@@ -2499,7 +2499,7 @@ async def hire_and_pay(
     if callback_url:
         vault_body["callback_url"] = callback_url
     if metadata:
-        vault_body["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else metadata
+        vault_body["metadata"] = metadata if isinstance(metadata, dict) else (json.loads(metadata) if metadata else None)
     if criteria:
         vault_body["criteria"] = criteria
     if deliverable_type != "work":
@@ -2568,8 +2568,9 @@ async def hire_and_pay(
         "evaluate_token":     evaluate_token,
         "evaluate_token_hint": "⚠ SAVE THIS TOKEN. Share it with the worker before they call evaluate_escrow_work(). It is not shown again. If lost, call reissue_evaluate_token() with proof of buyer wallet ownership.",
         "next_step": (
-            "1. Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
-            f"then call submit_escrow_transaction('{actual_escrow_id}', signed.tx_blob) to submit to XRPL. "
+            "1. Sign the 'transaction' dict with your buyer wallet "
+            "(xrpl-py 4.x: from xrpl.transaction import sign; blob = sign(tx, wallet).blob), "
+            f"then call submit_escrow_transaction('{actual_escrow_id}', blob) to submit to XRPL. "
             "2. Share evaluate_token with the worker — they must pass it to evaluate_escrow_work(). "
             "3. Worker submits work via evaluate_escrow_work() and gets paid automatically on PASS."
             + delegate_note
@@ -2602,11 +2603,9 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
       1. Call hire_and_pay() → get 'transaction' dict
       2. Sign the transaction locally:
            from xrpl.wallet import Wallet
-           from xrpl.core.keypairs import sign
-           import json, xrpl
+           from xrpl.transaction import sign
            wallet = Wallet.from_seed("sBuyerSeed")
-           signed = wallet.sign(transaction_dict)   # returns SignedTransaction
-           tx_blob = signed.tx_blob
+           tx_blob = sign(transaction_dict, wallet).blob
       3. Call submit_escrow_transaction(escrow_id, tx_blob) → vault activated, done.
 
     Args:
