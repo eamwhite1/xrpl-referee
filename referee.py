@@ -9770,7 +9770,8 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
     )
     return {
         "escrow_id":      req.escrow_id,
-        "transaction":    tx,
+        "tx_dict":        tx,
+        "transaction":    tx,   # alias kept for backwards compatibility
         "instructions": (
             "Sign this transaction with your buyer wallet and submit the signed blob to the XRPL. "
             "Then call POST /escrow/{escrow_id}/confirm with the resulting tx hash."
@@ -13224,25 +13225,45 @@ async def enterprise_payment_details(account: EnterpriseAccount = Depends(_get_c
 
 @app.post("/subscribe/xaman")
 async def subscribe_xaman_create(
+    body: dict = None,
     account: EnterpriseAccount = Depends(_get_current_account),
 ):
-    """Create a Xaman (XUMM) XRP payment payload for Pro subscription ($199/year)."""
-    price = await _get_xrp_price_usd()
-    if not price or price <= 0:
-        raise HTTPException(status_code=503, detail="XRP price unavailable — try again shortly")
-
-    amount_xrp = max(10.0, round(199.0 / price, 2))
-    drops = str(int(amount_xrp * 1_000_000))
+    """Create a Xaman (XUMM) XRP or RLUSD payment payload for Pro subscription ($199/year)."""
+    if body is None:
+        body = {}
+    currency = (body.get("currency") or "XRP").upper()
+    if currency not in ("XRP", "RLUSD"):
+        currency = "XRP"
 
     memo_type = "agenttrust-pro-sub".encode().hex().upper()
     memo_data = f"sub:{account.email or account.id}".encode().hex().upper()
+    memos = [{"Memo": {"MemoType": memo_type, "MemoData": memo_data}}]
 
-    txjson = {
-        "TransactionType": "Payment",
-        "Destination": ENTERPRISE_WALLET,
-        "Amount": drops,
-        "Memos": [{"Memo": {"MemoType": memo_type, "MemoData": memo_data}}],
-    }
+    if currency == "RLUSD":
+        txjson = {
+            "TransactionType": "Payment",
+            "Destination":     ENTERPRISE_WALLET,
+            "Amount": {
+                "currency": RLUSD_HEX,
+                "issuer":   RLUSD_ISSUER,
+                "value":    "199",
+            },
+            "Memos": memos,
+        }
+        amount_xrp = None
+        price = None
+    else:
+        price = await _get_xrp_price_usd()
+        if not price or price <= 0:
+            raise HTTPException(status_code=503, detail="XRP price unavailable — try again shortly")
+        amount_xrp = max(10.0, round(199.0 / price, 2))
+        drops = str(int(amount_xrp * 1_000_000))
+        txjson = {
+            "TransactionType": "Payment",
+            "Destination":     ENTERPRISE_WALLET,
+            "Amount":          drops,
+            "Memos":           memos,
+        }
 
     # Allow Payment type through for subscription (create payload directly, bypass EscrowCreate restriction)
     if not xumm_api_key or not xumm_api_secret:
@@ -13259,11 +13280,13 @@ async def subscribe_xaman_create(
         data = res.json()
 
     return {
-        "uuid":         data.get("uuid"),
-        "qr_png":       data.get("refs", {}).get("qr_png"),
-        "deeplink":     data.get("next", {}).get("always"),
-        "amount_xrp":   amount_xrp,
-        "amount_usd":   199,
+        "uuid":          data.get("uuid"),
+        "qr_png":        data.get("refs", {}).get("qr_png"),
+        "deeplink":      data.get("next", {}).get("always"),
+        "currency":      currency,
+        "amount_xrp":    amount_xrp,
+        "amount_rlusd":  199 if currency == "RLUSD" else None,
+        "amount_usd":    199,
         "xrp_price_usd": price,
     }
 
@@ -14963,12 +14986,15 @@ async def testnet_demo(request: Request):
     except Exception as _e:
         raise HTTPException(status_code=502, detail={"error": "sign_failed", "reason": str(_e)[:300]})
 
-    # Step 4: submit tx_blob to confirm vault is funded
+    # Step 4: confirm vault is funded on-chain (sets escrow_sequence so /evaluate can proceed)
     async with httpx.AsyncClient(base_url=_base, timeout=30.0) as _client:
-        sub_res = await _client.post(f"/escrow/{demo_escrow_id}/submit", json={"tx_blob": tx_hash})
-        # best-effort — vault may already be updated by submit_and_wait side-effects
+        await _client.post(
+            f"/escrow/{demo_escrow_id}/confirm",
+            json={"tx_hash": tx_hash or ""},
+        )
+        # best-effort — if confirm fails the vault may still be LOCKED from the submit path
 
-        # Step 5: evaluate work
+        # Step 5: evaluate work — /evaluate requires escrow_sequence to be set
         eval_res = await _client.post("/evaluate", json={
             "escrow_id":      demo_escrow_id,
             "work":           _demo_work,
@@ -14979,20 +15005,23 @@ async def testnet_demo(request: Request):
         else:
             verdict_data = eval_res.json()
 
-    verdict   = verdict_data.get("verdict", "UNKNOWN") if isinstance(verdict_data, dict) else "UNKNOWN"
-    score     = verdict_data.get("score") if isinstance(verdict_data, dict) else None
-    summary   = verdict_data.get("summary", "") if isinstance(verdict_data, dict) else str(verdict_data)
+    verdict      = verdict_data.get("verdict", "UNKNOWN") if isinstance(verdict_data, dict) else "UNKNOWN"
+    score        = verdict_data.get("score") if isinstance(verdict_data, dict) else None
+    summary      = verdict_data.get("summary", "") if isinstance(verdict_data, dict) else str(verdict_data)
+    release_hash = (verdict_data.get("release_tx_hash") or verdict_data.get("auto_finish_hash")
+                    or verdict_data.get("fulfillment_tx_hash")) if isinstance(verdict_data, dict) else None
 
     return {
         "demo":            True,
         "escrow_id":       demo_escrow_id,
-        "evaluate_token":  evaluate_token or "",
+        "evaluate_token":  "<evaluate_token>",
         "verdict":         verdict,
         "score":           score,
         "summary":         summary,
+        "release_tx":      release_hash,
         "next_call":       (
             f"submitWork({{ escrowId: '{demo_escrow_id}', work: '...', "
-            f"evaluateToken: '{evaluate_token or ''}' }})"
+            f"evaluateToken: '<evaluate_token>' }})"
         ),
         "buyer_addr":      buyer_addr,
         "worker_addr":     worker_addr,
