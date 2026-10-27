@@ -18,11 +18,12 @@ Usage in Claude Desktop / Cursor / any MCP client:
 """
 
 import asyncio
+import json
 import httpx
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Union
 
 try:
     from referee import APP_VERSION
@@ -1665,6 +1666,11 @@ async def get_wallet_trust_score(
         title="XRPL Wallet Address",
         description="The XRPL wallet address (r...) to score.",
     )],
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default) or 'testnet'. Testnet wallets score on activity within the testnet ledger.",
+        enum=["mainnet", "testnet"],
+    )] = "mainnet",
 ) -> dict:
     """
     Open reputation layer for XRPL agents — returns raw points (max 133) plus score_100 (0–100 normalised) for any wallet.
@@ -1683,7 +1689,8 @@ async def get_wallet_trust_score(
     Returns full score breakdown by signal so you can reason about why a wallet scores as it does.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
-        res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}")
+        params = {"network": network} if network != "mainnet" else {}
+        res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}", params=params)
         res.raise_for_status()
         return res.json()
 
@@ -2391,9 +2398,9 @@ async def hire_and_pay(
         title="Callback URL",
         description="HTTPS endpoint on your server to receive webhook POST notifications on escrow state changes (funded, PASS, FAIL, expired). Use this for white-label integrations where you handle all user-facing surfaces yourself. Payload: {escrow_id, event, verdict, timestamp, metadata}.",
     )] = None,
-    metadata: Annotated[Optional[str], Field(
-        title="Metadata (JSON string)",
-        description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.). Example: '{\"invoice_id\": \"INV-2026-0042\"}'.",
+    metadata: Annotated[Optional[Union[str, dict]], Field(
+        title="Metadata",
+        description="Optional key/value pairs to attach to this escrow and echo back in every webhook payload. Pass as a dict or JSON string. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.). Example: {\"invoice_id\": \"INV-2026-0042\"}.",
     )] = None,
     delegate_address: Annotated[Optional[str], Field(
         title="Delegate Agent Address (XLS-75)",
@@ -2492,7 +2499,7 @@ async def hire_and_pay(
     if callback_url:
         vault_body["callback_url"] = callback_url
     if metadata:
-        vault_body["metadata"] = metadata
+        vault_body["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else metadata
     if criteria:
         vault_body["criteria"] = criteria
     if deliverable_type != "work":

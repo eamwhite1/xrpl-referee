@@ -7089,6 +7089,7 @@ def _send_challenge_submitted_email(vault):
     A senior AI model is now re-reviewing your submission against the disputed criteria.
     You will receive another email once the review is complete.
   </p>
+  <a href="{escrow_status_url(vault.escrow_id)}" class="btn">View Escrow →</a>
   <div class="footer">
     AgentTrust · <a href="{SITE_URL}" style="color:#0066FF;">cryptovault.co.uk</a>
   </div>
@@ -8896,7 +8897,8 @@ async def submit_challenge(escrow_id: str, req: ChallengeSubmitRequest, db: Sess
             UPDATE escrow_vault
             SET status='CHALLENGED', challenged_at=:now, challenge_fee_state='LOCKED',
                 challenge_fee_owner=:fee_owner, challenge_fee_seq=:fee_seq,
-                challenge_fee_drops=:fee_drops, challenge_fee_condition=:fee_condition,
+                challenge_fee_drops=:fee_drops, challenge_fee_amount=:fee_amount,
+                challenge_fee_condition=:fee_condition,
                 challenge_fee_cancel_after=:cancel_after, challenge_quote_id=:quote_id,
                 challenge_fee_hash=:fee_hash
             WHERE escrow_id=:eid
@@ -8909,6 +8911,7 @@ async def submit_challenge(escrow_id: str, req: ChallengeSubmitRequest, db: Sess
             "fee_owner": challenger_address,
             "fee_seq": (fee_info or {}).get("seq"),
             "fee_drops": quote.fee_drops,
+            "fee_amount": round(quote.fee_drops / 1_000_000, 6),
             "fee_condition": quote.condition,
             "cancel_after": cancel_after_dt,
             "quote_id": quote.id,
@@ -10180,12 +10183,14 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         for _missing_cid in _all_crit_ids - _result_ids:
             _results.append({"criterion_id": _missing_cid, "verdict": "INCONCLUSIVE", "reasoning": "criterion not evaluated by model", "evidence_quote": None, "score": 0})
         structured_result["criteria_results"] = _results
-        # Recalculate overall from criteria (code gates take precedence)
+        # Recalculate overall from criteria (code gates take precedence; re-read after overwrite)
         _all_verdicts = [_r["verdict"] for _r in _results]
         if "FAIL" in _all_verdicts:
             structured_result["overall_verdict"] = "FAIL"
         elif "INCONCLUSIVE" in _all_verdicts:
             structured_result["overall_verdict"] = "INCONCLUSIVE"
+        elif all(v == "PASS" for v in _all_verdicts) and _all_verdicts:
+            structured_result["overall_verdict"] = "PASS"
 
         used_models_list = structured_result.get("models_used", [])
         overall_verdict = structured_result.get("overall_verdict", "INCONCLUSIVE")
@@ -14549,6 +14554,156 @@ async def _poll_expired_escrows_once():
 
 # Pollers are started in _lifespan via _hourly_db_window — @app.on_event("startup") is ignored
 # when lifespan= is set on FastAPI.
+
+
+# ---------------------------------------------------------------------------
+# TESTNET DEMO — one-call end-to-end flow (10 runs / ip-hash / day)
+# ---------------------------------------------------------------------------
+_testnet_demo_counter: dict = {}
+
+@app.post("/testnet/demo", tags=["testnet"])
+async def testnet_demo(request: Request):
+    """Run a complete testnet escrow flow server-side — no setup, no real XRP.
+
+    Creates two throwaway faucet wallets, locks 2 test-XRP in escrow,
+    submits demo work, runs AI audit, and returns the full verdict.
+    Rate-limited to 10 runs per IP-hash per day.
+    """
+    import hashlib as _hl
+    import uuid as _uuid
+
+    raw_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown").split(",")[0].strip()
+    ip_hash = _hl.sha256(raw_ip.encode()).hexdigest()[:16]
+    day_key = f"demo_{ip_hash}_{datetime.utcnow().date()}"
+    count = _testnet_demo_counter.get(day_key, 0)
+    if count >= 10:
+        raise HTTPException(status_code=429, detail={"error": "demo_limit_reached", "reason": "10 testnet demos per IP per day"})
+    _testnet_demo_counter[day_key] = count + 1
+
+    if not XRPL_TESTNET_SEED:
+        raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured"})
+
+    # Create two throwaway wallets via faucet
+    import xrpl.core.keypairs as _kp
+    buyer_seed  = _kp.generate_seed()
+    worker_seed = _kp.generate_seed()
+    buyer_pub,  buyer_priv  = _kp.derive_keypair(buyer_seed)
+    worker_pub, worker_priv = _kp.derive_keypair(worker_seed)
+    from xrpl.core.keypairs import derive_classic_address as _dca
+    buyer_addr  = _dca(buyer_pub)
+    worker_addr = _dca(worker_pub)
+
+    # Fund both wallets via faucet
+    _faucet_url = "https://faucet.altnet.rippletest.net/accounts"
+    _funded = []
+    async with httpx.AsyncClient(timeout=30.0) as _fc:
+        for addr in [buyer_addr, worker_addr]:
+            try:
+                fr = await _fc.post(_faucet_url, json={"destination": addr}, headers={"Content-Type": "application/json"})
+                _funded.append(fr.status_code)
+            except Exception:
+                _funded.append(None)
+
+    # Wait for ledger to propagate funding
+    await asyncio.sleep(4)
+
+    # Build escrow_id
+    demo_escrow_id = f"TN-{_uuid.uuid4().hex[:4].upper()}-DEMO"
+
+    # Create vault directly via internal logic (bypass HTTP round-trip)
+    from fastapi.testclient import TestClient as _TC  # noqa: only available in test context
+    # Use httpx internal call instead
+    _demo_task = "Summarise the AgentTrust escrow flow in one sentence."
+    _demo_work = ("AgentTrust locks XRP in crypto-condition escrow on XRPL, runs an AI audit on the "
+                  "submitted work, and auto-releases payment to the worker on PASS.")
+
+    # Internal base URL — call our own endpoints
+    _base = f"http://localhost:{os.getenv('PORT', '8000')}"
+    async with httpx.AsyncClient(base_url=_base, timeout=60.0) as _client:
+        # Step 1: create vault
+        gen_res = await _client.post("/escrow/generate", json={
+            "escrow_id":        demo_escrow_id,
+            "project_label":    "Testnet Demo",
+            "buyer_address":    buyer_addr,
+            "buyer_name":       "Demo Buyer",
+            "task_description": _demo_task,
+            "worker_address":   worker_addr,
+            "currency":         "XRP",
+            "amount_xrp":       2.0,
+            "network":          "testnet",
+        })
+        if not gen_res.is_success:
+            raise HTTPException(status_code=502, detail={"error": "vault_create_failed", "reason": gen_res.text[:200]})
+        vault_data = gen_res.json()
+        evaluate_token = vault_data.get("evaluate_token")
+
+        # Step 2: prepare unsigned EscrowCreate tx
+        prep_res = await _client.post(f"/escrow/{demo_escrow_id}/prepare", json={
+            "buyer_address": buyer_addr,
+            "network": "testnet",
+        })
+        if not prep_res.is_success:
+            raise HTTPException(status_code=502, detail={"error": "prepare_failed", "reason": prep_res.text[:200]})
+        prep_data = prep_res.json()
+        unsigned_tx = prep_data.get("transaction") or prep_data.get("unsigned_tx")
+
+    if not unsigned_tx:
+        raise HTTPException(status_code=502, detail={"error": "no_unsigned_tx", "reason": "prepare returned no transaction"})
+
+    # Step 3: sign and submit EscrowCreate
+    from xrpl.models.transactions import EscrowCreate as _EscrowCreate
+
+    _tn_client = AsyncJsonRpcClient(XRPL_TESTNET_URL)
+    _buyer_wallet = Wallet.from_seed(buyer_seed)
+    try:
+        _tx_obj = _EscrowCreate.from_dict(unsigned_tx)
+        _filled_tx = await autofill(_tx_obj, _tn_client)
+        _signed_tx = _buyer_wallet.sign(_filled_tx)
+        _submit_res = await async_submit_and_wait(_signed_tx, _tn_client, _buyer_wallet)
+        tx_hash = _submit_res.result.get("tx_json", {}).get("hash") or _submit_res.result.get("hash")
+        engine = _submit_res.result.get("engine_result", "unknown")
+        if engine not in ("tesSUCCESS", "terQUEUED"):
+            raise HTTPException(status_code=502, detail={"error": "escrow_submit_failed", "reason": engine})
+    except HTTPException:
+        raise
+    except Exception as _e:
+        raise HTTPException(status_code=502, detail={"error": "sign_failed", "reason": str(_e)[:200]})
+
+    # Step 4: submit tx_blob to confirm vault is funded
+    async with httpx.AsyncClient(base_url=_base, timeout=30.0) as _client:
+        sub_res = await _client.post(f"/escrow/{demo_escrow_id}/submit", json={"tx_blob": tx_hash})
+        # best-effort — vault may already be updated by submit_and_wait side-effects
+
+        # Step 5: evaluate work
+        eval_res = await _client.post("/evaluate", json={
+            "escrow_id":      demo_escrow_id,
+            "work":           _demo_work,
+            "evaluate_token": evaluate_token or "",
+        })
+        if not eval_res.is_success:
+            verdict_data = {"error": "eval_failed", "raw": eval_res.text[:300]}
+        else:
+            verdict_data = eval_res.json()
+
+    return {
+        "demo": True,
+        "escrow_id":    demo_escrow_id,
+        "buyer_addr":   buyer_addr,
+        "worker_addr":  worker_addr,
+        "task":         _demo_task,
+        "work":         _demo_work,
+        "escrow_tx":    tx_hash,
+        "verdict":      verdict_data,
+        "network":      "testnet",
+        "note":         "All wallets and XRP are test-only. No real value was transferred.",
+    }
+
+
+@app.get("/stats/testnet", tags=["testnet"])
+async def stats_testnet():
+    """Public stats for the testnet demo endpoint."""
+    total = sum(_testnet_demo_counter.values())
+    return {"total_demo_runs_today": total, "network": "testnet"}
 
 
 # ---------------------------------------------------------------------------
