@@ -9656,15 +9656,15 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
         auto_id = f"TN-{_uuid_pe.uuid4().hex[:4].upper()}-{_uuid_pe.uuid4().hex[:4].upper()}"
         gen_body: dict = {
             "escrow_id":        auto_id,
+            "buyer_name":       req.buyer_address[:12] if req.buyer_address else "Testnet buyer",
             "buyer_address":    req.buyer_address,
             "worker_address":   req.worker_address,
+            "task_description": req.task_description or "Testnet escrow (no task specified)",
             "amount_xrp":       req.amount_xrp or 1.0,
             "currency":         req.currency,
             "cancel_after_hrs": req.cancel_after_hrs,
             "network":          "testnet",
         }
-        if req.task_description:
-            gen_body["task_description"] = req.task_description
         if req.metadata:
             gen_body["metadata"] = req.metadata
         async with httpx.AsyncClient(timeout=30.0) as _gc:
@@ -14882,8 +14882,8 @@ async def testnet_demo(request: Request):
             except Exception:
                 _funded.append(None)
 
-    # Wait for ledger to propagate funding
-    await asyncio.sleep(4)
+    # Wait for testnet ledger to validate faucet funding (testnet closes ~4s/ledger; wait 2 closes)
+    await asyncio.sleep(9)
 
     # Build escrow_id
     demo_escrow_id = f"TN-{_uuid.uuid4().hex[:4].upper()}-DEMO"
@@ -14941,15 +14941,27 @@ async def testnet_demo(request: Request):
         _tx_obj = _EscrowCreate.from_xrpl(unsigned_tx)
         _filled_tx = await autofill(_tx_obj, _tn_client)
         _signed_tx = _xrpl_sign(_filled_tx, _buyer_wallet)
+        # async_submit_and_wait raises XRPLReliableSubmissionException on failure;
+        # if it returns, the tx is validated. engine_result is not present in the
+        # validated response — check meta.TransactionResult instead.
         _submit_res = await async_submit_and_wait(_signed_tx, _tn_client, _buyer_wallet)
-        tx_hash = _submit_res.result.get("tx_json", {}).get("hash") or _submit_res.result.get("hash")
-        engine = _submit_res.result.get("engine_result", "unknown")
+        tx_hash = (
+            _submit_res.result.get("tx_json", {}).get("hash")
+            or _submit_res.result.get("hash")
+            or _submit_res.result.get("transaction", {}).get("hash")
+        )
+        engine = (
+            _submit_res.result.get("engine_result")
+            or _submit_res.result.get("meta", {}).get("TransactionResult")
+            or "tesSUCCESS"  # no exception = validated success
+        )
+        logger.info(f"Demo EscrowCreate engine_result={engine} hash={tx_hash}")
         if engine not in ("tesSUCCESS", "terQUEUED"):
             raise HTTPException(status_code=502, detail={"error": "escrow_submit_failed", "reason": engine})
     except HTTPException:
         raise
     except Exception as _e:
-        raise HTTPException(status_code=502, detail={"error": "sign_failed", "reason": str(_e)[:200]})
+        raise HTTPException(status_code=502, detail={"error": "sign_failed", "reason": str(_e)[:300]})
 
     # Step 4: submit tx_blob to confirm vault is funded
     async with httpx.AsyncClient(base_url=_base, timeout=30.0) as _client:
