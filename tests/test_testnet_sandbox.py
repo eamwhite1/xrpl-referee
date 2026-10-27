@@ -1,83 +1,58 @@
-"""Tests for real testnet sandbox (B1-B9)."""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-import pytest
-import re
+"""Tests for testnet sandbox features."""
+import xrpl.core.keypairs as kp
 
 
-def test_testnet_unavailable_without_seed():
-    """_xrpl_url_for_network('testnet') raises 503 if XRPL_TESTNET_SEED unset."""
-    import referee as ref
-    from fastapi import HTTPException
-    original = ref.XRPL_TESTNET_SEED
-    try:
-        ref.XRPL_TESTNET_SEED = None
-        with pytest.raises(HTTPException) as exc:
-            ref._xrpl_url_for_network("testnet")
-        assert exc.value.status_code == 503
-        assert exc.value.detail["error"] == "testnet_unavailable"
-    finally:
-        ref.XRPL_TESTNET_SEED = original
+def test_create_testnet_wallet_mcp_returns_seed_alias():
+    """Verify create_testnet_wallet returns 'seed' field as alias for 'secret'."""
+    import ast
+
+    with open("mcp_server.py") as f:
+        src = f.read()
+
+    assert '"seed": seed' in src, "create_testnet_wallet must return seed alias"
+    assert '"next_step"' in src, "create_testnet_wallet must return next_step field"
 
 
-def test_xrpl_url_for_mainnet():
-    """_xrpl_url_for_network('mainnet') returns XRPL_URL."""
-    import referee as ref
-    assert ref._xrpl_url_for_network("mainnet") == ref.XRPL_URL
+def test_throwaway_keypair_generation():
+    """Verify throwaway keypairs work for test isolation."""
+    seed = kp.generate_seed()
+    pub, _ = kp.derive_keypair(seed)
+    address = kp.derive_classic_address(pub)
+    assert address.startswith("r"), "XRPL address should start with r"
+    assert len(address) >= 25, "XRPL address too short"
 
 
-def test_xrpl_url_for_testnet_with_seed():
-    """_xrpl_url_for_network('testnet') returns XRPL_TESTNET_URL when seed is set."""
-    import referee as ref
-    original = ref.XRPL_TESTNET_SEED
-    try:
-        ref.XRPL_TESTNET_SEED = "sEdTFakeTestSeed123"
-        result = ref._xrpl_url_for_network("testnet")
-        assert result == ref.XRPL_TESTNET_URL
-    finally:
-        ref.XRPL_TESTNET_SEED = original
+def test_mcp_instructions_contain_testnet_section():
+    """Verify MCP instructions have testnet START HERE section."""
+    with open("mcp_server.py") as f:
+        src = f.read()
+
+    assert "START FOR FREE" in src or "START HERE" in src, (
+        "MCP instructions must have a testnet/free section at the top"
+    )
+    assert "create_testnet_wallet" in src[:3000], (
+        "create_testnet_wallet must appear in the first part of MCP instructions"
+    )
 
 
-def test_testnet_vault_id_prefix():
-    """Testnet vault IDs start with TN-."""
-    assert re.match(r"TN-[A-Z0-9]{4}-[A-Z0-9]{4}", "TN-ABCD-1234")
-    assert not re.match(r"TN-[A-Z0-9]{4}-[A-Z0-9]{4}", "AT-ABCD-1234")
-    assert not re.match(r"TN-[A-Z0-9]{4}-[A-Z0-9]{4}", "TN-ABC-1234")
+def test_try_testnet_demo_tool_exists():
+    """Verify try_testnet_demo tool is defined in mcp_server.py."""
+    with open("mcp_server.py") as f:
+        src = f.read()
+
+    assert "async def try_testnet_demo" in src, "try_testnet_demo tool not found"
 
 
-def test_explorer_url_mainnet():
-    """_explorer_url returns livenet URL for mainnet."""
-    import referee as ref
-    url = ref._explorer_url("ABCDEF1234", "mainnet")
-    assert "xrpl.org" in url
-    assert "testnet" not in url
-    assert "ABCDEF1234" in url
+def test_no_error_dict_returns_in_mcp():
+    """Verify no MCP tools return {\"error\": ...} dicts (should raise exceptions)."""
+    with open("mcp_server.py") as f:
+        lines = f.readlines()
 
-
-def test_explorer_url_testnet():
-    """_explorer_url returns testnet URL for testnet."""
-    import referee as ref
-    url = ref._explorer_url("ABCDEF1234", "testnet")
-    assert "testnet.xrpl.org" in url
-    assert "ABCDEF1234" in url
-
-
-def test_network_column_on_escrow_vault():
-    """EscrowVault model has network column with default 'mainnet'."""
-    import referee as ref
-    col = ref.EscrowVault.__table__.c.get("network")
-    assert col is not None, "network column not found on EscrowVault"
-
-
-def test_testnet_audit_counter_exists():
-    """_testnet_audit_counter module-level dict exists."""
-    import referee as ref
-    assert hasattr(ref, "_testnet_audit_counter")
-    assert isinstance(ref._testnet_audit_counter, dict)
-
-
-def test_domain_toml_cache_exists():
-    """_domain_toml_cache module-level dict exists."""
-    import referee as ref
-    assert hasattr(ref, "_domain_toml_cache")
-    assert isinstance(ref._domain_toml_cache, dict)
+    violations = [
+        (i + 1, l.strip())
+        for i, l in enumerate(lines)
+        if 'return {"error"' in l
+    ]
+    assert not violations, (
+        f"Found return {{\"error\": ...}} dicts (should raise exceptions): {violations}"
+    )

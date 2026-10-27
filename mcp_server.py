@@ -18,11 +18,12 @@ Usage in Claude Desktop / Cursor / any MCP client:
 """
 
 import asyncio
+import json
 import httpx
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Union
 
 try:
     from referee import APP_VERSION
@@ -33,6 +34,11 @@ mcp = FastMCP(
     name="AgentTrust Referee",
     version=APP_VERSION,
     instructions=(
+        "## NEW HERE? START FOR FREE — no real XRP needed\n"
+        "  create_testnet_wallet() → get a free testnet wallet funded with 1,000 test XRP\n"
+        "  try_testnet_demo()      → run a complete escrow flow (create, audit, release) in one call\n"
+        "  Full testnet guide:     https://www.cryptovault.co.uk/testnet/\n"
+        "\n"
         "## CORE FLOW\n"
         "1. get_wallet_setup_guide() — secure wallet setup (seed stays local)\n"
         "2. get_fees() — live fee schedule before any paid call\n"
@@ -195,9 +201,9 @@ async def audit_task(
             },
         )
         if res.status_code == 402:
-            return {"error": "Payment required. Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR or $0.10 USDC on Base, then provide the tx hash as fee_hash."}
+            raise ValueError("payment_required: Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR or $0.10 USDC on Base, then provide the tx hash as fee_hash.")
         if res.status_code == 403:
-            return {"error": "This fee_hash has already been used. Each payment hash is single-use."}
+            raise ValueError("fee_already_used: This fee_hash has already been used. Each payment hash is single-use.")
         res.raise_for_status()
         return res.json()
 
@@ -449,13 +455,17 @@ async def create_escrow_vault(
                 data = res.json()
             except Exception:
                 data = {}
-            return {"error": "payment_required", "message": "Protocol fee required. Pay $0.10 (XRP or RLUSD to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and pass the tx hash as fee_hash.", "detail": data.get("detail", data)}
+            raise ValueError(
+                "payment_required: Protocol fee required. Pay $0.10 (XRP or RLUSD to "
+                "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and "
+                f"pass the tx hash as fee_hash. Detail: {data.get('detail', data)}"
+            )
         if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
                 detail = res.text[:400]
-            return {"error": f"http_{res.status_code}", "message": detail}
+            raise RuntimeError(f"http_{res.status_code}: {detail}")
         return res.json()
 
 
@@ -617,29 +627,32 @@ async def evaluate_escrow_work(
         res = await client.post(f"{REFEREE_BASE}/evaluate", json=body)
         if res.status_code == 429:
             data = res.json()
-            return {
-                "error":   "submission_limit_reached",
-                "message": data.get("detail", "Submission limit reached."),
-                "hint":    "Purchase an extra attempt for 0.05 XRP via POST /evaluate/purchase-attempt",
-            }
+            raise ValueError(
+                f"submission_limit_reached: {data.get('detail', 'Submission limit reached.')} "
+                "Purchase an extra attempt for 0.05 XRP via purchase_extra_attempt()."
+            )
         if res.status_code == 402:
             try:
                 data = res.json()
             except Exception:
                 data = {}
-            return {"error": "payment_required", "message": "Protocol fee required. Pay $0.10 (XRP or RLUSD to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and pass the tx hash as fee_hash.", "detail": data.get("detail", data)}
+            raise ValueError(
+                "payment_required: Protocol fee required. Pay $0.10 (XRP or RLUSD to "
+                "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR, or USDC on Base chain 8453) and "
+                f"pass the tx hash as fee_hash. Detail: {data.get('detail', data)}"
+            )
         if res.status_code == 403:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
                 detail = res.text[:400]
-            return {"error": "forbidden", "message": detail}
+            raise PermissionError(f"forbidden: {detail}")
         if not res.is_success:
             try:
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
                 detail = res.text[:400]
-            return {"error": f"http_{res.status_code}", "message": detail}
+            raise RuntimeError(f"http_{res.status_code}: {detail}")
         return res.json()
 
 
@@ -713,7 +726,7 @@ async def prepare_challenge_escrow(
     """
     import os as _os
     if _os.getenv("CHALLENGES_ENABLED", "true").lower() != "true":
-        return {"error": "challenges_disabled"}
+        raise ValueError('challenges_disabled')
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/{escrow_id}/challenge/prepare",
@@ -725,7 +738,7 @@ async def prepare_challenge_escrow(
             detail = res.json().get("detail", res.text[:400])
         except Exception:
             detail = res.text[:400]
-        return {"error": f"http_{res.status_code}", "message": detail}
+        raise RuntimeError(f"http_{res.status_code}: {detail}")
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -783,7 +796,7 @@ async def challenge_escrow_verdict(
     """
     import os as _os
     if _os.getenv("CHALLENGES_ENABLED", "true").lower() != "true":
-        return {"error": "challenges_disabled"}
+        raise ValueError('challenges_disabled')
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(
             f"{REFEREE_BASE}/escrow/{escrow_id}/challenge",
@@ -801,7 +814,7 @@ async def challenge_escrow_verdict(
             detail = res.json().get("detail", res.text[:400])
         except Exception:
             detail = res.text[:400]
-        return {"error": f"http_{res.status_code}", "message": detail}
+        raise RuntimeError(f"http_{res.status_code}: {detail}")
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -850,7 +863,7 @@ async def reissue_evaluate_token(
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
                 detail = res.text[:400]
-            return {"error": f"http_{res.status_code}", "message": detail}
+            raise RuntimeError(f"http_{res.status_code}: {detail}")
         return res.json()
 
 
@@ -881,12 +894,12 @@ async def get_escrow_info(
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/escrow/{escrow_id}")
         if res.status_code == 404:
-            return {"error": "not_found", "message": f"No escrow found with id {escrow_id}"}
+            raise ValueError(f"not_found: No escrow found with id {escrow_id}")
         if not res.is_success:
             try:
-                return {"error": "request_failed", "status": res.status_code, "detail": res.json()}
+                raise RuntimeError(f"request_failed http_{res.status_code}: {res.json()}")
             except Exception:
-                return {"error": "request_failed", "status": res.status_code, "detail": res.text}
+                raise RuntimeError(f"request_failed http_{res.status_code}: {res.text}")
         return res.json()
 
 
@@ -1125,7 +1138,7 @@ async def create_skill_listing(
             },
         )
         if res.status_code == 402:
-            return {"error": "Payment required. Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR or $0.10 USDC on Base, then provide the tx hash as fee_hash."}
+            raise ValueError('Payment required. Send $0.10 (XRP or RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR or $0.10 USDC on Base, then provide the tx hash as fee_hash.')
         res.raise_for_status()
         return res.json()
 
@@ -1163,7 +1176,7 @@ async def direct_hire(
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/marketplace/skills/{skill_id}")
         if res.status_code == 404:
-            return {"error": "not_found", "message": f"Skill listing '{skill_id}' not found."}
+            raise ValueError(f"not_found: Skill listing '{skill_id}' not found.")
         res.raise_for_status()
         data = res.json()
         if data.get("is_expired"):
@@ -1464,12 +1477,12 @@ async def view_job(
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/jobs/{job_id}")
         if res.status_code == 404:
-            return {"error": "not_found", "message": f"No job found with id {job_id}"}
+            raise ValueError(f"not_found: No job found with id {job_id}")
         if not res.is_success:
             try:
-                return {"error": "request_failed", "status": res.status_code, "detail": res.json()}
+                raise RuntimeError(f"request_failed http_{res.status_code}: {res.json()}")
             except Exception:
-                return {"error": "request_failed", "status": res.status_code, "detail": res.text}
+                raise RuntimeError(f"request_failed http_{res.status_code}: {res.text}")
         return res.json()
 
 
@@ -1520,10 +1533,10 @@ async def award_job(
         )
         if res.status_code == 403:
             data = res.json()
-            return {"error": "not_authorized", "message": data.get("detail", "Invalid award_token or not the job poster.")}
+            raise ValueError(f"not_authorized: {data.get('detail', 'Invalid award_token or not the job poster.')}")
         if res.status_code == 409:
             data = res.json()
-            return {"error": "not_open", "message": data.get("detail", "Job is not open.")}
+            raise ValueError(f"not_open: {data.get('detail', 'Job is not open.')}")
         res.raise_for_status()
         return res.json()
 
@@ -1560,7 +1573,7 @@ async def check_wallet_sanctions(
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.get(f"{REFEREE_BASE}/wallet/sanctions/{wallet_address}")
         if res.status_code == 400:
-            return {"error": "invalid_address", "message": res.json().get("detail", "Invalid XRPL address")}
+            raise ValueError(f"invalid_address: {res.json().get('detail', 'Invalid XRPL address')}")
         res.raise_for_status()
         return res.json()
 
@@ -1653,6 +1666,11 @@ async def get_wallet_trust_score(
         title="XRPL Wallet Address",
         description="The XRPL wallet address (r...) to score.",
     )],
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default) or 'testnet'. Testnet wallets score on activity within the testnet ledger.",
+        enum=["mainnet", "testnet"],
+    )] = "mainnet",
 ) -> dict:
     """
     Open reputation layer for XRPL agents — returns raw points (max 133) plus score_100 (0–100 normalised) for any wallet.
@@ -1671,7 +1689,8 @@ async def get_wallet_trust_score(
     Returns full score breakdown by signal so you can reason about why a wallet scores as it does.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
-        res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}")
+        params = {"network": network} if network != "mainnet" else {}
+        res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}", params=params)
         res.raise_for_status()
         return res.json()
 
@@ -2224,11 +2243,11 @@ async def claim_job(
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(f"{REFEREE_BASE}/jobs/{job_id}/claim", json=body)
         if res.status_code == 403:
-            return {"error": "not_claimable", "message": res.json().get("detail", "Job is not directly claimable. Use submit_bid() instead.")}
+            raise ValueError(f"not_claimable: {res.json().get('detail', 'Job is not directly claimable. Use submit_bid() instead.')}")
         if res.status_code == 409:
-            return {"error": "not_open", "message": res.json().get("detail", "Job is not open.")}
+            raise ValueError(f"not_open: {res.json().get('detail', 'Job is not open.')}")
         if res.status_code == 404:
-            return {"error": "not_found", "message": f"Job '{job_id}' not found."}
+            raise ValueError(f"not_found: Job '{job_id}' not found.")
         res.raise_for_status()
         return res.json()
 
@@ -2298,9 +2317,9 @@ async def prepare_escrow(
             json=body,
         )
         if res.status_code == 404:
-            return {"error": "not_found", "message": f"Escrow '{escrow_id}' not found. Call create_escrow_vault() first."}
+            raise ValueError(f"not_found: Escrow '{escrow_id}' not found. Call create_escrow_vault() first.")
         if res.status_code == 502:
-            return {"error": "xrpl_unavailable", "message": res.json().get("detail", "Could not fetch XRPL account info.")}
+            raise ValueError(f"xrpl_unavailable: {res.json().get('detail', 'Could not fetch XRPL account info.')}")
         res.raise_for_status()
         return res.json()
 
@@ -2379,9 +2398,9 @@ async def hire_and_pay(
         title="Callback URL",
         description="HTTPS endpoint on your server to receive webhook POST notifications on escrow state changes (funded, PASS, FAIL, expired). Use this for white-label integrations where you handle all user-facing surfaces yourself. Payload: {escrow_id, event, verdict, timestamp, metadata}.",
     )] = None,
-    metadata: Annotated[Optional[str], Field(
-        title="Metadata (JSON string)",
-        description="Optional JSON string of key/value pairs to attach to this escrow and echo back in every webhook payload. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.). Example: '{\"invoice_id\": \"INV-2026-0042\"}'.",
+    metadata: Annotated[Optional[Union[str, dict]], Field(
+        title="Metadata",
+        description="Optional key/value pairs to attach to this escrow and echo back in every webhook payload. Pass as a dict or JSON string. Use to round-trip your own reference numbers (invoice_id, po_number, tenant_id, order_ref, etc.). Example: {\"invoice_id\": \"INV-2026-0042\"}.",
     )] = None,
     delegate_address: Annotated[Optional[str], Field(
         title="Delegate Agent Address (XLS-75)",
@@ -2480,7 +2499,7 @@ async def hire_and_pay(
     if callback_url:
         vault_body["callback_url"] = callback_url
     if metadata:
-        vault_body["metadata"] = metadata
+        vault_body["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else metadata
     if criteria:
         vault_body["criteria"] = criteria
     if deliverable_type != "work":
@@ -2506,7 +2525,7 @@ async def hire_and_pay(
                 "accepts": data.get("accepts", []),
             }
         if vault_res.status_code != 200:
-            return {"error": "vault_creation_failed", "message": vault_res.text[:300]}
+            raise RuntimeError(f"vault_creation_failed: {vault_res.text[:300]}")
 
         vault_data = vault_res.json()
         actual_escrow_id = vault_data.get("escrow_id") or escrow_id
@@ -2550,7 +2569,7 @@ async def hire_and_pay(
         "evaluate_token_hint": "⚠ SAVE THIS TOKEN. Share it with the worker before they call evaluate_escrow_work(). It is not shown again. If lost, call reissue_evaluate_token() with proof of buyer wallet ownership.",
         "next_step": (
             "1. Sign the 'transaction' dict with your buyer wallet (xrpl-py: wallet.sign(tx)), "
-            f"then call submit_escrow_transaction('{escrow_id}', signed.tx_blob) to submit to XRPL. "
+            f"then call submit_escrow_transaction('{actual_escrow_id}', signed.tx_blob) to submit to XRPL. "
             "2. Share evaluate_token with the worker — they must pass it to evaluate_escrow_work(). "
             "3. Worker submits work via evaluate_escrow_work() and gets paid automatically on PASS."
             + delegate_note
@@ -2601,7 +2620,7 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
         )
     if res.status_code == 200:
         return res.json()
-    return {"error": res.status_code, "detail": res.text[:300]}
+    raise RuntimeError(f"http_{res.status_code}: {res.text[:300]}")
 
 
 # ---------------------------------------------------------------------------
@@ -2730,7 +2749,7 @@ async def request_escrow(
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
                 detail = res.text[:400]
-            return {"error": f"http_{res.status_code}", "message": detail}
+            raise RuntimeError(f"http_{res.status_code}: {detail}")
         return res.json()
 
 
@@ -2862,7 +2881,7 @@ async def register_wallet_free_tier(
                 detail = res.json().get("detail", res.text[:400])
             except Exception:
                 detail = res.text[:400]
-            return {"error": f"http_{res.status_code}", "message": detail}
+            raise RuntimeError(f"http_{res.status_code}: {detail}")
         return res.json()
 
 
@@ -3083,7 +3102,7 @@ async def fund_xrpl_wallet_via_coinbase(
         }
 
     if usd_amount < 2.0:
-        return {"error": "amount_too_low", "message": "Minimum $2 USD to cover 1 XRP reserve + Coinbase fees."}
+        raise ValueError("amount_too_low: Minimum $2 USD to cover 1 XRP reserve + Coinbase fees.")
 
     base = "https://api.coinbase.com"
 
@@ -3097,7 +3116,7 @@ async def fund_xrpl_wallet_via_coinbase(
             # Step 1 — list accounts, find USD account with sufficient balance
             r = await cb.get(f"{base}/v2/accounts", headers=_headers("GET", "/v2/accounts"))
             if r.status_code != 200:
-                return {"error": "accounts_failed", "status": r.status_code, "detail": r.text[:300]}
+                raise RuntimeError(f"accounts_failed http_{r.status_code}: {r.text[:300]}")
 
             accounts    = r.json().get("data", [])
             usd_account = next(
@@ -3120,7 +3139,7 @@ async def fund_xrpl_wallet_via_coinbase(
             buy_body = _json.dumps({"amount": str(round(usd_amount, 2)), "currency": "USD", "payment_method": "default", "total": "true"})
             r2 = await cb.post(f"{base}{buy_path}", headers=_headers("POST", buy_path, buy_body), content=buy_body)
             if r2.status_code not in (200, 201):
-                return {"error": "buy_failed", "status": r2.status_code, "detail": r2.text[:300]}
+                raise RuntimeError(f"buy_failed http_{r2.status_code}: {r2.text[:300]}")
 
             buy_data = r2.json().get("data", {})
             buy_id   = buy_data.get("id")
@@ -3182,7 +3201,7 @@ async def fund_xrpl_wallet_via_coinbase(
         }
 
     except Exception as e:
-        return {"error": "unexpected", "detail": str(e)}
+        raise RuntimeError(f"unexpected: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -3763,13 +3782,58 @@ async def create_testnet_wallet() -> dict:
             or address
         )
         balance = data.get("amount", data.get("balance", "unknown"))
-    except Exception:
+    except Exception as _faucet_err:
         funded_address = address
-        balance = "faucet_error"
-    return {
+        balance = "faucet_unavailable"
+        _faucet_error = str(_faucet_err)
+    else:
+        _faucet_error = None
+    result = {
         "address": funded_address,
         "secret": seed,
+        "seed": seed,  # alias for xrpl-py Wallet.from_seed()
         "balance_xrp": balance,
         "network": "testnet",
         "warning": "Save this secret immediately. AgentTrust never stores testnet secrets.",
+        "next_step": (
+            f"Call hire_and_pay(task='describe the work', buyer_address='{funded_address}', "
+            f"amount_xrp=5.0, worker_address='rWorkerAddress...', network='testnet') "
+            "to create a testnet escrow — no real XRP, no fees."
+        ),
     }
+    if _faucet_error:
+        result["faucet_error"] = (
+            f"Faucet request failed ({_faucet_error}). "
+            "You can fund manually at https://faucet.altnet.rippletest.net/accounts"
+        )
+    return result
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Try Testnet Demo",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def try_testnet_demo() -> dict:
+    """Run a complete end-to-end testnet escrow demo in one call.
+
+    Creates two wallets, posts a demo task, locks payment in testnet escrow,
+    submits demo work, and returns the full AI audit verdict — all with test XRP,
+    zero real cost, and no setup required.
+
+    Returns the full flow result including escrow_id, verdict, and next steps.
+    """
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/testnet/demo",
+            headers={"Content-Type": "application/json"},
+        )
+        if not res.is_success:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            raise RuntimeError(f"Testnet demo failed http_{res.status_code}: {detail}")
+        return res.json()
