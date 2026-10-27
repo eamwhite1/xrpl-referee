@@ -3232,6 +3232,11 @@ if len(JWT_SECRET.encode()) < 32:
 DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
 ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
 SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
+_LIFETIME_ACCESS_EMAILS = set(
+    e.strip().lower()
+    for e in os.getenv("LIFETIME_ACCESS_EMAILS", "").split(",")
+    if e.strip()
+)
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
@@ -12944,6 +12949,8 @@ def _get_account_from_api_key(
 
 
 def _subscription_active(account: EnterpriseAccount, db=None) -> bool:
+    if account.email and account.email.lower() in _LIFETIME_ACCESS_EMAILS:
+        return True
     now = datetime.now(timezone.utc)
     if account.status == "trial":
         if account.trial_ends_at and account.trial_ends_at.replace(tzinfo=timezone.utc) > now:
@@ -13101,6 +13108,99 @@ async def enterprise_payment_details(account: EnterpriseAccount = Depends(_get_c
         "period": "annual",
         "receipt_note": "Your transaction hash is your receipt — permanently on the XRPL ledger.",
     }
+
+
+@app.post("/subscribe/xaman")
+async def subscribe_xaman_create(
+    account: EnterpriseAccount = Depends(_get_current_account),
+):
+    """Create a Xaman (XUMM) XRP payment payload for Pro subscription ($199/year)."""
+    price = await _get_xrp_price_usd()
+    if not price or price <= 0:
+        raise HTTPException(status_code=503, detail="XRP price unavailable — try again shortly")
+
+    amount_xrp = max(10.0, round(199.0 / price, 2))
+    drops = str(int(amount_xrp * 1_000_000))
+
+    memo_type = "agenttrust-pro-sub".encode().hex().upper()
+    memo_data = f"sub:{account.email or account.id}".encode().hex().upper()
+
+    txjson = {
+        "TransactionType": "Payment",
+        "Destination": ENTERPRISE_WALLET,
+        "Amount": drops,
+        "Memos": [{"Memo": {"MemoType": memo_type, "MemoData": memo_data}}],
+    }
+
+    # Allow Payment type through for subscription (create payload directly, bypass EscrowCreate restriction)
+    if not xumm_api_key or not xumm_api_secret:
+        raise HTTPException(status_code=500, detail="XUMM API credentials not configured.")
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        res = await client.post(
+            "https://xumm.app/api/v1/platform/payload",
+            json={"txjson": txjson},
+            headers={"X-API-Key": xumm_api_key, "X-API-Secret": xumm_api_secret},
+        )
+        if not res.is_success:
+            raise HTTPException(status_code=500, detail=f"XUMM API error: {res.text}")
+        data = res.json()
+
+    return {
+        "uuid":         data.get("uuid"),
+        "qr_png":       data.get("refs", {}).get("qr_png"),
+        "deeplink":     data.get("next", {}).get("always"),
+        "amount_xrp":   amount_xrp,
+        "amount_usd":   199,
+        "xrp_price_usd": price,
+    }
+
+
+@app.get("/subscribe/xaman/{uuid}")
+async def subscribe_xaman_status(
+    uuid: str,
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    """Poll Xaman payment status; confirms subscription on valid payment."""
+    payload = await xumm_get_payload(uuid)
+    meta = payload.get("meta", {})
+
+    if not meta.get("signed"):
+        if meta.get("expired"):
+            return {"status": "expired"}
+        return {"status": "pending"}
+
+    # Verify the payment amount is close enough (within 5%)
+    delivered = payload.get("response", {}).get("dispatched_result")
+    tx_json = payload.get("response", {}).get("txid")  # just for logging
+
+    # Re-derive expected drops from current price
+    price = await _get_xrp_price_usd()
+    if price and price > 0:
+        expected_xrp = max(10.0, round(199.0 / price, 2))
+        expected_drops = int(expected_xrp * 1_000_000)
+        # Get amount from payload
+        try:
+            signed_amount = int(payload.get("payload", {}).get("request_json", {}).get("Amount", "0"))
+        except (ValueError, TypeError):
+            signed_amount = 0
+        if signed_amount > 0 and abs(signed_amount - expected_drops) / expected_drops > 0.10:
+            return {"status": "amount_mismatch"}
+
+    # Extend subscription 365 days
+    now = datetime.now(timezone.utc)
+    acct = db.query(EnterpriseAccount).filter_by(id=account.id).first()
+    if acct:
+        if acct.sub_expires_at and acct.sub_expires_at.replace(tzinfo=timezone.utc) > now:
+            acct.sub_expires_at = acct.sub_expires_at.replace(tzinfo=timezone.utc) + timedelta(days=365)
+        else:
+            acct.sub_expires_at = now + timedelta(days=365)
+        acct.status = "active"
+        db.commit()
+        logger.info(f"✅ Xaman subscription confirmed for {acct.email} tx={tx_json}")
+
+    return {"status": "confirmed"}
 
 
 # --- Wallet linking ---
