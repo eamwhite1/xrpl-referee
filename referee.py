@@ -13225,7 +13225,7 @@ async def enterprise_payment_details(account: EnterpriseAccount = Depends(_get_c
 
 @app.post("/subscribe/xaman")
 async def subscribe_xaman_create(
-    body: dict = None,
+    body: dict = Body(default=None),
     account: EnterpriseAccount = Depends(_get_current_account),
 ):
     """Create a Xaman (XUMM) XRP or RLUSD payment payload for Pro subscription ($199/year)."""
