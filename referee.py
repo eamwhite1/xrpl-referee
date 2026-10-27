@@ -5,7 +5,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.1"
+APP_VERSION = "7.0.2"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -3766,14 +3766,17 @@ if xumm_api_key:
 else:
     logger.error("❌ XUMM_API_KEY missing!")
 
-async def xumm_create_payload(txjson: dict) -> dict:
+async def xumm_create_payload(txjson: dict, options: dict | None = None) -> dict:
     """Create a XUMM payload via direct REST API call. Returns {nextUrl, uuid, qr}."""
     if not xumm_api_key or not xumm_api_secret:
         raise HTTPException(status_code=500, detail="XUMM API credentials not configured.")
+    payload_body: dict = {"txjson": txjson}
+    if options:
+        payload_body["options"] = options
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(
             "https://xumm.app/api/v1/platform/payload",
-            json={"txjson": txjson},
+            json=payload_body,
             headers={
                 "X-API-Key":    xumm_api_key,
                 "X-API-Secret": xumm_api_secret,
@@ -7013,10 +7016,10 @@ def _send_challenge_window_opened_email(vault):
     criteria_html = ""
     if criteria_results:
         rows = "".join(
-            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{c.get('name','—')}</td>"
-            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:{'#16a34a' if c.get('passed') else '#dc2626'}'>"
-            f"{'PASS' if c.get('passed') else 'FAIL'}</td>"
-            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{c.get('reasoning','')}</td></tr>"
+            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{c.get('criterion_id', c.get('name', '—'))}</td>"
+            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:{'#16a34a' if c.get('verdict','').upper() == 'PASS' else '#dc2626'}'>"
+            f"{c.get('verdict', '—').upper()}</td>"
+            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{c.get('reasoning', c.get('reason', ''))}</td></tr>"
             for c in criteria_results
         )
         criteria_html = (
@@ -9023,7 +9026,7 @@ async def challenge_session_get(request: Request, db: Session = Depends(get_db))
         "criteria":           criteria_results,
         "submission_excerpt": submission_excerpt,
         "explorer_links": {
-            "release": f"{explorer_base}/transactions/{vault.finish_tx_hash}" if getattr(vault, 'finish_tx_hash', None) else None,
+            "release": f"{explorer_base}/transactions/{vault.release_tx_hash}" if getattr(vault, 'release_tx_hash', None) else None,
             "cancel":  f"{explorer_base}/transactions/{vault.cancel_tx_hash}" if getattr(vault, 'cancel_tx_hash', None) else None,
         },
     }
@@ -9102,11 +9105,11 @@ async def challenge_session_xaman(
             }
         }],
     }
+    xaman_options: dict = {"expire": 5}
     if network == "testnet":
-        txjson["NetworkID"] = 1
-        txjson["Force_Network"] = "TESTNET"
+        xaman_options["network"] = "TESTNET"
 
-    payload = await xumm_create_payload(txjson)
+    payload = await xumm_create_payload(txjson, options=xaman_options)
     return {"xaman_payload": payload, "fee_drops": quote.fee_drops, "quote_id": quote.id}
 
 
@@ -9736,8 +9739,9 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     import asyncio as _asyncio
     _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
 
+    confirmed_status = "queued" if engine == "terQUEUED" else "submitted_and_confirmed"
     return {
-        "status":    "submitted_and_confirmed",
+        "status":    confirmed_status,
         "escrow_id": escrow_id,
         "tx_hash":   tx_hash,
         "sequence":  sequence,
@@ -9823,6 +9827,9 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "challenged_at":           vault.challenged_at.isoformat() if vault.challenged_at else None,
         "challenge_criteria_ids":  vault.challenge_criteria_ids,
         "remedy_attempt_used":     vault.remedy_attempt_used or False,
+        "challenge_outcome":       vault.challenge_outcome,
+        "challenge_fee_state":     vault.challenge_fee_state,
+        "challenge_fee_tx_hash":   vault.challenge_fee_finish_hash or vault.challenge_fee_cancel_hash,
         # Part D — BYO
         "external_ref":            vault.external_ref,
         "external_url":            vault.external_url,
@@ -10251,6 +10258,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     is_approved          = verdict_dict.get("verdict") == "PASS"
     revealed_fulfillment = None
     dex_quote            = None
+    _prev_status         = vault.status  # captured before any branch mutates it
 
     if is_approved:
         try:
@@ -10395,7 +10403,6 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 ),
             }
 
-        _prev_status = vault.status
         vault.status              = "RELEASED"
         vault.delivery_status     = "RELEASED"
         vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
