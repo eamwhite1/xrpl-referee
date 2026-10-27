@@ -381,6 +381,88 @@
         }
       }
     },
+    "/testnet/wallet": {
+      "post": {
+        "summary": "Create a free funded XRPL testnet wallet",
+        "description": "Generates a fresh XRPL testnet keypair and funds it via the public faucet. No real XRP. The seed is returned once and never stored — save it immediately. Rate-limited to 20 per IP per day.",
+        "operationId": "createTestnetWallet",
+        "tags": ["testnet"],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Funded testnet wallet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "address":     { "type": "string" },
+                    "seed":        { "type": "string", "description": "Save immediately — never stored by AgentTrust." },
+                    "balance_xrp": { },
+                    "network":     { "type": "string", "example": "testnet" },
+                    "next_step":   { "type": "string" },
+                    "warning":     { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "429": { "description": "Rate limit exceeded (20 wallets/IP/day)" }
+        }
+      }
+    },
+    "/testnet/demo": {
+      "post": {
+        "summary": "Run a complete testnet escrow demo flow",
+        "description": "Creates two throwaway faucet wallets, locks 2 test-XRP in escrow, submits demo work, runs AI audit, and returns the full verdict. No setup required. Rate-limited to 10 runs per IP per day.",
+        "operationId": "testnetDemo",
+        "tags": ["testnet"],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "task": { "type": "string", "description": "Custom task description (optional)" },
+                  "work": { "type": "string", "description": "Custom deliverable (optional)" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Demo complete — verdict, escrow_id, evaluate_token returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "escrow_id":      { "type": "string" },
+                    "evaluate_token": { "type": "string" },
+                    "verdict":        { "type": "string", "enum": ["PASS", "FAIL"] },
+                    "score":          { "type": "number" },
+                    "summary":        { "type": "string" },
+                    "next_call":      { "type": "string" },
+                    "network":        { "type": "string", "example": "testnet" }
+                  }
+                }
+              }
+            }
+          },
+          "429": { "description": "Rate limit exceeded (10 demos/IP/day)" },
+          "502": { "description": "Upstream XRPL or faucet error" }
+        }
+      }
+    },
     "/status": {
       "get": {
         "summary": "Health check",
