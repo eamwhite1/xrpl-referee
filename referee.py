@@ -9218,7 +9218,7 @@ async def challenge_session_submit(
 
 
 class PrepareEscrowRequest(BaseModel):
-    escrow_id:        str
+    escrow_id:        Optional[str] = None   # omit for testnet: auto-generated TN- ID
     buyer_address:    str
     worker_address:   str
     amount_xrp:       Optional[float] = None
@@ -9226,6 +9226,11 @@ class PrepareEscrowRequest(BaseModel):
     currency:         str = "XRP"
     cancel_after_hrs: int = 168
     delegate_address: Optional[str] = None  # XLS-75: agent submits on buyer's behalf
+    network:          Optional[str] = None
+    # vault-creation fields forwarded by SDK when escrow_id is absent
+    task_description: Optional[str] = None
+    fee_hash:         Optional[str] = None
+    metadata:         Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -9633,7 +9638,43 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
     This endpoint does NOT create the vault record — call POST /escrow/generate
     first (to register the escrow and get the condition), then call this endpoint
     to get the signable transaction.
+
+    Exception: when network='testnet' and no escrow_id is provided, this endpoint
+    auto-generates a TN- ID, creates the vault, and returns the tx in one call.
+    This matches the SDK's hireAndPay({network:'testnet'}) flow.
     """
+    import uuid as _uuid_pe
+    # Testnet shortcut: no escrow_id → auto-generate vault
+    evaluate_token_from_generate: Optional[str] = None
+    if not req.escrow_id:
+        if req.network != "testnet":
+            raise HTTPException(
+                status_code=422,
+                detail="escrow_id is required for mainnet. Call POST /escrow/generate first, then POST /escrow/prepare.",
+            )
+        # Auto-generate TN- ID and create vault inline
+        auto_id = f"TN-{_uuid_pe.uuid4().hex[:4].upper()}-{_uuid_pe.uuid4().hex[:4].upper()}"
+        gen_body: dict = {
+            "escrow_id":        auto_id,
+            "buyer_address":    req.buyer_address,
+            "worker_address":   req.worker_address,
+            "amount_xrp":       req.amount_xrp or 1.0,
+            "currency":         req.currency,
+            "cancel_after_hrs": req.cancel_after_hrs,
+            "network":          "testnet",
+        }
+        if req.task_description:
+            gen_body["task_description"] = req.task_description
+        if req.metadata:
+            gen_body["metadata"] = req.metadata
+        async with httpx.AsyncClient(timeout=30.0) as _gc:
+            gen_res = await _gc.post(f"http://localhost:{os.getenv('PORT', '8000')}/escrow/generate", json=gen_body)
+        if not gen_res.is_success:
+            raise HTTPException(status_code=502, detail={"error": "vault_create_failed", "reason": gen_res.text[:200]})
+        gen_data = gen_res.json()
+        req = req.model_copy(update={"escrow_id": auto_id})
+        evaluate_token_from_generate = gen_data.get("evaluate_token")
+
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if not vault:
         raise HTTPException(
@@ -9737,6 +9778,7 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
         ),
         "condition":      vault.condition,
         "delegate_mode":  bool(req.delegate_address),
+        **({"evaluate_token": evaluate_token_from_generate} if evaluate_token_from_generate else {}),
     }
 
 
@@ -14896,7 +14938,7 @@ async def testnet_demo(request: Request):
     _tn_client = AsyncJsonRpcClient(XRPL_TESTNET_URL)
     _buyer_wallet = Wallet.from_seed(buyer_seed)
     try:
-        _tx_obj = _EscrowCreate.from_dict(unsigned_tx)
+        _tx_obj = _EscrowCreate.from_xrpl(unsigned_tx)
         _filled_tx = await autofill(_tx_obj, _tn_client)
         _signed_tx = _xrpl_sign(_filled_tx, _buyer_wallet)
         _submit_res = await async_submit_and_wait(_signed_tx, _tn_client, _buyer_wallet)
