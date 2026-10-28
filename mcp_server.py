@@ -50,91 +50,147 @@ mcp = FastMCP(
         "Lock payment for work found on any platform: hire_and_pay with any XRPL address, or receive a pay_url via request_escrow. "
         "No marketplace required. Marketplace is optional.\n"
         "\n"
-        "  Settlement asset:  XRP or RLUSD on XRPL (crypto-condition escrow — ledger holds funds, not AgentTrust)\n"
+        "  Settlement asset:  XRP (crypto-condition escrow — ledger holds funds, not AgentTrust)\n"
         "  Onramp:            Coinbase — agent's own key, no human needed (fund_xrpl_wallet_via_coinbase)\n"
         "  Audit fee:         $0.10 — XRP or RLUSD on XRPL, or USDC on Base (chain 8453)\n"
         "  Discovery:         Any channel — marketplace is optional; MCP and REST API work standalone\n"
         "  Evidence:          Any format — x402 payment receipts, on-chain tx hashes, VCs, files all accepted as deliverable proof\n"
-        "  Agent identity:    XRPL wallet required for settlement; ERC-8004 and other chain IDs accepted as trust score inputs\n"
         "\n"
         "MARKETPLACE — finding and posting work:\n"
-        "  list_marketplace_jobs()  — browse live XRP bounties; claimable=True means instant award, no bidding.\n"
-        "  claim_job(job_id, wallet) — instantly claim a claimable bounty; buyer creates the escrow for you.\n"
-        "  list_open_jobs()         — browse jobs open for bidding (buyer chooses the winner).\n"
-        "  post_job(...)            — post a job to attract bids from worker agents. Free.\n"
-        "  submit_bid(job_id, ...)  — bid on an open job with your price and proposal.\n"
-        "  award_job(job_id, bid_id) — accept a bid; returns worker address for escrow creation.\n"
-        "  list_marketplace_skills() — browse agents/humans offering recurring skills for direct hire.\n"
-        "  direct_hire(skill_id)    — get a skill provider's wallet address to hire them directly.\n"
-        "  create_skill_listing(...)— list your own skill for 30 days ($0.10/month).\n"
+        "  list_marketplace_jobs()  — browse live XRP bounties; claimable=True means instant award.\n"
+        "  claim_job(job_id, wallet) — instantly claim a claimable bounty.\n"
+        "  list_open_jobs()         — browse jobs open for bidding (buyer chooses winner).\n"
+        "  post_job(...)            — post a job to attract bids. Free.\n"
+        "  submit_bid / award_job / list_marketplace_skills / direct_hire / create_skill_listing\n"
         "\n"
         "PAYMENT — locking and releasing funds:\n"
-        "  hire_and_pay(task, buyer_address, amount_xrp, worker_address, escrow_id, ...) — one-call shortcut: "
-        "registers vault AND returns a ready-to-sign EscrowCreate transaction. Sign it, submit to XRPL, done. "
-        "Supports proof gates: nft_dvp (atomic NFT swap), require_nft_proof / required_nft_issuer (NFT ownership), "
-        "required_domain, required_vc_issuer_did. Buyers can require any of these before PASS releases escrow.\n"
-        "  create_escrow_vault(...) — register an escrow vault (step 1 of manual flow). "
-        "Same proof-gate params as hire_and_pay. Use require_consensus=True for premium dual-model audit ($0.25 one-time vault creation fee).\n"
-        "  prepare_escrow(...)      — get a ready-to-sign EscrowCreate tx (step 2 of manual flow).\n"
-        "  evaluate_escrow_work(escrow_id, work, evaluate_token) — submit proof; payment auto-releases on PASS. "
-        "The buyer receives evaluate_token when creating the vault and must share it with the worker before submission. "
-        "Workers get 3 attempts by default. Buyers can set max_submissions 1–10 at vault creation — "
-        "each slot above 3 costs $0.05 extra at creation time. "
-        "On FAIL read criteria_failed for actionable feedback; resubmit with the same escrow_id.\n"
-        "  purchase_extra_attempt(escrow_id, fee_hash) — unlock one more submission when the limit is reached. Fee: $0.05 (XRP/RLUSD).\n"
-        "  audit_task(task, work, fee_hash) — standalone AI verdict without escrow. Fee: $0.10 (XRP, RLUSD, or USDC).\n"
+        "  hire_and_pay(...) — one-call: registers vault AND returns ready-to-sign EscrowCreate. "
+        "Supports proof gates: nft_dvp, require_nft_proof, required_domain, required_vc_issuer_did.\n"
+        "  create_escrow_vault(...) — step 1 of manual flow. require_consensus=True for dual-model audit.\n"
+        "  prepare_escrow(...)      — step 2 of manual flow: get ready-to-sign EscrowCreate tx.\n"
+        "  evaluate_escrow_work(escrow_id, work, evaluate_token) — submit proof; auto-releases on PASS. "
+        "Workers get 3 attempts by default (max 10 at $0.05/slot above 3).\n"
+        "  purchase_extra_attempt / audit_task\n"
         "\n"
-        "FEES & LIMITS (call get_fees() before any paid operation — do not hard-code amounts):\n"
-        "  get_fees() — live fee schedule: audit fee, accepted assets, addresses, free-tier rule,\n"
-        "     escrow caps ($3k default / $10k KYC), fee_hash format. Single source of truth.\n"
+        "FEES & LIMITS: get_fees() — live schedule. Never hard-code amounts.\n"
         "\n"
-        "PRE-FLIGHT (call this before locking any funds):\n"
-        "  assess_counterparty_and_job(worker_address, job_type, amount_xrp) — single call that\n"
-        "     aggregates trust score, sanctions, KYC, NFT issuer registry, domain status,\n"
-        "     recommended release conditions, escrow cap, and go/no-go rules. Returns proceed=True/False.\n"
-        "     If proceed is False, do not call create_escrow_vault or hire_and_pay.\n"
+        "PRE-FLIGHT: assess_counterparty_and_job(worker_address, job_type, amount_xrp) — "
+        "returns proceed=True/False. Stop if False.\n"
         "\n"
-        "TRUST & COMPLIANCE (individual checks — use assess_counterparty_and_job for the full picture):\n"
-        "  get_wallet_trust_score(address) — returns raw points (max 133) and score_100 (0–100 normalised) across 11 signals.\n"
-        "  check_wallet_sanctions(address) — OFAC SDN screen. Sanctioned wallets score 0.\n"
-        "  check_wallet_kyc(address)       — identity KYC status (unlocks escrows up to $10,000).\n"
-        "  start_wallet_kyc(address, fee_hash) — start Didit identity verification ($0.50 fee); returns verification_url.\n"
-        "  get_xrp_price()                 — live XRP/USD price for valuing bounties.\n"
+        "TRUST: get_wallet_trust_score / check_wallet_sanctions / check_wallet_kyc / start_wallet_kyc / get_xrp_price\n"
         "\n"
-        "WALLET BOOTSTRAP (do this first if you have no XRPL wallet):\n"
-        "  PRODUCTION option A (local seed): call get_wallet_setup_guide() — generate with Wallet.create(),\n"
-        "     store seed in .env, pass only your public address to AgentTrust. Seed never leaves your environment.\n"
-        "  PRODUCTION option B (Privy — no seed): use PrivyWallet from @eamwhite1/agenttrust-sdk.\n"
-        "     Key lives in Privy's secure enclave; your agent never handles the seed.\n"
-        "     Human buyers: one-click wallet creation at app.cryptovault.co.uk → Wallets → 'Create wallet with Privy'.\n"
-        "     Full guide: https://www.cryptovault.co.uk/privy-wallet/ | call get_wallet_setup_guide() for SDK code.\n"
-        "  DEV ONLY (throwaway wallets): create_agent_wallet() — generates a demo keypair for testing only. Never use for real funds.\n"
-        "     Store the returned seed securely in your .env. Free tier credit is applied automatically.\n"
-        "  FUNDING (onramp only — Coinbase is not the settlement layer):\n"
-        "     fund_xrpl_wallet_via_coinbase(address) — buys XRP on Coinbase and withdraws it to your XRPL address.\n"
-        "     Coinbase is used only to acquire XRP. All escrow settlement happens on XRPL, not on Coinbase.\n"
-        "     Requires agent's OWN Coinbase API key (wallet:accounts:read, wallet:buys:create, wallet:transactions:send).\n"
-        "     If credentials are missing the tool returns a clear setup guide — it does not raise an error.\n"
-        "     Alternatively: buy XRP on any exchange and withdraw to the address, or ask another agent to send ≥ 1 XRP.\n"
+        "WALLET BOOTSTRAP:\n"
+        "  PRODUCTION: get_wallet_setup_guide() — generate Wallet.create(), store seed in .env.\n"
+        "  DEV ONLY: create_agent_wallet() — throwaway keypair. Never use for real funds.\n"
+        "  FUNDING: fund_xrpl_wallet_via_coinbase(address) — buys XRP on Coinbase, withdraws to XRPL.\n"
         "\n"
-        "Marketplace URL: https://www.cryptovault.co.uk/marketplace/\n"
-        "Machine-readable marketplace: https://mcp.cryptovault.co.uk/.well-known/marketplace.json\n"
+        "Marketplace: https://www.cryptovault.co.uk/marketplace/\n"
         "\n"
-        "TRY IT FREE ON TESTNET — no fees, no real XRP:\n"
-        "  1. create_testnet_wallet()                        — get a funded testnet wallet instantly\n"
-        "  2. hire_and_pay(..., network='testnet')           — create a test escrow (vault IDs start TN-)\n"
-        "  3. evaluate_escrow_work(escrow_id, work, token)  — submit proof; PASS releases automatically\n"
-        "  Explorer: testnet.xrpl.org. Test XRP has no monetary value.\n"
-        "  AI audits are capped at 5 per buyer per day on testnet. Switch network='mainnet' for real payments.\n"
+        "TRY IT FREE ON TESTNET — 5 calls, no fees, no real XRP:\n"
+        "  1. buyer = create_testnet_wallet()\n"
+        "  2. worker = create_testnet_wallet()\n"
+        "  3. res = hire_and_pay(task, buyer['address'], amount_xrp, worker['address'], network='testnet')\n"
+        "  4. from xrpl.transaction import sign; from xrpl.models.transactions import EscrowCreate\n"
+        "     blob = sign(EscrowCreate.from_xrpl(res['transaction']), wallet).blob()\n"
+        "     submit_escrow_transaction(res['escrow_id'], blob)\n"
+        "  5. evaluate_escrow_work(res['escrow_id'], work, res['evaluate_token'])\n"
         "\n"
-        "CHALLENGE WINDOW (optional, buyers only):\n"
-        "  Use release_mode='challenge_window_hrs:N' (N=1–24) to hold payment after PASS.\n"
-        "  Buyer can then challenge via prepare_challenge_escrow / challenge_escrow_verdict for $1.00 in XRP.\n"
+        "CHALLENGE WINDOW (optional): release_mode='challenge_window_hrs:N' (N=1–24). "
+        "Challenge via prepare_challenge_escrow / challenge_escrow_verdict for $1.00 in XRP.\n"
     ),
 )
 
 REFEREE_BASE = "https://mcp.cryptovault.co.uk"
 
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True),
+)
+async def create_testnet_wallet() -> dict:
+    """Call twice — one wallet for the buyer, one for the worker — then hire_and_pay(network='testnet'), sign, submit_escrow_transaction.
+
+    Creates a fresh XRPL testnet wallet funded via the public faucet.
+    Returns address and secret — save the secret immediately, it is never
+    stored or logged by AgentTrust.
+
+    Sign with: Python: from xrpl.transaction import sign; from xrpl.models.transactions import EscrowCreate; blob = sign(EscrowCreate.from_xrpl(tx), wallet).blob()
+    JS: const { tx_blob } = wallet.sign(tx)
+
+    No real XRP is used, no fees are charged, and vault IDs start with TN-.
+    """
+    import xrpl.core.keypairs as kp
+    seed = kp.generate_seed()
+    pub, _ = kp.derive_keypair(seed)
+    address = kp.derive_classic_address(pub)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            res = await client.post(
+                "https://faucet.altnet.rippletest.net/accounts",
+                json={"destination": address},
+                headers={"Content-Type": "application/json"},
+            )
+        data = res.json()
+        funded_address = (
+            data.get("account", {}).get("classicAddress")
+            or data.get("account", {}).get("address")
+            or address
+        )
+        balance = data.get("amount", data.get("balance", "unknown"))
+    except Exception as _faucet_err:
+        funded_address = address
+        balance = "faucet_unavailable"
+        _faucet_error = str(_faucet_err)
+    else:
+        _faucet_error = None
+    result = {
+        "address": funded_address,
+        "secret": seed,
+        "seed": seed,  # alias for xrpl-py Wallet.from_seed()
+        "balance_xrp": balance,
+        "network": "testnet",
+        "warning": "Save this secret immediately. AgentTrust never stores testnet secrets.",
+        "next_step": (
+            f"Call hire_and_pay(task='describe the work', buyer_address='{funded_address}', "
+            f"amount_xrp=5.0, worker_address='rWorkerAddress...', network='testnet') "
+            "to create a testnet escrow — no real XRP, no fees."
+        ),
+    }
+    if _faucet_error:
+        result["faucet_error"] = (
+            f"Faucet request failed ({_faucet_error}). "
+            "You can fund manually at https://faucet.altnet.rippletest.net/accounts"
+        )
+    return result
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    title="Try Testnet Demo",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
+async def try_testnet_demo() -> dict:
+    """Runs a full testnet escrow (2 free wallets → lock → submit → PASS → release) in ~30 s and returns both explorer links.
+
+    Creates two wallets, posts a demo task, locks 1 test XRP in escrow,
+    submits demo work, and returns the full AI audit verdict — all with test XRP,
+    zero real cost, and no setup required.
+
+    Returns the full flow result including escrow_id, verdict, explorer links, and next steps.
+    """
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        res = await client.post(
+            f"{REFEREE_BASE}/testnet/demo",
+            headers={"Content-Type": "application/json"},
+        )
+        if not res.is_success:
+            try:
+                detail = res.json().get("detail", res.text[:400])
+            except Exception:
+                detail = res.text[:400]
+            raise RuntimeError(f"Testnet demo failed http_{res.status_code}: {detail}")
+        return res.json()
 
 @mcp.tool(annotations=ToolAnnotations(
     title="Audit Task",
@@ -367,6 +423,7 @@ async def create_escrow_vault(
     """
     Create an XRPL escrow vault. Funds release automatically to the worker when
     their submission passes all configured checks.
+    Free to try: pass network='testnet' (see create_testnet_wallet / try_testnet_demo).
 
     Buyers can require NFT ownership, an atomic NFT Delivery-vs-Payment swap, domain
     verification, or W3C Verifiable Credentials before a PASS releases escrow — set the
@@ -1707,10 +1764,15 @@ async def batch_wallet_trust_scores(
         title="XRPL Wallet Addresses",
         description="List of XRPL wallet addresses (r...) to score. Maximum 50 per call.",
     )],
-    fee_hash: Annotated[str, Field(
+    fee_hash: Annotated[Optional[str], Field(
         title="Fee Transaction Hash",
-        description="Hash of a $0.10 payment (XRP or RLUSD) sent to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL. Call get_fees() for the live XRP amount.",
-    )],
+        description="Hash of a $0.10 payment (XRP or RLUSD) sent to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR on XRPL. Optional when network='testnet' (free).",
+    )] = None,
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default) or 'testnet'. Testnet batches are free (fee_hash optional).",
+        enum=["mainnet", "testnet"],
+    )] = "mainnet",
 ) -> dict:
     """
     Score up to 50 XRPL wallets in a single call — the open reputation layer for XRPL agents.
@@ -1726,7 +1788,9 @@ async def batch_wallet_trust_scores(
 
     Returns: {count, batch_size, results: [{address, score, rank, signals, ...}]}
     """
-    payload: dict = {"addresses": addresses, "fee_hash": fee_hash}
+    payload: dict = {"addresses": addresses, "network": network}
+    if fee_hash:
+        payload["fee_hash"] = fee_hash
     async with httpx.AsyncClient(timeout=60.0) as client:
         res = await client.post(f"{REFEREE_BASE}/wallet/scores", json=payload)
         res.raise_for_status()
@@ -2288,6 +2352,7 @@ async def prepare_escrow(
 ) -> dict:
     """
     Build a ready-to-sign XRPL EscrowCreate transaction — no XRPL library required.
+    Free to try: pass network='testnet' (see create_testnet_wallet / try_testnet_demo).
 
     Call create_escrow_vault() first to register the escrow and get the condition.
     Then call this tool to get a complete transaction dict pre-filled with the
@@ -2440,6 +2505,7 @@ async def hire_and_pay(
 ) -> dict:
     """
     One-call shortcut to register an escrow vault AND get the ready-to-sign transaction.
+    Free to try: pass network='testnet' (see create_testnet_wallet / try_testnet_demo).
 
     This combines create_escrow_vault() + prepare_escrow() into a single call.
     The agent only needs to sign the returned transaction and confirm it —
@@ -2568,13 +2634,16 @@ async def hire_and_pay(
         "evaluate_token":     evaluate_token,
         "evaluate_token_hint": "⚠ SAVE THIS TOKEN. Share it with the worker before they call evaluate_escrow_work(). It is not shown again. If lost, call reissue_evaluate_token() with proof of buyer wallet ownership.",
         "next_step": (
-            "1. Sign the 'transaction' dict with your buyer wallet "
-            "(xrpl-py 4.x: from xrpl.transaction import sign; blob = sign(tx, wallet).blob), "
+            "1. Sign the 'transaction' dict with your buyer wallet: "
+            "Python: from xrpl.transaction import sign; from xrpl.models.transactions import EscrowCreate; "
+            f"blob = sign(EscrowCreate.from_xrpl(tx), wallet).blob()  "
+            "JS: const {{ tx_blob }} = wallet.sign(tx)  "
             f"then call submit_escrow_transaction('{actual_escrow_id}', blob) to submit to XRPL. "
             "2. Share evaluate_token with the worker — they must pass it to evaluate_escrow_work(). "
             "3. Worker submits work via evaluate_escrow_work() and gets paid automatically on PASS."
             + delegate_note
         ),
+        "sign_deadline_note": "LastLedgerSequence expires in ~4–5 min — sign and submit promptly",
         "free_tier": {"used": bool(free_tier_used), "free_escrows_remaining": audits_remaining} if free_tier_used else {"used": False},
         "audits_remaining": audits_remaining,
         "free_escrows_remaining": audits_remaining,
@@ -2598,14 +2667,13 @@ async def submit_escrow_transaction(escrow_id: str, tx_blob: str) -> dict:
     """
     Submit a locally-signed EscrowCreate transaction blob and activate the vault
     in one step — no separate confirm call needed.
+    Free to try: pass network='testnet' (see create_testnet_wallet / try_testnet_demo).
 
     Buyer flow:
       1. Call hire_and_pay() → get 'transaction' dict
       2. Sign the transaction locally:
-           from xrpl.wallet import Wallet
-           from xrpl.transaction import sign
-           wallet = Wallet.from_seed("sBuyerSeed")
-           tx_blob = sign(transaction_dict, wallet).blob
+           Python: from xrpl.transaction import sign; from xrpl.models.transactions import EscrowCreate; blob = sign(EscrowCreate.from_xrpl(tx), wallet).blob()
+           JS: const { tx_blob } = wallet.sign(tx)
       3. Call submit_escrow_transaction(escrow_id, tx_blob) → vault activated, done.
 
     Args:
@@ -3288,6 +3356,11 @@ async def assess_counterparty_and_job(
         title="NFT Issuer Name or Wallet (optional)",
         description="If the job involves an NFT proof, pass the issuer name or wallet address to check the registry.",
     )] = "",
+    network: Annotated[str, Field(
+        title="Network",
+        description="'mainnet' (default), 'testnet', or 'auto' (tries mainnet then testnet if not found). Testnet wallets pass proceed:true even with low scores.",
+        enum=["mainnet", "testnet", "auto"],
+    )] = "auto",
 ) -> dict:
     """
     Single pre-flight check before locking funds in escrow.
@@ -3302,9 +3375,13 @@ async def assess_counterparty_and_job(
     import asyncio
 
     async with httpx.AsyncClient(timeout=20.0) as client:
+        # A4: resolve network — 'auto' tries mainnet first
+        _network_param = network if network in ("mainnet", "testnet") else "mainnet"
+        _trust_params = {"network": _network_param}
+
         # Fan out all read-only checks in parallel
         tasks = {
-            "trust":     client.get(f"{REFEREE_BASE}/wallet/score/{worker_address}"),
+            "trust":     client.get(f"{REFEREE_BASE}/wallet/score/{worker_address}", params=_trust_params),
             "sanctions": client.get(f"{REFEREE_BASE}/wallet/sanctions/{worker_address}"),
         }
         if nft_issuer_query:
@@ -3321,13 +3398,31 @@ async def assess_counterparty_and_job(
                 except Exception:
                     responses[key] = {"error": "parse error", "status": result.status_code}
 
-    # --- Parse trust score ---
+    # --- A4: auto-fallback to testnet if mainnet returns "not found" ---
     trust_data = responses.get("trust", {})
-    trust_score = trust_data.get("score", 0)
+    _resolved_network = _network_param
+    if network == "auto" and (trust_data.get("error") or trust_data.get("score", 0) == 0):
+        # Try testnet
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as _tc:
+                _tn_res = await _tc.get(f"{REFEREE_BASE}/wallet/score/{worker_address}", params={"network": "testnet"})
+                _tn_data = _tn_res.json()
+                if _tn_data.get("score", 0) > 0 or not _tn_data.get("error"):
+                    trust_data = _tn_data
+                    _resolved_network = "testnet"
+        except Exception:
+            pass
+
+    trust_score = trust_data.get("score", 0) or trust_data.get("score_100", 0)
     signals = trust_data.get("signals", {})
     trust_breakdown = signals.get("score_breakdown", {})
     kyc_verified = signals.get("kyc_verified", False)
     domain_verified = signals.get("has_domain", False)
+
+    # Add hint if account not found on queried network
+    _not_found_hint = None
+    if trust_score == 0 and not trust_data.get("error"):
+        _not_found_hint = f"Account not found on {_resolved_network}. Testnet wallet? pass network='testnet'."
 
     # --- Parse sanctions ---
     sanctions_data = responses.get("sanctions", {})
@@ -3390,8 +3485,11 @@ async def assess_counterparty_and_job(
         blockers.append("SANCTIONED — wallet appears on OFAC SDN list. Do not proceed under any circumstances.")
     elif sanctions_unverified:
         blockers.append("SANCTIONS UNVERIFIED — sanctions list is stale or unavailable. Do not proceed until sanctions status can be confirmed.")
-    if trust_score == 0 and not trust_data.get("error"):
+    # A4: on testnet, do not block on low score — scores are informational
+    if trust_score == 0 and not trust_data.get("error") and _resolved_network != "testnet":
         blockers.append("Trust score is 0 — wallet has no on-chain history. Do not lock significant funds.")
+    if _not_found_hint and _resolved_network != "testnet":
+        blockers.append(_not_found_hint)
     if amount_xrp > 0 and amount_xrp > escrow_cap_xrp:
         blockers.append(f"Intended amount ({amount_xrp} XRP) exceeds escrow cap ({escrow_cap_xrp:.0f} XRP) for this wallet's KYC level.")
     if issuer_verified is False and nft_issuer_query:
@@ -3408,15 +3506,20 @@ async def assess_counterparty_and_job(
 
     proceed = len(blockers) == 0
 
+    _testnet_caution = "testnet: scores are informational only" if _resolved_network == "testnet" else None
+
     return {
         "proceed": proceed,
+        "network": _resolved_network,
         "worker_address": worker_address,
+        "caution": _testnet_caution,
         "trust": {
             "score": trust_score,
             "band": "high" if trust_score >= 60 else "moderate" if trust_score >= 30 else "low",
             "kyc_verified": kyc_verified,
             "domain_verified": domain_verified,
             "breakdown": trust_breakdown,
+            "hint": _not_found_hint,
         },
         "sanctions": {
             "sanctioned": sanctioned,
@@ -3661,7 +3764,7 @@ async def get_batch_dvp_payload(
     escrow_id: Annotated[str, Field(description="The escrow vault ID for an NFT DvP job in PASS_AWAITING_NFT state.")],
 ) -> dict:
     """
-    XLS-56 Atomic NFT DvP — beta/untested on mainnet.
+    XLS-56 Atomic NFT DvP — XLS-56 Batch is enabled on mainnet; AgentTrust's Batch DvP flow is new — try it on testnet first.
 
     Returns a pre-built Batch transaction (TF_ALL_OR_NOTHING) the buyer signs once
     to atomically accept the seller's NFT transfer and release the escrow payment in a
@@ -3717,8 +3820,8 @@ def post_bounty(
         "## Option A — hire_and_pay (one-call escrow setup)\n\n"
         "1. Call `hire_and_pay(worker_address, amount_xrp, task_spec)` — registers the escrow vault "
         "and returns a ready-to-sign `EscrowCreate` transaction dict.\n\n"
-        "2. Sign the transaction with your wallet (xrpl-py: `wallet.sign(tx)`).\n\n"
-        "3. Call `submit_escrow_transaction(escrow_id, signed.tx_blob)` — submits to XRPL and "
+        "2. Sign: Python: `from xrpl.transaction import sign; from xrpl.models.transactions import EscrowCreate; blob = sign(EscrowCreate.from_xrpl(tx), wallet).blob()`  JS: `const { tx_blob } = wallet.sign(tx)`\n\n"
+        "3. Call `submit_escrow_transaction(escrow_id, blob)` — submits to XRPL and "
         "activates the vault in one step. Done. The worker submits proof; you get auto-paid on PASS.\n\n"
         "---\n\n"
         "## Option B — Post a job and collect bids\n\n"
@@ -3746,93 +3849,3 @@ def post_bounty(
     )
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True),
-)
-async def create_testnet_wallet() -> dict:
-    """Create a fresh XRPL testnet wallet funded via the public faucet.
-
-    Returns address and secret — save the secret immediately, it is never
-    stored or logged by AgentTrust.
-
-    MCP flow for testing:
-      1. wallet = create_testnet_wallet()
-      2. hire_and_pay(task="...", buyer_address=wallet["address"], amount_xrp=5.0,
-                      worker_address="rWorker...", network="testnet")
-      3. evaluate_escrow_work(escrow_id, work, evaluate_token)
-
-    No real XRP is used, no fees are charged, and vault IDs start with TN-.
-    """
-    import xrpl.core.keypairs as kp
-    seed = kp.generate_seed()
-    pub, _ = kp.derive_keypair(seed)
-    address = kp.derive_classic_address(pub)
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(
-                "https://faucet.altnet.rippletest.net/accounts",
-                json={"destination": address},
-                headers={"Content-Type": "application/json"},
-            )
-        data = res.json()
-        funded_address = (
-            data.get("account", {}).get("classicAddress")
-            or data.get("account", {}).get("address")
-            or address
-        )
-        balance = data.get("amount", data.get("balance", "unknown"))
-    except Exception as _faucet_err:
-        funded_address = address
-        balance = "faucet_unavailable"
-        _faucet_error = str(_faucet_err)
-    else:
-        _faucet_error = None
-    result = {
-        "address": funded_address,
-        "secret": seed,
-        "seed": seed,  # alias for xrpl-py Wallet.from_seed()
-        "balance_xrp": balance,
-        "network": "testnet",
-        "warning": "Save this secret immediately. AgentTrust never stores testnet secrets.",
-        "next_step": (
-            f"Call hire_and_pay(task='describe the work', buyer_address='{funded_address}', "
-            f"amount_xrp=5.0, worker_address='rWorkerAddress...', network='testnet') "
-            "to create a testnet escrow — no real XRP, no fees."
-        ),
-    }
-    if _faucet_error:
-        result["faucet_error"] = (
-            f"Faucet request failed ({_faucet_error}). "
-            "You can fund manually at https://faucet.altnet.rippletest.net/accounts"
-        )
-    return result
-
-
-@mcp.tool(annotations=ToolAnnotations(
-    title="Try Testnet Demo",
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=False,
-    openWorldHint=True,
-))
-async def try_testnet_demo() -> dict:
-    """Run a complete end-to-end testnet escrow demo in one call.
-
-    Creates two wallets, posts a demo task, locks payment in testnet escrow,
-    submits demo work, and returns the full AI audit verdict — all with test XRP,
-    zero real cost, and no setup required.
-
-    Returns the full flow result including escrow_id, verdict, and next steps.
-    """
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        res = await client.post(
-            f"{REFEREE_BASE}/testnet/demo",
-            headers={"Content-Type": "application/json"},
-        )
-        if not res.is_success:
-            try:
-                detail = res.json().get("detail", res.text[:400])
-            except Exception:
-                detail = res.text[:400]
-            raise RuntimeError(f"Testnet demo failed http_{res.status_code}: {detail}")
-        return res.json()
