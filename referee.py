@@ -15622,15 +15622,26 @@ async def testnet_try_lock(sid: str):
         "Condition":       final_condition,
         "CancelAfter":     cancel_ripple,
     }
-    try:
-        _tx_obj = _EscrowCreate.from_xrpl(unsigned_dict)
-        _filled = await autofill(_tx_obj, _tn_client)
-        _signed = _xrpl_sign(_filled, _buyer_wallet)
-        _result = await async_submit_and_wait(_signed, _tn_client, _buyer_wallet)
-        tx_hash  = (_result.result.get("tx_json", {}).get("hash") or _result.result.get("hash", ""))
-        sequence = _result.result.get("tx_json", {}).get("Sequence") or _result.result.get("Sequence")
-    except Exception as _e:
-        raise HTTPException(status_code=502, detail={"error": "lock_failed", "reason": str(_e)[:200]})
+    tx_hash = ""
+    sequence = None
+    _last_err = None
+    for _attempt in range(3):
+        try:
+            _tx_obj = _EscrowCreate.from_xrpl(unsigned_dict)
+            _filled = await autofill(_tx_obj, _tn_client)
+            _signed = _xrpl_sign(_filled, _buyer_wallet)
+            _result = await async_submit_and_wait(_signed, _tn_client, _buyer_wallet)
+            tx_hash  = (_result.result.get("tx_json", {}).get("hash") or _result.result.get("hash", ""))
+            sequence = _result.result.get("tx_json", {}).get("Sequence") or _result.result.get("Sequence")
+            _last_err = None
+            break
+        except Exception as _e:
+            _last_err = _e
+            if "tefPAST_SEQ" in str(_e) and _attempt < 2:
+                continue
+            break
+    if _last_err:
+        raise HTTPException(status_code=502, detail={"error": "lock_failed", "reason": str(_last_err)[:200]})
 
     # Insert vault row as LOCKED
     with SessionLocal() as _db:
