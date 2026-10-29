@@ -15267,23 +15267,37 @@ async def run_testnet_flow(
             "Memos": [{"Memo": {"MemoData": f"agenttrust:{escrow_id}".encode().hex().upper(),
                                 "MemoType": "6167656E7474727573740A"}}],
         }
-        _tx_obj   = _EscrowCreate.from_xrpl(unsigned_dict)
-        _filled   = await autofill(_tx_obj, _tn_client)
-        _signed   = _xrpl_sign(_filled, _buyer_wallet)
-
-        # 5. Submit + wait for validation — vault row created ONLY after success
+        # 5. Submit + wait for validation — retry on tefPAST_SEQ (LastLedgerSequence expired)
         step = "submit"
-        _result = await async_submit_and_wait(_signed, _tn_client, _buyer_wallet)
-        tx_hash = (
-            _result.result.get("tx_json", {}).get("hash")
-            or _result.result.get("hash")
-            or _result.result.get("transaction", {}).get("hash")
-        )
-        sequence = _result.result.get("tx_json", {}).get("Sequence") or _result.result.get("Sequence")
-        engine = (
-            _result.result.get("meta", {}).get("TransactionResult")
-            or _result.result.get("engine_result", "tesSUCCESS")
-        )
+        tx_hash = ""
+        sequence = None
+        engine = ""
+        _last_submit_err = None
+        for _attempt in range(3):
+            try:
+                _tx_obj = _EscrowCreate.from_xrpl(unsigned_dict)
+                _filled = await autofill(_tx_obj, _tn_client)
+                _signed = _xrpl_sign(_filled, _buyer_wallet)
+                _result = await async_submit_and_wait(_signed, _tn_client, _buyer_wallet)
+                tx_hash = (
+                    _result.result.get("tx_json", {}).get("hash")
+                    or _result.result.get("hash")
+                    or _result.result.get("transaction", {}).get("hash")
+                )
+                sequence = _result.result.get("tx_json", {}).get("Sequence") or _result.result.get("Sequence")
+                engine = (
+                    _result.result.get("meta", {}).get("TransactionResult")
+                    or _result.result.get("engine_result", "tesSUCCESS")
+                )
+                _last_submit_err = None
+                break
+            except Exception as _se:
+                _last_submit_err = _se
+                if "tefPAST_SEQ" in str(_se) and _attempt < 2:
+                    continue
+                break
+        if _last_submit_err:
+            raise RuntimeError(f"submit|step=submit|{_last_submit_err}")
         logger.info(f"run_testnet_flow EscrowCreate hash={tx_hash} engine={engine} escrow_id={escrow_id}")
         if engine not in ("tesSUCCESS",) and not (engine or "").startswith("tes"):
             raise RuntimeError(f"EscrowCreate engine_result={engine}")
