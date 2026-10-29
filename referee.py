@@ -15545,9 +15545,11 @@ async def testnet_try_start(request: Request):
         buyer_addr  = _dca(buyer_pub)
         worker_addr = _dca(worker_pub)
 
-        # Fund buyer only (worker is auto-activated on receive)
-        buyer_funded = await _faucet_fund(buyer_addr)
-        if not buyer_funded:
+        # Fund both wallets — escrow destination must exist on ledger (tecNO_DST otherwise)
+        buyer_funded, worker_funded = await asyncio.gather(
+            _faucet_fund(buyer_addr), _faucet_fund(worker_addr)
+        )
+        if not buyer_funded or not worker_funded:
             raise HTTPException(status_code=502, detail={"error": "faucet_failed"})
 
         sid = secrets.token_urlsafe(16)
