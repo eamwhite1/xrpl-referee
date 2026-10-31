@@ -1,35 +1,36 @@
 {
+  "name": "agenttrust-xrpl-escrow",
+  "version": "2",
   "chain_type": "xrpl",
   "rules": [
     {
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
-      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCreate"}]
+      "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCreate"}]
     },
     {
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
-      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCancel"}]
+      "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCancel"}]
     },
     {
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
-      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowFinish"}]
+      "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowFinish"}]
     },
     {
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
-      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "AccountSet"}]
+      "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "AccountSet"}]
     },
     {
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
       "conditions": [
-        {"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "Payment"},
-        {"field_source": "ethereum_transaction", "field": "Amount", "operator": "lt", "value": "100000000000"}
+        {"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "Payment"},
+        {"field_source": "xrpl_transaction", "field": "Amount.drops", "operator": "lt", "value": "100000000000"}
       ]
     },
-    {"action": "ALLOW", "method": "exportPrivateKey"},
     {"action": "DENY", "method": "xrpl_signTransaction"}
   ]
 }
