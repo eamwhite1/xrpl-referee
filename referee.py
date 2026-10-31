@@ -3343,6 +3343,7 @@ JWT_SECRET           = os.getenv("JWT_SECRET", secrets.token_hex(32))
 if len(JWT_SECRET.encode()) < 32:
     logger.warning("⚠️ JWT_SECRET is shorter than 32 bytes — set a longer secret in Render environment variables")
 DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
+ADMIN_EMAIL          = os.getenv("ADMIN_EMAIL", "").strip().lower()
 ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
 SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
 _LIFETIME_ACCESS_EMAILS = set(
@@ -13552,6 +13553,73 @@ async def auth_logout():
     response = JSONResponse({"ok": True})
     response.delete_cookie("at_session")
     return response
+
+
+@app.get("/admin/accounts")
+async def admin_list_accounts(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Admin-only: list all EnterpriseAccounts with subscription status and stats."""
+    if not ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Admin access not configured")
+    account = _get_current_account(request=request, db=db)
+    if not account or account.email.lower() != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    now = datetime.now(timezone.utc)
+    accounts = db.query(EnterpriseAccount).order_by(EnterpriseAccount.created_at.desc()).all()
+
+    # Per-account wallet and API key counts in two queries
+    from sqlalchemy import func
+    wallet_counts = dict(
+        db.query(LinkedWallet.account_id, func.count(LinkedWallet.id))
+        .group_by(LinkedWallet.account_id)
+        .all()
+    )
+    key_counts = dict(
+        db.query(EnterpriseApiKey.account_id, func.count(EnterpriseApiKey.id))
+        .group_by(EnterpriseApiKey.account_id)
+        .all()
+    )
+
+    rows = []
+    for a in accounts:
+        is_lifetime = a.email.lower() in _LIFETIME_ACCESS_EMAILS
+        if is_lifetime:
+            effective_status = "lifetime"
+            expires_at = None
+            days_remaining = None
+        elif a.status == "active" and a.sub_expires_at:
+            effective_status = "active" if a.sub_expires_at > now else "expired"
+            expires_at = a.sub_expires_at.isoformat()
+            delta = a.sub_expires_at - now
+            days_remaining = max(0, delta.days) if a.sub_expires_at > now else 0
+        elif a.status == "trial" and a.trial_ends_at:
+            effective_status = "trial" if a.trial_ends_at > now else "trial_expired"
+            expires_at = a.trial_ends_at.isoformat()
+            delta = a.trial_ends_at - now
+            days_remaining = max(0, delta.days) if a.trial_ends_at > now else 0
+        else:
+            effective_status = a.status or "unknown"
+            expires_at = None
+            days_remaining = None
+
+        rows.append({
+            "id": a.id,
+            "email": a.email,
+            "name": a.name or "",
+            "org_name": a.org_name or "",
+            "status": effective_status,
+            "expires_at": expires_at,
+            "days_remaining": days_remaining,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "wallet_count": wallet_counts.get(a.id, 0),
+            "api_key_count": key_counts.get(a.id, 0),
+            "last_payment_hash": a.last_payment_hash or "",
+        })
+
+    return {"accounts": rows, "total": len(rows)}
 
 
 @app.get("/enterprise/me")
