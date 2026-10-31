@@ -6220,6 +6220,7 @@ class BatchScoreRequest(BaseModel):
     addresses: list[str]
     fee_hash: Optional[str] = None
     payment_signature: Optional[str] = None
+    network: Optional[str] = "mainnet"
 
 
 @app.post("/wallet/scores")
@@ -6252,22 +6253,23 @@ async def batch_wallet_scores(
     addresses = [a for a in req.addresses if not (a in seen or seen.add(a))]
 
     ps = payment_signature or req.payment_signature
-    if not req.fee_hash and not ps:
-        _raise_402(
-            "/wallet/scores",
-            "Batch scoring requires payment. Pay $0.10 (XRP/RLUSD) to the protocol wallet.",
+    network = getattr(req, "network", "mainnet") or "mainnet"
+    if network != "testnet":
+        if not req.fee_hash and not ps:
+            _raise_402(
+                "/wallet/scores",
+                "Batch scoring requires payment. Pay $0.10 (XRP/RLUSD) to the protocol wallet.",
+            )
+        await verify_fee_payment(
+            fee_hash=req.fee_hash or "",
+            escrow_id=f"batch-scores-{int(time.time())}",
+            db=db,
+            resource="/wallet/scores",
+            payment_signature=ps,
         )
 
-    await verify_fee_payment(
-        fee_hash=req.fee_hash or "",
-        escrow_id=f"batch-scores-{int(time.time())}",
-        db=db,
-        resource="/wallet/scores",
-        payment_signature=ps,
-    )
-
     results = await asyncio.gather(
-        *[compute_xrpl_trust_score(addr, db=db) for addr in addresses],
+        *[compute_xrpl_trust_score(addr, db=db, network=network) for addr in addresses],
         return_exceptions=True,
     )
 
@@ -7281,6 +7283,7 @@ async def _gemini_schema_selftest():
 # ---------------------------------------------------------------------------
 
 def _send_challenge_window_opened_email(vault):
+    import html as _html
     hours = vault.release_mode.split(":")[1] if vault.release_mode and ":" in vault.release_mode else "24"
     deadline_str = vault.challenge_deadline.strftime("%A %d %B %Y at %H:%M UTC") if vault.challenge_deadline else "soon"
     recipient = vault.buyer_email
@@ -7290,8 +7293,8 @@ def _send_challenge_window_opened_email(vault):
     token_expires = int(time.time()) + 48 * 3600
     challenge_token = _make_challenge_token(vault.escrow_id, vault.buyer_address, token_expires)
     challenge_url = f"{SITE_URL}/challenge/?token={challenge_token}"
-    # Verdict summary for display
-    ai_verdict = vault.ai_verdict or "PASS"
+    # Verdict summary — parse from evaluation_verdicts, not raw ai_verdict JSON
+    ai_verdict_str = "PASS"
     score = None
     criteria_results = None
     submission_excerpt = None
@@ -7299,6 +7302,7 @@ def _send_challenge_window_opened_email(vault):
         try:
             last = vault.evaluation_verdicts[-1] if isinstance(vault.evaluation_verdicts, list) else None
             if last and isinstance(last, dict):
+                ai_verdict_str = last.get("verdict", "PASS") or "PASS"
                 score = last.get("score")
                 criteria_results = last.get("criteria_results") or last.get("criteria")
                 submission_excerpt = last.get("submission_excerpt") or last.get("excerpt")
@@ -7310,10 +7314,10 @@ def _send_challenge_window_opened_email(vault):
     criteria_html = ""
     if criteria_results:
         rows = "".join(
-            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{c.get('criterion_id', c.get('name', '—'))}</td>"
+            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{_html.escape(str(c.get('criterion_id', c.get('name', '—'))))}</td>"
             f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:{'#16a34a' if c.get('verdict','').upper() == 'PASS' else '#dc2626'}'>"
-            f"{c.get('verdict', '—').upper()}</td>"
-            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{c.get('reasoning', c.get('reason', ''))}</td></tr>"
+            f"{_html.escape(str(c.get('verdict', '—')).upper())}</td>"
+            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{_html.escape(str(c.get('reasoning', c.get('reason', ''))))}</td></tr>"
             for c in criteria_results
         )
         criteria_html = (
@@ -7328,7 +7332,7 @@ def _send_challenge_window_opened_email(vault):
     if submission_excerpt:
         excerpt_html = (
             f"<div class='detail'><span>Submission excerpt</span><br>"
-            f"<em style='font-size:.85rem;color:#5c5c6e'>{str(submission_excerpt)[:300]}…</em></div>"
+            f"<em style='font-size:.85rem;color:#5c5c6e'>{_html.escape(str(submission_excerpt)[:300])}…</em></div>"
         )
     try:
         resend.Emails.send({
@@ -7340,7 +7344,7 @@ def _send_challenge_window_opened_email(vault):
   <div class="logo">AgentTrust<span>.</span></div>
   <h1>Work passed — challenge window open</h1>
   <p>The AI referee has reviewed the submission for escrow <strong>{vault.escrow_id}</strong>
-     and returned a <strong>{ai_verdict}</strong> verdict{score_str}.</p>
+     and returned a <strong>{_html.escape(ai_verdict_str)}</strong> verdict{score_str}.</p>
   {criteria_html}
   {excerpt_html}
   <p>If you believe the work does not meet the criteria, you have <strong>{hours_plural}</strong>
@@ -7423,9 +7427,10 @@ def _send_challenge_outcome_email(vault, outcome: str):
                 logger.error(f"❌ Challenge rejected email failed for {vault.escrow_id}: {e}")
 
     elif outcome == "upheld_remedy":
+        import html as _html
         recipient = vault.worker_email
         if recipient:
-            criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "disputed criteria"
+            criteria_list = _html.escape(", ".join(vault.challenge_criteria_ids or []) or "disputed criteria")
             submit_url = escrow_status_url(vault.escrow_id)
             try:
                 resend.Emails.send({
@@ -8474,7 +8479,7 @@ async def create_challenge_fee_cancel_payload(req: ChallengeFeeCancelPayloadRequ
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
 @app.post("/escrow/generate")
-async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
+async def generate_escrow(req: EscrowSetupRequest, request: Request, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
@@ -8752,6 +8757,11 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         if len(serialized) > 4096:
             raise HTTPException(status_code=422, detail="metadata must be 4 KB or smaller")
         vault.metadata_json = serialized
+    # R3: tag source and internal flag
+    _raw_ip  = _client_ip(request)
+    _ip_hash = __import__('hashlib').sha256(_raw_ip.encode()).hexdigest()[:16]
+    vault.is_internal = _is_internal_vault(req.buyer_address or "", req.worker_address or "", _ip_hash, dict(request.headers))
+    vault.source      = "mcp" if request.headers.get("X-AgentTrust-Internal") == "1" else "rest"
     db.add(vault)
     db.commit()
 
@@ -9379,6 +9389,13 @@ async def challenge_session_xaman(
         raise HTTPException(status_code=404, detail="vault_not_found")
     if vault.status not in ("PASS_CHALLENGE_WINDOW", "CHALLENGED"):
         raise HTTPException(status_code=409, detail="challenge_window_not_open")
+    # R4: 15-minute cutoff — reject Xaman sign request if window closes within 15 min
+    if vault.challenge_deadline:
+        _dl = vault.challenge_deadline
+        if _dl.tzinfo is None:
+            _dl = _dl.replace(tzinfo=timezone.utc)
+        if (_dl - datetime.now(timezone.utc)).total_seconds() < 15 * 60:
+            raise HTTPException(status_code=409, detail={"error": "challenge_window_closing", "message": "Challenge window closes in less than 15 minutes."})
 
     quote = (
         db.query(ChallengeQuote)
@@ -9761,6 +9778,11 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         req.task or "", req.buyer_email or "",
         request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db, request,
     )
+    # R3: tag source and internal flag
+    _req_ip   = _client_ip(request)
+    _req_hash = __import__('hashlib').sha256(_req_ip.encode()).hexdigest()[:16]
+    vault.is_internal = _is_internal_vault(req.buyer_address or "", req.seller_address or "", _req_hash, dict(request.headers))
+    vault.source      = "mcp" if request.headers.get("X-AgentTrust-Internal") == "1" else "rest"
     db.add(vault)
     db.commit()
 
@@ -10235,8 +10257,7 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "metadata":                json.loads(vault.metadata_json) if vault.metadata_json else None,
         # A5: stable verdict fields + created_at
         "created_at":              vault.created_at.isoformat() if vault.created_at else None,
-        **{f"_v_{k}": v for k, v in _verdict_view(vault).items()},
-        # inline the stable fields at top level too
+        # stable verdict fields at top level
         "verdict":                 _verdict_view(vault).get("verdict"),
         "score":                   _verdict_view(vault).get("score"),
         "summary":                 _verdict_view(vault).get("summary"),
@@ -10959,7 +10980,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             if finish_hash else
             _explorer_url(vault.escrow_tx_hash, vault.network or "mainnet")
         ),
-        "poll":                 f"/escrow/{req.escrow_id}" if is_approved and not finish_hash else None,
+        "poll":                 f"{os.getenv('REFEREE_BASE_URL','https://mcp.cryptovault.co.uk')}/escrow/{req.escrow_id}" if is_approved and not finish_hash else None,
         # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
         "dex_quote_rlusd":      dex_quote,
         "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
