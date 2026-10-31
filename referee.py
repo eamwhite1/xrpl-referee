@@ -1403,13 +1403,26 @@ def serve_marketplace_json():
 
 
 def _get_free_escrows_remaining(wallet_address: str) -> dict:
-    """Return eligibility info and remaining free escrows for a wallet."""
+    """Return eligibility info and remaining free escrows for a wallet.
+
+    If the wallet belongs to a Pro account (privy_user_id set), usage is
+    pooled across all wallets sharing that account — the account gets
+    FREE_AUDIT_LIMIT credits total, not per wallet.
+    """
     db = SessionLocal()
     try:
         bootstrapped = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == wallet_address).first()
         if not bootstrapped:
-            return {"remaining": 0, "eligible": False, "reason": "Wallet not registered through AgentTrust. Use create_agent_wallet for instant free-tier access, or call register_wallet_free_tier after building on-chain history (score >= 25)."}
-        used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count()
+            return {"remaining": 0, "eligible": False, "reason": "Wallet not registered through AgentTrust. Use create_agent_wallet or link a wallet to a Pro account for free-tier access."}
+        privy_user_id = bootstrapped.privy_user_id
+        if privy_user_id:
+            sibling_addrs = [
+                w.wallet_address for w in
+                db.query(BootstrappedWallet).filter(BootstrappedWallet.privy_user_id == privy_user_id).all()
+            ]
+            used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address.in_(sibling_addrs)).count()
+        else:
+            used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count()
         remaining = max(0, FREE_AUDIT_LIMIT - used)
         return {"remaining": remaining, "eligible": True, "reason": "AgentTrust-registered wallet"}
     finally:
@@ -1487,7 +1500,7 @@ async def get_fees(wallet_address: Optional[str] = None):  # noqa: E501
             ],
         },
         "free_tier": {
-            "rule": f"Wallets registered through AgentTrust (via create_agent_wallet or register_wallet_free_tier with score >= {FREE_AUDIT_MIN_SCORE}) receive {FREE_AUDIT_LIMIT} free escrows — omit fee_hash.",
+            "rule": f"New agent wallets and new Pro accounts get {FREE_AUDIT_LIMIT} free escrows, each including the AI check.",
             "free_escrows": FREE_AUDIT_LIMIT,
             "min_trust_score_for_non_bootstrapped": FREE_AUDIT_MIN_SCORE,
             "check_score": "GET /wallet/score/{address}",
@@ -1625,7 +1638,7 @@ async def serve_payment_required():
             "/wallet/sanctions/{address}", "/jobs (GET)", "/jobs/{id}", "/status",
             "/.well-known/*",
         ],
-        "freeAudits":   f"Wallets registered through AgentTrust receive {FREE_AUDIT_LIMIT} free escrows — omit fee_hash. Call /wallet/{{address}}/register-free-tier with ownership proof to qualify.",
+        "freeAudits":   f"New agent wallets and new Pro accounts get {FREE_AUDIT_LIMIT} free escrows, each including the AI check. Standalone audit_task is always $0.10. Testnet is always free.",
         "liveAmounts": {
             "audit_xrp":           fee_xrp,
             "premium_audit_xrp":   premium_xrp,
@@ -13810,7 +13823,21 @@ async def admin_list_accounts(
 
 
 @app.get("/enterprise/me")
-async def enterprise_me(account: EnterpriseAccount = Depends(_get_current_account)):
+async def enterprise_me(
+    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
+):
+    # Compute free_escrows_remaining pooled across all account wallets
+    account_wallets = db.query(BootstrappedWallet).filter(
+        BootstrappedWallet.privy_user_id == account.id
+    ).all()
+    if account_wallets:
+        wallet_addrs = [w.wallet_address for w in account_wallets]
+        used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address.in_(wallet_addrs)).count()
+        free_escrows_remaining = max(0, FREE_AUDIT_LIMIT - used)
+    else:
+        free_escrows_remaining = 0
+
     return {
         "id": account.id,
         "email": account.email,
@@ -13820,6 +13847,7 @@ async def enterprise_me(account: EnterpriseAccount = Depends(_get_current_accoun
         "subscription_active": _subscription_active(account),
         "trial_ends_at": account.trial_ends_at.isoformat() if account.trial_ends_at else None,
         "sub_expires_at": account.sub_expires_at.isoformat() if account.sub_expires_at else None,
+        "free_escrows_remaining": free_escrows_remaining,
     }
 
 
@@ -14047,6 +14075,10 @@ async def enterprise_link_wallet(
         verify_challenge=secrets.token_hex(16),
     )
     db.add(wallet)
+    # Grant account free-tier pool if this address has no BootstrappedWallet row yet
+    bw_existing = db.query(BootstrappedWallet).filter_by(wallet_address=req.xrpl_address).first()
+    if not bw_existing:
+        db.add(BootstrappedWallet(wallet_address=req.xrpl_address, privy_user_id=account.id))
     db.commit()
     db.refresh(wallet)
     return {
@@ -14105,6 +14137,10 @@ async def enterprise_create_privy_wallet(
         privy_wallet_id=privy_wallet_id,
     )
     db.add(wallet)
+    # Grant account free-tier pool if this address has no BootstrappedWallet row yet
+    bw_existing = db.query(BootstrappedWallet).filter_by(wallet_address=xrpl_address).first()
+    if not bw_existing:
+        db.add(BootstrappedWallet(wallet_address=xrpl_address, privy_user_id=account.id))
     db.commit()
     db.refresh(wallet)
     return {

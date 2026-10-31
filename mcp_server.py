@@ -294,7 +294,7 @@ async def create_escrow_vault(
     )],
     fee_hash: Annotated[str, Field(
         title="XRPL Payment Hash",
-        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier if eligible (new wallets bootstrapped via create_agent_wallet or get_wallet_setup_guide get 3 free escrows).",
+        description="64-character hex transaction hash of the $0.10 payment (XRP/RLUSD) to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR. Omit to use free tier if eligible (new agent wallets and new Pro accounts get 3 free escrows, each including the AI check).",
     )] = "",
     amount_xrp: Annotated[float | None, Field(
         title="XRP Amount",
@@ -2420,7 +2420,7 @@ async def hire_and_pay(
     )] = "",
     fee_hash: Annotated[str, Field(
         title="Protocol Fee Hash",
-        description="64-char hex hash of your $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR (XRP or RLUSD on XRPL) or USDC on Base (chain 8453, 0x-prefixed tx hash). Omit to use free tier (wallets created via create_agent_wallet get 3 free escrows).",
+        description="64-char hex hash of your $0.10 payment to rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR (XRP or RLUSD on XRPL) or USDC on Base (chain 8453, 0x-prefixed tx hash). Omit to use free tier if eligible (new agent wallets and new Pro accounts get 3 free escrows, each including the AI check).",
     )] = "",
     cancel_after_hrs: Annotated[int, Field(
         title="Deadline (hours)",

@@ -131,5 +131,5 @@ Buyers can optionally hold payment 1–24 h after a PASS verdict and challenge i
 
 ## Try it free
 - Testnet: create_testnet_wallet() then hire_and_pay(..., network='testnet'). No fees. Full flow including challenges. AI audits capped at 5/day.
-- Mainnet: 3 free escrows via create_agent_wallet or register_wallet_free_tier (trust score ≥ 25).
+- Mainnet: New agent wallets and new Pro accounts get 3 free escrows, each including the AI check.
 - Pro trial: 30-day free trial on first Google sign-in at https://app.cryptovault.co.uk/dashboard/. $199/year after.
