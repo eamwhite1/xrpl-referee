@@ -3343,6 +3343,7 @@ JWT_SECRET           = os.getenv("JWT_SECRET", secrets.token_hex(32))
 if len(JWT_SECRET.encode()) < 32:
     logger.warning("⚠️ JWT_SECRET is shorter than 32 bytes — set a longer secret in Render environment variables")
 DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
+ADMIN_URL            = os.getenv("ADMIN_URL", "https://www.cryptovault.co.uk/admin/")
 ADMIN_EMAIL          = os.getenv("ADMIN_EMAIL", "").strip().lower()
 ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
 SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
@@ -13545,7 +13546,7 @@ async def auth_google_callback(request: Request, code: str = None, state: str = 
     session_token = _make_session_token(account.id)
     oauth_return = request.cookies.get("oauth_return", "")
     _RETURN_URLS = {
-        "admin":        f"{DASHBOARD_URL.rstrip('/')}/admin/",
+        "admin":        ADMIN_URL,
         "subscription": f"{DASHBOARD_URL.rstrip('/')}/enterprise/",
     }
     redirect_url = _RETURN_URLS.get(oauth_return, DASHBOARD_URL)
