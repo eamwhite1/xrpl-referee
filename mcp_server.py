@@ -710,7 +710,12 @@ async def evaluate_escrow_work(
             except Exception:
                 detail = res.text[:400]
             raise RuntimeError(f"http_{res.status_code}: {detail}")
-        return res.json()
+        data = res.json()
+        # R6: verdict must always be a flat string, never a nested dict
+        if isinstance(data.get("verdict"), dict):
+            nested = data["verdict"]
+            data["verdict"] = str(nested.get("verdict") or nested.get("result") or "INCONCLUSIVE").upper()
+        return data
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -1746,10 +1751,21 @@ async def get_wallet_trust_score(
     Returns full score breakdown by signal so you can reason about why a wallet scores as it does.
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
-        params = {"network": network} if network != "mainnet" else {}
-        res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}", params=params)
-        res.raise_for_status()
-        return res.json()
+        params = {"network": network}
+        try:
+            res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}", params=params)
+            res.raise_for_status()
+            return res.json()
+        except Exception as exc:
+            # R7: surface a helpful hint rather than a bare network error
+            hint = (
+                "Tip: testnet wallets can be scored by passing network='testnet'."
+                if network == "mainnet"
+                else "Tip: this wallet may not exist on testnet. Try network='mainnet'."
+            )
+            raise RuntimeError(
+                f"Could not retrieve trust score for {wallet_address} ({network}): {exc}. {hint}"
+            ) from exc
 
 
 @mcp.tool(annotations=ToolAnnotations(
