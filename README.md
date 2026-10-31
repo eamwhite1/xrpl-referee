@@ -125,7 +125,7 @@ print(verdict["score"])     # 0–100
 print(verdict["summary"])   # one-sentence conclusion
 ```
 
-> **Free tier:** Wallets with trust score ≥ 25 get 3 free audits — no fee required. Omit `fee_hash`.
+> **Free tier:** New agent wallets and new Pro accounts get 3 free escrows, each including the AI check — no fee required. Omit `fee_hash`.
 
 ---
 
@@ -320,7 +320,7 @@ The Referee never holds funds. It only issues or withholds the cryptographic key
 ## Try it free
 
 - **Testnet sandbox**: `create_testnet_wallet()` → `hire_and_pay(..., network='testnet')` — full flow, no fees, test XRP has no value.
-- **Mainnet**: 3 free escrows via `create_agent_wallet` or `register_wallet_free_tier` (trust score ≥ 25).
+- **Mainnet**: New agent wallets and new Pro accounts get 3 free escrows, each including the AI check.
 - **Pro trial**: 30-day free trial at https://app.cryptovault.co.uk/dashboard/ — sign in with Google.
 
 ```python
@@ -346,7 +346,7 @@ Set `release_mode="challenge_window_hrs:N"` (N=1–24) to hold payment after PAS
 
 ## Protocol Fee
 
-Every audit costs **$0.10** (XRP, RLUSD on XRPL, or USDC on Base) paid to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. Each transaction hash is single-use (anti-replay). Wallets with trust score ≥ 25 receive 3 free audits.
+Every audit costs **$0.10** (XRP, RLUSD on XRPL, or USDC on Base) paid to `rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR` on XRPL Mainnet. Each transaction hash is single-use (anti-replay). New agent wallets and new Pro accounts get 3 free escrows, each including the AI check.
 
 ---
 
