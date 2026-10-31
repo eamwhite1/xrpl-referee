@@ -3343,7 +3343,7 @@ JWT_SECRET           = os.getenv("JWT_SECRET", secrets.token_hex(32))
 if len(JWT_SECRET.encode()) < 32:
     logger.warning("⚠️ JWT_SECRET is shorter than 32 bytes — set a longer secret in Render environment variables")
 DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
-ADMIN_URL            = os.getenv("ADMIN_URL", "https://www.cryptovault.co.uk/admin/")
+ADMIN_URL            = os.getenv("ADMIN_URL", "https://mcp.cryptovault.co.uk/admin")
 ADMIN_EMAIL          = os.getenv("ADMIN_EMAIL", "").strip().lower()
 ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
 SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
@@ -13565,6 +13565,173 @@ async def auth_logout():
     response = JSONResponse({"ok": True})
     response.delete_cookie("at_session")
     return response
+
+
+_ADMIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Admin — AgentTrust</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{--bg:#f7f8fa;--surface:#fff;--border:#e4e7ed;--text:#0f1117;--muted:#6b7280;--blue:#2563eb;--blue-dim:#eff4ff;--green:#16a34a;--green-dim:#f0fdf4;--amber:#b45309;--amber-dim:#fffbeb;--red:#dc2626;--red-dim:#fef2f2;--purple:#7c3aed;--purple-dim:#f5f3ff;--radius:10px;--shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d0f14;--surface:#161a22;--border:#252b36;--text:#e8ecf3;--muted:#8891a0;--blue-dim:#1e2a4a;--green-dim:#0d2018;--amber-dim:#2a1f08;--red-dim:#2a1010;--purple-dim:#1e1530}}
+:root[data-theme="dark"]{--bg:#0d0f14;--surface:#161a22;--border:#252b36;--text:#e8ecf3;--muted:#8891a0;--blue-dim:#1e2a4a;--green-dim:#0d2018;--amber-dim:#2a1f08;--red-dim:#2a1010;--purple-dim:#1e1530}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',system-ui,sans-serif;font-size:.9rem;line-height:1.5;min-height:100vh;padding:0 1rem}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:0 1.5rem;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:env(safe-area-inset-top,0px);z-index:10;margin:0 -1rem}
+.header-brand{font-weight:700;font-size:1rem;display:flex;align-items:center;gap:.5rem}
+.badge-admin{font-size:.6rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;background:#6b21a8;color:#fff;border-radius:4px;padding:1px 5px}
+.header-meta{font-size:.8rem;color:var(--muted)}
+main{max-width:1200px;margin:0 auto;padding:1.5rem 0 3rem}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.75rem;margin-bottom:1.5rem}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1.1rem;box-shadow:var(--shadow)}
+.stat-card .stat-value{font-size:1.6rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.stat-card .stat-label{font-size:.75rem;color:var(--muted);margin-top:.2rem;text-transform:uppercase;letter-spacing:.05em}
+.controls{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;margin-bottom:1rem}
+.search-input{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:.45rem .8rem;font-family:inherit;font-size:.85rem;color:var(--text);width:220px;outline:none}
+.search-input:focus{border-color:var(--blue)}
+.filter-btn{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:.45rem .85rem;font-family:inherit;font-size:.82rem;color:var(--muted);cursor:pointer;transition:all .15s}
+.filter-btn.active{background:var(--blue-dim);color:var(--blue);border-color:var(--blue);font-weight:600}
+.filter-btn:hover:not(.active){border-color:var(--blue);color:var(--text)}
+.controls-right{margin-left:auto;font-size:.8rem;color:var(--muted)}
+.table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.84rem}
+th{padding:.7rem 1rem;text-align:left;font-size:.72rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
+th:hover{color:var(--text)}
+th .sort-arrow{opacity:.3;margin-left:.2rem}
+th.sorted .sort-arrow{opacity:1}
+td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--bg)}
+.col-email{max-width:220px;overflow:hidden;text-overflow:ellipsis}
+.col-name{max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.pill{display:inline-flex;align-items:center;gap:.3rem;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;border-radius:20px;padding:2px 9px}
+.pill-active{background:var(--green-dim);color:var(--green)}
+.pill-trial{background:var(--blue-dim);color:var(--blue)}
+.pill-trial_expired,.pill-expired{background:var(--red-dim);color:var(--red)}
+.pill-lifetime{background:var(--purple-dim);color:var(--purple)}
+.pill-unknown{background:var(--amber-dim);color:var(--amber)}
+.days-wrap{display:flex;align-items:center;gap:.5rem}
+.days-bar-track{width:64px;height:5px;background:var(--border);border-radius:3px;overflow:hidden;flex-shrink:0}
+.days-bar-fill{height:100%;border-radius:3px;background:var(--green);transition:width .3s}
+.days-bar-fill.low{background:var(--amber)}
+.days-bar-fill.crit{background:var(--red)}
+.days-text{font-variant-numeric:tabular-nums;color:var(--muted);font-size:.8rem}
+#state-loading,#state-error,#state-login{text-align:center;padding:4rem 1rem;color:var(--muted)}
+#state-error{color:var(--red)}
+.btn{display:inline-flex;align-items:center;gap:.4rem;background:var(--blue);color:#fff;border:none;border-radius:8px;padding:.55rem 1.1rem;font-family:inherit;font-size:.85rem;font-weight:600;cursor:pointer;text-decoration:none}
+.empty-row td{text-align:center;color:var(--muted);padding:2.5rem}
+</style>
+</head>
+<body>
+<header>
+  <div class="header-brand">AgentTrust<span class="badge-admin">Admin</span></div>
+  <div class="header-meta" id="header-meta">Loading…</div>
+</header>
+<main>
+  <div id="state-login" style="display:none">
+    <p style="margin-bottom:1rem">Sign in with your admin Google account to access this page.</p>
+    <a class="btn" href="/auth/google?return_to=admin">Sign in with Google</a>
+  </div>
+  <div id="state-error" style="display:none"></div>
+  <div id="state-loading">Loading accounts…</div>
+  <div id="dashboard" style="display:none">
+    <div class="stats-row" id="stats-row"></div>
+    <div class="controls">
+      <input class="search-input" id="search" type="search" placeholder="Search email or name…" oninput="applyFilters()">
+      <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
+      <button class="filter-btn" data-filter="active" onclick="setFilter('active')">Active</button>
+      <button class="filter-btn" data-filter="trial" onclick="setFilter('trial')">Trial</button>
+      <button class="filter-btn" data-filter="lifetime" onclick="setFilter('lifetime')">Lifetime</button>
+      <button class="filter-btn" data-filter="expired" onclick="setFilter('expired')">Expired</button>
+      <span class="controls-right" id="count-label"></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th onclick="sortBy('email')">Email <span class="sort-arrow" id="s-email">↕</span></th>
+          <th onclick="sortBy('name')">Name <span class="sort-arrow" id="s-name">↕</span></th>
+          <th onclick="sortBy('status')">Status <span class="sort-arrow" id="s-status">↕</span></th>
+          <th onclick="sortBy('days_remaining')">Expires / Remaining <span class="sort-arrow" id="s-days_remaining">↕</span></th>
+          <th onclick="sortBy('created_at')">Joined <span class="sort-arrow" id="s-created_at">↕</span></th>
+          <th onclick="sortBy('wallet_count')">Wallets <span class="sort-arrow" id="s-wallet_count">↕</span></th>
+          <th onclick="sortBy('api_key_count')">API Keys <span class="sort-arrow" id="s-api_key_count">↕</span></th>
+        </tr></thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+(function(){
+  let _all=[],_filter='all',_sortKey='created_at',_sortDir=-1;
+  async function init(){
+    try{
+      const res=await fetch('/admin/accounts',{credentials:'include'});
+      if(res.status===401||res.status===403){show('state-login');return;}
+      if(!res.ok)throw new Error('HTTP '+res.status);
+      const data=await res.json();
+      _all=data.accounts||[];
+      show('dashboard');renderStats();applyFilters();
+      document.getElementById('header-meta').textContent=_all.length+' accounts \xb7 '+new Date().toLocaleString();
+    }catch(e){show('state-error');document.getElementById('state-error').textContent='Error: '+e.message;}
+  }
+  function show(id){['state-loading','state-error','state-login','dashboard'].forEach(i=>{document.getElementById(i).style.display=i===id?'':'none';});}
+  function renderStats(){
+    const total=_all.length,active=_all.filter(a=>a.status==='active').length,trial=_all.filter(a=>a.status==='trial').length,
+      lifetime=_all.filter(a=>a.status==='lifetime').length,expired=_all.filter(a=>a.status==='expired'||a.status==='trial_expired').length,
+      expiring=_all.filter(a=>(a.status==='active'||a.status==='trial')&&a.days_remaining!==null&&a.days_remaining<=7).length;
+    document.getElementById('stats-row').innerHTML=[
+      {v:total,l:'Total',c:'var(--text)'},{v:active,l:'Active',c:'var(--green)'},{v:trial,l:'Trial',c:'var(--blue)'},
+      {v:lifetime,l:'Lifetime',c:'var(--purple)'},{v:expired,l:'Expired',c:'var(--red)'},{v:expiring,l:'≤7 days left',c:'var(--amber)'}
+    ].map(t=>'<div class="stat-card"><div class="stat-value" style="color:'+t.c+'">'+t.v+'</div><div class="stat-label">'+t.l+'</div></div>').join('');
+  }
+  window.setFilter=function(f){_filter=f;document.querySelectorAll('.filter-btn').forEach(b=>b.classList.toggle('active',b.dataset.filter===f));applyFilters();};
+  window.applyFilters=function(){
+    const q=(document.getElementById('search').value||'').toLowerCase();
+    let rows=_all.filter(a=>{
+      if(_filter==='expired')return a.status==='expired'||a.status==='trial_expired';
+      if(_filter!=='all'&&a.status!==_filter)return false;
+      if(q&&!a.email.toLowerCase().includes(q)&&!a.name.toLowerCase().includes(q))return false;
+      return true;
+    });
+    rows.sort((a,b)=>{let av=a[_sortKey]??'',bv=b[_sortKey]??'';if(av===null)av=_sortDir===1?Infinity:-Infinity;if(bv===null)bv=_sortDir===1?Infinity:-Infinity;if(av<bv)return -_sortDir;if(av>bv)return _sortDir;return 0;});
+    document.getElementById('count-label').textContent=rows.length+' account'+(rows.length!==1?'s':'');
+    renderTable(rows);
+  };
+  window.sortBy=function(k){if(_sortKey===k)_sortDir*=-1;else{_sortKey=k;_sortDir=-1;}document.querySelectorAll('.sort-arrow').forEach(el=>el.textContent='↕');document.querySelectorAll('th').forEach(th=>th.classList.remove('sorted'));const a=document.getElementById('s-'+k);if(a){a.textContent=_sortDir===1?'↑':'↓';a.closest('th').classList.add('sorted');}applyFilters();};
+  function renderTable(rows){
+    const tbody=document.getElementById('table-body');
+    if(!rows.length){tbody.innerHTML='<tr class="empty-row"><td colspan="7">No accounts match this filter.</td></tr>';return;}
+    tbody.innerHTML=rows.map(a=>{
+      const labels={active:'Active',trial:'Trial',trial_expired:'Trial ended',expired:'Expired',lifetime:'Lifetime',unknown:'Unknown'};
+      const cls=a.status in labels?a.status:'unknown';
+      const pill='<span class="pill pill-'+cls+'">'+(labels[cls]||a.status)+'</span>';
+      let expiry;
+      if(a.status==='lifetime')expiry='<span style="color:var(--purple)">∞ Lifetime</span>';
+      else if(a.days_remaining===null||a.expires_at===null)expiry='<span style="color:var(--muted)">—</span>';
+      else if(a.status==='expired'||a.status==='trial_expired')expiry='<span style="color:var(--red);font-size:.8rem">'+fmtDate(a.expires_at)+'</span>';
+      else{const d=a.days_remaining,c=d<=3?'crit':d<=14?'low':'',pct=Math.min(100,Math.round((d/(a.status==='trial'?30:365))*100));expiry='<div class="days-wrap"><div class="days-bar-track"><div class="days-bar-fill '+c+'" style="width:'+pct+'%"></div></div><span class="days-text">'+d+'d left</span></div>';}
+      const joined=a.created_at?fmtDate(a.created_at):'—';
+      return '<tr><td class="col-email" title="'+esc(a.email)+'">'+esc(a.email)+'</td><td class="col-name">'+esc(a.name||'—')+(a.org_name?'<br><span style="font-size:.75rem;color:var(--muted)">'+esc(a.org_name)+'</span>':'')+'</td><td>'+pill+'</td><td>'+expiry+'</td><td style="color:var(--muted)">'+joined+'</td><td style="text-align:center;font-variant-numeric:tabular-nums">'+a.wallet_count+'</td><td style="text-align:center;font-variant-numeric:tabular-nums">'+a.api_key_count+'</td></tr>';
+    }).join('');
+  }
+  function fmtDate(iso){return new Date(iso).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'});}
+  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+  init();
+})();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """Serve the admin dashboard HTML — same origin as the API so cookies work."""
+    return HTMLResponse(content=_ADMIN_HTML)
 
 
 @app.get("/admin/accounts")
