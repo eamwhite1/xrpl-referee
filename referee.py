@@ -2769,6 +2769,18 @@ class EnterpriseAccount(Base):
     created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class PendingProPayment(Base):
+    """Payment made via Xaman before the buyer has a Pro account. Redeemed on first Google sign-in."""
+    __tablename__ = "pending_pro_payment"
+    id             = Column(String, primary_key=True)   # xaman uuid
+    xrpl_address   = Column(String, index=True, nullable=False)
+    currency       = Column(String, default="XRP")
+    tx_hash        = Column(String, nullable=True)
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    redeemed_at    = Column(DateTime, nullable=True)
+    redeemed_by    = Column(String, nullable=True)   # EnterpriseAccount.id
+
+
 class LinkedWallet(Base):
     __tablename__ = "linked_wallet"
     id             = Column(Integer, primary_key=True, index=True)
@@ -3092,6 +3104,16 @@ def run_migrations():
         "ALTER TABLE escrow_template ADD COLUMN IF NOT EXISTS max_submissions    INTEGER DEFAULT 3",
         # EnterpriseAccount — seller profile
         "ALTER TABLE enterprise_account ADD COLUMN IF NOT EXISTS public_seller_profile BOOLEAN DEFAULT FALSE",
+        # PendingProPayment — pre-signup Xaman payments
+        """CREATE TABLE IF NOT EXISTS pending_pro_payment (
+            id VARCHAR PRIMARY KEY,
+            xrpl_address VARCHAR NOT NULL,
+            currency VARCHAR DEFAULT 'XRP',
+            tx_hash VARCHAR,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            redeemed_at TIMESTAMPTZ,
+            redeemed_by VARCHAR
+        )""",
         # P1-2: release retry counter
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS release_attempts INT DEFAULT 0",
         # P0-1: updated_at for RELEASING sweeper
@@ -13489,6 +13511,29 @@ async def auth_google_callback(request: Request, code: str = None, state: str = 
                 account.name = userinfo.get("name")
         db.commit()
         db.refresh(account)
+
+        # Redeem any pending Xaman Pro payment made before sign-up
+        linked_wallets = db.query(LinkedWallet).filter_by(account_id=account.id).all()
+        linked_addresses = [w.xrpl_address for w in linked_wallets]
+        if linked_addresses:
+            pending = (
+                db.query(PendingProPayment)
+                .filter(
+                    PendingProPayment.xrpl_address.in_(linked_addresses),
+                    PendingProPayment.redeemed_at == None,  # noqa: E711
+                )
+                .order_by(PendingProPayment.created_at.desc())
+                .first()
+            )
+            if pending:
+                pending.redeemed_at = datetime.now(timezone.utc)
+                pending.redeemed_by = account.id
+                account.status = "active"
+                now = datetime.now(timezone.utc)
+                base = account.sub_expires_at if (account.sub_expires_at and account.sub_expires_at > now) else now
+                account.sub_expires_at = base + timedelta(days=365)
+                db.commit()
+                db.refresh(account)
     finally:
         db.close()
 
@@ -13557,18 +13602,31 @@ async def enterprise_payment_details(account: EnterpriseAccount = Depends(_get_c
 
 @app.post("/subscribe/xaman")
 async def subscribe_xaman_create(
+    request: Request,
     body: dict = Body(default=None),
-    account: EnterpriseAccount = Depends(_get_current_account),
+    db: Session = Depends(get_db),
 ):
-    """Create a Xaman (XUMM) XRP or RLUSD payment payload for Pro subscription ($199/year)."""
+    """
+    Create a Xaman (XUMM) XRP or RLUSD payment payload for Pro subscription ($199/year).
+    Works without a session — the signing wallet address is captured on confirmation and
+    used to activate an existing account or store a PendingProPayment for first sign-in.
+    """
     if body is None:
         body = {}
     currency = (body.get("currency") or "XRP").upper()
     if currency not in ("XRP", "RLUSD"):
         currency = "XRP"
 
+    # Use account email in memo if signed in; otherwise the XRPL address will be captured from the signed tx
+    account = None
+    try:
+        account = _get_current_account(request=request, db=db)
+    except Exception:
+        pass
+
     memo_type = "agenttrust-pro-sub".encode().hex().upper()
-    memo_data = f"sub:{account.email or account.id}".encode().hex().upper()
+    memo_value = f"sub:{account.email}" if account else "sub:pending"
+    memo_data = memo_value.encode().hex().upper()
     memos = [{"Memo": {"MemoType": memo_type, "MemoData": memo_data}}]
 
     if currency == "RLUSD":
@@ -13597,7 +13655,6 @@ async def subscribe_xaman_create(
             "Memos":           memos,
         }
 
-    # Allow Payment type through for subscription (create payload directly, bypass EscrowCreate restriction)
     if not xumm_api_key or not xumm_api_secret:
         raise HTTPException(status_code=500, detail="XUMM API credentials not configured.")
 
@@ -13620,16 +13677,22 @@ async def subscribe_xaman_create(
         "amount_rlusd":  199 if currency == "RLUSD" else None,
         "amount_usd":    199,
         "xrp_price_usd": price,
+        "authenticated": bool(account),
     }
 
 
 @app.get("/subscribe/xaman/{uuid}")
 async def subscribe_xaman_status(
     uuid: str,
-    account: EnterpriseAccount = Depends(_get_current_account),
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """Poll Xaman payment status; confirms subscription on valid payment."""
+    """
+    Poll Xaman payment status. Works authenticated or not.
+    - Signed in: activates subscription on the current account.
+    - Not signed in: stores a PendingProPayment keyed by the signing wallet address,
+      redeemed automatically on first Google sign-in when that wallet is linked.
+    """
     payload = await xumm_get_payload(uuid)
     meta = payload.get("meta", {})
 
@@ -13638,34 +13701,70 @@ async def subscribe_xaman_status(
             return {"status": "expired"}
         return {"status": "pending"}
 
-    # Verify the payment amount is close enough (within 5%)
-    delivered = payload.get("response", {}).get("dispatched_result")
-    tx_json = payload.get("response", {}).get("txid")  # just for logging
+    tx_hash    = payload.get("response", {}).get("txid")
+    signed_by  = payload.get("response", {}).get("account")   # XRPL address that signed
+    currency   = "RLUSD" if isinstance(
+        payload.get("payload", {}).get("request_json", {}).get("Amount"), dict
+    ) else "XRP"
 
-    # Re-derive expected drops from current price
-    price = await _get_xrp_price_usd()
-    if price and price > 0:
-        expected_xrp = max(10.0, round(199.0 / price, 2))
-        expected_drops = int(expected_xrp * 1_000_000)
-        # Get amount from payload
-        try:
-            signed_amount = int(payload.get("payload", {}).get("request_json", {}).get("Amount", "0"))
-        except (ValueError, TypeError):
-            signed_amount = 0
-        if signed_amount > 0 and abs(signed_amount - expected_drops) / expected_drops > 0.10:
-            return {"status": "amount_mismatch"}
+    # Verify XRP amount is within 10% of expected (skip for RLUSD — value is exact)
+    if currency == "XRP":
+        price = await _get_xrp_price_usd()
+        if price and price > 0:
+            expected_drops = int(max(10.0, round(199.0 / price, 2)) * 1_000_000)
+            try:
+                signed_drops = int(payload.get("payload", {}).get("request_json", {}).get("Amount", "0"))
+            except (ValueError, TypeError):
+                signed_drops = 0
+            if signed_drops > 0 and abs(signed_drops - expected_drops) / expected_drops > 0.10:
+                return {"status": "amount_mismatch"}
 
-    # Extend subscription 365 days
     now = datetime.now(timezone.utc)
-    acct = db.query(EnterpriseAccount).filter_by(id=account.id).first()
-    if acct:
-        if acct.sub_expires_at and acct.sub_expires_at.replace(tzinfo=timezone.utc) > now:
-            acct.sub_expires_at = acct.sub_expires_at.replace(tzinfo=timezone.utc) + timedelta(days=365)
-        else:
-            acct.sub_expires_at = now + timedelta(days=365)
-        acct.status = "active"
-        db.commit()
-        logger.info(f"✅ Xaman subscription confirmed for {acct.email} tx={tx_json}")
+
+    # Try to find authenticated account
+    account = None
+    try:
+        account = _get_current_account(request=request, db=db)
+    except Exception:
+        pass
+
+    # If no session, check if the signing wallet belongs to an existing account
+    if not account and signed_by:
+        linked = db.query(LinkedWallet).filter_by(xrpl_address=signed_by).first()
+        if linked:
+            account = db.query(EnterpriseAccount).filter_by(id=linked.account_id).first()
+
+    if account:
+        acct = db.query(EnterpriseAccount).filter_by(id=account.id).first()
+        if acct:
+            if acct.sub_expires_at and acct.sub_expires_at.replace(tzinfo=timezone.utc) > now:
+                acct.sub_expires_at = acct.sub_expires_at.replace(tzinfo=timezone.utc) + timedelta(days=365)
+            else:
+                acct.sub_expires_at = now + timedelta(days=365)
+            acct.status = "active"
+            if tx_hash:
+                acct.last_payment_hash = tx_hash
+            db.commit()
+            logger.info(f"✅ Xaman subscription confirmed for {acct.email} tx={tx_hash}")
+        return {"status": "confirmed", "authenticated": True}
+
+    # No account found — store pending payment keyed by signing wallet
+    if signed_by:
+        existing = db.query(PendingProPayment).filter_by(id=uuid).first()
+        if not existing:
+            db.add(PendingProPayment(
+                id=uuid,
+                xrpl_address=signed_by,
+                currency=currency,
+                tx_hash=tx_hash,
+            ))
+            db.commit()
+            logger.info(f"💳 Pending Pro payment stored for wallet {signed_by} tx={tx_hash}")
+        return {
+            "status":        "pending_account",
+            "xrpl_address":  signed_by,
+            "message":       "Payment received. Sign in with Google to activate your Pro subscription — your wallet address will be matched automatically.",
+        }
 
     return {"status": "confirmed"}
 
