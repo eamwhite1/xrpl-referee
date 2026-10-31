@@ -13762,6 +13762,14 @@ async def admin_list_accounts(
         .all()
     )
 
+    def _aware(dt):
+        """Make a datetime timezone-aware (UTC) regardless of whether it already is."""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
     rows = []
     for a in accounts:
         is_lifetime = a.email.lower() in _LIFETIME_ACCESS_EMAILS
@@ -13770,15 +13778,15 @@ async def admin_list_accounts(
             expires_at = None
             days_remaining = None
         elif a.status == "active" and a.sub_expires_at:
-            effective_status = "active" if a.sub_expires_at > now else "expired"
-            expires_at = a.sub_expires_at.isoformat()
-            delta = a.sub_expires_at - now
-            days_remaining = max(0, delta.days) if a.sub_expires_at > now else 0
+            exp = _aware(a.sub_expires_at)
+            effective_status = "active" if exp > now else "expired"
+            expires_at = exp.isoformat()
+            days_remaining = max(0, (exp - now).days) if exp > now else 0
         elif a.status == "trial" and a.trial_ends_at:
-            effective_status = "trial" if a.trial_ends_at > now else "trial_expired"
-            expires_at = a.trial_ends_at.isoformat()
-            delta = a.trial_ends_at - now
-            days_remaining = max(0, delta.days) if a.trial_ends_at > now else 0
+            exp = _aware(a.trial_ends_at)
+            effective_status = "trial" if exp > now else "trial_expired"
+            expires_at = exp.isoformat()
+            days_remaining = max(0, (exp - now).days) if exp > now else 0
         else:
             effective_status = a.status or "unknown"
             expires_at = None
