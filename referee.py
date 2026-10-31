@@ -13438,7 +13438,7 @@ def _subscription_active(account: EnterpriseAccount, db=None) -> bool:
 
 
 @app.get("/auth/google")
-async def auth_google_start(request: Request):
+async def auth_google_start(request: Request, return_to: str = None):
     """Redirect to Google OAuth consent screen."""
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google OAuth not configured")
@@ -13456,6 +13456,10 @@ async def auth_google_start(request: Request):
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     response = RedirectResponse(url)
     response.set_cookie("oauth_state", state, max_age=600, httponly=True, samesite="lax")
+    # Persist the post-login destination for the callback
+    _ALLOWED_RETURN = {"admin", "subscription", "dashboard"}
+    if return_to and return_to in _ALLOWED_RETURN:
+        response.set_cookie("oauth_return", return_to, max_age=600, httponly=True, samesite="lax")
     return response
 
 
@@ -13539,12 +13543,19 @@ async def auth_google_callback(request: Request, code: str = None, state: str = 
         db.close()
 
     session_token = _make_session_token(account.id)
-    response = RedirectResponse(DASHBOARD_URL)
+    oauth_return = request.cookies.get("oauth_return", "")
+    _RETURN_URLS = {
+        "admin":        f"{DASHBOARD_URL.rstrip('/')}/admin/",
+        "subscription": f"{DASHBOARD_URL.rstrip('/')}/enterprise/",
+    }
+    redirect_url = _RETURN_URLS.get(oauth_return, DASHBOARD_URL)
+    response = RedirectResponse(redirect_url)
     response.set_cookie(
         "at_session", session_token,
         max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax", secure=True,
     )
     response.delete_cookie("oauth_state")
+    response.delete_cookie("oauth_return")
     return response
 
 
