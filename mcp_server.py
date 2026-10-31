@@ -2637,7 +2637,7 @@ async def hire_and_pay(
             "1. Sign the 'transaction' dict with your buyer wallet: "
             "Python: from xrpl.transaction import sign; from xrpl.models.transactions import EscrowCreate; "
             f"blob = sign(EscrowCreate.from_xrpl(tx), wallet).blob()  "
-            "JS: const {{ tx_blob }} = wallet.sign(tx)  "
+            "JS: const { tx_blob } = wallet.sign(tx)  "
             f"then call submit_escrow_transaction('{actual_escrow_id}', blob) to submit to XRPL. "
             "2. Share evaluate_token with the worker — they must pass it to evaluate_escrow_work(). "
             "3. Worker submits work via evaluate_escrow_work() and gets paid automatically on PASS."

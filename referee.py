@@ -3230,6 +3230,7 @@ def _backfill_wallet_verifications():
 # ---------------------------------------------------------------------------
 XRPL_URL         = os.getenv("XRPL_URL", "https://xrplcluster.com")
 XRPL_TESTNET_URL = os.getenv("XRPL_TESTNET_URL", "https://testnet.xrpl-labs.com")
+XRPL_TESTNET_URL_FALLBACK = "https://s.altnet.rippletest.net:51234"  # fallback if primary autofill fails
 XRPL_TESTNET_SEED = os.getenv("XRPL_TESTNET_SEED")
 BITHOMP_API_KEY = os.getenv("BITHOMP_API_KEY")  # optional — enables Bithomp domain verification
 PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
@@ -6219,6 +6220,7 @@ class BatchScoreRequest(BaseModel):
     addresses: list[str]
     fee_hash: Optional[str] = None
     payment_signature: Optional[str] = None
+    network: Optional[str] = "mainnet"
 
 
 @app.post("/wallet/scores")
@@ -6251,22 +6253,23 @@ async def batch_wallet_scores(
     addresses = [a for a in req.addresses if not (a in seen or seen.add(a))]
 
     ps = payment_signature or req.payment_signature
-    if not req.fee_hash and not ps:
-        _raise_402(
-            "/wallet/scores",
-            "Batch scoring requires payment. Pay $0.10 (XRP/RLUSD) to the protocol wallet.",
+    network = getattr(req, "network", "mainnet") or "mainnet"
+    if network != "testnet":
+        if not req.fee_hash and not ps:
+            _raise_402(
+                "/wallet/scores",
+                "Batch scoring requires payment. Pay $0.10 (XRP/RLUSD) to the protocol wallet.",
+            )
+        await verify_fee_payment(
+            fee_hash=req.fee_hash or "",
+            escrow_id=f"batch-scores-{int(time.time())}",
+            db=db,
+            resource="/wallet/scores",
+            payment_signature=ps,
         )
 
-    await verify_fee_payment(
-        fee_hash=req.fee_hash or "",
-        escrow_id=f"batch-scores-{int(time.time())}",
-        db=db,
-        resource="/wallet/scores",
-        payment_signature=ps,
-    )
-
     results = await asyncio.gather(
-        *[compute_xrpl_trust_score(addr, db=db) for addr in addresses],
+        *[compute_xrpl_trust_score(addr, db=db, network=network) for addr in addresses],
         return_exceptions=True,
     )
 
@@ -6720,19 +6723,24 @@ def _parse_criteria(raw_criteria) -> list:
     if not isinstance(raw_criteria, list) or len(raw_criteria) == 0:
         raise ValueError("criteria must be a non-empty list")
     result = []
+    errors = []
     for i, item in enumerate(raw_criteria):
         cid = f"c{i+1}"
         if isinstance(item, str):
             result.append({"id": cid, "type": "judgment", "description": item})
         elif isinstance(item, dict):
-            if "description" not in item:
-                raise ValueError(f"criterion #{i+1} missing 'description'")
             ctype = item.get("type", "judgment")
             if ctype not in _VALID_CRITERION_TYPES:
-                raise ValueError(f"criterion #{i+1} has invalid type '{ctype}'; must be one of {sorted(_VALID_CRITERION_TYPES)}")
+                errors.append(f"criterion #{i+1} has invalid type '{ctype}'; must be one of {sorted(_VALID_CRITERION_TYPES)}")
+                continue
+            if "description" not in item and ctype != "code":
+                errors.append(f"criterion #{i+1} missing 'description'")
+                continue
             result.append({**item, "id": item.get("id", cid), "type": ctype})
         else:
-            raise ValueError(f"criterion #{i+1} must be a string or dict")
+            errors.append(f"criterion #{i+1} must be a string or dict")
+    if errors:
+        raise ValueError("; ".join(errors))
     return result
 
 
@@ -7275,6 +7283,7 @@ async def _gemini_schema_selftest():
 # ---------------------------------------------------------------------------
 
 def _send_challenge_window_opened_email(vault):
+    import html as _html
     hours = vault.release_mode.split(":")[1] if vault.release_mode and ":" in vault.release_mode else "24"
     deadline_str = vault.challenge_deadline.strftime("%A %d %B %Y at %H:%M UTC") if vault.challenge_deadline else "soon"
     recipient = vault.buyer_email
@@ -7284,8 +7293,8 @@ def _send_challenge_window_opened_email(vault):
     token_expires = int(time.time()) + 48 * 3600
     challenge_token = _make_challenge_token(vault.escrow_id, vault.buyer_address, token_expires)
     challenge_url = f"{SITE_URL}/challenge/?token={challenge_token}"
-    # Verdict summary for display
-    ai_verdict = vault.ai_verdict or "PASS"
+    # Verdict summary — parse from evaluation_verdicts, not raw ai_verdict JSON
+    ai_verdict_str = "PASS"
     score = None
     criteria_results = None
     submission_excerpt = None
@@ -7293,6 +7302,7 @@ def _send_challenge_window_opened_email(vault):
         try:
             last = vault.evaluation_verdicts[-1] if isinstance(vault.evaluation_verdicts, list) else None
             if last and isinstance(last, dict):
+                ai_verdict_str = last.get("verdict", "PASS") or "PASS"
                 score = last.get("score")
                 criteria_results = last.get("criteria_results") or last.get("criteria")
                 submission_excerpt = last.get("submission_excerpt") or last.get("excerpt")
@@ -7304,10 +7314,10 @@ def _send_challenge_window_opened_email(vault):
     criteria_html = ""
     if criteria_results:
         rows = "".join(
-            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{c.get('criterion_id', c.get('name', '—'))}</td>"
+            f"<tr><td style='padding:.4rem .6rem;border-bottom:1px solid #eee'>{_html.escape(str(c.get('criterion_id', c.get('name', '—'))))}</td>"
             f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:{'#16a34a' if c.get('verdict','').upper() == 'PASS' else '#dc2626'}'>"
-            f"{c.get('verdict', '—').upper()}</td>"
-            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{c.get('reasoning', c.get('reason', ''))}</td></tr>"
+            f"{_html.escape(str(c.get('verdict', '—')).upper())}</td>"
+            f"<td style='padding:.4rem .6rem;border-bottom:1px solid #eee;color:#5c5c6e;font-size:.82rem'>{_html.escape(str(c.get('reasoning', c.get('reason', ''))))}</td></tr>"
             for c in criteria_results
         )
         criteria_html = (
@@ -7322,7 +7332,7 @@ def _send_challenge_window_opened_email(vault):
     if submission_excerpt:
         excerpt_html = (
             f"<div class='detail'><span>Submission excerpt</span><br>"
-            f"<em style='font-size:.85rem;color:#5c5c6e'>{str(submission_excerpt)[:300]}…</em></div>"
+            f"<em style='font-size:.85rem;color:#5c5c6e'>{_html.escape(str(submission_excerpt)[:300])}…</em></div>"
         )
     try:
         resend.Emails.send({
@@ -7334,7 +7344,7 @@ def _send_challenge_window_opened_email(vault):
   <div class="logo">AgentTrust<span>.</span></div>
   <h1>Work passed — challenge window open</h1>
   <p>The AI referee has reviewed the submission for escrow <strong>{vault.escrow_id}</strong>
-     and returned a <strong>{ai_verdict}</strong> verdict{score_str}.</p>
+     and returned a <strong>{_html.escape(ai_verdict_str)}</strong> verdict{score_str}.</p>
   {criteria_html}
   {excerpt_html}
   <p>If you believe the work does not meet the criteria, you have <strong>{hours_plural}</strong>
@@ -7417,9 +7427,10 @@ def _send_challenge_outcome_email(vault, outcome: str):
                 logger.error(f"❌ Challenge rejected email failed for {vault.escrow_id}: {e}")
 
     elif outcome == "upheld_remedy":
+        import html as _html
         recipient = vault.worker_email
         if recipient:
-            criteria_list = ", ".join(vault.challenge_criteria_ids or []) or "disputed criteria"
+            criteria_list = _html.escape(", ".join(vault.challenge_criteria_ids or []) or "disputed criteria")
             submit_url = escrow_status_url(vault.escrow_id)
             try:
                 resend.Emails.send({
@@ -8468,7 +8479,7 @@ async def create_challenge_fee_cancel_payload(req: ChallengeFeeCancelPayloadRequ
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
 @app.post("/escrow/generate")
-async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
+async def generate_escrow(req: EscrowSetupRequest, request: Request, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
@@ -8746,6 +8757,11 @@ async def generate_escrow(req: EscrowSetupRequest, db: Session = Depends(get_db)
         if len(serialized) > 4096:
             raise HTTPException(status_code=422, detail="metadata must be 4 KB or smaller")
         vault.metadata_json = serialized
+    # R3: tag source and internal flag
+    _raw_ip  = _client_ip(request)
+    _ip_hash = __import__('hashlib').sha256(_raw_ip.encode()).hexdigest()[:16]
+    vault.is_internal = _is_internal_vault(req.buyer_address or "", req.worker_address or "", _ip_hash, dict(request.headers))
+    vault.source      = "mcp" if request.headers.get("X-AgentTrust-Internal") == "1" else "rest"
     db.add(vault)
     db.commit()
 
@@ -9373,6 +9389,13 @@ async def challenge_session_xaman(
         raise HTTPException(status_code=404, detail="vault_not_found")
     if vault.status not in ("PASS_CHALLENGE_WINDOW", "CHALLENGED"):
         raise HTTPException(status_code=409, detail="challenge_window_not_open")
+    # R4: 15-minute cutoff — reject Xaman sign request if window closes within 15 min
+    if vault.challenge_deadline:
+        _dl = vault.challenge_deadline
+        if _dl.tzinfo is None:
+            _dl = _dl.replace(tzinfo=timezone.utc)
+        if (_dl - datetime.now(timezone.utc)).total_seconds() < 15 * 60:
+            raise HTTPException(status_code=409, detail={"error": "challenge_window_closing", "message": "Challenge window closes in less than 15 minutes."})
 
     quote = (
         db.query(ChallengeQuote)
@@ -9755,6 +9778,11 @@ async def request_escrow(req: EscrowRequestBody, request: Request, db: Session =
         req.task or "", req.buyer_email or "",
         request.headers.get("x-api-key"), request.headers.get("x-seller-signature"), db, request,
     )
+    # R3: tag source and internal flag
+    _req_ip   = _client_ip(request)
+    _req_hash = __import__('hashlib').sha256(_req_ip.encode()).hexdigest()[:16]
+    vault.is_internal = _is_internal_vault(req.buyer_address or "", req.seller_address or "", _req_hash, dict(request.headers))
+    vault.source      = "mcp" if request.headers.get("X-AgentTrust-Internal") == "1" else "rest"
     db.add(vault)
     db.commit()
 
@@ -10229,8 +10257,7 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
         "metadata":                json.loads(vault.metadata_json) if vault.metadata_json else None,
         # A5: stable verdict fields + created_at
         "created_at":              vault.created_at.isoformat() if vault.created_at else None,
-        **{f"_v_{k}": v for k, v in _verdict_view(vault).items()},
-        # inline the stable fields at top level too
+        # stable verdict fields at top level
         "verdict":                 _verdict_view(vault).get("verdict"),
         "score":                   _verdict_view(vault).get("score"),
         "summary":                 _verdict_view(vault).get("summary"),
@@ -10953,7 +10980,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             if finish_hash else
             _explorer_url(vault.escrow_tx_hash, vault.network or "mainnet")
         ),
-        "poll":                 f"/escrow/{req.escrow_id}" if is_approved and not finish_hash else None,
+        "poll":                 f"{os.getenv('REFEREE_BASE_URL','https://mcp.cryptovault.co.uk')}/escrow/{req.escrow_id}" if is_approved and not finish_hash else None,
         # DEX quote for XRP→RLUSD swap (if seller wants RLUSD)
         "dex_quote_rlusd":      dex_quote,
         "rlusd_issuer":         RLUSD_ISSUER if dex_quote else None,
@@ -15189,6 +15216,25 @@ async def _faucet_fund(addr: str, timeout: float = 30.0) -> bool:
         return False
 
 
+async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str) -> dict:
+    """Call evaluate_work in-process — no loopback HTTP."""
+    req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token)
+    with SessionLocal() as _db:
+        try:
+            result = await evaluate_work(req, _db)
+        except HTTPException as _he:
+            return {"verdict": "ERROR", "summary": str(_he.detail), "score": 0}
+        except Exception as _ex:
+            logger.error(f"_evaluate_internal error: {_ex}")
+            return {"verdict": "ERROR", "summary": str(_ex), "score": 0}
+    if hasattr(result, "body"):
+        import json as _json
+        return _json.loads(result.body)
+    if isinstance(result, dict):
+        return result
+    return {}
+
+
 async def run_testnet_flow(
     task: str = _DEMO_TASK,
     work: str = _DEMO_WORK,
@@ -15224,6 +15270,7 @@ async def run_testnet_flow(
         worker_addr = _dca(worker_pub)
         _buyer_wallet  = Wallet.from_seed(buyer_seed)
         _tn_client = AsyncJsonRpcClient(XRPL_TESTNET_URL)
+        _tn_client_fb = AsyncJsonRpcClient(XRPL_TESTNET_URL_FALLBACK)
 
         # 2. Fund both wallets in parallel
         step = "faucet"
@@ -15265,20 +15312,22 @@ async def run_testnet_flow(
             "Condition": final_condition,
             "CancelAfter": cancel_ripple,
             "Memos": [{"Memo": {"MemoData": f"agenttrust:{escrow_id}".encode().hex().upper(),
-                                "MemoType": "6167656E7474727573740A"}}],
+                                "MemoType": "6167656E747472757374"}}],
         }
         # 5. Submit + wait for validation — retry on tefPAST_SEQ (LastLedgerSequence expired)
+        #    On autofill failure, retry once with the fallback testnet node.
         step = "submit"
         tx_hash = ""
         sequence = None
         engine = ""
         _last_submit_err = None
-        for _attempt in range(3):
+        for _attempt in range(4):
+            _client_to_use = _tn_client_fb if _attempt >= 2 else _tn_client
             try:
                 _tx_obj = _EscrowCreate.from_xrpl(unsigned_dict)
-                _filled = await autofill(_tx_obj, _tn_client)
+                _filled = await autofill(_tx_obj, _client_to_use)
                 _signed = _xrpl_sign(_filled, _buyer_wallet)
-                _result = await async_submit_and_wait(_signed, _tn_client, _buyer_wallet)
+                _result = await async_submit_and_wait(_signed, _client_to_use, _buyer_wallet)
                 tx_hash = (
                     _result.result.get("tx_json", {}).get("hash")
                     or _result.result.get("hash")
@@ -15293,7 +15342,8 @@ async def run_testnet_flow(
                 break
             except Exception as _se:
                 _last_submit_err = _se
-                if "tefPAST_SEQ" in str(_se) and _attempt < 2:
+                _se_str = str(_se)
+                if ("tefPAST_SEQ" in _se_str or "autofill" in _se_str.lower() or "connect" in _se_str.lower()) and _attempt < 3:
                     continue
                 break
         if _last_submit_err:
@@ -15338,36 +15388,15 @@ async def run_testnet_flow(
                 logger.error(f"run_testnet_flow DB insert failed for {escrow_id}: {_db_err} — tx={tx_hash}")
                 raise RuntimeError(f"vault_insert_failed: {_db_err}")
 
-        # 7. Evaluate work (auto_submit=True path)
+        # 7. Evaluate work (auto_submit=True path) — call in-process, no loopback HTTP
         verdict_result = {}
         if auto_submit:
             step = "evaluate"
-            # Call evaluate_work directly by reusing the DB session
-            with SessionLocal() as _db:
-                _v = _db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-                if _v and _v.escrow_sequence:
-                    # Inline the code-gate / AI evaluation path
-                    from fastapi import Request as _FRq
-                    _work_obj = type("W", (), {
-                        "escrow_id": escrow_id, "work": work, "evaluate_token": evaluate_token,
-                        "worker_attachments": [], "invoices": None,
-                    })()
-                    # Hit the /evaluate endpoint as a function call via httpx to localhost
-                    # (still internal, but isolated from network — use run_in_threadpool for heavy AI)
-                    eval_res = None
-                    try:
-                        from starlette.concurrency import run_in_threadpool
-                        import httpx as _hx
-                        _port = os.getenv("PORT", "8000")
-                        async with _hx.AsyncClient(timeout=60.0) as _ec:
-                            eval_res = await _ec.post(
-                                f"http://localhost:{_port}/evaluate",
-                                json={"escrow_id": escrow_id, "work": work, "evaluate_token": evaluate_token},
-                            )
-                        verdict_result = eval_res.json() if eval_res and eval_res.is_success else {}
-                    except Exception as _ev_err:
-                        logger.error(f"run_testnet_flow evaluate error: {_ev_err}")
-                        verdict_result = {}
+            try:
+                verdict_result = await _evaluate_internal(escrow_id, work, evaluate_token)
+            except Exception as _ev_err:
+                logger.error(f"run_testnet_flow evaluate error: {_ev_err}")
+                verdict_result = {}
 
         # 8. Wait up to 20s for release hash
         step = "wait_release"
@@ -15691,11 +15720,13 @@ async def testnet_try_lock(sid: str):
         _db.commit()
 
     sess.update({
-        "escrow_id":      escrow_id,
-        "evaluate_token": evaluate_token,
-        "buyer_seed":     buyer_seed,
-        "worker_seed":    worker_seed,
-        "step":           "locked",
+        "escrow_id":        escrow_id,
+        "evaluate_token":   evaluate_token,
+        "buyer_seed":       buyer_seed,
+        "worker_seed":      worker_seed,
+        "step":             "locked",
+        "cancel_after_iso": cancel_after_ts.isoformat(),
+        "escrow_sequence":  sequence,
     })
     sess["timeline"].append({"at": datetime.now(timezone.utc).isoformat(), "label": "Escrow locked",
                               "explorer_url": f"https://testnet.xrpl.org/transactions/{tx_hash}"})
@@ -15726,11 +15757,11 @@ async def testnet_try_submit(sid: str, body: dict = Body(default={})):
     if not escrow_id or not evaluate_token:
         raise HTTPException(status_code=409, detail={"error": "lock_first", "message": "Call /lock before /submit"})
 
-    _port = os.getenv("PORT", "8000")
-    payload: dict = {"escrow_id": escrow_id, "work": work, "evaluate_token": evaluate_token}
-    async with httpx.AsyncClient(timeout=60.0) as _ec:
-        eval_res = await _ec.post(f"http://localhost:{_port}/evaluate", json=payload)
-    verdict_data = eval_res.json() if eval_res.is_success else {}
+    try:
+        verdict_data = await _evaluate_internal(escrow_id, work, evaluate_token)
+    except Exception as _ev_err:
+        logger.error(f"testnet_try_submit evaluate error: {_ev_err}")
+        verdict_data = {}
 
     release_hash = verdict_data.get("release_tx_hash") or verdict_data.get("auto_finish_hash")
     if not release_hash:
@@ -15792,7 +15823,88 @@ async def testnet_try_status(sid: str):
         "verdict":        sess.get("verdict"),
         "release_tx_hash": vault_data.get("release_tx_hash"),
         "cancel_tx_hash":  vault_data.get("cancel_tx_hash"),
-        "refund_ready_at": sess.get("escrow_id") and vault_data.get("status") in ("LOCKED", "FAILED") and "check cancel_after in escrow" or None,
+        "refund_ready_at": sess.get("cancel_after_iso") if vault_data.get("status") in ("LOCKED", "FAILED") else None,
+        "test_money": True,
+        "note": "Test XRP on XRPL Testnet — no real value.",
+    }
+
+
+@app.post("/testnet/try/{sid}/refund", tags=["testnet-try"])
+async def testnet_try_refund(sid: str):
+    """A2: Cancel the escrow and return funds to buyer (used when user gives up)."""
+    from xrpl.models.transactions import EscrowCancel as _EscrowCancel
+    from xrpl.transaction import sign as _xrpl_sign
+
+    _try_session_cleanup()
+    sess = _testnet_try_sessions.get(sid)
+    if not sess:
+        raise HTTPException(status_code=404, detail={"error": "session_not_found"})
+
+    escrow_id  = sess.get("escrow_id")
+    sequence   = sess.get("escrow_sequence")
+    buyer_seed = sess.get("buyer_seed")
+    if not escrow_id or not sequence or not buyer_seed:
+        raise HTTPException(status_code=409, detail={"error": "lock_first", "message": "No locked escrow to refund"})
+
+    with SessionLocal() as _db:
+        _v = _db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+        if not _v:
+            raise HTTPException(status_code=404, detail={"error": "vault_not_found"})
+        if _v.status == "CANCELLED":
+            return {"status": "already_cancelled", "cancel_tx_hash": _v.cancel_tx_hash}
+        if _v.status == "RELEASED":
+            raise HTTPException(status_code=409, detail={"error": "already_released"})
+        cancel_after_ts = _v.cancel_after_ts
+        buyer_addr = _v.buyer_address
+
+    now_utc = datetime.now(timezone.utc)
+    if cancel_after_ts and cancel_after_ts.tzinfo is None:
+        cancel_after_ts = cancel_after_ts.replace(tzinfo=timezone.utc)
+    if cancel_after_ts and now_utc < cancel_after_ts:
+        wait_secs = int((cancel_after_ts - now_utc).total_seconds())
+        raise HTTPException(status_code=425, detail={"error": "too_early", "refund_ready_at": cancel_after_ts.isoformat(), "wait_seconds": wait_secs})
+
+    _buyer_wallet = Wallet.from_seed(buyer_seed)
+    _tn_client = AsyncJsonRpcClient(XRPL_TESTNET_URL)
+    cancel_tx = _EscrowCancel(
+        account=buyer_addr,
+        owner=buyer_addr,
+        offer_sequence=int(sequence),
+    )
+    cancel_hash = ""
+    _last_err = None
+    for _attempt in range(3):
+        try:
+            _filled = await autofill(cancel_tx, _tn_client)
+            _signed = _xrpl_sign(_filled, _buyer_wallet)
+            _result = await async_submit_and_wait(_signed, _tn_client, _buyer_wallet)
+            cancel_hash = _result.result.get("tx_json", {}).get("hash") or _result.result.get("hash", "")
+            _last_err = None
+            break
+        except Exception as _e:
+            _last_err = _e
+            if "tefPAST_SEQ" in str(_e) and _attempt < 2:
+                continue
+            break
+    if _last_err:
+        raise HTTPException(status_code=502, detail={"error": "cancel_failed", "reason": str(_last_err)[:200]})
+
+    with SessionLocal() as _db:
+        _v = _db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+        if _v:
+            _v.status = "CANCELLED"
+            _v.cancel_tx_hash = cancel_hash
+            _db.commit()
+
+    sess["step"] = "refunded"
+    sess["timeline"].append({"at": datetime.now(timezone.utc).isoformat(),
+                              "label": "Escrow cancelled — test XRP returned",
+                              "explorer_url": f"https://testnet.xrpl.org/transactions/{cancel_hash}"})
+
+    return {
+        "status": "cancelled",
+        "cancel_tx_hash": cancel_hash,
+        "cancel_explorer_url": f"https://testnet.xrpl.org/transactions/{cancel_hash}",
         "test_money": True,
         "note": "Test XRP on XRPL Testnet — no real value.",
     }

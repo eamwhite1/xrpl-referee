@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "name": "AgentTrust Referee",
-  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP or RLUSD in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
+  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
   "url": "https://mcp.cryptovault.co.uk",
   "agentVersion": "9.0.0",
   "protocolVersion": "0.6.0",
@@ -68,7 +68,7 @@
     {
       "id": "escrow-create",
       "name": "Create Escrow Vault",
-      "description": "Lock XRP or RLUSD in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), or both. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping. Use /escrow/prepare with delegate_address for XLS-75 delegated signing.",
+      "description": "Lock XRP in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), or both. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping. Use /escrow/prepare with delegate_address for XLS-75 delegated signing.",
       "endpoint": "/escrow/generate",
       "method": "POST",
       "tags": ["escrow", "payment", "xrpl"]
