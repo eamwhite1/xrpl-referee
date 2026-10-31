@@ -1,0 +1,35 @@
+{
+  "chain_type": "xrpl",
+  "rules": [
+    {
+      "action": "ALLOW",
+      "method": "xrpl_signTransaction",
+      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCreate"}]
+    },
+    {
+      "action": "ALLOW",
+      "method": "xrpl_signTransaction",
+      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCancel"}]
+    },
+    {
+      "action": "ALLOW",
+      "method": "xrpl_signTransaction",
+      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowFinish"}]
+    },
+    {
+      "action": "ALLOW",
+      "method": "xrpl_signTransaction",
+      "conditions": [{"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "AccountSet"}]
+    },
+    {
+      "action": "ALLOW",
+      "method": "xrpl_signTransaction",
+      "conditions": [
+        {"field_source": "ethereum_transaction", "field": "TransactionType", "operator": "eq", "value": "Payment"},
+        {"field_source": "ethereum_transaction", "field": "Amount", "operator": "lt", "value": "100000000000"}
+      ]
+    },
+    {"action": "ALLOW", "method": "exportPrivateKey"},
+    {"action": "DENY", "method": "xrpl_signTransaction"}
+  ]
+}

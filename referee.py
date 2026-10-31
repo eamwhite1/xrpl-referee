@@ -48,6 +48,8 @@ from xrpl.models.transactions.transaction import Transaction as XrplTransaction
 from xrpl.asyncio.transaction import autofill
 from xrpl.core.addresscodec import decode_seed
 from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
+from xrpl.core.binarycodec import encode_for_signing as xrpl_encode_for_signing
+from xrpl.core import keypairs as xrpl_keypairs
 from xrpl.utils import xrp_to_drops
 
 # XUMM SDK removed — using direct HTTP calls instead (no dependency conflict)
@@ -1420,13 +1422,47 @@ def _get_free_escrows_remaining(wallet_address: str) -> dict:
                 w.wallet_address for w in
                 db.query(BootstrappedWallet).filter(BootstrappedWallet.privy_user_id == privy_user_id).all()
             ]
-            used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address.in_(sibling_addrs)).count()
+            used = db.query(FreeAuditUsage).filter(
+                FreeAuditUsage.wallet_address.in_(sibling_addrs),
+                FreeAuditUsage.status.in_(["used", "reserved"]),
+            ).count()
         else:
-            used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address == wallet_address).count()
+            used = db.query(FreeAuditUsage).filter(
+                FreeAuditUsage.wallet_address == wallet_address,
+                FreeAuditUsage.status.in_(["used", "reserved"]),
+            ).count()
         remaining = max(0, FREE_AUDIT_LIMIT - used)
         return {"remaining": remaining, "eligible": True, "reason": "AgentTrust-registered wallet"}
     finally:
         db.close()
+
+
+def _consume_free_credit(escrow_id: str, db_session=None):
+    """Flip a reserved free-credit row to 'used' when a lock is validated."""
+    close = db_session is None
+    db = db_session or SessionLocal()
+    try:
+        row = db.query(FreeAuditUsage).filter_by(escrow_id=escrow_id, status="reserved").first()
+        if row:
+            row.status = "used"
+            db.commit()
+    finally:
+        if close:
+            db.close()
+
+
+def _release_free_credit(escrow_id: str, db_session=None):
+    """Release a reserved free-credit when vault is abandoned or reservation expires."""
+    close = db_session is None
+    db = db_session or SessionLocal()
+    try:
+        row = db.query(FreeAuditUsage).filter_by(escrow_id=escrow_id, status="reserved").first()
+        if row:
+            row.status = "released"
+            db.commit()
+    finally:
+        if close:
+            db.close()
 
 
 @app.get("/fees")
@@ -1502,7 +1538,6 @@ async def get_fees(wallet_address: Optional[str] = None):  # noqa: E501
         "free_tier": {
             "rule": f"New agent wallets and new Pro accounts get {FREE_AUDIT_LIMIT} free escrows, each including the AI check.",
             "free_escrows": FREE_AUDIT_LIMIT,
-            "min_trust_score_for_non_bootstrapped": FREE_AUDIT_MIN_SCORE,
             "check_score": "GET /wallet/score/{address}",
             **(_get_free_escrows_remaining(wallet_address) if wallet_address else {}),
         },
@@ -1826,6 +1861,7 @@ class FreeAuditUsage(Base):
     wallet_address = Column(String, index=True, nullable=False)
     escrow_id      = Column(String, nullable=False)
     resource       = Column(String, nullable=True)
+    status         = Column(String, default="used")  # "reserved" | "used" | "released"
     timestamp      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -2803,6 +2839,7 @@ class LinkedWallet(Base):
     verified       = Column(Boolean, default=False)
     verify_challenge = Column(String, nullable=True)
     privy_wallet_id  = Column(String, nullable=True)
+    privy_public_key = Column(String, nullable=True)
     created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -3186,6 +3223,10 @@ def run_migrations():
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS source VARCHAR(32)",
         # A8: inconclusive_count if not present
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS inconclusive_count INTEGER DEFAULT 0",
+        # Privy public key for XRPL signing
+        "ALTER TABLE linked_wallet ADD COLUMN IF NOT EXISTS privy_public_key VARCHAR(66)",
+        # Free credit reservation status
+        "ALTER TABLE free_audit_usage ADD COLUMN IF NOT EXISTS status VARCHAR(16) DEFAULT 'used'",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -8806,7 +8847,7 @@ async def generate_escrow(req: EscrowSetupRequest, request: Request, db: Session
     # Skip for testnet vaults
     _free_tier_wallet = fee_result.get("_free_tier_wallet")
     if _free_tier_wallet and network != "testnet":
-        db.add(FreeAuditUsage(wallet_address=_free_tier_wallet, escrow_id=req.escrow_id, resource="/escrow/generate"))
+        db.add(FreeAuditUsage(wallet_address=_free_tier_wallet, escrow_id=req.escrow_id, resource="/escrow/generate", status="reserved"))
         db.commit()
 
     logger.info(f"🔒 VAULT CREATED: {req.escrow_id} | currency={currency} | seller_wants={req.seller_currency}")
@@ -8952,6 +8993,7 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     # Set escrow_owner from the confirmed EscrowCreate tx Account field (may differ from buyer_address)
     vault.escrow_owner = vault.buyer_address  # fallback; backfill will correct if wrong
     db.commit()
+    _consume_free_credit(escrow_id, db)
 
     return {"status": "confirmed", "escrow_id": escrow_id, "sequence": sequence}
 
@@ -9899,6 +9941,7 @@ async def fund_escrow_request(escrow_id: str, body: FundEscrowBody, db: Session 
     vault.escrow_tx_hash = body.tx_hash
     vault.delivery_status = "PENDING"
     db.commit()
+    _consume_free_credit(escrow_id, db)
 
     # Notify worker
     if vault.worker_email:
@@ -10171,6 +10214,7 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     _wh_payload, _wh_url = _build_webhook_payload(vault, "PENDING", tx_hash)
     try:
         db.commit()
+        _consume_free_credit(escrow_id, db)
     except Exception as e:
         logger.error(f"DB commit failed after successful XRPL submit for {escrow_id}: {e} — tx={tx_hash}")
         db.rollback()
@@ -13833,7 +13877,10 @@ async def enterprise_me(
     ).all()
     if account_wallets:
         wallet_addrs = [w.wallet_address for w in account_wallets]
-        used = db.query(FreeAuditUsage).filter(FreeAuditUsage.wallet_address.in_(wallet_addrs)).count()
+        used = db.query(FreeAuditUsage).filter(
+            FreeAuditUsage.wallet_address.in_(wallet_addrs),
+            FreeAuditUsage.status.in_(["used", "reserved"]),
+        ).count()
         free_escrows_remaining = max(0, FREE_AUDIT_LIMIT - used)
     else:
         free_escrows_remaining = 0
@@ -13848,6 +13895,159 @@ async def enterprise_me(
         "trial_ends_at": account.trial_ends_at.isoformat() if account.trial_ends_at else None,
         "sub_expires_at": account.sub_expires_at.isoformat() if account.sub_expires_at else None,
         "free_escrows_remaining": free_escrows_remaining,
+    }
+
+
+@app.post("/enterprise/escrow/{escrow_id}/privy-lock")
+async def privy_lock_escrow(escrow_id: str, db: Session = Depends(get_db), account=Depends(_get_current_account)):
+    """Sign and submit an EscrowCreate for a Privy wallet without Xaman."""
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    buyer_wallet = db.query(LinkedWallet).filter_by(account_id=account.id, xrpl_address=vault.buyer_address).first()
+    if not buyer_wallet or not buyer_wallet.privy_wallet_id:
+        raise HTTPException(status_code=409, detail="Buyer is not a Privy wallet on this account")
+    if vault.escrow_tx_hash:
+        return {"status": "LOCKED", "tx_hash": vault.escrow_tx_hash}
+    if vault.status != "PENDING":
+        raise HTTPException(status_code=409, detail=f"Vault status is {vault.status}")
+    network = getattr(vault, "network", "mainnet") or "mainnet"
+    # Pre-flight balance check
+    from xrpl.models.requests import AccountInfo, ServerInfo
+    xrpl_url = _xrpl_url_for_network(network)
+    try:
+        async with AsyncJsonRpcClient(xrpl_url) as client:
+            srv = await client.request(ServerInfo())
+            reserve_base = float(srv.result["info"]["validated_ledger"].get("reserve_base_xrp", 1))
+            reserve_inc  = float(srv.result["info"]["validated_ledger"].get("reserve_inc_xrp", 0.2))
+            try:
+                ai = await client.request(AccountInfo(account=vault.buyer_address, ledger_index="current"))
+                balance_xrp = int(ai.result["account_data"]["Balance"]) / 1_000_000
+                owner_count  = int(ai.result["account_data"].get("OwnerCount", 0))
+                need_xrp = reserve_base + reserve_inc * (owner_count + 1) + int(vault.amount) / 1_000_000 + 0.001
+                if balance_xrp < need_xrp:
+                    raise HTTPException(status_code=402, detail={
+                        "error": "insufficient_xrp", "balance_xrp": balance_xrp,
+                        "fund_xrp": round(need_xrp - balance_xrp, 6), "address": vault.buyer_address,
+                    })
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=402, detail={
+                    "error": "wallet_not_activated", "address": vault.buyer_address,
+                    "fund_xrp": round(reserve_base + int(vault.amount) / 1_000_000 + 1.0, 6),
+                })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"XRPL pre-flight failed: {e}")
+    # Build EscrowCreate
+    tx = {
+        "TransactionType": "EscrowCreate",
+        "Account": vault.buyer_address,
+        "Destination": vault.worker_address,
+        "Amount": str(int(vault.amount)),
+        "Condition": vault.condition.upper() if vault.condition else "",
+        "CancelAfter": vault.cancel_after,
+    }
+    if vault.destination_tag is not None:
+        tx["DestinationTag"] = int(vault.destination_tag)
+    result = await _privy_sign_and_submit(buyer_wallet, tx, network)
+    if not result.get("validated") or result.get("engine_result") != "tesSUCCESS":
+        raise HTTPException(status_code=502, detail=f"Lock failed: {result.get('engine_result')}")
+    vault.escrow_tx_hash  = result["hash"]
+    vault.escrow_sequence = tx.get("Sequence")
+    vault.escrow_owner    = vault.buyer_address
+    vault.status          = "LOCKED"
+    db.commit()
+    _consume_free_credit(escrow_id, db)
+    explorer = (f"https://xrpl.org/transactions/{result['hash']}" if network == "mainnet"
+                else f"https://testnet.xrpl.org/transactions/{result['hash']}")
+    logger.info("privy-lock validated escrow=%s addr=%s hash=%s result=%s",
+                escrow_id, vault.buyer_address, result["hash"], result["engine_result"])
+    return {"status": "LOCKED", "tx_hash": result["hash"], "explorer_url": explorer}
+
+
+@app.post("/enterprise/escrow/{escrow_id}/privy-refund")
+async def privy_refund_escrow(escrow_id: str, db: Session = Depends(get_db), account=Depends(_get_current_account)):
+    """Sign and submit an EscrowCancel for a Privy wallet without Xaman."""
+    vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+    if not vault:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    buyer_wallet = db.query(LinkedWallet).filter_by(account_id=account.id, xrpl_address=vault.buyer_address).first()
+    if not buyer_wallet or not buyer_wallet.privy_wallet_id:
+        raise HTTPException(status_code=409, detail="Buyer is not a Privy wallet on this account")
+    if vault.status in ("RELEASED", "CANCELLED"):
+        raise HTTPException(status_code=409, detail=f"Vault already {vault.status}")
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    ripple_epoch = 946684800
+    cancel_after_unix = vault.cancel_after + ripple_epoch if vault.cancel_after else None
+    if cancel_after_unix and now_ts < cancel_after_unix:
+        raise HTTPException(status_code=425, detail={"error": "too_early", "refund_ready_at": cancel_after_unix})
+    network = getattr(vault, "network", "mainnet") or "mainnet"
+    offer_sequence = vault.escrow_sequence
+    owner = vault.escrow_owner or vault.buyer_address
+    if not offer_sequence and vault.escrow_tx_hash:
+        xrpl_url = _xrpl_url_for_network(network)
+        try:
+            async with httpx.AsyncClient(timeout=10) as hc:
+                r = await hc.post(xrpl_url, json={"method": "tx", "params": [{"transaction": vault.escrow_tx_hash}]})
+            tx_data = r.json().get("result", {})
+            owner = tx_data.get("Account", owner)
+            offer_sequence = tx_data.get("Sequence", offer_sequence)
+        except Exception:
+            pass
+    if not offer_sequence:
+        raise HTTPException(status_code=409, detail="Cannot determine EscrowCreate sequence")
+    tx = {
+        "TransactionType": "EscrowCancel",
+        "Account": vault.buyer_address,
+        "Owner": owner,
+        "OfferSequence": int(offer_sequence),
+    }
+    result = await _privy_sign_and_submit(buyer_wallet, tx, network)
+    if not result.get("validated") or result.get("engine_result") != "tesSUCCESS":
+        raise HTTPException(status_code=502, detail=f"Refund failed: {result.get('engine_result')}")
+    vault.status = "CANCELLED"
+    vault.cancel_tx_hash = result["hash"]
+    db.commit()
+    explorer = (f"https://xrpl.org/transactions/{result['hash']}" if network == "mainnet"
+                else f"https://testnet.xrpl.org/transactions/{result['hash']}")
+    logger.info("privy-refund validated escrow=%s addr=%s hash=%s", escrow_id, vault.buyer_address, result["hash"])
+    return {"status": "CANCELLED", "tx_hash": result["hash"], "explorer_url": explorer}
+
+
+@app.get("/enterprise/wallets/{wallet_id}/funding")
+async def get_wallet_funding_info(
+    wallet_id: int, amount_xrp: float = 0.1,
+    db: Session = Depends(get_db), account=Depends(_get_current_account),
+):
+    """Return current balance and XRP needed to lock a given escrow amount from a Privy wallet."""
+    wallet = db.query(LinkedWallet).filter_by(id=wallet_id, account_id=account.id).first()
+    if not wallet or not wallet.privy_wallet_id:
+        raise HTTPException(status_code=404, detail="Privy wallet not found")
+    from xrpl.models.requests import AccountInfo, ServerInfo
+    xrpl_url = _xrpl_url_for_network("mainnet")
+    async with AsyncJsonRpcClient(xrpl_url) as client:
+        srv = await client.request(ServerInfo())
+        reserve_base = float(srv.result["info"]["validated_ledger"].get("reserve_base_xrp", 1))
+        reserve_inc  = float(srv.result["info"]["validated_ledger"].get("reserve_inc_xrp", 0.2))
+        try:
+            ai = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
+            balance_xrp = int(ai.result["account_data"]["Balance"]) / 1_000_000
+            owner_count = int(ai.result["account_data"].get("OwnerCount", 0))
+            activated = True
+        except Exception:
+            balance_xrp, owner_count, activated = 0.0, 0, False
+    need_xrp = reserve_base + reserve_inc * (owner_count + 1) + amount_xrp + 0.001
+    return {
+        "address": wallet.xrpl_address,
+        "balance_xrp": balance_xrp,
+        "activated": activated,
+        "need_xrp": round(max(0.0, need_xrp - balance_xrp), 6),
+        "reserve_base": reserve_base,
+        "reserve_inc": reserve_inc,
+        "owner_count": owner_count,
     }
 
 
@@ -14075,10 +14275,7 @@ async def enterprise_link_wallet(
         verify_challenge=secrets.token_hex(16),
     )
     db.add(wallet)
-    # Grant account free-tier pool if this address has no BootstrappedWallet row yet
-    bw_existing = db.query(BootstrappedWallet).filter_by(wallet_address=req.xrpl_address).first()
-    if not bw_existing:
-        db.add(BootstrappedWallet(wallet_address=req.xrpl_address, privy_user_id=account.id))
+    # BootstrappedWallet added on wallet verification, not at link time
     db.commit()
     db.refresh(wallet)
     return {
@@ -14091,6 +14288,128 @@ async def enterprise_link_wallet(
             f"with a Memo containing: {wallet.verify_challenge}"
         ),
     }
+
+
+async def _privy_get_or_fetch_pubkey(wallet, db) -> str:
+    """Return the stored Privy public key, fetching lazily if missing."""
+    if wallet.privy_public_key:
+        return wallet.privy_public_key
+    if not wallet.privy_wallet_id:
+        raise ValueError("Not a Privy wallet")
+    privy_app_id = os.getenv("PRIVY_APP_ID", "")
+    privy_app_secret = os.getenv("PRIVY_APP_SECRET", "")
+    async with httpx.AsyncClient(timeout=15) as hc:
+        r = await hc.get(
+            f"https://api.privy.io/v1/wallets/{wallet.privy_wallet_id}",
+            auth=(privy_app_id, privy_app_secret),
+            headers={"privy-app-id": privy_app_id},
+        )
+    r.raise_for_status()
+    pub_key = r.json().get("public_key", "")
+    if pub_key and len(pub_key) == 66 and pub_key[:2].upper() in ("02", "03"):
+        wallet.privy_public_key = pub_key.upper()
+        if db:
+            db.commit()
+        return wallet.privy_public_key
+    raise ValueError(f"Unexpected Privy public_key: {pub_key!r}")
+
+
+async def _privy_sign_xrpl_tx(privy_wallet_id: str, tx_dict: dict) -> str:
+    """Ask Privy to sign an XRPL tx and return the signed blob (hex). tx_dict must have SigningPubKey set."""
+    privy_app_id = os.getenv("PRIVY_APP_ID", "")
+    privy_app_secret = os.getenv("PRIVY_APP_SECRET", "")
+    prefixed_hex = xrpl_encode_for_signing(tx_dict)
+    assert prefixed_hex.upper().startswith("53545800"), \
+        f"encode_for_signing must start with 53545800, got: {prefixed_hex[:8]}"
+    async with httpx.AsyncClient(timeout=30) as hc:
+        r = await hc.post(
+            f"https://api.privy.io/v1/wallets/{privy_wallet_id}/rpc",
+            auth=(privy_app_id, privy_app_secret),
+            headers={"privy-app-id": privy_app_id, "Content-Type": "application/json"},
+            json={"method": "xrpl_signTransaction", "params": {"transaction": prefixed_hex, "encoding": "hex"}},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Privy signing failed: {r.text[:300]}")
+    data = r.json().get("data", {})
+    blob = data.get("signed_transaction", "")
+    if not blob:
+        raise HTTPException(status_code=502, detail="Privy returned no signed_transaction")
+    return blob
+
+
+async def _privy_sign_and_submit(wallet, tx: dict, network: str) -> dict:
+    """Autofill, sign with Privy, verify blob, submit, poll for validation. Returns {hash, engine_result, validated, ledger_index}."""
+    from xrpl.models.requests import Fee, ServerInfo, AccountInfo, SubmitOnly, Tx as TxReq
+    pub_key = await _privy_get_or_fetch_pubkey(wallet, None)
+    xrpl_url = _xrpl_url_for_network(network)
+    async with AsyncJsonRpcClient(xrpl_url) as client:
+        fee_resp = await client.request(Fee())
+        min_fee = int(fee_resp.result.get("drops", {}).get("minimum_fee", "12"))
+        base_fee = max(12, min_fee)
+        srv_resp = await client.request(ServerInfo())
+        cur_ledger = srv_resp.result["info"]["validated_ledger"]["seq"]
+        acct_resp = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
+        sequence = acct_resp.result["account_data"]["Sequence"]
+        tx["Account"] = wallet.xrpl_address
+        tx["Fee"] = str(base_fee)
+        tx["Sequence"] = sequence
+        tx["LastLedgerSequence"] = cur_ledger + 20
+        tx["SigningPubKey"] = pub_key
+        blob = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
+        # Verify the blob
+        decoded = xrpl_decode_tx_blob(blob)
+        tx_type = tx.get("TransactionType", "")
+        if decoded.get("TransactionType") != tx_type:
+            raise HTTPException(status_code=502, detail="Privy returned wrong TransactionType")
+        if tx_type == "EscrowCreate":
+            if decoded.get("Destination") != tx.get("Destination"):
+                raise HTTPException(status_code=502, detail="Privy returned wrong Destination")
+            if decoded.get("Amount") != tx.get("Amount"):
+                raise HTTPException(status_code=502, detail="Privy returned wrong Amount")
+        # Submit
+        submit_resp = await client.request(SubmitOnly(tx_blob=blob))
+        result = submit_resp.result
+        engine = result.get("engine_result", "")
+        if engine not in ("tesSUCCESS", "terQUEUED"):
+            if any(k in engine for k in ("UNFUNDED", "INSUFFICIENT", "actNotFound")):
+                raise HTTPException(status_code=402, detail={
+                    "error": "insufficient_xrp", "engine_result": engine,
+                    "message": "Fund this wallet with XRP before locking an escrow.",
+                })
+            if any(k in engine for k in ("PAST_SEQ", "BAD_SEQ")):
+                acct_resp2 = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
+                tx["Sequence"] = acct_resp2.result["account_data"]["Sequence"]
+                tx["SigningPubKey"] = pub_key
+                blob = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
+                submit_resp = await client.request(SubmitOnly(tx_blob=blob))
+                result = submit_resp.result
+                engine = result.get("engine_result", "")
+                if engine not in ("tesSUCCESS", "terQUEUED"):
+                    raise HTTPException(status_code=502, detail=f"Submit failed: {engine}")
+        # Compute tx hash
+        from hashlib import sha512 as _sha512
+        raw = bytes.fromhex(blob)
+        prefix = bytes.fromhex("54584E00")
+        tx_hash = _sha512(prefix + raw).hexdigest()[:64].upper()
+        # Poll for validation (up to 90s)
+        last_ledger = tx["LastLedgerSequence"]
+        for _ in range(18):
+            await asyncio.sleep(5)
+            try:
+                tx_resp = await client.request(TxReq(transaction=tx_hash))
+                if tx_resp.result.get("validated"):
+                    return {
+                        "hash": tx_hash,
+                        "engine_result": tx_resp.result.get("meta", {}).get("TransactionResult", engine),
+                        "validated": True,
+                        "ledger_index": tx_resp.result.get("ledger_index"),
+                    }
+            except Exception:
+                pass
+            srv2 = await client.request(ServerInfo())
+            if srv2.result["info"]["validated_ledger"]["seq"] > last_ledger:
+                raise HTTPException(status_code=504, detail="Transaction expired (LastLedgerSequence exceeded)")
+        raise HTTPException(status_code=504, detail="Transaction not validated within timeout")
 
 
 @app.post("/enterprise/wallets/privy")
@@ -14129,15 +14448,18 @@ async def enterprise_create_privy_wallet(
     if existing:
         return {"wallet_id": existing.id, "xrpl_address": xrpl_address, "status": "already_linked", "privy_wallet_id": privy_wallet_id}
 
+    pub_key = privy_data.get("public_key", "")
+    privy_public_key = pub_key.upper() if pub_key and len(pub_key) == 66 and pub_key[:2].upper() in ("02", "03") else None
     wallet = LinkedWallet(
         account_id=account.id,
         xrpl_address=xrpl_address,
         label="Privy wallet",
         verify_challenge=secrets.token_hex(16),
         privy_wallet_id=privy_wallet_id,
+        privy_public_key=privy_public_key,
     )
     db.add(wallet)
-    # Grant account free-tier pool if this address has no BootstrappedWallet row yet
+    # Privy wallets are trusted by construction — grant free-tier pool immediately
     bw_existing = db.query(BootstrappedWallet).filter_by(wallet_address=xrpl_address).first()
     if not bw_existing:
         db.add(BootstrappedWallet(wallet_address=xrpl_address, privy_user_id=account.id))
@@ -14195,6 +14517,7 @@ async def enterprise_withdraw_privy_wallet(
     sequence = result["account_data"]["Sequence"]
 
     drops = str(int(round(amount_xrp * 1_000_000)))
+    pub_key = await _privy_get_or_fetch_pubkey(wallet, db)
     tx = {
         "TransactionType": "Payment",
         "Account": wallet.xrpl_address,
@@ -14203,29 +14526,9 @@ async def enterprise_withdraw_privy_wallet(
         "Fee": "12",
         "Sequence": sequence,
         "LastLedgerSequence": result["ledger_current_index"] + 20,
-        "SigningPubKey": "",
+        "SigningPubKey": pub_key,
     }
-
-    import base64 as _b64
-    creds = _b64.b64encode(f"{privy_app_id}:{privy_app_secret}".encode()).decode()
-    async with httpx.AsyncClient(timeout=20) as client:
-        sign_resp = await client.post(
-            f"https://api.privy.io/v1/wallets/{wallet.privy_wallet_id}/rpc",
-            headers={
-                "Authorization": f"Basic {creds}",
-                "privy-app-id": privy_app_id,
-                "Content-Type": "application/json",
-            },
-            json={"method": "xrpl_signTransaction", "params": {"transaction": tx}},
-        )
-    if sign_resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Privy sign error: {sign_resp.text}")
-
-    sign_data = sign_resp.json()
-    signed_tx = sign_data.get("data", {}).get("signed_transaction") or sign_data.get("signed_transaction")
-    if not signed_tx:
-        raise HTTPException(status_code=502, detail=f"Privy returned no signed transaction: {sign_data}")
-
+    signed_tx = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
     async with httpx.AsyncClient(timeout=15) as client:
         submit_resp = await client.post(XRPL_URL, json={
             "method": "submit",
@@ -14319,6 +14622,8 @@ async def enterprise_verify_wallet(
                 decoded = bytes.fromhex(memo_data).decode("utf-8")
                 if wallet.verify_challenge and wallet.verify_challenge in decoded:
                     wallet.verified = True
+                    if not db.query(BootstrappedWallet).filter_by(wallet_address=wallet.xrpl_address).first():
+                        db.add(BootstrappedWallet(wallet_address=wallet.xrpl_address, privy_user_id=account.id))
                     db.commit()
                     matched_tx_hash = (
                         entry.get("hash")
@@ -14366,7 +14671,7 @@ async def enterprise_verify_privy_wallet(
 
     sequence = result["account_data"]["Sequence"]
     memo_hex = wallet.verify_challenge.encode("utf-8").hex().upper()
-
+    pub_key = await _privy_get_or_fetch_pubkey(wallet, db)
     tx = {
         "TransactionType": "AccountSet",
         "Account": wallet.xrpl_address,
@@ -14374,25 +14679,9 @@ async def enterprise_verify_privy_wallet(
         "Sequence": sequence,
         "LastLedgerSequence": result["ledger_current_index"] + 20,
         "Memos": [{"Memo": {"MemoData": memo_hex}}],
-        "SigningPubKey": "",
+        "SigningPubKey": pub_key,
     }
-
-    import base64 as _b64
-    creds = _b64.b64encode(f"{privy_app_id}:{privy_app_secret}".encode()).decode()
-    async with httpx.AsyncClient(timeout=20) as client:
-        sign_resp = await client.post(
-            f"https://api.privy.io/v1/wallets/{wallet.privy_wallet_id}/rpc",
-            headers={"Authorization": f"Basic {creds}", "privy-app-id": privy_app_id, "Content-Type": "application/json"},
-            json={"method": "xrpl_signTransaction", "params": {"transaction": tx}},
-        )
-    if sign_resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Privy sign error: {sign_resp.text}")
-
-    sign_data = sign_resp.json()
-    signed_tx = sign_data.get("data", {}).get("signed_transaction") or sign_data.get("signed_transaction")
-    if not signed_tx:
-        raise HTTPException(status_code=502, detail="Privy returned no signed transaction.")
-
+    signed_tx = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
     async with httpx.AsyncClient(timeout=15) as client:
         submit_resp = await client.post(XRPL_URL, json={"method": "submit", "params": [{"tx_blob": signed_tx}]})
     submit_result = submit_resp.json().get("result", {})
@@ -15401,11 +15690,12 @@ async def _poll_expired_escrows_once():
             if orphaned:
                 db.commit()
 
-            # Cancel expired LOCKED escrows — fetch real owner/sequence from EscrowCreate tx
+            # Cancel expired LOCKED/FAILED escrows — fetch real owner/sequence from EscrowCreate tx
             expired = db.query(EscrowVault).filter(
-                EscrowVault.status == "LOCKED",
+                EscrowVault.status.in_(["LOCKED", "FAILED"]),
                 EscrowVault.cancel_after_ts != None,
                 EscrowVault.cancel_after_ts < now,
+                EscrowVault.escrow_tx_hash != None,
             ).all()
             for vault in expired:
                 try:
