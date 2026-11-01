@@ -206,7 +206,7 @@ app = FastAPI(
         "the seller creates an NFTokenCreateOffer (Destination=buyer, Amount=0) and the buyer accepts "
         "it on-chain — both transfer and payment are then settled automatically. "
         "Register the offer via POST /escrow/{id}/nft-offer and poll status via GET /escrow/{id}/nft-status.\n\n"
-        "**Enterprise landing page:** https://www.cryptovault.co.uk/enterprise/"
+        "**Enterprise landing page:** https://agenttrustxrpl.com/enterprise/"
     ),
     lifespan=_lifespan,
 )
@@ -257,8 +257,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://app.cryptovault.co.uk",
-        "https://www.cryptovault.co.uk",
+        "https://agenttrustxrpl.com",
         "https://cryptovault.co.uk",
+        "https://agenttrustxrpl.com",
+        "https://www.agenttrustxrpl.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -999,7 +1001,7 @@ def serve_playground():
 <h1>AgentTrust Referee</h1>
 <p>API is online. Full playground coming soon.</p>
 <p style="margin-top:1rem"><a href="/docs">API Docs →</a></p>
-<p><a href="https://www.cryptovault.co.uk">AgentTrust App →</a></p>
+<p><a href="https://agenttrustxrpl.com">AgentTrust App →</a></p>
 </div></body></html>""", status_code=200)
 
 @app.get("/status")
@@ -1164,7 +1166,7 @@ def _build_agent_card():
         "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Free testnet sandbox (no real XRP).",
         "url": "https://mcp.cryptovault.co.uk/mcp/",
         "version": APP_VERSION,
-        "provider": {"organization": "Boxclever Media Ltd", "url": "https://www.cryptovault.co.uk"},
+        "provider": {"organization": "Boxclever Media Ltd", "url": "https://agenttrustxrpl.com"},
         "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": False},
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json"],
@@ -1199,7 +1201,7 @@ def _agent_json_legacy_unused():
         "url": "https://mcp.cryptovault.co.uk",
         "agentVersion": "9.0.0",
         "protocolVersion": "0.6.0",
-        "provider": {"organization": "Boxclever Media Ltd (trading as AgentTrust)", "url": "https://www.cryptovault.co.uk"},
+        "provider": {"organization": "Boxclever Media Ltd (trading as AgentTrust)", "url": "https://agenttrustxrpl.com"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True, "delegation": True},
         "authentication": {
             "schemes": ["x402", "x-payment-hash"],
@@ -1305,7 +1307,7 @@ async def serve_mcp_server_card():
             "a 402 with an X-Payment-Required header describing exactly how to pay in XRP."
         ),
         "url":         "https://mcp.cryptovault.co.uk/mcp",
-        "homepage":    "https://www.cryptovault.co.uk",
+        "homepage":    "https://agenttrustxrpl.com",
         "contact":     "hello@cryptovault.co.uk",
         "license":     "MIT",
         "transport":   ["http"],
@@ -1376,7 +1378,7 @@ def serve_marketplace_json():
     return {
         "name": "AgentTrust Marketplace",
         "description": "Open agent marketplace — post jobs, bid, claim bounties, list skills, hire directly. All payments settled via XRPL escrow with AI-verified automatic release.",
-        "url": "https://www.cryptovault.co.uk/marketplace/",
+        "url": "https://agenttrustxrpl.com/marketplace/",
         "api_base": "https://mcp.cryptovault.co.uk",
         "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "currency": ["XRP", "RLUSD"],
@@ -1550,7 +1552,7 @@ async def get_fees(wallet_address: Optional[str] = None):  # noqa: E501
                 f"Hard ceiling ${THRESHOLD_BLOCK_KYC_USD:,} even for verified wallets. "
                 f"Travel Rule compliance warning issued above ${THRESHOLD_WARN_USD:,}."
             ),
-            "kyc_guide": "https://www.cryptovault.co.uk/kyc/",
+            "kyc_guide": "https://agenttrustxrpl.com/kyc/",
             "kyc_fee_usd": 0.50,
         },
         "challenge_fee": {
@@ -1707,7 +1709,7 @@ def serve_mcp_config():
 def serve_issuer_registry_discovery():
     return {
         "registry_api": "https://mcp.cryptovault.co.uk/nft/issuers",
-        "spec": "https://www.cryptovault.co.uk/docs/issuer-registry-spec.md",
+        "spec": "https://agenttrustxrpl.com/docs/issuer-registry-spec.md",
         "version": "1.0.0",
         "mcp_endpoint": "https://mcp.cryptovault.co.uk/mcp",
         "contact": "admin@cryptovault.co.uk",
@@ -1739,9 +1741,9 @@ def serve_ai_plugin():
         ),
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": "https://mcp.cryptovault.co.uk/openapi.json"},
-        "logo_url": "https://www.cryptovault.co.uk/logo.svg",
+        "logo_url": "https://agenttrustxrpl.com/logo.svg",
         "contact_email": "hello@cryptovault.co.uk",
-        "legal_info_url": "https://www.cryptovault.co.uk/terms/",
+        "legal_info_url": "https://agenttrustxrpl.com/terms/",
     }
 
 # ---------------------------------------------------------------------------
@@ -2669,7 +2671,7 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
             "level": "kyc_required",
             "usd_value": round(usd_value, 2),
             "error": "kyc_required",
-            "kyc_url": "https://www.cryptovault.co.uk/kyc/",
+            "kyc_url": "https://agenttrustxrpl.com/kyc/",
             "message": (
                 f"This escrow value (~${usd_value:,.0f} USD) exceeds the ${THRESHOLD_BLOCK_USD:,} USD "
                 f"limit for unverified wallets. Complete identity verification to unlock escrows up to "
@@ -2686,7 +2688,7 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
                 f"of $1,000 USD. In many jurisdictions, VASPs are required to exchange originator and "
                 f"beneficiary identity data for transfers of this size. AgentTrust does not currently "
                 f"implement the Travel Rule. Participants should ensure their own compliance with "
-                f"applicable regulations. See cryptovault.co.uk/compliance for details."
+                f"applicable regulations. See agenttrustxrpl.com/compliance for details."
             ),
         }
     return {"ok": True}
@@ -3386,7 +3388,7 @@ RESEND_API_KEY          = os.getenv("RESEND_API_KEY")
 RESEND_FROM             = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
 WEBHOOK_SIGNING_SECRET  = os.getenv("WEBHOOK_SIGNING_SECRET", "")
 DELIVERY_EXPIRY_DAYS = 7
-SITE_URL             = os.getenv("SITE_URL", "https://www.cryptovault.co.uk")
+SITE_URL             = os.getenv("SITE_URL", "https://agenttrustxrpl.com")
 RATING_LINK_TTL_S    = 7 * 24 * 3600  # 7 days
 
 
@@ -3400,7 +3402,7 @@ JWT_SECRET           = os.getenv("JWT_SECRET", secrets.token_hex(32))
 if len(JWT_SECRET.encode()) < 32:
     logger.warning("⚠️ JWT_SECRET is shorter than 32 bytes — set a longer secret in Render environment variables")
 DASHBOARD_URL        = os.getenv("DASHBOARD_URL", "https://app.cryptovault.co.uk")
-ADMIN_URL            = os.getenv("ADMIN_URL", "https://www.cryptovault.co.uk/admin/")
+ADMIN_URL            = os.getenv("ADMIN_URL", "https://agenttrustxrpl.com/admin/")
 ADMIN_EMAIL          = os.getenv("ADMIN_EMAIL", "").strip().lower()
 ENTERPRISE_WALLET    = os.getenv("ENTERPRISE_WALLET", "")   # AgentTrust XRPL wallet receiving subscriptions
 SUBSCRIPTION_RLUSD   = float(os.getenv("SUBSCRIPTION_RLUSD", "199"))
@@ -5070,7 +5072,6 @@ async def fire_bid_awarded_webhook(
 
 def _verdict_view(vault, last_result: dict = None) -> dict:
     """A5: stable verdict shape for all evaluate responses, GET /escrow/{id}, get_escrow_info, challenge."""
-    import html as _html
     verdict = None
     score = None
     summary = ""
@@ -5113,14 +5114,14 @@ def _verdict_view(vault, last_result: dict = None) -> dict:
             "description": crit.get("description") or item.get("description") or "",
             "verdict": item.get("verdict") or item.get("result") or "",
             "score": item.get("score"),
-            "reasoning": _html.escape(str(item.get("reasoning") or "")),
-            "evidence_quote": _html.escape(str(item.get("evidence_quote") or "")[:200]),
+            "reasoning": str(item.get("reasoning") or ""),
+            "evidence_quote": str(item.get("evidence_quote") or "")[:200],
         })
 
     # submission_excerpt
     submission_excerpt = ""
     if vault.worker_submission:
-        submission_excerpt = _html.escape(vault.worker_submission[:600])
+        submission_excerpt = vault.worker_submission[:600]
 
     # explorer links
     explorer_base = "https://testnet.xrpl.org" if getattr(vault, "network", "mainnet") == "testnet" else "https://livenet.xrpl.org"
@@ -5135,7 +5136,7 @@ def _verdict_view(vault, last_result: dict = None) -> dict:
     return {
         "verdict": verdict or ("PASS" if vault.status == "RELEASED" else ("FAIL" if vault.status == "CANCELLED" else "UNKNOWN")),
         "score": score,
-        "summary": _html.escape(str(summary)) if summary else "",
+        "summary": str(summary) if summary else "",
         "criteria_results": criteria_results,
         "submission_excerpt": submission_excerpt,
         "explorer_links": explorer_links,
@@ -5772,27 +5773,35 @@ async def domain_preview(domain: str, db: Session = Depends(get_db)):
 # 11e. W3C VERIFIABLE CREDENTIAL VERIFICATION
 # ---------------------------------------------------------------------------
 async def verify_w3c_credential(vc_jwt: str, required_issuer_did: str = None, required_type: str = None) -> dict:
-    try:
-        parts = vc_jwt.split(".")
-        if len(parts) == 3:
-            payload_b64 = parts[1]
-            payload_b64 += "=" * (4 - len(payload_b64) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
-            vc = payload.get("vc", payload)
-        else:
-            payload = {}
-            vc = json.loads(vc_jwt)
-    except Exception as e:
-        return {"verified": False, "detail": f"Could not decode credential: {e}"}
+    """Verify a W3C VC JWT with full JWS signature check. Fail closed on any error."""
+    parts = vc_jwt.strip().split(".")
+    if len(parts) != 3:
+        return {"verified": False, "detail": "Not a valid JWT (expected header.payload.signature)."}
 
+    header_b64, payload_b64, signature_b64 = parts
+
+    try:
+        header = json.loads(base64.urlsafe_b64decode(header_b64 + "=" * (4 - len(header_b64) % 4)).decode("utf-8"))
+    except Exception as e:
+        return {"verified": False, "detail": f"Could not decode JWT header: {e}"}
+
+    alg = header.get("alg", "")
+    if not alg or alg.lower() == "none" or alg.upper().startswith("HS"):
+        return {"verified": False, "detail": f"JWT algorithm '{alg}' is not accepted. Only ES256, ES256K, EdDSA are allowed."}
+    if alg not in ("ES256", "ES256K", "EdDSA"):
+        return {"verified": False, "detail": f"JWT algorithm '{alg}' is not supported. Only ES256, ES256K, EdDSA are allowed."}
+
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * (4 - len(payload_b64) % 4)).decode("utf-8"))
+    except Exception as e:
+        return {"verified": False, "detail": f"Could not decode JWT payload: {e}"}
+
+    vc = payload.get("vc", payload)
     issuer = vc.get("issuer") or payload.get("iss", "")
     if isinstance(issuer, dict):
         issuer = issuer.get("id", "")
 
-    subject = vc.get("credentialSubject", {})
-    vc_types = vc.get("type", [])
     expiry = vc.get("expirationDate") or payload.get("exp")
-
     if expiry:
         try:
             if isinstance(expiry, int):
@@ -5804,34 +5813,84 @@ async def verify_w3c_credential(vc_jwt: str, required_issuer_did: str = None, re
         except Exception:
             pass
 
+    nbf = payload.get("nbf")
+    if nbf and isinstance(nbf, (int, float)):
+        if datetime.now(timezone.utc) < datetime.fromtimestamp(nbf, tz=timezone.utc):
+            return {"verified": False, "detail": "Credential not yet valid (nbf claim)."}
+
     if required_issuer_did and issuer != required_issuer_did:
         return {"verified": False, "detail": f"Credential issuer is '{issuer}', expected '{required_issuer_did}'."}
 
+    vc_types = vc.get("type", [])
     if required_type and required_type not in vc_types:
         return {"verified": False, "detail": f"Credential type '{required_type}' not found. Types present: {vc_types}"}
 
-    did_verified = False
-    did_detail = "DID resolution skipped"
-    if issuer and issuer.startswith("did:"):
-        resolver_url = f"https://dev.uniresolver.io/1.0/identifiers/{issuer}"
+    subject = vc.get("credentialSubject", {})
+
+    if not issuer or not issuer.startswith("did:web:"):
+        return {"verified": False, "detail": f"Only did:web DIDs are supported. Got: '{issuer}'"}
+
+    did_host_path = issuer[len("did:web:"):].replace(":", "/")
+    if "/" in did_host_path:
+        _hp = did_host_path.split("/", 1)
+        did_url = f"https://{_hp[0]}/{_hp[1]}/did.json"
+    else:
+        did_url = f"https://{did_host_path}/.well-known/did.json"
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as _did_client:
+            _r = await _did_client.get(did_url)
+            if _r.status_code != 200:
+                return {"verified": False, "detail": f"DID {issuer} could not be resolved (HTTP {_r.status_code})."}
+            did_doc = _r.json()
+    except Exception as e:
+        return {"verified": False, "detail": f"DID resolution failed: {e}"}
+
+    verification_methods = did_doc.get("verificationMethod", [])
+    if not verification_methods:
+        return {"verified": False, "detail": "DID document has no verificationMethod entries."}
+
+    try:
+        from jwt import algorithms as _jwt_algs
+    except ImportError:
+        return {"verified": False, "detail": "PyJWT[crypto] is not installed — cannot verify signature."}
+
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    try:
+        sig_bytes = base64.urlsafe_b64decode(signature_b64 + "=" * (4 - len(signature_b64) % 4))
+    except Exception as e:
+        return {"verified": False, "detail": f"Could not decode signature: {e}"}
+
+    verified = False
+    for vm in verification_methods:
+        jwk = vm.get("publicKeyJwk")
+        if not jwk:
+            continue
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.get(resolver_url)
-                if r.status_code == 200:
-                    did_verified = True
-                    did_detail = f"DID {issuer} resolved successfully"
-                else:
-                    did_detail = f"DID {issuer} could not be resolved (status {r.status_code})"
-        except Exception as e:
-            did_detail = f"DID resolution failed: {e}"
+            if alg in ("ES256", "ES256K"):
+                key = _jwt_algs.ECAlgorithm.from_jwk(json.dumps(jwk))
+                alg_impl = _jwt_algs.ECAlgorithm(_jwt_algs.ECAlgorithm.SHA256)
+            elif alg == "EdDSA":
+                key = _jwt_algs.OKPAlgorithm.from_jwk(json.dumps(jwk))
+                alg_impl = _jwt_algs.OKPAlgorithm()
+            else:
+                continue
+            if alg_impl.verify(signing_input, key, sig_bytes):
+                verified = True
+                break
+        except Exception:
+            continue
+
+    if not verified:
+        return {"verified": False, "detail": "JWT signature verification failed — no matching key in DID document."}
 
     return {
         "verified": True,
-        "detail": f"Credential decoded. Issuer: {issuer}. {did_detail}",
+        "detail": f"Credential verified. Issuer: {issuer}. Signature valid.",
         "issuer": issuer,
         "subject": subject,
         "types": vc_types,
-        "did_resolved": did_verified,
+        "did_resolved": True,
     }
 
 
@@ -8679,7 +8738,7 @@ async def generate_escrow(req: EscrowSetupRequest, request: Request, db: Session
                 status_code=403,
                 detail={
                     "error": "kyc_required",
-                    "kyc_url": "https://www.cryptovault.co.uk/kyc/",
+                    "kyc_url": "https://agenttrustxrpl.com/kyc/",
                     "message": threshold["message"],
                 },
             )
@@ -8870,6 +8929,16 @@ async def generate_escrow(req: EscrowSetupRequest, request: Request, db: Session
     _ip_hash = __import__('hashlib').sha256(_raw_ip.encode()).hexdigest()[:16]
     vault.is_internal = _is_internal_vault(req.buyer_address or "", req.worker_address or "", _ip_hash, dict(request.headers))
     vault.source      = "mcp" if request.headers.get("X-AgentTrust-Internal") == "1" else "rest"
+    # Link to dashboard account if caller has a session cookie (P0-C)
+    _at_cookie = request.cookies.get("at_session")
+    if _at_cookie:
+        try:
+            _tok = pyjwt.decode(_at_cookie, JWT_SECRET, algorithms=["HS256"])
+            _acct_id = _tok.get("sub")
+            if _acct_id:
+                vault.created_by_account_id = str(_acct_id)
+        except Exception:
+            pass
     db.add(vault)
     db.commit()
 
@@ -11244,7 +11313,7 @@ async def _send_nft_accept_email(buyer_email: str, buyer_name: str, escrow_id: s
             <li>Accept the incoming offer for token <code>{nft_token_id[:16]}...</code></li>
         </ol>
         <p style="color:#94a3b8;font-size:.85rem;">Once you accept, payment releases automatically to the seller. You cannot be charged — the NFT transfer is free (payment comes from the escrow you already funded).</p>
-        <a href="https://www.cryptovault.co.uk?track={escrow_id}" style="display:inline-block;background:#10b981;color:#fff;padding:.75rem 1.5rem;border-radius:8px;text-decoration:none;font-weight:700;margin-top:1rem;">Track Escrow</a>
+        <a href="https://agenttrustxrpl.com?track={escrow_id}" style="display:inline-block;background:#10b981;color:#fff;padding:.75rem 1.5rem;border-radius:8px;text-decoration:none;font-weight:700;margin-top:1rem;">Track Escrow</a>
     </div>
     """
     try:
@@ -12773,7 +12842,7 @@ async def list_nft_issuers(q: str = None, category: str = None, include_pending:
             }
             for r in rows
         ],
-        "register_url": "https://www.cryptovault.co.uk/marketplace#issuers",
+        "register_url": "https://agenttrustxrpl.com/marketplace#issuers",
         "register_api": f"{base_url}/nft/issuers",
     }
 
@@ -12913,7 +12982,7 @@ async def issuer_registry_feed(
     generated_at = datetime.now(timezone.utc).isoformat()
     payload = {
         "spec_version": "1.1.0",
-        "spec": "https://www.cryptovault.co.uk/docs/issuer-registry-spec.md",
+        "spec": "https://agenttrustxrpl.com/docs/issuer-registry-spec.md",
         "generated_at": generated_at,
         "pagination": {
             "page": page,
@@ -13325,7 +13394,7 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
             "xrpl_wallet":   None,
             "xrpl_verified": False,
             "domain":        None,
-            "register_url":  "https://www.cryptovault.co.uk/marketplace#issuers",
+            "register_url":  "https://agenttrustxrpl.com/marketplace#issuers",
             "message":       "Not in the AgentTrust registry. Ask the organisation to register their XRPL wallet.",
         })
     return {"results": results}
@@ -13459,7 +13528,7 @@ async def kyc_status(wallet_address: str, db: Session = Depends(get_db)):
         "wallet_address": wallet_address,
         "kyc_verified": False,
         "message": "Not KYC verified. Call POST /kyc/start with a fee_hash to begin identity verification ($0.50).",
-        "kyc_url": "https://www.cryptovault.co.uk/kyc/",
+        "kyc_url": "https://agenttrustxrpl.com/kyc/",
     }
 
 
@@ -13472,15 +13541,31 @@ def _make_session_token(account_id: str) -> str:
     return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
-_ALLOWED_ORIGINS = {"https://www.cryptovault.co.uk", "https://cryptovault.co.uk"}
+_ALLOWED_ORIGINS = {
+    "https://app.cryptovault.co.uk",
+    "https://agenttrustxrpl.com",
+    "https://cryptovault.co.uk",
+    "https://agenttrustxrpl.com",
+    "https://www.agenttrustxrpl.com",
+}
 
 
 def _check_csrf_origin_header(request: Request = None):
     """Reject state-changing requests that don't originate from our own site."""
     if request is None:
         return
-    origin = request.headers.get("origin") or request.headers.get("referer", "")
-    if not any(origin.startswith(o) for o in _ALLOWED_ORIGINS):
+    from urllib.parse import urlsplit as _urlsplit
+    origin = request.headers.get("origin", "").strip()
+    referer = request.headers.get("referer", "").strip()
+    if not origin and not referer:
+        raise HTTPException(status_code=403, detail="CSRF: missing Origin and Referer headers")
+    check_val = origin or referer
+    try:
+        parsed = _urlsplit(check_val)
+        origin_base = f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        origin_base = check_val
+    if origin_base not in _ALLOWED_ORIGINS:
         raise HTTPException(status_code=403, detail="CSRF: request origin not allowed")
 
 
@@ -13984,7 +14069,6 @@ async def privy_lock_escrow(escrow_id: str, request: Request, db: Session = Depe
         from xrpl.models.requests import AccountInfo, ServerInfo
         xrpl_url = _xrpl_url_for_network(network)
         client = AsyncJsonRpcClient(xrpl_url)
-        await client.open()
         try:
             try:
                 srv = await client.request(ServerInfo())
@@ -14013,8 +14097,6 @@ async def privy_lock_escrow(escrow_id: str, request: Request, db: Session = Depe
             raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"XRPL pre-flight failed: {e}")
-        finally:
-            await client.close()
         # Build EscrowCreate
         tx = {
             "TransactionType": "EscrowCreate",
@@ -14108,23 +14190,19 @@ async def get_wallet_funding_info(
     from xrpl.models.requests import AccountInfo, ServerInfo
     xrpl_url = _xrpl_url_for_network("mainnet")
     client = AsyncJsonRpcClient(xrpl_url)
-    await client.open()
     try:
-        try:
-            srv = await client.request(ServerInfo())
-            reserve_base = float(srv.result["info"]["validated_ledger"].get("reserve_base_xrp", 1))
-            reserve_inc  = float(srv.result["info"]["validated_ledger"].get("reserve_inc_xrp", 0.2))
-        except Exception:
-            reserve_base, reserve_inc = 1.0, 0.2
-        try:
-            ai = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
-            balance_xrp = int(ai.result["account_data"]["Balance"]) / 1_000_000
-            owner_count = int(ai.result["account_data"].get("OwnerCount", 0))
-            activated = True
-        except Exception:
-            balance_xrp, owner_count, activated = 0.0, 0, False
-    finally:
-        await client.close()
+        srv = await client.request(ServerInfo())
+        reserve_base = float(srv.result["info"]["validated_ledger"].get("reserve_base_xrp", 1))
+        reserve_inc  = float(srv.result["info"]["validated_ledger"].get("reserve_inc_xrp", 0.2))
+    except Exception:
+        reserve_base, reserve_inc = 1.0, 0.2
+    try:
+        ai = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
+        balance_xrp = int(ai.result["account_data"]["Balance"]) / 1_000_000
+        owner_count = int(ai.result["account_data"].get("OwnerCount", 0))
+        activated = True
+    except Exception:
+        balance_xrp, owner_count, activated = 0.0, 0, False
     need_xrp = reserve_base + reserve_inc * (owner_count + 1) + amount_xrp + 0.001
     return {
         "address": wallet.xrpl_address,
@@ -14429,86 +14507,82 @@ async def _privy_sign_and_submit(wallet, tx: dict, network: str) -> dict:
     pub_key = await _privy_get_or_fetch_pubkey(wallet, None)
     xrpl_url = _xrpl_url_for_network(network)
     client = AsyncJsonRpcClient(xrpl_url)
-    await client.open()
-    try:
-        fee_resp = await client.request(Fee())
-        min_fee = int(fee_resp.result.get("drops", {}).get("minimum_fee", "12"))
-        base_fee = max(12, min_fee)
-        srv_resp = await client.request(ServerInfo())
-        cur_ledger = srv_resp.result["info"]["validated_ledger"]["seq"]
-        acct_resp = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
-        sequence = acct_resp.result["account_data"]["Sequence"]
-        tx["Account"] = wallet.xrpl_address
-        tx["Fee"] = str(base_fee)
-        tx["Sequence"] = sequence
-        tx["LastLedgerSequence"] = cur_ledger + 20
-        tx["SigningPubKey"] = pub_key
-        blob = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
-        # Verify the blob fields match what we requested
-        decoded = xrpl_decode_tx_blob(blob)
-        tx_type = tx.get("TransactionType", "")
-        if decoded.get("TransactionType") != tx_type:
-            raise HTTPException(status_code=502, detail="Privy returned wrong TransactionType")
-        if tx_type == "EscrowCreate":
-            if decoded.get("Destination") != tx.get("Destination"):
-                raise HTTPException(status_code=502, detail="Privy returned wrong Destination")
-            if decoded.get("Amount") != tx.get("Amount"):
-                raise HTTPException(status_code=502, detail="Privy returned wrong Amount")
-            if tx.get("Condition") and decoded.get("Condition", "").upper() != tx["Condition"].upper():
-                raise HTTPException(status_code=502, detail="Privy returned wrong Condition")
-            if tx.get("CancelAfter") and decoded.get("CancelAfter") != tx["CancelAfter"]:
-                raise HTTPException(status_code=502, detail="Privy returned wrong CancelAfter")
-        elif tx_type == "EscrowCancel":
-            if decoded.get("Owner") != tx.get("Owner"):
-                raise HTTPException(status_code=502, detail="Privy returned wrong Owner")
-            if decoded.get("OfferSequence") != tx.get("OfferSequence"):
-                raise HTTPException(status_code=502, detail="Privy returned wrong OfferSequence")
-        # Submit
-        submit_resp = await client.request(SubmitOnly(tx_blob=blob))
-        result = submit_resp.result
-        engine = result.get("engine_result", "")
-        if engine not in ("tesSUCCESS", "terQUEUED"):
-            if any(k in engine for k in ("UNFUNDED", "INSUFFICIENT", "actNotFound")):
-                raise HTTPException(status_code=402, detail={
-                    "error": "insufficient_xrp", "engine_result": engine,
-                    "message": "Fund this wallet with XRP before locking an escrow.",
-                })
-            if any(k in engine for k in ("PAST_SEQ", "BAD_SEQ")):
-                acct_resp2 = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
-                tx["Sequence"] = acct_resp2.result["account_data"]["Sequence"]
-                tx["SigningPubKey"] = pub_key
-                blob = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
-                submit_resp = await client.request(SubmitOnly(tx_blob=blob))
-                result = submit_resp.result
-                engine = result.get("engine_result", "")
-                if engine not in ("tesSUCCESS", "terQUEUED"):
-                    raise HTTPException(status_code=502, detail=f"Submit failed: {engine}")
-        # Compute tx hash
-        from hashlib import sha512 as _sha512
-        raw = bytes.fromhex(blob)
-        prefix = bytes.fromhex("54584E00")
-        tx_hash = _sha512(prefix + raw).hexdigest()[:64].upper()
-        # Poll for validation (up to 90s)
-        last_ledger = tx["LastLedgerSequence"]
-        for _ in range(18):
-            await asyncio.sleep(5)
-            try:
-                tx_resp = await client.request(TxReq(transaction=tx_hash))
-                if tx_resp.result.get("validated"):
-                    return {
-                        "hash": tx_hash,
-                        "engine_result": tx_resp.result.get("meta", {}).get("TransactionResult", engine),
-                        "validated": True,
-                        "ledger_index": tx_resp.result.get("ledger_index"),
-                    }
-            except Exception:
-                pass
-            srv2 = await client.request(ServerInfo())
-            if srv2.result["info"]["validated_ledger"]["seq"] > last_ledger:
-                raise HTTPException(status_code=504, detail="Transaction expired (LastLedgerSequence exceeded)")
-        raise HTTPException(status_code=504, detail="Transaction not validated within timeout")
-    finally:
-        await client.close()
+    fee_resp = await client.request(Fee())
+    min_fee = int(fee_resp.result.get("drops", {}).get("minimum_fee", "12"))
+    base_fee = max(12, min_fee)
+    srv_resp = await client.request(ServerInfo())
+    cur_ledger = srv_resp.result["info"]["validated_ledger"]["seq"]
+    acct_resp = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
+    sequence = acct_resp.result["account_data"]["Sequence"]
+    tx["Account"] = wallet.xrpl_address
+    tx["Fee"] = str(base_fee)
+    tx["Sequence"] = sequence
+    tx["LastLedgerSequence"] = cur_ledger + 20
+    tx["SigningPubKey"] = pub_key
+    blob = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
+    # Verify the blob fields match what we requested
+    decoded = xrpl_decode_tx_blob(blob)
+    tx_type = tx.get("TransactionType", "")
+    if decoded.get("TransactionType") != tx_type:
+        raise HTTPException(status_code=502, detail="Privy returned wrong TransactionType")
+    if tx_type == "EscrowCreate":
+        if decoded.get("Destination") != tx.get("Destination"):
+            raise HTTPException(status_code=502, detail="Privy returned wrong Destination")
+        if decoded.get("Amount") != tx.get("Amount"):
+            raise HTTPException(status_code=502, detail="Privy returned wrong Amount")
+        if tx.get("Condition") and decoded.get("Condition", "").upper() != tx["Condition"].upper():
+            raise HTTPException(status_code=502, detail="Privy returned wrong Condition")
+        if tx.get("CancelAfter") and decoded.get("CancelAfter") != tx["CancelAfter"]:
+            raise HTTPException(status_code=502, detail="Privy returned wrong CancelAfter")
+    elif tx_type == "EscrowCancel":
+        if decoded.get("Owner") != tx.get("Owner"):
+            raise HTTPException(status_code=502, detail="Privy returned wrong Owner")
+        if decoded.get("OfferSequence") != tx.get("OfferSequence"):
+            raise HTTPException(status_code=502, detail="Privy returned wrong OfferSequence")
+    # Submit
+    submit_resp = await client.request(SubmitOnly(tx_blob=blob))
+    result = submit_resp.result
+    engine = result.get("engine_result", "")
+    if engine not in ("tesSUCCESS", "terQUEUED"):
+        if any(k in engine for k in ("UNFUNDED", "INSUFFICIENT", "actNotFound")):
+            raise HTTPException(status_code=402, detail={
+                "error": "insufficient_xrp", "engine_result": engine,
+                "message": "Fund this wallet with XRP before locking an escrow.",
+            })
+        if any(k in engine for k in ("PAST_SEQ", "BAD_SEQ")):
+            acct_resp2 = await client.request(AccountInfo(account=wallet.xrpl_address, ledger_index="current"))
+            tx["Sequence"] = acct_resp2.result["account_data"]["Sequence"]
+            tx["SigningPubKey"] = pub_key
+            blob = await _privy_sign_xrpl_tx(wallet.privy_wallet_id, tx)
+            submit_resp = await client.request(SubmitOnly(tx_blob=blob))
+            result = submit_resp.result
+            engine = result.get("engine_result", "")
+            if engine not in ("tesSUCCESS", "terQUEUED"):
+                raise HTTPException(status_code=502, detail=f"Submit failed: {engine}")
+    # Compute tx hash
+    from hashlib import sha512 as _sha512
+    raw = bytes.fromhex(blob)
+    prefix = bytes.fromhex("54584E00")
+    tx_hash = _sha512(prefix + raw).hexdigest()[:64].upper()
+    # Poll for validation (up to 90s)
+    last_ledger = tx["LastLedgerSequence"]
+    for _ in range(18):
+        await asyncio.sleep(5)
+        try:
+            tx_resp = await client.request(TxReq(transaction=tx_hash))
+            if tx_resp.result.get("validated"):
+                return {
+                    "hash": tx_hash,
+                    "engine_result": tx_resp.result.get("meta", {}).get("TransactionResult", engine),
+                    "validated": True,
+                    "ledger_index": tx_resp.result.get("ledger_index"),
+                }
+        except Exception:
+            pass
+        srv2 = await client.request(ServerInfo())
+        if srv2.result["info"]["validated_ledger"]["seq"] > last_ledger:
+            raise HTTPException(status_code=504, detail="Transaction expired (LastLedgerSequence exceeded)")
+    raise HTTPException(status_code=504, detail="Transaction not validated within timeout")
 
 
 @app.post("/enterprise/wallets/privy")

@@ -715,6 +715,26 @@ async def evaluate_escrow_work(
         if isinstance(data.get("verdict"), dict):
             nested = data["verdict"]
             data["verdict"] = str(nested.get("verdict") or nested.get("result") or "INCONCLUSIVE").upper()
+        # P1-C: stable MCP field names
+        if "poll" in data and "poll_url" not in data:
+            data["poll_url"] = data["poll"]
+        if "explorer_links" not in data:
+            _el = {}
+            if data.get("escrow_tx_url"):
+                _el["escrow_create"] = data["escrow_tx_url"]
+            if data.get("release_explorer_url"):
+                _el["release"] = data["release_explorer_url"]
+            elif data.get("explorer_url"):
+                _el["tx"] = data["explorer_url"]
+            if _el:
+                data["explorer_links"] = _el
+        if data.get("status") == "rejected" and "criteria_failed" not in data:
+            _crs = data.get("criteria_results") or []
+            data["criteria_failed"] = [
+                f"{cr.get('criterion_id', '')}: {cr.get('reasoning', '')}"
+                for cr in _crs
+                if cr.get("verdict") not in ("PASS", "pass")
+            ]
         return data
 
 
@@ -1756,15 +1776,23 @@ async def get_wallet_trust_score(
             res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}", params=params)
             res.raise_for_status()
             return res.json()
-        except Exception as exc:
-            # R7: surface a helpful hint rather than a bare network error
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404 and network == "mainnet":
+                raise RuntimeError(
+                    f"Wallet {wallet_address} not found on mainnet. "
+                    "Not found on mainnet; pass network='testnet' for testnet wallets."
+                ) from exc
             hint = (
-                "Tip: testnet wallets can be scored by passing network='testnet'."
+                "Not found on mainnet; pass network='testnet' for testnet wallets."
                 if network == "mainnet"
-                else "Tip: this wallet may not exist on testnet. Try network='mainnet'."
+                else "Wallet not found on testnet. Try network='mainnet' if this is a mainnet wallet."
             )
             raise RuntimeError(
                 f"Could not retrieve trust score for {wallet_address} ({network}): {exc}. {hint}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not retrieve trust score for {wallet_address} ({network}): {exc}"
             ) from exc
 
 
@@ -2581,7 +2609,10 @@ async def hire_and_pay(
     if callback_url:
         vault_body["callback_url"] = callback_url
     if metadata:
-        vault_body["metadata"] = metadata if isinstance(metadata, dict) else (json.loads(metadata) if metadata else None)
+        try:
+            vault_body["metadata"] = metadata if isinstance(metadata, dict) else (json.loads(metadata) if metadata else None)
+        except json.JSONDecodeError as _e:
+            raise ValueError(f"metadata must be valid JSON: {_e}")
     if criteria:
         vault_body["criteria"] = criteria
     if deliverable_type != "work":
@@ -2665,6 +2696,9 @@ async def hire_and_pay(
         "free_escrows_remaining": audits_remaining,
         "worker_url": vault_data.get("worker_url"),
         "worker_instructions": vault_data.get("worker_instructions"),
+        "tx_dict":        prep_data.get("transaction"),
+        "network":        vault_data.get("network", "mainnet"),
+        "explorer_base":  "https://testnet.xrpl.org" if vault_data.get("network") == "testnet" else "https://livenet.xrpl.org",
     }
 
 

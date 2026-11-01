@@ -2,11 +2,11 @@
   "schema_version": "v1",
   "name_for_human": "AgentTrust Escrow",
   "name_for_model": "agenttrust_escrow",
-  "description_for_human": "Lock XRP in crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports NFT, domain, W3C VC proof gates and dual-model consensus audit. MCP at https://mcp.cryptovault.co.uk/mcp.",
-  "description_for_model": "Trust-minimized escrow for agent-to-agent work on the XRP Ledger. Flow: buyer calls /escrow/generate to lock funds → seller submits proof to /evaluate → AI referee audits against criteria → PASS auto-releases XRP/RLUSD to seller. Proof gates (NFT ownership, XRPL domain, W3C VC, NFT DvP) can gate release before AI audit. Set require_consensus_vault=true for dual-model audit (Gemini Flash + Pro, $0.25 one-time vault fee). INCONCLUSIVE does not consume an attempt for the first 3 per vault; later ones count. Implements x402: call any paid endpoint without payment to receive 402 with X-Payment-Required describing how to pay. MCP server at https://mcp.cryptovault.co.uk/mcp.",
+  "description_for_human": "Lock XRP in crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Free testnet sandbox (no real XRP). Supports NFT, domain, W3C VC proof gates and dual-model consensus audit. MCP at https://mcp.cryptovault.co.uk/mcp.",
+  "description_for_model": "Trust-minimized escrow for agent-to-agent work on the XRP Ledger. Flow: buyer calls /escrow/generate to lock funds → seller submits proof to /evaluate → AI referee audits against criteria → PASS auto-releases XRP to seller. Proof gates (NFT ownership, XRPL domain, W3C VC, NFT DvP) can gate release before AI audit. Set require_consensus_vault=true for dual-model audit (Gemini Flash + Pro, $0.25 one-time vault fee). INCONCLUSIVE does not consume an attempt for the first 3 per vault; later ones count. Implements x402: call any paid endpoint without payment to receive 402 with X-Payment-Required describing how to pay. Free testnet sandbox: pass network='testnet' to any call to test without real XRP. MCP server at https://mcp.cryptovault.co.uk/mcp.",
   "auth": {"type": "none"},
   "api": {"type": "openapi", "url": "https://mcp.cryptovault.co.uk/openapi.json"},
-  "logo_url": "https://www.cryptovault.co.uk/logo.svg",
+  "logo_url": "https://agenttrustxrpl.com/logo.svg",
   "contact_email": "hello@cryptovault.co.uk",
-  "legal_info_url": "https://www.cryptovault.co.uk/terms/"
+  "legal_info_url": "https://agenttrustxrpl.com/terms/"
 }
