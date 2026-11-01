@@ -1,6 +1,8 @@
 import os
 import time
 import asyncio
+import socket
+import ipaddress
 import httpx
 from decimal import Decimal, InvalidOperation
 import logging
@@ -46,7 +48,7 @@ from xrpl.models.transactions.transaction import Memo as XrplMemo
 from xrpl.models.transactions.batch import Batch, BatchSigner, BatchFlag
 from xrpl.models.transactions.transaction import Transaction as XrplTransaction
 from xrpl.asyncio.transaction import autofill
-from xrpl.core.addresscodec import decode_seed
+from xrpl.core.addresscodec import decode_seed, is_valid_classic_address
 from xrpl.core.binarycodec import decode as xrpl_decode_tx_blob
 from xrpl.core.binarycodec import encode_for_signing as xrpl_encode_for_signing
 from xrpl.core import keypairs as xrpl_keypairs
@@ -257,7 +259,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://app.cryptovault.co.uk",
-        "https://agenttrustxrpl.com",
+        "https://www.cryptovault.co.uk",
         "https://cryptovault.co.uk",
         "https://agenttrustxrpl.com",
         "https://www.agenttrustxrpl.com",
@@ -5833,12 +5835,22 @@ async def verify_w3c_credential(vc_jwt: str, required_issuer_did: str = None, re
     did_host_path = issuer[len("did:web:"):].replace(":", "/")
     if "/" in did_host_path:
         _hp = did_host_path.split("/", 1)
+        did_host_only = _hp[0]
         did_url = f"https://{_hp[0]}/{_hp[1]}/did.json"
     else:
+        did_host_only = did_host_path
         did_url = f"https://{did_host_path}/.well-known/did.json"
 
+    # SSRF guard: reject DIDs that resolve to private/loopback/link-local IPs
     try:
-        async with httpx.AsyncClient(timeout=8.0) as _did_client:
+        _resolved_ip = ipaddress.ip_address(socket.gethostbyname(did_host_only))
+        if _resolved_ip.is_private or _resolved_ip.is_loopback or _resolved_ip.is_link_local or _resolved_ip.is_reserved:
+            return {"verified": False, "detail": "SSRF: DID host resolves to a private/internal address."}
+    except Exception:
+        return {"verified": False, "detail": "SSRF: DID host could not be resolved."}
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as _did_client:
             _r = await _did_client.get(did_url)
             if _r.status_code != 200:
                 return {"verified": False, "detail": f"DID {issuer} could not be resolved (HTTP {_r.status_code})."}
@@ -8540,6 +8552,8 @@ async def create_xumm_payload(req: XummPayloadRequest, db: Session = Depends(get
         txjson["Owner"]       = vault.buyer_address
         txjson["OfferSequence"] = vault.escrow_sequence
     if req.account:
+        if not is_valid_classic_address(req.account):
+            raise HTTPException(status_code=400, detail="Invalid XRPL classic address")
         txjson["Account"] = req.account
     result = await xumm_create_payload(txjson)
     return {"nextUrl": result["nextUrl"], "uuid": result["uuid"]}
@@ -10726,6 +10740,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             ]
             vault.verdict_hash = hashlib.sha256(json.dumps(verdict_dict, sort_keys=True).encode()).hexdigest()
             db.commit()
+            _gate_explorer_base = "https://testnet.xrpl.org" if getattr(vault, "network", "mainnet") == "testnet" else "https://livenet.xrpl.org"
+            _gate_explorer_links = {}
+            if vault.escrow_tx_hash:
+                _gate_explorer_links["escrow_create"] = f"{_gate_explorer_base}/transactions/{vault.escrow_tx_hash}"
             return {
                 "escrow_id": req.escrow_id,
                 "status": "rejected",
@@ -10733,6 +10751,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 "model_used": model_used,
                 "attempts_used": vault.submission_count,
                 "attempts_remaining": max(0, (vault.max_submissions or 3) - vault.submission_count),
+                "criteria_failed": verdict_dict["criteria_failed"],
+                "criteria_results": vault.evaluation_verdicts,
+                "summary": verdict_dict["summary"],
+                "poll_url": f"{SITE_URL}/escrow/?id={req.escrow_id}",
+                "explorer_links": _gate_explorer_links,
             }
 
         # B6: Testnet AI audit rate limit — 5/buyer/day, flash only, no consensus upgrade
@@ -13543,7 +13566,7 @@ def _make_session_token(account_id: str) -> str:
 
 _ALLOWED_ORIGINS = {
     "https://app.cryptovault.co.uk",
-    "https://agenttrustxrpl.com",
+    "https://www.cryptovault.co.uk",
     "https://cryptovault.co.uk",
     "https://agenttrustxrpl.com",
     "https://www.agenttrustxrpl.com",
@@ -14037,7 +14060,7 @@ async def privy_lock_escrow(escrow_id: str, request: Request, db: Session = Depe
     if not vault:
         raise HTTPException(status_code=404, detail="Escrow not found")
     # CSRF guard: only the Privy account that generated this vault may lock it
-    if vault.created_by_account_id and vault.created_by_account_id != account.id:
+    if vault.created_by_account_id != account.id:
         raise HTTPException(status_code=403, detail="Not your escrow")
     # RLUSD escrows must be released via the standard flow (crypto-condition only)
     if getattr(vault, "currency", "XRP") not in (None, "", "XRP"):
@@ -14130,6 +14153,8 @@ async def privy_refund_escrow(escrow_id: str, request: Request, db: Session = De
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
     if not vault:
         raise HTTPException(status_code=404, detail="Escrow not found")
+    if vault.created_by_account_id != account.id:
+        raise HTTPException(status_code=403, detail="Not your escrow")
     buyer_wallet = db.query(LinkedWallet).filter_by(account_id=account.id, xrpl_address=vault.buyer_address).first()
     if not buyer_wallet or not buyer_wallet.privy_wallet_id:
         raise HTTPException(status_code=409, detail="Buyer is not a Privy wallet on this account")

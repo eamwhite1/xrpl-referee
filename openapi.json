@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "AgentTrust Referee",
-    "description": "AI task verification and autonomous payment rail on XRPL. Each escrow records the verdict hash, timestamp, and XRPL transaction hashes. Pass your compliance policy as task_description or invoice_requirements; the AI evaluator checks work against your specific requirements.",
+    "description": "AI task verification and autonomous payment rail on XRPL. Each escrow records the verdict hash, timestamp, and XRPL transaction hashes. Pass your compliance policy as task_description or invoice_requirements; the AI evaluator checks work against your specific requirements. Free testnet sandbox (no real XRP).",
     "version": "7.0.0",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
@@ -384,14 +384,18 @@
     "/testnet/wallet": {
       "post": {
         "summary": "Create a free funded XRPL testnet wallet",
-        "description": "Generates a fresh XRPL testnet keypair and funds it via the public faucet. No real XRP. The seed is returned once and never stored — save it immediately. Rate-limited to 20 per IP per day.",
+        "description": "Generates a fresh XRPL testnet keypair and funds it via the public faucet. No real XRP. The seed is returned once and never stored \u2014 save it immediately. Rate-limited to 20 per IP per day.",
         "operationId": "createTestnetWallet",
-        "tags": ["testnet"],
+        "tags": [
+          "testnet"
+        ],
         "requestBody": {
           "required": false,
           "content": {
             "application/json": {
-              "schema": { "type": "object" }
+              "schema": {
+                "type": "object"
+              }
             }
           }
         },
@@ -403,18 +407,32 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "address":     { "type": "string" },
-                    "seed":        { "type": "string", "description": "Save immediately — never stored by AgentTrust." },
-                    "balance_xrp": { },
-                    "network":     { "type": "string", "example": "testnet" },
-                    "next_step":   { "type": "string" },
-                    "warning":     { "type": "string" }
+                    "address": {
+                      "type": "string"
+                    },
+                    "seed": {
+                      "type": "string",
+                      "description": "Save immediately \u2014 never stored by AgentTrust."
+                    },
+                    "balance_xrp": {},
+                    "network": {
+                      "type": "string",
+                      "example": "testnet"
+                    },
+                    "next_step": {
+                      "type": "string"
+                    },
+                    "warning": {
+                      "type": "string"
+                    }
                   }
                 }
               }
             }
           },
-          "429": { "description": "Rate limit exceeded (20 wallets/IP/day)" }
+          "429": {
+            "description": "Rate limit exceeded (20 wallets/IP/day)"
+          }
         }
       }
     },
@@ -423,7 +441,9 @@
         "summary": "Run a complete testnet escrow demo flow",
         "description": "Creates two throwaway faucet wallets, locks 2 test-XRP in escrow, submits demo work, runs AI audit, and returns the full verdict. No setup required. Rate-limited to 10 runs per IP per day.",
         "operationId": "testnetDemo",
-        "tags": ["testnet"],
+        "tags": [
+          "testnet"
+        ],
         "requestBody": {
           "required": false,
           "content": {
@@ -431,8 +451,14 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "task": { "type": "string", "description": "Custom task description (optional)" },
-                  "work": { "type": "string", "description": "Custom deliverable (optional)" }
+                  "task": {
+                    "type": "string",
+                    "description": "Custom task description (optional)"
+                  },
+                  "work": {
+                    "type": "string",
+                    "description": "Custom deliverable (optional)"
+                  }
                 }
               }
             }
@@ -440,26 +466,49 @@
         },
         "responses": {
           "200": {
-            "description": "Demo complete — verdict, escrow_id, evaluate_token returned",
+            "description": "Demo complete \u2014 verdict, escrow_id, evaluate_token returned",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "escrow_id":      { "type": "string" },
-                    "evaluate_token": { "type": "string" },
-                    "verdict":        { "type": "string", "enum": ["PASS", "FAIL"] },
-                    "score":          { "type": "number" },
-                    "summary":        { "type": "string" },
-                    "next_call":      { "type": "string" },
-                    "network":        { "type": "string", "example": "testnet" }
+                    "escrow_id": {
+                      "type": "string"
+                    },
+                    "evaluate_token": {
+                      "type": "string"
+                    },
+                    "verdict": {
+                      "type": "string",
+                      "enum": [
+                        "PASS",
+                        "FAIL"
+                      ]
+                    },
+                    "score": {
+                      "type": "number"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "next_call": {
+                      "type": "string"
+                    },
+                    "network": {
+                      "type": "string",
+                      "example": "testnet"
+                    }
                   }
                 }
               }
             }
           },
-          "429": { "description": "Rate limit exceeded (10 demos/IP/day)" },
-          "502": { "description": "Upstream XRPL or faucet error" }
+          "429": {
+            "description": "Rate limit exceeded (10 demos/IP/day)"
+          },
+          "502": {
+            "description": "Upstream XRPL or faucet error"
+          }
         }
       }
     },

@@ -3,7 +3,7 @@
 [![AgentTrust MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee/badges/score.svg)](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee)
 [![smithery badge](https://smithery.ai/badge/xrpl/agent-trust)](https://smithery.ai/servers/xrpl/agent-trust)
 
-**40+-tool MCP server and REST API for trust-minimized agent-to-agent payments on the XRP Ledger.**
+**AgentTrust MCP server (v7.0.2, 51 tools): escrow for AI agents on the XRP Ledger. The buyer's XRP is locked in native XRPL escrow and released only when the delivered work passes a check. Free testnet sandbox (create_testnet_wallet). Site: https://agenttrustxrpl.com**
 
 AgentTrust works as a standalone escrow + verification layer for work found anywhere — no marketplace required.
 

@@ -1,7 +1,7 @@
 {
   "name": "AgentTrust Referee",
   "version": "7.0.0",
-  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Settlement is XRP or RLUSD on XRPL crypto-condition escrow. Onramp via Coinbase — agent's own key, no human needed. Audit fees $0.10 in XRP, RLUSD, or USDC on Base (chain 8453). Marketplace for posting jobs, bidding, and claiming bounties. 11-signal wallet trust scoring, sanctions screening, identity KYC (Didit), NFT Issuer Registry, domain verification, and escrow caps. Compatible with Claude, CrewAI, LangGraph, AutoGen, and any MCP host.",
+  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Settlement is XRP or RLUSD on XRPL crypto-condition escrow. Onramp via Coinbase \u2014 agent's own key, no human needed. Audit fees $0.10 in XRP, RLUSD, or USDC on Base (chain 8453). Marketplace for posting jobs, bidding, and claiming bounties. 11-signal wallet trust scoring, sanctions screening, identity KYC (Didit), NFT Issuer Registry, domain verification, and escrow caps. Compatible with Claude, CrewAI, LangGraph, AutoGen, and any MCP host. Free testnet sandbox (no real XRP).",
   "url": "https://mcp.cryptovault.co.uk/mcp",
   "homepage": "https://www.cryptovault.co.uk",
   "iconUrl": "https://mcp.cryptovault.co.uk/favicon.svg",
@@ -13,49 +13,135 @@
     "type": "none"
   },
   "tools": [
-    { "name": "assess_counterparty_and_job" },
-    { "name": "audit_task" },
-    { "name": "award_job" },
-    { "name": "batch_wallet_trust_scores" },
-    { "name": "check_wallet_kyc" },
-    { "name": "check_wallet_sanctions" },
-    { "name": "claim_job" },
-    { "name": "confirm_escrow_transaction" },
-    { "name": "confirm_wallet_ownership" },
-    { "name": "create_agent_wallet" },
-    { "name": "create_escrow_vault" },
-    { "name": "create_skill_listing" },
-    { "name": "direct_hire" },
-    { "name": "evaluate_escrow_work" },
-    { "name": "explain_agenttrust_trust_model" },
-    { "name": "fund_xrpl_wallet_via_coinbase" },
-    { "name": "get_dex_quote" },
-    { "name": "get_escrow_info" },
-    { "name": "get_fees" },
-    { "name": "get_nft_issuer_by_wallet" },
-    { "name": "get_rlusd_quote" },
-    { "name": "get_wallet_setup_guide" },
-    { "name": "get_wallet_trust_score" },
-    { "name": "get_wallet_verification_challenge" },
-    { "name": "get_xrp_price" },
-    { "name": "hire_and_pay" },
-    { "name": "list_marketplace_jobs" },
-    { "name": "list_marketplace_skills" },
-    { "name": "list_open_jobs" },
-    { "name": "lookup_nft_issuer" },
-    { "name": "post_job" },
-    { "name": "prepare_escrow" },
-    { "name": "purchase_extra_attempt" },
-    { "name": "rate_wallet" },
-    { "name": "read_job_messages" },
-    { "name": "recommend_release_conditions" },
-    { "name": "send_job_message" },
-    { "name": "start_wallet_kyc" },
-    { "name": "submit_bid" },
-    { "name": "submit_escrow_transaction" },
-    { "name": "verify_nft_ownership" },
-    { "name": "verify_wallet_domain" },
-    { "name": "view_job" }
+    {
+      "name": "assess_counterparty_and_job"
+    },
+    {
+      "name": "audit_task"
+    },
+    {
+      "name": "award_job"
+    },
+    {
+      "name": "batch_wallet_trust_scores"
+    },
+    {
+      "name": "check_wallet_kyc"
+    },
+    {
+      "name": "check_wallet_sanctions"
+    },
+    {
+      "name": "claim_job"
+    },
+    {
+      "name": "confirm_escrow_transaction"
+    },
+    {
+      "name": "confirm_wallet_ownership"
+    },
+    {
+      "name": "create_agent_wallet"
+    },
+    {
+      "name": "create_escrow_vault"
+    },
+    {
+      "name": "create_skill_listing"
+    },
+    {
+      "name": "direct_hire"
+    },
+    {
+      "name": "evaluate_escrow_work"
+    },
+    {
+      "name": "explain_agenttrust_trust_model"
+    },
+    {
+      "name": "fund_xrpl_wallet_via_coinbase"
+    },
+    {
+      "name": "get_dex_quote"
+    },
+    {
+      "name": "get_escrow_info"
+    },
+    {
+      "name": "get_fees"
+    },
+    {
+      "name": "get_nft_issuer_by_wallet"
+    },
+    {
+      "name": "get_rlusd_quote"
+    },
+    {
+      "name": "get_wallet_setup_guide"
+    },
+    {
+      "name": "get_wallet_trust_score"
+    },
+    {
+      "name": "get_wallet_verification_challenge"
+    },
+    {
+      "name": "get_xrp_price"
+    },
+    {
+      "name": "hire_and_pay"
+    },
+    {
+      "name": "list_marketplace_jobs"
+    },
+    {
+      "name": "list_marketplace_skills"
+    },
+    {
+      "name": "list_open_jobs"
+    },
+    {
+      "name": "lookup_nft_issuer"
+    },
+    {
+      "name": "post_job"
+    },
+    {
+      "name": "prepare_escrow"
+    },
+    {
+      "name": "purchase_extra_attempt"
+    },
+    {
+      "name": "rate_wallet"
+    },
+    {
+      "name": "read_job_messages"
+    },
+    {
+      "name": "recommend_release_conditions"
+    },
+    {
+      "name": "send_job_message"
+    },
+    {
+      "name": "start_wallet_kyc"
+    },
+    {
+      "name": "submit_bid"
+    },
+    {
+      "name": "submit_escrow_transaction"
+    },
+    {
+      "name": "verify_nft_ownership"
+    },
+    {
+      "name": "verify_wallet_domain"
+    },
+    {
+      "name": "view_job"
+    }
   ],
   "tags": [
     "xrpl",
