@@ -183,8 +183,9 @@ async def test_privy_sign_and_submit_no_context_manager_error():
     ):
         result = await _privy_sign_and_submit(wallet, tx, "mainnet")
 
-    mock_client.open.assert_called_once()
-    mock_client.close.assert_called_once()
+    # xrpl-py 5.x: AsyncJsonRpcClient is stateless HTTP — open/close must NOT be called
+    mock_client.open.assert_not_called()
+    mock_client.close.assert_not_called()
     assert result["validated"] is True
 
 
