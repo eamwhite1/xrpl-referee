@@ -40,6 +40,7 @@ def _make_db():
                 verified        BOOLEAN DEFAULT 0,
                 verify_challenge VARCHAR,
                 privy_wallet_id VARCHAR,
+                privy_public_key VARCHAR,
                 created_at      DATETIME
             )
         """))

@@ -1,36 +1,41 @@
 {
   "name": "agenttrust-xrpl-escrow",
-  "version": "2",
+  "version": "1.0",
   "chain_type": "xrpl",
   "rules": [
     {
+      "name": "allow-escrow-create",
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
       "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCreate"}]
     },
     {
+      "name": "allow-escrow-cancel",
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
       "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowCancel"}]
     },
     {
+      "name": "allow-escrow-finish",
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
       "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "EscrowFinish"}]
     },
     {
+      "name": "allow-account-set",
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
       "conditions": [{"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "AccountSet"}]
     },
     {
+      "name": "allow-payment-under-100k-xrp",
       "action": "ALLOW",
       "method": "xrpl_signTransaction",
       "conditions": [
         {"field_source": "xrpl_transaction", "field": "TransactionType", "operator": "eq", "value": "Payment"},
-        {"field_source": "xrpl_transaction", "field": "Amount.drops", "operator": "lt", "value": "100000000000"}
+        {"field_source": "xrpl_transaction", "field": "Payment.Amount.drops", "operator": "lt", "value": "100000000000"}
       ]
     },
-    {"action": "DENY", "method": "xrpl_signTransaction"}
+    {"name": "deny-all-other", "action": "DENY", "method": "xrpl_signTransaction", "conditions": []}
   ]
 }
