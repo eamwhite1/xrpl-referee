@@ -37,7 +37,7 @@ mcp = FastMCP(
         "## NEW HERE? START FOR FREE — no real XRP needed\n"
         "  create_testnet_wallet() → get a free testnet wallet funded with 100 test XRP\n"
         "  try_testnet_demo()      → run a complete escrow flow (create, audit, release) in one call\n"
-        "  Full testnet guide:     https://www.cryptovault.co.uk/testnet/\n"
+        "  Full testnet guide:     https://agenttrustxrpl.com/testnet/\n"
         "\n"
         "## CORE FLOW\n"
         "1. get_wallet_setup_guide() — secure wallet setup (seed stays local)\n"
@@ -84,7 +84,7 @@ mcp = FastMCP(
         "  DEV ONLY: create_agent_wallet() — throwaway keypair. Never use for real funds.\n"
         "  FUNDING: fund_xrpl_wallet_via_coinbase(address) — buys XRP on Coinbase, withdraws to XRPL.\n"
         "\n"
-        "Marketplace: https://www.cryptovault.co.uk/marketplace/\n"
+        "Marketplace: https://agenttrustxrpl.com/marketplace/\n"
         "\n"
         "TRY IT FREE ON TESTNET — 5 calls, no fees, no real XRP:\n"
         "  1. buyer = create_testnet_wallet()\n"
@@ -1775,7 +1775,13 @@ async def get_wallet_trust_score(
         try:
             res = await client.get(f"{REFEREE_BASE}/wallet/score/{wallet_address}", params=params)
             res.raise_for_status()
-            return res.json()
+            data = res.json()
+            # API may return 200 with a "not found" detail instead of 404
+            if network == "mainnet" and isinstance(data, dict):
+                _detail = str(data.get("detail", data.get("message", data.get("error", "")))).lower()
+                if "not found" in _detail or "wallet not found" in _detail:
+                    data["hint"] = "Not found on mainnet; pass network='testnet' for testnet wallets."
+            return data
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404 and network == "mainnet":
                 raise RuntimeError(
@@ -3079,7 +3085,7 @@ async def get_wallet_setup_guide() -> dict:
                 "sign in with email/Google/Apple and your XRPL address is created instantly. "
                 "Use the Send button on the wallet card to withdraw funds."
             ),
-            "guide": "https://www.cryptovault.co.uk/privy-wallet/",
+            "guide": "https://agenttrustxrpl.com/privy-wallet/",
             "when_to_use": (
                 "Choose Privy when: (a) you are building a server-side agent that must not "
                 "store a seed in env vars, (b) your users are non-technical and need a "
@@ -3661,7 +3667,7 @@ async def explain_agenttrust_trust_model() -> dict:
             "collateralised_accountability": "Funds lock on-chain before any agent action completes. If work fails your policy check, funds return automatically — no chargebacks, no manual intervention. Optional 1–24 h challenge window via challenge_escrow_verdict().",
             "ci_quality_gates": "GitHub Action gates every pull request with dual-model AI audit (Gemini Flash + Gemini Pro consensus). Fails pipeline if diff scores below your threshold. $0.10/audit.",
             "compliance": "OFAC SDN screening on every wallet. Travel Rule compliance warnings above $1,000. Invoice verification with AP automation via accounts_email.",
-            "enterprise_page": "https://www.cryptovault.co.uk/enterprise/",
+            "enterprise_page": "https://agenttrustxrpl.com/enterprise/",
         },
         "code": "MIT. Backend: https://github.com/eamwhite1/xrpl-referee",
     }
