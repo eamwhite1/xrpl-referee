@@ -3391,6 +3391,7 @@ RESEND_FROM             = os.getenv("RESEND_FROM", "noreply@cryptovault.co.uk")
 WEBHOOK_SIGNING_SECRET  = os.getenv("WEBHOOK_SIGNING_SECRET", "")
 DELIVERY_EXPIRY_DAYS = 7
 SITE_URL             = os.getenv("SITE_URL", "https://agenttrustxrpl.com")
+TOOL_COUNT           = 51
 RATING_LINK_TTL_S    = 7 * 24 * 3600  # 7 days
 
 
@@ -11928,6 +11929,7 @@ async def marketplace_jobs(
             "The buyer awards your bid, then creates an escrow with your wallet address. "
             "Demo jobs (is_demo=true) are illustrative — submit a real bid via the job board."
         ),
+        "next_step": "Try it free on testnet: create_testnet_wallet(), then hire_and_pay(task, buyer_address, amount_xrp, worker_address, network='testnet')",
     }
     return result
 
