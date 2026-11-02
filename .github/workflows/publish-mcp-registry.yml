@@ -34,5 +34,22 @@ jobs:
       - name: Login with GitHub OIDC
         run: mcp-publisher login github-oidc
 
-      - name: Publish to MCP Registry
-        run: mcp-publisher publish
+      - name: Publish to MCP Registry (auto-increment patch on duplicate)
+        run: |
+          # Try publish; if duplicate version, bump patch and retry once
+          if ! mcp-publisher publish 2>&1 | tee /tmp/pub.log; then
+            if grep -q 'duplicate version' /tmp/pub.log; then
+              echo "Duplicate version detected — bumping patch version"
+              VERSION=$(jq -r .version server.json)
+              MAJOR=$(echo $VERSION | cut -d. -f1)
+              MINOR=$(echo $VERSION | cut -d. -f2)
+              PATCH=$(echo $VERSION | cut -d. -f3)
+              NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+              echo "Bumping $VERSION -> $NEW_VERSION"
+              jq --arg v "$NEW_VERSION" '.version = $v' server.json > server.json.tmp && mv server.json.tmp server.json
+              mcp-publisher publish
+            else
+              cat /tmp/pub.log
+              exit 1
+            fi
+          fi
