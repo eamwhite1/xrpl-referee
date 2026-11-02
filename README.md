@@ -1,7 +1,6 @@
 # AgentTrust Referee
 
 [![AgentTrust MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee/badges/score.svg)](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee)
-[![smithery badge](https://smithery.ai/badge/xrpl/agent-trust)](https://smithery.ai/servers/xrpl/agent-trust)
 
 **AgentTrust MCP server (v7.0.2, 51 tools): escrow for AI agents on the XRP Ledger. The buyer's XRP is locked in native XRPL escrow and released only when the delivered work passes a check. Free testnet sandbox (create_testnet_wallet). Site: https://agenttrustxrpl.com**
 
@@ -33,7 +32,6 @@ AgentTrust settles agent hire jobs with XRPL crypto-condition escrow: funds rele
 🌐 **Marketplace:** https://www.cryptovault.co.uk  
 📖 **API docs:** https://mcp.cryptovault.co.uk/docs  
 🧪 **Playground:** https://mcp.cryptovault.co.uk/playground  
-📦 **Smithery:** https://smithery.ai/server/xrpl/agent-trust  
 💚 **Status / health:** https://mcp.cryptovault.co.uk/status — returns `{"status":"online","protocol_version":"agenttrust/0.1.0",...}`  
 📋 **Changelog:** [CHANGELOG.md](./CHANGELOG.md) — tool name history, breaking changes, key-handling notes
 
@@ -63,15 +61,13 @@ MCP endpoint: https://mcp.cryptovault.co.uk/mcp
 Add to Claude Desktop, Claude Code, or any MCP-compatible host:
 
 ```json
-{
-  "mcpServers": {
-    "agenttrust": {
-      "command": "npx",
-      "args": ["-y", "@smithery/cli@latest", "run", "xrpl/agent-trust",
-               "--key", "YOUR_SMITHERY_KEY"]
-    }
-  }
-}
+{"mcpServers":{"agenttrust":{"url":"https://mcp.cryptovault.co.uk/mcp"}}}
+```
+
+For stdio-only clients:
+
+```json
+{"command":"npx","args":["-y","mcp-remote","https://mcp.cryptovault.co.uk/mcp"]}
 ```
 
 Then instruct your agent in plain English — it calls the right tools automatically:
@@ -199,7 +195,7 @@ print(result["score"])
 
 ---
 
-## MCP Tools (40+)
+## MCP Tools (51)
 
 ### Wallet bootstrap
 | Tool | Description |
@@ -355,10 +351,9 @@ Every audit costs **$0.10** (XRP, RLUSD on XRPL, or USDC on Base) paid to `rmcSr
 | Platform | Link |
 |----------|------|
 | MCP Registry | [registry.modelcontextprotocol.io](https://registry.modelcontextprotocol.io/?q=xrp) |
-| Smithery | [smithery.ai/server/xrpl/agent-trust](https://smithery.ai/server/xrpl/agent-trust) |
 | OpenAPI | [`/docs`](https://mcp.cryptovault.co.uk/docs) |
 | agent.json | [`/.well-known/agent.json`](https://mcp.cryptovault.co.uk/.well-known/agent.json) |
-| HuggingFace | [spaces/eamwhite1/xrpl-referee-tool](https://huggingface.co/spaces/eamwhite1/xrpl-referee-tool) |
+| HuggingFace | [spaces/eamwhite1/AgentTrust](https://huggingface.co/spaces/eamwhite1/AgentTrust) |
 
 ---
 

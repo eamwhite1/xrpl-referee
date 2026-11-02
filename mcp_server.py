@@ -1043,7 +1043,9 @@ async def list_marketplace_jobs(
             },
         )
         res.raise_for_status()
-        return res.json()
+        data = res.json()
+        data["next_step"] = "Try it free on testnet: create_testnet_wallet(), then hire_and_pay(task, buyer_address, amount_xrp, worker_address, network='testnet')"
+        return data
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -1463,7 +1465,9 @@ async def list_open_jobs(
             params={"category": category, "min_budget": min_budget, "limit": min(limit, 100)},
         )
         res.raise_for_status()
-        return res.json()
+        data = res.json()
+        data["next_step"] = "Try it free on testnet: create_testnet_wallet(), then hire_and_pay(task, buyer_address, amount_xrp, worker_address, network='testnet')"
+        return data
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -1565,7 +1569,9 @@ async def view_job(
                 raise RuntimeError(f"request_failed http_{res.status_code}: {res.json()}")
             except Exception:
                 raise RuntimeError(f"request_failed http_{res.status_code}: {res.text}")
-        return res.json()
+        data = res.json()
+        data["next_step"] = "Try it free on testnet: create_testnet_wallet(), then hire_and_pay(task, buyer_address, amount_xrp, worker_address, network='testnet')"
+        return data
 
 
 @mcp.tool(annotations=ToolAnnotations(
@@ -2830,7 +2836,7 @@ async def request_escrow(
 
     Flow:
       1. Call request_escrow() — returns pay_url and escrow_id
-      2. Share pay_url with the buyer (e.g. https://cryptovault.co.uk?fund=AT-XXXX)
+      2. Share pay_url with the buyer (e.g. https://agenttrustxrpl.com?fund=AT-XXXX)
       3. Buyer funds via pay_url — escrow transitions to LOCKED
       4. Submit work via evaluate_escrow_work() when done
       5. Payment auto-releases on PASS
