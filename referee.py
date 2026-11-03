@@ -7322,7 +7322,7 @@ async def _run_structured_audit(
         },
     }
 
-    FLASH_MODEL = "gemini-2.5-flash"
+    FLASH_MODEL = "gemini-3.5-flash-lite"
     PRO_MODEL = "gemini-2.5-pro"
     models_used = []
 
@@ -7402,7 +7402,7 @@ async def _check_gemini_models():
     if not api_key:
         logger.warning("GEMINI_API_KEY not set — AI audits will fail")
         return
-    configured = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-pro").split(",") if m.strip()]
+    configured = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-2.5-pro").split(",") if m.strip()]
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
@@ -7437,7 +7437,7 @@ async def _gemini_schema_selftest():
                 "responseSchema": schema,
             },
         }
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
         if r.status_code == 200:
@@ -8294,7 +8294,7 @@ async def run_ai_audit(
     if not api_key:
         raise Exception("GEMINI_API_KEY is missing from environment.")
 
-    _gemini_models_env = os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-pro")
+    _gemini_models_env = os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-2.5-pro")
     candidates = [m.strip() for m in _gemini_models_env.split(",") if m.strip()]
     # Premium consensus: Flash as primary, Pro as independent second opinion
     CONSENSUS_MODEL = "gemini-2.5-pro"
@@ -8408,7 +8408,7 @@ async def run_ai_audit(
 
                     if require_consensus:
                         # Premium consensus: Flash as primary, Pro as independent second opinion
-                        model_2 = "gemini-2.5-flash" if model_id == "gemini-2.5-pro" else CONSENSUS_MODEL
+                        model_2 = "gemini-3.5-flash-lite" if model_id == "gemini-2.5-pro" else CONSENSUS_MODEL
                         try:
                             url2 = (
                                 f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -10866,7 +10866,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             "criteria_failed": [cr["criterion_id"] for cr in structured_result.get("criteria_results", []) if cr.get("verdict") == "FAIL"],
             "criteria_results": structured_result.get("criteria_results", []),
         }
-        model_used = ", ".join(used_models_list) if used_models_list else "gemini-2.5-flash"
+        model_used = ", ".join(used_models_list) if used_models_list else "gemini-3.5-flash-lite"
         evaluation_verdicts_json = structured_result.get("criteria_results")
 
     # Increment submission count only after a verdict is produced (server-side failures don't consume attempts)

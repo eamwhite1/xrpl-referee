@@ -237,7 +237,7 @@ async def audit_task(
           "details":         "full reasoning",
           "criteria_met":    ["criterion A passed", "criterion B passed"],
           "criteria_failed": ["criterion C not met — specific reason"],
-          "model_used":      "gemini-2.5-flash"
+          "model_used":      "gemini-3.5-flash-lite"
         }
 
     On PASS: proceed to payment or accept the deliverable.
@@ -616,7 +616,7 @@ async def evaluate_escrow_work(
           "summary":          "explanation",
           "criteria_results": [{"criterion_id": "c1", "verdict": "PASS", ...}],
           "auto_finish_queued": True,
-          "model_used":       "gemini-2.5-flash"
+          "model_used":       "gemini-3.5-flash-lite"
         }
 
     Response shape on FAIL:
@@ -628,7 +628,7 @@ async def evaluate_escrow_work(
           "summary":           "explanation",
           "criteria_results":  [{"criterion_id": "c1", "verdict": "FAIL", "reasoning": "..."}],
           "attempts_remaining": 2,
-          "model_used":        "gemini-2.5-flash"
+          "model_used":        "gemini-3.5-flash-lite"
         }
 
     Response shape on INCONCLUSIVE (attempt NOT consumed):
