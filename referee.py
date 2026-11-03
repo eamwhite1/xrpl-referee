@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.2"
+APP_VERSION = "7.0.5"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -150,6 +150,14 @@ async def _lifespan(app):
             _ensure_hourly_window()
             asyncio.create_task(_refresh_jobs_snapshot())  # initial snapshot on startup
             asyncio.create_task(_sweep_orphan_testnet_vaults())  # A1: clean up orphan PENDING vaults
+            # Prime sweep timer from DB so a restart doesn't lose pending deadlines
+            try:
+                with SessionLocal() as _sd:
+                    _startup_due = _compute_next_sweep_due(_sd)
+                if _startup_due:
+                    _note_sweep_due(_startup_due)
+            except Exception as _sd_err:
+                logger.warning(f"[sweep] startup prime failed: {_sd_err}")
         else:
             global _db_recovery_task_ref
             _db_recovery_task_ref[0] = asyncio.create_task(_db_recovery_loop())
@@ -309,8 +317,8 @@ async def mcp_smithery_compat(request, call_next):
         if hdr in response.headers:
             del response.headers[hdr]
 
-    response.headers["X-AgentTrust-Version"] = "7.0.1"
-    response.headers["X-AgentTrust-Server"] = "7.0.1"
+    response.headers["X-AgentTrust-Version"] = APP_VERSION
+    response.headers["X-AgentTrust-Server"] = APP_VERSION
 
     return response
 
@@ -391,6 +399,28 @@ def _wrap_mcp_with_logger(asgi_app):
                 except Exception:
                     pass
     return logged_app
+
+
+# ---------------------------------------------------------------------------
+# Deadline-driven sweep timer — keeps Neon from being woken every 5 minutes.
+# _next_sweep_due is the earliest time any sweep item needs servicing.
+# Set to None when no items are pending, or to a timezone-aware datetime.
+# ---------------------------------------------------------------------------
+import threading as _threading
+_sweep_lock = _threading.Lock()
+_next_sweep_due: Optional[datetime] = None
+
+
+def _note_sweep_due(when: Optional[datetime]) -> None:
+    """Record the earliest known time a sweep item will be due. Thread-safe."""
+    global _next_sweep_due
+    if when is None:
+        return
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    with _sweep_lock:
+        if _next_sweep_due is None or when < _next_sweep_due:
+            _next_sweep_due = when
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +586,14 @@ async def _db_recovery_loop():
             logger.info("✅ DB connection recovered — ensuring hourly window task")
             _ensure_hourly_window()
             await _refresh_jobs_snapshot()
+            # Recompute sweep timer after DB comes back
+            try:
+                with SessionLocal() as _rd:
+                    _recovery_due = _compute_next_sweep_due(_rd)
+                if _recovery_due:
+                    _note_sweep_due(_recovery_due)
+            except Exception as _rd_err:
+                logger.warning(f"[sweep] recovery prime failed: {_rd_err}")
             return
         except Exception as e:
             attempt += 1
@@ -577,14 +615,78 @@ def _ensure_hourly_window():
         _release_sweep_task = asyncio.create_task(_release_sweep_loop())
 
 
+def _compute_next_sweep_due(db) -> Optional[datetime]:
+    """Query DB in one session for the earliest time any sweep item will be due."""
+    from sqlalchemy import text as _text
+    now = datetime.now(timezone.utc)
+    results = []
+
+    # Sweep 1: PASS_CHALLENGE_WINDOW — due at challenge_deadline
+    row = db.execute(_text(
+        "SELECT MIN(challenge_deadline) FROM escrow_vault WHERE status = 'PASS_CHALLENGE_WINDOW'"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t)
+
+    # Sweep 2: RELEASING stuck — due 10 min after updated_at
+    row = db.execute(_text(
+        "SELECT MIN(updated_at) FROM escrow_vault WHERE status = 'RELEASING' "
+        "AND release_tx_hash IS NULL AND (release_attempts IS NULL OR release_attempts < 5)"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t + timedelta(minutes=10))
+
+    # Sweep 3: CHALLENGED stuck review — due 10 min after challenge_review_started_at
+    row = db.execute(_text(
+        "SELECT MIN(challenge_review_started_at) FROM escrow_vault WHERE status = 'CHALLENGED' "
+        "AND challenge_reviewed_at IS NULL AND challenge_review_started_at IS NOT NULL"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t + timedelta(minutes=10))
+
+    # Sweep 4: PASS_UPHELD fee LOCKED — due now + 5 min (retry pending)
+    row = db.execute(_text(
+        "SELECT COUNT(*) FROM escrow_vault WHERE challenge_outcome = 'PASS_UPHELD' "
+        "AND challenge_fee_state = 'LOCKED' AND challenge_fee_finish_hash IS NULL "
+        "AND (challenge_fee_finish_attempts IS NULL OR challenge_fee_finish_attempts < 5)"
+    )).fetchone()
+    if row and row[0] > 0:
+        results.append(now + timedelta(minutes=5))
+
+    # Sweep 5: REFUNDABLE past CancelAfter
+    row = db.execute(_text(
+        "SELECT MIN(challenge_fee_cancel_after) FROM escrow_vault "
+        "WHERE challenge_fee_state = 'REFUNDABLE' AND challenge_fee_cancel_hash IS NULL "
+        "AND challenge_fee_cancel_after IS NOT NULL"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t)
+
+    return min(results) if results else None
+
+
 async def _release_sweep_loop():
-    """Runs PASS_CHALLENGE_WINDOW and RELEASING sweeps every 5 minutes."""
+    """Deadline-driven sweep: wakes every 60 s but only queries the DB when a deadline is due."""
+    global _next_sweep_due
     await asyncio.sleep(30)  # let startup complete
     while True:
         try:
             _now = datetime.now(timezone.utc)
+            with _sweep_lock:
+                _due = _next_sweep_due
+            if not _db_available or _due is None or _now < _due:
+                logger.debug("[sweep] nothing due, skipping")
+                await asyncio.sleep(60)
+                continue
+            logger.info("[sweep] due item(s) — running")
+            # All 5 sweeps in ONE session
             try:
                 with SessionLocal() as _db:
+                    # --- Sweep 1: PASS_CHALLENGE_WINDOW expired ---
                     expired_cw = _db.query(EscrowVault).filter(
                         EscrowVault.status == "PASS_CHALLENGE_WINDOW",
                         EscrowVault.challenge_deadline <= _now,
@@ -592,7 +694,7 @@ async def _release_sweep_loop():
                     for _v in expired_cw:
                         _v.status = "RELEASING"
                         _v.updated_at = _now
-                        logger.info(f"[5min sweep] RELEASING {_v.escrow_id} after challenge window expired")
+                        logger.info(f"[sweep] RELEASING {_v.escrow_id} after challenge window expired")
                         _send_challenge_window_expired_email(_v)
                     if expired_cw:
                         _db.commit()
@@ -606,11 +708,9 @@ async def _release_sweep_loop():
                                     _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
                                 ))
                         except Exception as _fe:
-                            logger.error(f"[5min sweep] auto_finish queue failed for {_v.escrow_id}: {_fe}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] challenge-window sweep error: {_e}")
-            try:
-                with SessionLocal() as _db:
+                            logger.error(f"[sweep] auto_finish queue failed for {_v.escrow_id}: {_fe}")
+
+                    # --- Sweep 2: stuck RELEASING retry ---
                     stuck = _db.query(EscrowVault).filter(
                         EscrowVault.status == "RELEASING",
                         EscrowVault.release_tx_hash == None,
@@ -627,16 +727,12 @@ async def _release_sweep_loop():
                                     _v.escrow_owner or _v.buyer_address,
                                     _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
                                 ))
-                                logger.warning(f"[5min sweep] retrying auto_finish for stuck {_v.escrow_id}")
+                                logger.warning(f"[sweep] retrying auto_finish for stuck {_v.escrow_id}")
                         except Exception as _se:
-                            logger.error(f"[5min sweep] RELEASING retry error for {_v.escrow_id}: {_se}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] RELEASING sweep error: {_e}")
-            # Sweep 3: re-queue stuck CHALLENGED reviews (started > 10 min ago, not completed)
-            # If challenge_review_attempts >= 2, force REVIEW_INCONCLUSIVE instead of re-queueing
-            try:
-                _stale_cutoff = _now - timedelta(minutes=10)
-                with SessionLocal() as _db:
+                            logger.error(f"[sweep] RELEASING retry error for {_v.escrow_id}: {_se}")
+
+                    # --- Sweep 3: stuck CHALLENGED review re-queue ---
+                    _stale_cutoff = _now - timedelta(minutes=10)
                     stuck_chal = _db.query(EscrowVault).filter(
                         EscrowVault.status == "CHALLENGED",
                         EscrowVault.challenge_review_started_at != None,
@@ -646,14 +742,14 @@ async def _release_sweep_loop():
                     for _v in stuck_chal:
                         if (_v.challenge_review_attempts or 0) < 2:
                             asyncio.create_task(_run_challenge_review(_v.escrow_id))
-                            logger.warning(f"[5min sweep] re-queuing stuck challenge review for {_v.escrow_id}")
+                            logger.warning(f"[sweep] re-queuing stuck challenge review for {_v.escrow_id}")
                         else:
-                            # Force REVIEW_INCONCLUSIVE → release to worker, fee REFUNDABLE
                             _v.status = "RELEASING"
                             _v.challenge_outcome = "REVIEW_INCONCLUSIVE"
                             _v.challenge_fee_state = "REFUNDABLE"
                             _v.challenge_reviewed_at = _now
-                            logger.warning(f"[5min sweep] forcing REVIEW_INCONCLUSIVE for stuck {_v.escrow_id}")
+                            _note_sweep_due(_now + timedelta(minutes=10))
+                            logger.warning(f"[sweep] forcing REVIEW_INCONCLUSIVE for stuck {_v.escrow_id}")
                     if stuck_chal:
                         _db.commit()
                     for _v in stuck_chal:
@@ -666,12 +762,9 @@ async def _release_sweep_loop():
                                     _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
                                 ))
                             except Exception as _fe:
-                                logger.error(f"[5min sweep] auto_finish for stuck inconclusive {_v.escrow_id}: {_fe}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] stuck challenge review sweep error: {_e}")
-            # Sweep 4: retry _finish_challenge_fee_escrow for PASS_UPHELD where fee not finished (LOCKED, no hash)
-            try:
-                with SessionLocal() as _db:
+                                logger.error(f"[sweep] auto_finish for stuck inconclusive {_v.escrow_id}: {_fe}")
+
+                    # --- Sweep 4: retry fee finish for PASS_UPHELD LOCKED ---
                     needs_finish = _db.query(EscrowVault).filter(
                         EscrowVault.challenge_outcome == "PASS_UPHELD",
                         EscrowVault.challenge_fee_state == "LOCKED",
@@ -680,12 +773,9 @@ async def _release_sweep_loop():
                     ).all()
                     for _v in needs_finish:
                         asyncio.create_task(_finish_challenge_fee_escrow(_v.escrow_id))
-                        logger.info(f"[5min sweep] retrying _finish_challenge_fee_escrow for {_v.escrow_id}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] fee finish retry sweep error: {_e}")
-            # Sweep 5: auto-cancel REFUNDABLE challenge fee escrows past CancelAfter
-            try:
-                with SessionLocal() as _db:
+                        logger.info(f"[sweep] retrying _finish_challenge_fee_escrow for {_v.escrow_id}")
+
+                    # --- Sweep 5: auto-cancel REFUNDABLE past CancelAfter ---
                     refundable = _db.query(EscrowVault).filter(
                         EscrowVault.challenge_fee_state == "REFUNDABLE",
                         EscrowVault.challenge_fee_cancel_after != None,
@@ -694,12 +784,22 @@ async def _release_sweep_loop():
                     ).all()
                     for _v in refundable:
                         asyncio.create_task(_cancel_challenge_fee_escrow(_v.escrow_id))
-                        logger.info(f"[5min sweep] auto-cancelling REFUNDABLE challenge fee for {_v.escrow_id}")
+                        logger.info(f"[sweep] auto-cancelling REFUNDABLE challenge fee for {_v.escrow_id}")
+
+                    # Recompute next due time in the same session
+                    _new_due = _compute_next_sweep_due(_db)
+                    with _sweep_lock:
+                        if _new_due is None:
+                            _next_sweep_due = None
+                        else:
+                            # Retry floor: never schedule sooner than 5 min from now
+                            _floor = _now + timedelta(minutes=5)
+                            _next_sweep_due = max(_new_due, _floor) if _new_due < _floor else _new_due
             except Exception as _e:
-                logger.error(f"[5min sweep] refundable cancel sweep error: {_e}")
+                logger.error(f"[sweep] error: {_e}", exc_info=True)
         except Exception as _outer:
-            logger.error(f"[5min sweep] outer error: {_outer}")
-        await asyncio.sleep(300)
+            logger.error(f"[sweep] outer error: {_outer}")
+        await asyncio.sleep(60)
 
 
 async def _hourly_db_window():
@@ -852,6 +952,14 @@ async def _hourly_db_window():
                 backfill_db.close()
             if ENTERPRISE_WALLET:
                 await _poll_enterprise_subscriptions_once()
+        # Hourly refresh of sweep deadline from DB
+        try:
+            with SessionLocal() as _hw_sd:
+                _hw_due = _compute_next_sweep_due(_hw_sd)
+            if _hw_due:
+                _note_sweep_due(_hw_due)
+        except Exception as _hw_sd_err:
+            logger.warning(f"[sweep] hourly refresh failed: {_hw_sd_err}")
         await asyncio.sleep(3600)
 
 
@@ -4635,6 +4743,8 @@ async def auto_finish_escrow(
                     import asyncio as _asyncio
                     _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 else:
+                    if attempts < 5:
+                        _note_sweep_due(datetime.now(timezone.utc) + timedelta(minutes=10))
                     db.commit()
         finally:
             db.close()
@@ -7940,6 +8050,7 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                 if vault.challenge_fee_state not in ("REFUNDABLE", "CANCELLED", "FINISHED"):
                     vault.challenge_fee_state = "REFUNDABLE"
                     db.commit()
+                    _note_sweep_due(cancel_after_ts)
                 return
 
         quote = db.query(ChallengeQuote).filter(ChallengeQuote.id == vault.challenge_quote_id).first()
@@ -7997,6 +8108,7 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                     if v2.challenge_fee_state not in ("FINISHED", "CANCELLED"):
                         v2.challenge_fee_state = "REFUNDABLE"
                         db.commit()
+                        _note_sweep_due(now + timedelta(minutes=5))
                 else:
                     logger.warning(f"_finish_challenge_fee_escrow: tec result {_tx_result} for {_eid}, will retry")
                     db.commit()
@@ -8105,6 +8217,7 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
         vault.challenge_review_started_at = now
         vault.challenge_review_attempts = (vault.challenge_review_attempts or 0) + 1
         db.commit()
+        _note_sweep_due(now + timedelta(minutes=10))
 
         # Filter to non-code criteria only
         all_criteria = vault.criteria_v2 or [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
@@ -8235,6 +8348,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
             db.commit()
             _queue_auto_finish(vault)
             asyncio.create_task(_finish_challenge_fee_escrow(escrow_id))
+            _note_sweep_due(now + timedelta(minutes=5))
+            _note_sweep_due(now + timedelta(minutes=10))
             _send_challenge_outcome_email(vault, "rejected")
 
         elif pro_verdict == "PASS_OVERTURNED":
@@ -8247,6 +8362,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
             submission_count = vault.submission_count or 0
             max_subs = vault.max_submissions or 3
             vault.challenge_fee_state = "REFUNDABLE"
+            if cancel_after:
+                _note_sweep_due(cancel_after)
             if cancel_after and time_remaining >= 2 * 3600 and submission_count < max_subs:
                 vault.status = "REMEDY"
                 _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
@@ -8267,6 +8384,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
             vault.status = "RELEASING"
             vault.challenge_fee_state = "REFUNDABLE"
             db.commit()
+            _note_sweep_due(now + timedelta(minutes=10))
+            _note_sweep_due(now + timedelta(minutes=5))
             _queue_auto_finish(vault)
             _send_challenge_outcome_email(vault, "pro_unavailable")
 
@@ -9425,6 +9544,7 @@ async def submit_challenge(escrow_id: str, req: ChallengeSubmitRequest, db: Sess
         {"now": now, "hash": fee_tx, "qid": quote.id}
     )
     db.commit()
+    _note_sweep_due(cancel_after_dt)
 
     if update_result.rowcount != 1:
         raise HTTPException(status_code=409, detail={
@@ -10996,6 +11116,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 _max_deadline = _cancel_aware - timedelta(minutes=30)
                 _raw_deadline = min(_raw_deadline, _max_deadline)
             vault.challenge_deadline = _raw_deadline
+            _note_sweep_due(_raw_deadline)
             vault.delivery_status    = "PASS_CHALLENGE_WINDOW"
             vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
             vault.worker_submission = json.dumps({

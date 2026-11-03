@@ -6,6 +6,19 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v7.0.5 — 2026-11-03
+
+### Changed
+- Release sweep is now deadline-driven so Neon can scale to zero; no user-visible timing change.
+  - `_release_sweep_loop` wakes every 60 s but only queries the DB when a deadline is actually due.
+  - `_compute_next_sweep_due` computes the earliest pending deadline in a single DB session.
+  - `_note_sweep_due` is called at each state-change site to update the in-memory timer immediately.
+  - Startup, DB recovery, and hourly window tick all refresh the timer from the DB as a backstop.
+- `X-AgentTrust-Version` and `X-AgentTrust-Server` response headers now reflect `APP_VERSION` instead of a hardcoded string.
+- Gemini Flash model updated to `gemini-3.5-flash-lite` (deprecation of `gemini-2.5-flash` Dec 1 2026).
+
+---
+
 ## v3.0.1 — 2026-10-09
 
 ### Changed
