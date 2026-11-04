@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.2"
+APP_VERSION = "7.0.6"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -150,6 +150,14 @@ async def _lifespan(app):
             _ensure_hourly_window()
             asyncio.create_task(_refresh_jobs_snapshot())  # initial snapshot on startup
             asyncio.create_task(_sweep_orphan_testnet_vaults())  # A1: clean up orphan PENDING vaults
+            # Prime sweep timer from DB so a restart doesn't lose pending deadlines
+            try:
+                with SessionLocal() as _sd:
+                    _startup_due = _compute_next_sweep_due(_sd)
+                if _startup_due:
+                    _note_sweep_due(_startup_due)
+            except Exception as _sd_err:
+                logger.warning(f"[sweep] startup prime failed: {_sd_err}")
         else:
             global _db_recovery_task_ref
             _db_recovery_task_ref[0] = asyncio.create_task(_db_recovery_loop())
@@ -309,8 +317,8 @@ async def mcp_smithery_compat(request, call_next):
         if hdr in response.headers:
             del response.headers[hdr]
 
-    response.headers["X-AgentTrust-Version"] = "7.0.1"
-    response.headers["X-AgentTrust-Server"] = "7.0.1"
+    response.headers["X-AgentTrust-Version"] = APP_VERSION
+    response.headers["X-AgentTrust-Server"] = APP_VERSION
 
     return response
 
@@ -391,6 +399,28 @@ def _wrap_mcp_with_logger(asgi_app):
                 except Exception:
                     pass
     return logged_app
+
+
+# ---------------------------------------------------------------------------
+# Deadline-driven sweep timer — keeps Neon from being woken every 5 minutes.
+# _next_sweep_due is the earliest time any sweep item needs servicing.
+# Set to None when no items are pending, or to a timezone-aware datetime.
+# ---------------------------------------------------------------------------
+import threading as _threading
+_sweep_lock = _threading.Lock()
+_next_sweep_due: Optional[datetime] = None
+
+
+def _note_sweep_due(when: Optional[datetime]) -> None:
+    """Record the earliest known time a sweep item will be due. Thread-safe."""
+    global _next_sweep_due
+    if when is None:
+        return
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    with _sweep_lock:
+        if _next_sweep_due is None or when < _next_sweep_due:
+            _next_sweep_due = when
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +586,14 @@ async def _db_recovery_loop():
             logger.info("✅ DB connection recovered — ensuring hourly window task")
             _ensure_hourly_window()
             await _refresh_jobs_snapshot()
+            # Recompute sweep timer after DB comes back
+            try:
+                with SessionLocal() as _rd:
+                    _recovery_due = _compute_next_sweep_due(_rd)
+                if _recovery_due:
+                    _note_sweep_due(_recovery_due)
+            except Exception as _rd_err:
+                logger.warning(f"[sweep] recovery prime failed: {_rd_err}")
             return
         except Exception as e:
             attempt += 1
@@ -577,14 +615,78 @@ def _ensure_hourly_window():
         _release_sweep_task = asyncio.create_task(_release_sweep_loop())
 
 
+def _compute_next_sweep_due(db) -> Optional[datetime]:
+    """Query DB in one session for the earliest time any sweep item will be due."""
+    from sqlalchemy import text as _text
+    now = datetime.now(timezone.utc)
+    results = []
+
+    # Sweep 1: PASS_CHALLENGE_WINDOW — due at challenge_deadline
+    row = db.execute(_text(
+        "SELECT MIN(challenge_deadline) FROM escrow_vault WHERE status = 'PASS_CHALLENGE_WINDOW'"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t)
+
+    # Sweep 2: RELEASING stuck — due 10 min after updated_at
+    row = db.execute(_text(
+        "SELECT MIN(updated_at) FROM escrow_vault WHERE status = 'RELEASING' "
+        "AND release_tx_hash IS NULL AND (release_attempts IS NULL OR release_attempts < 5)"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t + timedelta(minutes=10))
+
+    # Sweep 3: CHALLENGED stuck review — due 10 min after challenge_review_started_at
+    row = db.execute(_text(
+        "SELECT MIN(challenge_review_started_at) FROM escrow_vault WHERE status = 'CHALLENGED' "
+        "AND challenge_reviewed_at IS NULL AND challenge_review_started_at IS NOT NULL"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t + timedelta(minutes=10))
+
+    # Sweep 4: PASS_UPHELD fee LOCKED — due now + 5 min (retry pending)
+    row = db.execute(_text(
+        "SELECT COUNT(*) FROM escrow_vault WHERE challenge_outcome = 'PASS_UPHELD' "
+        "AND challenge_fee_state = 'LOCKED' AND challenge_fee_finish_hash IS NULL "
+        "AND (challenge_fee_finish_attempts IS NULL OR challenge_fee_finish_attempts < 5)"
+    )).fetchone()
+    if row and row[0] > 0:
+        results.append(now + timedelta(minutes=5))
+
+    # Sweep 5: REFUNDABLE past CancelAfter
+    row = db.execute(_text(
+        "SELECT MIN(challenge_fee_cancel_after) FROM escrow_vault "
+        "WHERE challenge_fee_state = 'REFUNDABLE' AND challenge_fee_cancel_hash IS NULL "
+        "AND challenge_fee_cancel_after IS NOT NULL"
+    )).fetchone()
+    if row and row[0]:
+        t = row[0] if row[0].tzinfo else row[0].replace(tzinfo=timezone.utc)
+        results.append(t)
+
+    return min(results) if results else None
+
+
 async def _release_sweep_loop():
-    """Runs PASS_CHALLENGE_WINDOW and RELEASING sweeps every 5 minutes."""
+    """Deadline-driven sweep: wakes every 60 s but only queries the DB when a deadline is due."""
+    global _next_sweep_due
     await asyncio.sleep(30)  # let startup complete
     while True:
         try:
             _now = datetime.now(timezone.utc)
+            with _sweep_lock:
+                _due = _next_sweep_due
+            if not _db_available or _due is None or _now < _due:
+                logger.debug("[sweep] nothing due, skipping")
+                await asyncio.sleep(60)
+                continue
+            logger.info("[sweep] due item(s) — running")
+            # All 5 sweeps in ONE session
             try:
                 with SessionLocal() as _db:
+                    # --- Sweep 1: PASS_CHALLENGE_WINDOW expired ---
                     expired_cw = _db.query(EscrowVault).filter(
                         EscrowVault.status == "PASS_CHALLENGE_WINDOW",
                         EscrowVault.challenge_deadline <= _now,
@@ -592,7 +694,7 @@ async def _release_sweep_loop():
                     for _v in expired_cw:
                         _v.status = "RELEASING"
                         _v.updated_at = _now
-                        logger.info(f"[5min sweep] RELEASING {_v.escrow_id} after challenge window expired")
+                        logger.info(f"[sweep] RELEASING {_v.escrow_id} after challenge window expired")
                         _send_challenge_window_expired_email(_v)
                     if expired_cw:
                         _db.commit()
@@ -606,11 +708,9 @@ async def _release_sweep_loop():
                                     _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
                                 ))
                         except Exception as _fe:
-                            logger.error(f"[5min sweep] auto_finish queue failed for {_v.escrow_id}: {_fe}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] challenge-window sweep error: {_e}")
-            try:
-                with SessionLocal() as _db:
+                            logger.error(f"[sweep] auto_finish queue failed for {_v.escrow_id}: {_fe}")
+
+                    # --- Sweep 2: stuck RELEASING retry ---
                     stuck = _db.query(EscrowVault).filter(
                         EscrowVault.status == "RELEASING",
                         EscrowVault.release_tx_hash == None,
@@ -627,16 +727,12 @@ async def _release_sweep_loop():
                                     _v.escrow_owner or _v.buyer_address,
                                     _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
                                 ))
-                                logger.warning(f"[5min sweep] retrying auto_finish for stuck {_v.escrow_id}")
+                                logger.warning(f"[sweep] retrying auto_finish for stuck {_v.escrow_id}")
                         except Exception as _se:
-                            logger.error(f"[5min sweep] RELEASING retry error for {_v.escrow_id}: {_se}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] RELEASING sweep error: {_e}")
-            # Sweep 3: re-queue stuck CHALLENGED reviews (started > 10 min ago, not completed)
-            # If challenge_review_attempts >= 2, force REVIEW_INCONCLUSIVE instead of re-queueing
-            try:
-                _stale_cutoff = _now - timedelta(minutes=10)
-                with SessionLocal() as _db:
+                            logger.error(f"[sweep] RELEASING retry error for {_v.escrow_id}: {_se}")
+
+                    # --- Sweep 3: stuck CHALLENGED review re-queue ---
+                    _stale_cutoff = _now - timedelta(minutes=10)
                     stuck_chal = _db.query(EscrowVault).filter(
                         EscrowVault.status == "CHALLENGED",
                         EscrowVault.challenge_review_started_at != None,
@@ -646,14 +742,14 @@ async def _release_sweep_loop():
                     for _v in stuck_chal:
                         if (_v.challenge_review_attempts or 0) < 2:
                             asyncio.create_task(_run_challenge_review(_v.escrow_id))
-                            logger.warning(f"[5min sweep] re-queuing stuck challenge review for {_v.escrow_id}")
+                            logger.warning(f"[sweep] re-queuing stuck challenge review for {_v.escrow_id}")
                         else:
-                            # Force REVIEW_INCONCLUSIVE → release to worker, fee REFUNDABLE
                             _v.status = "RELEASING"
                             _v.challenge_outcome = "REVIEW_INCONCLUSIVE"
                             _v.challenge_fee_state = "REFUNDABLE"
                             _v.challenge_reviewed_at = _now
-                            logger.warning(f"[5min sweep] forcing REVIEW_INCONCLUSIVE for stuck {_v.escrow_id}")
+                            _note_sweep_due(_now + timedelta(minutes=10))
+                            logger.warning(f"[sweep] forcing REVIEW_INCONCLUSIVE for stuck {_v.escrow_id}")
                     if stuck_chal:
                         _db.commit()
                     for _v in stuck_chal:
@@ -666,12 +762,9 @@ async def _release_sweep_loop():
                                     _fulfillment, _v.condition, _v.worker_address or "", SessionLocal,
                                 ))
                             except Exception as _fe:
-                                logger.error(f"[5min sweep] auto_finish for stuck inconclusive {_v.escrow_id}: {_fe}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] stuck challenge review sweep error: {_e}")
-            # Sweep 4: retry _finish_challenge_fee_escrow for PASS_UPHELD where fee not finished (LOCKED, no hash)
-            try:
-                with SessionLocal() as _db:
+                                logger.error(f"[sweep] auto_finish for stuck inconclusive {_v.escrow_id}: {_fe}")
+
+                    # --- Sweep 4: retry fee finish for PASS_UPHELD LOCKED ---
                     needs_finish = _db.query(EscrowVault).filter(
                         EscrowVault.challenge_outcome == "PASS_UPHELD",
                         EscrowVault.challenge_fee_state == "LOCKED",
@@ -680,12 +773,9 @@ async def _release_sweep_loop():
                     ).all()
                     for _v in needs_finish:
                         asyncio.create_task(_finish_challenge_fee_escrow(_v.escrow_id))
-                        logger.info(f"[5min sweep] retrying _finish_challenge_fee_escrow for {_v.escrow_id}")
-            except Exception as _e:
-                logger.error(f"[5min sweep] fee finish retry sweep error: {_e}")
-            # Sweep 5: auto-cancel REFUNDABLE challenge fee escrows past CancelAfter
-            try:
-                with SessionLocal() as _db:
+                        logger.info(f"[sweep] retrying _finish_challenge_fee_escrow for {_v.escrow_id}")
+
+                    # --- Sweep 5: auto-cancel REFUNDABLE past CancelAfter ---
                     refundable = _db.query(EscrowVault).filter(
                         EscrowVault.challenge_fee_state == "REFUNDABLE",
                         EscrowVault.challenge_fee_cancel_after != None,
@@ -694,12 +784,22 @@ async def _release_sweep_loop():
                     ).all()
                     for _v in refundable:
                         asyncio.create_task(_cancel_challenge_fee_escrow(_v.escrow_id))
-                        logger.info(f"[5min sweep] auto-cancelling REFUNDABLE challenge fee for {_v.escrow_id}")
+                        logger.info(f"[sweep] auto-cancelling REFUNDABLE challenge fee for {_v.escrow_id}")
+
+                    # Recompute next due time in the same session
+                    _new_due = _compute_next_sweep_due(_db)
+                    with _sweep_lock:
+                        if _new_due is None:
+                            _next_sweep_due = None
+                        else:
+                            # Retry floor: never schedule sooner than 5 min from now
+                            _floor = _now + timedelta(minutes=5)
+                            _next_sweep_due = max(_new_due, _floor) if _new_due < _floor else _new_due
             except Exception as _e:
-                logger.error(f"[5min sweep] refundable cancel sweep error: {_e}")
+                logger.error(f"[sweep] error: {_e}", exc_info=True)
         except Exception as _outer:
-            logger.error(f"[5min sweep] outer error: {_outer}")
-        await asyncio.sleep(300)
+            logger.error(f"[sweep] outer error: {_outer}")
+        await asyncio.sleep(60)
 
 
 async def _hourly_db_window():
@@ -736,6 +836,13 @@ async def _hourly_db_window():
         for _counter in (_testnet_wallet_counter, _testnet_demo_counter, _testnet_audit_counter):
             for _k in [k for k in list(_counter.keys()) if _today_str not in str(k)]:
                 _counter.pop(_k, None)
+        # Evict stale per-IP hourly timestamps from free AI budget
+        with _free_ai_lock:
+            _day_ago_ts = time.time() - 86400
+            for _ip_k in list(_free_ai_ip_hour.keys()):
+                _free_ai_ip_hour[_ip_k] = [t for t in _free_ai_ip_hour[_ip_k] if t > _day_ago_ts]
+                if not _free_ai_ip_hour[_ip_k]:
+                    _free_ai_ip_hour.pop(_ip_k, None)
         # A13: evict _seller_sig_replay past expiry
         for _k in [k for k, v in list(_seller_sig_replay.items()) if v < _now.timestamp()]:
             _seller_sig_replay.pop(_k, None)
@@ -852,6 +959,14 @@ async def _hourly_db_window():
                 backfill_db.close()
             if ENTERPRISE_WALLET:
                 await _poll_enterprise_subscriptions_once()
+        # Hourly refresh of sweep deadline from DB
+        try:
+            with SessionLocal() as _hw_sd:
+                _hw_due = _compute_next_sweep_due(_hw_sd)
+            if _hw_due:
+                _note_sweep_due(_hw_due)
+        except Exception as _hw_sd_err:
+            logger.warning(f"[sweep] hourly refresh failed: {_hw_sd_err}")
         await asyncio.sleep(3600)
 
 
@@ -1025,6 +1140,11 @@ def health_check():
         "ofac_addresses_loaded": len(_ofac_sanctioned_xrpl),
         "ofac_stale": ofac_age_s is None or ofac_age_s > 172800,
         "sanctions_source": "ofac_sdn_xml",
+        "free_ai": {
+            "enabled": _TRY_AI_ENABLED,
+            "calls_today": _free_ai_today(),
+            "daily_cap": _TRY_AI_DAILY_CAP,
+        },
     }
 
 @app.get("/llms.txt", include_in_schema=False)
@@ -3322,6 +3442,103 @@ PROTOCOL_WALLET    = "rmcSrkpZ2i2kuvtCPeTVetee9SixP4djR"
 _domain_toml_cache: dict = {}
 # Testnet audit rate limit counter: {key: count}
 _testnet_audit_counter: dict = {}
+
+# ---------------------------------------------------------------------------
+# FREE AI BUDGET — in-memory, resets at UTC midnight, no DB writes
+# ---------------------------------------------------------------------------
+import threading as _threading_ai
+_TRY_AI_ENABLED: bool = os.getenv("TRY_AI_ENABLED", "true").lower() == "true"
+_TRY_AI_DAILY_CAP: int = int(os.getenv("TRY_AI_DAILY_CAP", "100"))
+TRY_AI_MODEL: str = os.getenv("TRY_AI_MODEL", "gemini-3.5-flash-lite")
+_free_ai_budget: dict = {
+    "date": "", "try": 0, "demo": 0, "testnet_audit": 0,
+    "challenge": 0, "cached_hits": 0, "capped": 0, "total_calls": 0,
+}
+_free_ai_lock = _threading_ai.Lock()
+_try_ai_cache: dict = {}           # {sha256_key: (result_dict, expires_ts)}
+_TRY_AI_CACHE_MAX = 2_000
+_free_ai_ip_hour: dict = {}        # {ip_hash: [timestamps]}
+_FREE_AI_IP_HOUR_LIMIT = 5
+_FREE_AI_IP_DAY_LIMIT = 20
+
+def _free_ai_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _free_ai_reset_if_needed():
+    """Call inside _free_ai_lock only."""
+    today = _free_ai_today()
+    if _free_ai_budget["date"] != today:
+        old = _free_ai_budget.copy()
+        _free_ai_budget.update({
+            "date": today, "try": 0, "demo": 0,
+            "testnet_audit": 0, "challenge": 0,
+            "cached_hits": 0, "capped": 0, "total_calls": 0,
+        })
+        _free_ai_ip_hour.clear()
+        logger.info(
+            f"free_ai daily: date={old.get('date')} try={old['try']} demo={old['demo']} "
+            f"testnet_audit={old['testnet_audit']} challenge={old['challenge']} "
+            f"cached_hits={old['cached_hits']} capped={old['capped']} "
+            f"total_calls={old['total_calls']}/{_TRY_AI_DAILY_CAP}"
+        )
+
+def _free_ai_allow(path: str, ip) -> tuple:
+    """Return (allowed: bool, status: str). path in {'try','demo','testnet_audit','challenge'}."""
+    with _free_ai_lock:
+        _free_ai_reset_if_needed()
+        if not _TRY_AI_ENABLED:
+            return False, "disabled"
+        if _free_ai_budget["total_calls"] >= _TRY_AI_DAILY_CAP:
+            _free_ai_budget["capped"] += 1
+            return False, "capped"
+        if ip:
+            _ip_hash = hashlib.sha256(str(ip).encode()).hexdigest()[:16]
+            _now_ts = time.time()
+            _hour_ago = _now_ts - 3600
+            _day_ago  = _now_ts - 86400
+            _ts = _free_ai_ip_hour.get(_ip_hash, [])
+            _ts = [t for t in _ts if t > _day_ago]
+            _hour_ts = [t for t in _ts if t > _hour_ago]
+            if len(_hour_ts) >= _FREE_AI_IP_HOUR_LIMIT:
+                _free_ai_budget["capped"] += 1
+                return False, "capped"
+            if len(_ts) >= _FREE_AI_IP_DAY_LIMIT:
+                _free_ai_budget["capped"] += 1
+                return False, "capped"
+        return True, "allowed"
+
+def _free_ai_record(path: str, ip):
+    with _free_ai_lock:
+        _free_ai_budget[path] = _free_ai_budget.get(path, 0) + 1
+        _free_ai_budget["total_calls"] += 1
+        if ip:
+            _ip_hash = hashlib.sha256(str(ip).encode()).hexdigest()[:16]
+            _free_ai_ip_hour.setdefault(_ip_hash, []).append(time.time())
+        logger.info(
+            f"free_ai record path={path} total={_free_ai_budget['total_calls']}/{_TRY_AI_DAILY_CAP}"
+        )
+
+def _free_ai_record_cache_hit():
+    with _free_ai_lock:
+        _free_ai_budget["cached_hits"] += 1
+
+def _try_ai_cache_key(model: str, task: str, work: str) -> str:
+    return hashlib.sha256(f"{model}|{task}|{work.strip()}".encode()).hexdigest()
+
+def _try_ai_cache_get(key: str):
+    entry = _try_ai_cache.get(key)
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    if entry:
+        _try_ai_cache.pop(key, None)
+    return None
+
+def _try_ai_cache_set(key: str, result: dict):
+    if len(_try_ai_cache) >= _TRY_AI_CACHE_MAX:
+        oldest = min(_try_ai_cache, key=lambda k: _try_ai_cache[k][1])
+        _try_ai_cache.pop(oldest, None)
+    _try_ai_cache[key] = (result, time.time() + 86400)
+
 OPERATOR_WALLETS: set = set(filter(None, os.getenv("OPERATOR_WALLETS", PROTOCOL_WALLET).split(",")))
 MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
 MIN_FEE_XRP        = 0.1    # fallback if price oracle is unavailable
@@ -4635,6 +4852,8 @@ async def auto_finish_escrow(
                     import asyncio as _asyncio
                     _asyncio.create_task(_fire_vault_webhook(_wh_payload, _wh_url))
                 else:
+                    if attempts < 5:
+                        _note_sweep_due(datetime.now(timezone.utc) + timedelta(minutes=10))
                     db.commit()
         finally:
             db.close()
@@ -5711,7 +5930,7 @@ async def domain_preview(domain: str, db: Session = Depends(get_db)):
     Returns enough for the UI to show a meaningful status without a wallet address.
     """
     import re
-    clean = domain.replace("https://", "").replace("http://", "").rstrip("/").lower()
+    clean = _normalise_domain(domain)
 
     # 1. Registry lookup
     try:
@@ -6018,6 +6237,15 @@ async def _fetch_activity_90d(wallet_address: str, xrpl_url: str) -> int:
     return count
 
 
+def _normalise_domain(d: str) -> str:
+    """Strip any leading scheme and trailing slashes from a domain string."""
+    d = (d or "").strip()
+    for scheme in ("https://", "http://"):
+        if d.lower().startswith(scheme):
+            d = d[len(scheme):]
+    return d.rstrip("/").lower()
+
+
 async def _fetch_domain_toml(domain: str, wallet_address: str) -> tuple[bool, bool, str | None]:
     """
     Check xrp-ledger.toml for domain verification.
@@ -6025,6 +6253,7 @@ async def _fetch_domain_toml(domain: str, wallet_address: str) -> tuple[bool, bo
     Caches per domain for 1h.
     """
     import time as _time
+    domain = _normalise_domain(domain)
     toml_url = f"https://{domain}/.well-known/xrp-ledger.toml"
     cached = _domain_toml_cache.get(domain)
     if cached and cached["expires"] > _time.time():
@@ -6083,7 +6312,7 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None, netw
         domain: str | None = None
         if has_domain:
             try:
-                domain = bytes.fromhex(domain_hex).decode("ascii", errors="replace").strip()
+                domain = _normalise_domain(bytes.fromhex(domain_hex).decode("ascii", errors="replace"))
             except Exception:
                 domain = None
 
@@ -7303,6 +7532,7 @@ async def _run_structured_audit(
     evidence_items: list,
     require_consensus: bool,
     attempt_count: int,
+    allow_pro: bool = True,
 ) -> dict:
     """Run structured AI audit with criterion types, evidence, consensus logic."""
     api_key = os.getenv("GEMINI_API_KEY")
@@ -7358,7 +7588,7 @@ async def _run_structured_audit(
         flash_result["models_used"] = models_used
         return flash_result
 
-    use_pro = require_consensus or attempt_count >= 2 or flash_verdict == "INCONCLUSIVE"
+    use_pro = allow_pro and (require_consensus or attempt_count >= 2 or flash_verdict == "INCONCLUSIVE")
     if use_pro:
         pro_result = await _call_gemini(PRO_MODEL)
         if pro_result is not None:
@@ -7940,6 +8170,7 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                 if vault.challenge_fee_state not in ("REFUNDABLE", "CANCELLED", "FINISHED"):
                     vault.challenge_fee_state = "REFUNDABLE"
                     db.commit()
+                    _note_sweep_due(cancel_after_ts)
                 return
 
         quote = db.query(ChallengeQuote).filter(ChallengeQuote.id == vault.challenge_quote_id).first()
@@ -7997,6 +8228,7 @@ async def _finish_challenge_fee_escrow(escrow_id_or_vault) -> None:
                     if v2.challenge_fee_state not in ("FINISHED", "CANCELLED"):
                         v2.challenge_fee_state = "REFUNDABLE"
                         db.commit()
+                        _note_sweep_due(now + timedelta(minutes=5))
                 else:
                     logger.warning(f"_finish_challenge_fee_escrow: tec result {_tx_result} for {_eid}, will retry")
                     db.commit()
@@ -8105,6 +8337,7 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
         vault.challenge_review_started_at = now
         vault.challenge_review_attempts = (vault.challenge_review_attempts or 0) + 1
         db.commit()
+        _note_sweep_due(now + timedelta(minutes=10))
 
         # Filter to non-code criteria only
         all_criteria = vault.criteria_v2 or [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
@@ -8137,6 +8370,23 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
         api_key = os.getenv("GEMINI_API_KEY")
         pro_result = None
 
+        # On testnet: use Flash (not Pro), apply global free AI cap (1 per vault)
+        _challenge_network = getattr(vault, "network", "mainnet") or "mainnet"
+        _is_testnet_challenge = (_challenge_network == "testnet")
+        if _is_testnet_challenge:
+            _ch_allowed, _ch_status = _free_ai_allow("challenge", None)
+            if not _ch_allowed:
+                logger.warning(f"_run_challenge_review: global cap reached ({_ch_status}) for {escrow_id}")
+                vault.challenge_outcome = "REVIEW_INCONCLUSIVE"
+                vault.challenge_verdict = None
+                vault.challenge_reviewed_at = datetime.now(timezone.utc)
+                vault.status = "RELEASING"
+                vault.challenge_fee_state = "REFUNDABLE"
+                db.commit()
+                _note_sweep_due(datetime.now(timezone.utc) + timedelta(minutes=10))
+                _send_challenge_outcome_email(vault, "pro_unavailable")
+                return
+
         # Build prompt with UNTRUSTED_CLAIM block for buyer reason
         delim = secrets.token_hex(8)
         buyer_claim_block = ""
@@ -8167,7 +8417,11 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
                     "thinkingConfig": {"thinkingBudget": 8192},
                 },
             }
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+            if _is_testnet_challenge:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{TRY_AI_MODEL}:generateContent"
+                payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+            else:
+                url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
 
             async def _call_pro():
                 async with httpx.AsyncClient(timeout=150.0) as client:
@@ -8186,6 +8440,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
                 except Exception as e2:
                     logger.error(f"_run_challenge_review: second attempt failed for {escrow_id}: {e2}")
                     pro_result = None
+            if _is_testnet_challenge and pro_result is not None:
+                _free_ai_record("challenge", None)
 
         # Determine outcome
         if pro_result:
@@ -8235,6 +8491,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
             db.commit()
             _queue_auto_finish(vault)
             asyncio.create_task(_finish_challenge_fee_escrow(escrow_id))
+            _note_sweep_due(now + timedelta(minutes=5))
+            _note_sweep_due(now + timedelta(minutes=10))
             _send_challenge_outcome_email(vault, "rejected")
 
         elif pro_verdict == "PASS_OVERTURNED":
@@ -8247,6 +8505,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
             submission_count = vault.submission_count or 0
             max_subs = vault.max_submissions or 3
             vault.challenge_fee_state = "REFUNDABLE"
+            if cancel_after:
+                _note_sweep_due(cancel_after)
             if cancel_after and time_remaining >= 2 * 3600 and submission_count < max_subs:
                 vault.status = "REMEDY"
                 _wh_payload, _wh_url = _build_webhook_payload(vault, prev_status)
@@ -8267,6 +8527,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
             vault.status = "RELEASING"
             vault.challenge_fee_state = "REFUNDABLE"
             db.commit()
+            _note_sweep_due(now + timedelta(minutes=10))
+            _note_sweep_due(now + timedelta(minutes=5))
             _queue_auto_finish(vault)
             _send_challenge_outcome_email(vault, "pro_unavailable")
 
@@ -9425,6 +9687,7 @@ async def submit_challenge(escrow_id: str, req: ChallengeSubmitRequest, db: Sess
         {"now": now, "hash": fee_tx, "qid": quote.id}
     )
     db.commit()
+    _note_sweep_due(cancel_after_dt)
 
     if update_result.rowcount != 1:
         raise HTTPException(status_code=409, detail={
@@ -10759,17 +11022,26 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 "explorer_links": _gate_explorer_links,
             }
 
-        # B6: Testnet AI audit rate limit — 5/buyer/day, flash only, no consensus upgrade
+        # B6: Testnet AI audit rate limit — 5/buyer/day, flash only, no consensus upgrade, global cap
         _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
         if _vault_network == "testnet":
             _today_key = f"testnet_audit_{vault.buyer_address}_{datetime.utcnow().date()}"
             _audit_count = _testnet_audit_counter.get(_today_key, 0)
             if _audit_count >= 5:
                 raise HTTPException(status_code=429, detail={"error": "testnet_audit_limit", "reason": "5 AI audits per buyer per day on testnet"})
+            # Also check global free AI cap
+            _ai_allowed, _ai_status = _free_ai_allow("testnet_audit", None)
+            if not _ai_allowed:
+                raise HTTPException(status_code=429, detail={
+                    "error": "testnet_ai_daily_cap",
+                    "reason": f"Free testnet AI audits are used up for today ({_ai_status}). Try again after 00:00 UTC, or use require_ai_audit=False with a code/proof gate.",
+                })
             _testnet_audit_counter[_today_key] = _audit_count + 1
+            _free_ai_record("testnet_audit", None)
 
         collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
         use_consensus = bool(vault.require_consensus) and _vault_network != "testnet"
+        _allow_pro = (_vault_network != "testnet")
         try:
             structured_result = await _run_structured_audit(
                 task=vault.task_description or "",
@@ -10778,6 +11050,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 evidence_items=collected_evidence,
                 require_consensus=use_consensus,
                 attempt_count=current_count,
+                allow_pro=_allow_pro,
             )
         except HTTPException:
             raise
@@ -10996,6 +11269,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 _max_deadline = _cancel_aware - timedelta(minutes=30)
                 _raw_deadline = min(_raw_deadline, _max_deadline)
             vault.challenge_deadline = _raw_deadline
+            _note_sweep_due(_raw_deadline)
             vault.delivery_status    = "PASS_CHALLENGE_WINDOW"
             vault.delivery_expires_at = datetime.now(timezone.utc) + timedelta(days=DELIVERY_EXPIRY_DAYS)
             vault.worker_submission = json.dumps({
@@ -16035,7 +16309,7 @@ async def testnet_wallet(request: Request):
     import hashlib as _hl
     import xrpl.core.keypairs as _kp
 
-    raw_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown").split(",")[0].strip()
+    raw_ip = _client_ip(request)
     ip_hash = _hl.sha256(raw_ip.encode()).hexdigest()[:16]
     day_key = f"wallet_{ip_hash}_{datetime.utcnow().date()}"
     count = _testnet_wallet_counter.get(day_key, 0)
@@ -16113,9 +16387,9 @@ async def _faucet_fund(addr: str, timeout: float = 30.0) -> bool:
         return False
 
 
-async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str) -> dict:
+async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str, use_ai: bool = True) -> dict:
     """Call evaluate_work in-process — no loopback HTTP."""
-    req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token)
+    req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token, use_ai=use_ai)
     with SessionLocal() as _db:
         try:
             result = await evaluate_work(req, _db)
@@ -16143,6 +16417,7 @@ async def run_testnet_flow(
     cancel_after_hrs: float = 1.0,
     buyer_seed_override: str = None,
     worker_seed_override: str = None,
+    use_ai: bool = True,
 ) -> dict:
     """
     A1: Internal async service for testnet escrow flow — no loopback HTTP.
@@ -16290,7 +16565,7 @@ async def run_testnet_flow(
         if auto_submit:
             step = "evaluate"
             try:
-                verdict_result = await _evaluate_internal(escrow_id, work, evaluate_token)
+                verdict_result = await _evaluate_internal(escrow_id, work, evaluate_token, use_ai=use_ai)
             except Exception as _ev_err:
                 logger.error(f"run_testnet_flow evaluate error: {_ev_err}")
                 verdict_result = {}
@@ -16401,6 +16676,8 @@ async def testnet_demo(
     if count >= 10:
         raise HTTPException(status_code=429, detail={"error": "demo_limit_reached", "reason": "10 testnet demos per IP per day"})
 
+    _demo_ai_allowed, _ = _free_ai_allow("demo", raw_ip)
+
     if not XRPL_TESTNET_SEED:
         raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured"})
 
@@ -16411,9 +16688,11 @@ async def testnet_demo(
         raise HTTPException(status_code=429, detail={"error": "busy", "retry_after_s": 20})
 
     try:
-        result = await run_testnet_flow(auto_submit=auto_submit, source="demo")
+        result = await run_testnet_flow(auto_submit=auto_submit, source="demo", use_ai=_demo_ai_allowed)
         # A1: count only successful runs
         _testnet_demo_counter[day_key] = count + 1
+        if _demo_ai_allowed:
+            _free_ai_record("demo", raw_ip)
         # Cache for idempotency (10s)
         _testnet_demo_idempotency[_idem_key] = (result, datetime.now(timezone.utc).timestamp() + 10)
         return result
@@ -16639,8 +16918,60 @@ async def testnet_try_lock(sid: str):
     }
 
 
+async def _try_ai_judge(work: str, ip: str) -> dict:
+    """
+    Call Gemini Flash to judge whether the /try work passes _TESTNET_TRY_TASK.
+    Returns {"verdict": "PASS"|"FAIL"|"SKIP", "reason": str, "model": str, "cached": bool}.
+    Flash-only, thinkingBudget=0, 24h result cache, per-IP rate limit enforced by _free_ai_allow.
+    """
+    cache_key = _try_ai_cache_key(TRY_AI_MODEL, _TESTNET_TRY_TASK, work)
+    cached = _try_ai_cache_get(cache_key)
+    if cached:
+        _free_ai_record_cache_hit()
+        return {**cached, "cached": True}
+
+    allowed, status = _free_ai_allow("try", ip)
+    if not allowed:
+        return {"verdict": "SKIP", "reason": f"free AI quota reached ({status})", "model": TRY_AI_MODEL, "cached": False}
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return {"verdict": "SKIP", "reason": "AI judge not configured", "model": TRY_AI_MODEL, "cached": False}
+
+    prompt = (
+        f"Task: {_TESTNET_TRY_TASK}\n\n"
+        f"Worker submission:\n{work}\n\n"
+        "Reply with valid JSON: {\"verdict\": \"PASS\" or \"FAIL\", \"reason\": \"one sentence\"}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{TRY_AI_MODEL}:generateContent"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as _c:
+            r = await _c.post(url, json=payload, headers={"x-goog-api-key": api_key})
+        if r.status_code != 200:
+            return {"verdict": "SKIP", "reason": f"AI HTTP {r.status_code}", "model": TRY_AI_MODEL, "cached": False}
+        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        parsed = json.loads(raw)
+        verdict = "PASS" if str(parsed.get("verdict", "")).upper() == "PASS" else "FAIL"
+        reason = str(parsed.get("reason", ""))[:300]
+        result = {"verdict": verdict, "reason": reason, "model": TRY_AI_MODEL, "cached": False}
+        _try_ai_cache_set(cache_key, result)
+        _free_ai_record("try", ip)
+        return result
+    except Exception as _e:
+        logger.warning(f"_try_ai_judge error: {_e}")
+        return {"verdict": "SKIP", "reason": "AI judge error", "model": TRY_AI_MODEL, "cached": False}
+
+
 @app.post("/testnet/try/{sid}/submit", tags=["testnet-try"])
-async def testnet_try_submit(sid: str, body: dict = Body(default={})):
+async def testnet_try_submit(request: Request, sid: str, body: dict = Body(default={})):
     """A2: Evaluate work for the browser walkthrough session."""
     _try_session_cleanup()
     sess = _testnet_try_sessions.get(sid)
@@ -16660,6 +16991,16 @@ async def testnet_try_submit(sid: str, body: dict = Body(default={})):
         logger.error(f"testnet_try_submit evaluate error: {_ev_err}")
         verdict_data = {}
 
+    # Optionally run AI judge in parallel (never blocks payment release)
+    ai_result: dict | None = None
+    if use_ai and _TRY_AI_ENABLED:
+        client_ip = _client_ip(request)
+        try:
+            ai_result = await asyncio.wait_for(_try_ai_judge(work, client_ip), 35.0)
+        except Exception as _ae:
+            logger.warning(f"testnet_try_submit AI judge error: {_ae}")
+            ai_result = {"verdict": "SKIP", "reason": "timeout", "model": TRY_AI_MODEL, "cached": False}
+
     release_hash = verdict_data.get("release_tx_hash") or verdict_data.get("auto_finish_hash")
     if not release_hash:
         for _i in range(4):
@@ -16677,11 +17018,27 @@ async def testnet_try_submit(sid: str, body: dict = Body(default={})):
                                  "label": "Payment released",
                                  "explorer_url": f"https://testnet.xrpl.org/transactions/{release_hash}"})
 
+    criteria = verdict_data.get("criteria_results", [])
+    if ai_result and ai_result.get("verdict") != "SKIP":
+        criteria = list(criteria) + [{
+            "id": "ai",
+            "type": "ai",
+            "description": "AI referee opinion",
+            "verdict": ai_result["verdict"],
+            "result": ai_result["verdict"],
+            "reason": ai_result.get("reason", ""),
+            "model": ai_result.get("model", TRY_AI_MODEL),
+            "cached": ai_result.get("cached", False),
+        }]
+
     return {
         "verdict":          verdict_data.get("verdict", "UNKNOWN"),
         "score":            verdict_data.get("score"),
         "summary":          verdict_data.get("summary", ""),
-        "criteria":         verdict_data.get("criteria_results", []),
+        "criteria":         criteria,
+        "ai_verdict":       ai_result.get("verdict") if ai_result else None,
+        "ai_reason":        ai_result.get("reason") if ai_result else None,
+        "ai_model":         ai_result.get("model") if ai_result else None,
         "attempts_remaining": verdict_data.get("attempts_remaining", 0),
         "release_tx_hash":  release_hash,
         "release_explorer_url": f"https://testnet.xrpl.org/transactions/{release_hash}" if release_hash else None,

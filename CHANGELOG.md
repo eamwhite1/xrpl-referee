@@ -6,6 +6,41 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## v7.0.6 — 2026-11-04
+
+### Added
+- **"Also ask the AI referee" on /try/**: optional Gemini Flash judgment shown alongside the code gate result. Ticked by default; costs nothing (Flash-only, `thinkingBudget=0`, 24 h result cache).
+  - `_try_ai_judge(work, ip)` async helper: per-IP hourly/daily rate limits, 24 h LRU cache, Flash-only, never blocks payment release.
+  - `testnet_try_submit()` now accepts `use_ai` flag and returns `ai_verdict`, `ai_reason`, `ai_model` fields; AI row appended to `criteria` list.
+  - `_free_ai_allow(path, ip)` / `_free_ai_record(path, ip)` global cap helpers: in-memory only, never touches DB.
+  - Global daily cap (`TRY_AI_DAILY_CAP`, default 100 calls/day, env override) across all free AI paths: try, demo, testnet_audit, challenge.
+  - Kill switch: `TRY_AI_ENABLED=false` disables all free AI paths instantly.
+  - `/status` now returns `free_ai: {enabled, calls_today, daily_cap}`.
+  - Testnet challenge review uses Flash (not Pro) and applies the global cap; REVIEW_INCONCLUSIVE returned if cap reached (fee refundable).
+  - Testnet AI audit and testnet demo guard against global cap; testnet Pro escalation blocked.
+
+### Fixed
+- `_normalise_domain(d)` strips leading `https://`/`http://` and trailing slashes from XRPL `Domain` hex field before building xrp-ledger.toml URL (fixes double-scheme URL for wallets like ripple.com that store `https://ripple.com/` in their Domain field).
+- `/domain/preview` issuer check now uses `_normalise_domain()` instead of manual `replace("https://", "")`.
+- `create_testnet_wallet` IP extracted via `_client_ip(request)` (was taking the first X-Forwarded-For hop, spoofable).
+
+
+
+---
+
+## v7.0.5 — 2026-11-03
+
+### Changed
+- Release sweep is now deadline-driven so Neon can scale to zero; no user-visible timing change.
+  - `_release_sweep_loop` wakes every 60 s but only queries the DB when a deadline is actually due.
+  - `_compute_next_sweep_due` computes the earliest pending deadline in a single DB session.
+  - `_note_sweep_due` is called at each state-change site to update the in-memory timer immediately.
+  - Startup, DB recovery, and hourly window tick all refresh the timer from the DB as a backstop.
+- `X-AgentTrust-Version` and `X-AgentTrust-Server` response headers now reflect `APP_VERSION` instead of a hardcoded string.
+- Gemini Flash model updated to `gemini-3.5-flash-lite` (deprecation of `gemini-2.5-flash` Dec 1 2026).
+
+---
+
 ## v3.0.1 — 2026-10-09
 
 ### Changed
