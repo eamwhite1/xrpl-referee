@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Try AgentTrust</title>
+<meta name="description" content="See how AgentTrust pays for work — with test money. No wallet, no real XRP. Watch escrow lock, work get checked automatically, and payment release in real-time on XRPL Testnet.">
+<meta name="robots" content="index, follow">
+<meta property="og:title" content="Try AgentTrust — Test Money Demo">
+<meta property="og:description" content="See how AgentTrust pays for work — with test money. No wallet, no real XRP needed.">
+<meta property="og:url" content="https://agenttrustxrpl.com/try/">
+<meta property="og:type" content="website">
+<link rel="canonical" href="https://agenttrustxrpl.com/try/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Display:ital@0;1&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<style>
+    :root {
+        --blue:         #0066FF;
+        --blue-dim:     rgba(0,102,255,.08);
+        --blue-border:  rgba(0,102,255,.2);
+        --green:        #00B97A;
+        --green-dim:    rgba(0,185,122,.08);
+        --green-border: rgba(0,185,122,.2);
+        --amber:        #D97706;
+        --red:          #E5373D;
+        --text:         #0d0d12;
+        --text-muted:   #5c5c6e;
+        --glass:        rgba(255,255,255,0.52);
+        --glass-border: rgba(255,255,255,0.72);
+        --shadow:       0 8px 40px rgba(0,0,0,0.06);
+        --radius-lg:    24px;
+        --radius-md:    14px;
+        --radius-sm:    8px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body { font-family: 'DM Sans', sans-serif; color: var(--text); background: #f2f4fb; min-height: 100vh; line-height: 1.65; }
+
+    .bg { position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, #ffffff 0%, #edf0ff 100%); overflow: hidden; }
+    .blob { position: absolute; border-radius: 50%; width: 800px; height: 800px; top: -15%; left: -10%; background: radial-gradient(circle, rgba(0,185,122,.1) 0%, rgba(0,102,255,.07) 55%, transparent 75%); filter: blur(90px); }
+    .blob-2 { position: absolute; border-radius: 50%; width: 700px; height: 700px; bottom: -10%; right: -5%; background: radial-gradient(circle, rgba(0,200,255,.11) 0%, rgba(0,102,255,.06) 60%, transparent 80%); filter: blur(110px); }
+
+    /* Nav */
+    nav { position: sticky; top: 0; z-index: 100; display: flex; align-items: center; padding: 1rem 5%; background: rgba(255,255,255,.5); backdrop-filter: blur(28px); border-bottom: 1px solid rgba(255,255,255,.55); }
+    .logo { font-family: 'DM Serif Display', serif; font-size: 1.5rem; letter-spacing: -.02em; color: var(--text); text-decoration: none; }
+    .logo span { color: var(--blue); }
+    .nav-menu { display: flex; align-items: center; gap: 24px; flex: 1; justify-content: center; }
+    .nav-link { font-size: .82rem; font-weight: 600; color: var(--text-muted); text-decoration: none; white-space: nowrap; transition: color .18s; }
+    .nav-link:hover { color: var(--blue); }
+    .nav-right { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+    .nav-toggle { display: none; background: none; border: none; cursor: pointer; color: var(--text); padding: 6px; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; }
+    @media (max-width: 680px) {
+        nav { position: relative; flex-wrap: wrap; }
+        .nav-menu { display: none; position: absolute; top: 100%; left: 0; right: 0; flex-direction: column; align-items: flex-start; gap: 14px; padding: 1.2rem 1.5rem; background: rgba(255,255,255,.96); backdrop-filter: blur(20px); border-bottom: 1px solid rgba(0,0,0,.06); box-shadow: 0 14px 28px rgba(0,0,0,.08); }
+        .nav-menu.open { display: flex; }
+        .nav-toggle { display: flex; }
+    }
+    .ping-dot { position: relative; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+    .ping-dot::after { content: ''; position: absolute; top: 50%; left: 50%; width: 8px; height: 8px; transform: translate(-50%, -50%) scale(1); border-radius: 50%; background: rgba(34,197,94,.35); animation: ping-ring 1.8s ease-out infinite; opacity: 0; }
+    @keyframes ping-ring { 0% { transform: translate(-50%, -50%) scale(1); opacity: .8; } 80%, 100% { transform: translate(-50%, -50%) scale(2.8); opacity: 0; } }
+    .badge-live { display: flex; align-items: center; gap: 7px; padding: 5px 14px; border-radius: 40px; font-size: .72rem; font-weight: 600; color: #444 !important; background: rgba(255,255,255,.55); border: 1px solid rgba(255,255,255,.75); text-decoration: none !important; }
+
+    .page-header { max-width: 960px; margin: 0 auto; padding: 3.5rem 5% 0; }
+    .page-eyebrow { display: inline-flex; align-items: center; gap: 7px; font-size: .72rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--green); margin-bottom: 1.1rem; }
+    .page-header h1 { font-family: 'DM Serif Display', serif; font-size: clamp(2rem, 5vw, 2.9rem); letter-spacing: -.025em; line-height: 1.1; color: var(--text); margin-bottom: 1rem; text-wrap: balance; }
+    .page-lead { font-size: 1.05rem; color: var(--text-muted); max-width: 620px; margin-bottom: 0; line-height: 1.7; }
+
+    .container { max-width: 960px; margin: 0 auto; padding: 2rem 5% 6rem; }
+
+    .test-badge {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: rgba(0,185,122,.1); border: 1px solid rgba(0,185,122,.3);
+        color: var(--green); border-radius: 40px; padding: 4px 12px;
+        font-size: .68rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+        margin-bottom: 1.25rem;
+    }
+    .test-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+
+    /* Step icons */
+    .step-icon-wrap {
+        width: 40px; height: 40px; border-radius: 50%;
+        background: var(--blue-dim); color: var(--blue);
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; transition: background .3s, color .3s;
+    }
+    .step.done .step-icon-wrap {
+        background: var(--green-dim); color: var(--green);
+        animation: icon-pop .4s ease-out;
+    }
+    @keyframes icon-pop {
+        0%   { transform: scale(1); }
+        40%  { transform: scale(1.28); }
+        100% { transform: scale(1); }
+    }
+
+    /* Left-rail timeline — one row per step */
+    .steps-wrap { display: flex; flex-direction: column; }
+
+    .step-row {
+        display: flex;
+        gap: 1.25rem;
+        align-items: stretch;
+    }
+
+    /* Rail column: dot + connector line below */
+    .step-rail {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        flex-shrink: 0;
+        width: 28px;
+    }
+    .step-dot {
+        width: 28px; height: 28px; border-radius: 50%;
+        border: 2px solid rgba(0,102,255,.25);
+        background: rgba(0,102,255,.07);
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+        transition: background .3s, border-color .3s, box-shadow .3s;
+        position: relative; z-index: 1;
+        margin-top: 1.4rem; /* align with card top padding */
+    }
+    .step-dot::after {
+        content: '';
+        width: 8px; height: 8px; border-radius: 50%;
+        background: rgba(0,102,255,.3);
+        transition: background .3s;
+    }
+    /* Connector line below dot, fills remaining row height */
+    .step-connector {
+        width: 2px;
+        flex: 1;
+        background: linear-gradient(to bottom, rgba(0,102,255,.18), rgba(0,102,255,.05));
+        margin-top: 4px;
+        margin-bottom: 0;
+        min-height: 16px;
+    }
+    /* Last row has no connector */
+    .step-row:last-child .step-connector { display: none; }
+
+    /* Active step: glowing blue dot */
+    .step-row.active .step-dot {
+        border-color: var(--blue);
+        background: var(--blue-dim);
+        box-shadow: 0 0 0 5px rgba(0,102,255,.12);
+        animation: dot-arrive .5s ease-out;
+    }
+    .step-row.active .step-dot::after { background: var(--blue); }
+    @keyframes dot-arrive {
+        0%   { box-shadow: 0 0 0 0 rgba(0,102,255,.5); }
+        50%  { box-shadow: 0 0 0 8px rgba(0,102,255,.08); }
+        100% { box-shadow: 0 0 0 5px rgba(0,102,255,.12); }
+    }
+
+    /* Done step: green */
+    .step-row.done .step-dot {
+        border-color: var(--green);
+        background: var(--green-dim);
+        box-shadow: none;
+    }
+    .step-row.done .step-dot::after { background: var(--green); }
+    .step-row.done .step-connector {
+        background: linear-gradient(to bottom, rgba(0,185,122,.3), rgba(0,102,255,.05));
+    }
+
+    /* Card */
+    .step {
+        flex: 1;
+        background: var(--glass);
+        backdrop-filter: blur(20px);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow);
+        margin-bottom: 1rem;
+        overflow: hidden;
+        transition: opacity .3s;
+    }
+    .step.locked { opacity: .45; pointer-events: none; }
+    .step-header { display: flex; align-items: flex-start; gap: 1rem; padding: 1.5rem 1.75rem 1rem; }
+    .step-num {
+        width: 34px; height: 34px; border-radius: 50%;
+        background: var(--blue); color: #fff;
+        font-size: .8rem; font-weight: 700;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+    }
+    .step.done .step-num { background: var(--green); }
+
+    @media (max-width: 540px) {
+        .step-row { gap: .75rem; }
+        .step-rail { width: 20px; }
+        .step-dot { width: 20px; height: 20px; }
+        .step-dot::after { width: 6px; height: 6px; }
+    }
+    .step-title { font-size: 1rem; font-weight: 700; margin-bottom: .2rem; }
+    .step-desc { font-size: .84rem; color: var(--text-muted); line-height: 1.55; }
+    .step-body { padding: 0 1.75rem 1.5rem; }
+
+    .step-status { font-size: .8rem; color: var(--text-muted); margin-top: .75rem; display: flex; align-items: center; gap: .5rem; }
+    .step-status.ok { color: var(--green); }
+    .step-status.err { color: var(--red); }
+    .step-status.running { color: var(--blue); }
+
+    .spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; flex-shrink: 0; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .btn {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: .7rem 1.4rem; border-radius: var(--radius-md);
+        font-family: inherit; font-size: .9rem; font-weight: 600;
+        cursor: pointer; border: none; text-decoration: none;
+        transition: transform .15s, box-shadow .15s;
+    }
+    .btn:hover { transform: translateY(-2px); }
+    .btn-primary { background: var(--blue); color: #fff; box-shadow: 0 4px 18px rgba(0,102,255,.3); }
+    .btn-primary:hover { box-shadow: 0 6px 24px rgba(0,102,255,.38); }
+    .btn-secondary { background: rgba(255,255,255,.6); color: var(--text); border: 1px solid var(--glass-border); }
+    .btn-danger { background: var(--red); color: #fff; }
+    .btn[disabled] { opacity: .5; cursor: default; pointer-events: none; }
+
+    .explorer-link { font-size: .83rem; color: var(--blue); text-decoration: none; display: inline-flex; align-items: center; gap: 4px; margin-top: .5rem; }
+    .explorer-link:hover { text-decoration: underline; }
+
+    textarea {
+        width: 100%; padding: .65rem .85rem; border-radius: var(--radius-sm);
+        border: 1.5px solid rgba(0,0,0,.12); background: rgba(255,255,255,.7);
+        font-family: inherit; font-size: .9rem; resize: vertical;
+        min-height: 80px; color: var(--text); outline: none;
+        transition: border-color .2s;
+    }
+    textarea:focus { border-color: var(--blue); }
+
+    .toggle-row { display: flex; align-items: center; gap: .6rem; margin-top: .75rem; font-size: .85rem; color: var(--text-muted); }
+    .toggle-row input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--blue); }
+
+    .verdict-card {
+        border-radius: var(--radius-md); padding: 1.25rem 1.5rem; margin-top: 1rem;
+        border: 1.5px solid;
+    }
+    .verdict-pass { background: rgba(0,185,122,.07); border-color: rgba(0,185,122,.3); }
+    .verdict-fail { background: rgba(229,55,61,.06); border-color: rgba(229,55,61,.25); }
+    .verdict-label { font-size: 1.2rem; font-weight: 700; display: flex; align-items: center; gap: .5rem; margin-bottom: .4rem; }
+    .verdict-pass .verdict-label { color: var(--green); }
+    .verdict-fail .verdict-label { color: var(--red); }
+    .verdict-score { font-size: .82rem; color: var(--text-muted); margin-bottom: .75rem; }
+    .verdict-summary { font-size: .9rem; margin-bottom: 1rem; }
+    .criteria-row { display: flex; gap: .75rem; padding: .5rem 0; border-top: 1px solid rgba(0,0,0,.06); font-size: .83rem; }
+    .criteria-result-pass { color: var(--green); font-weight: 600; flex-shrink: 0; }
+    .criteria-result-fail { color: var(--red); font-weight: 600; flex-shrink: 0; }
+    .criteria-reasoning { color: var(--text-muted); font-size: .78rem; margin-top: 2px; }
+
+    .timeline { margin-top: 1.5rem; }
+    .timeline h3 { font-size: .75rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--text-muted); margin-bottom: .75rem; }
+    .tl-item { display: flex; gap: .75rem; padding: .4rem 0; font-size: .83rem; align-items: flex-start; }
+    .tl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); flex-shrink: 0; margin-top: 5px; }
+    .tl-dot.green { background: var(--green); }
+    .tl-time { color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+    .tl-label { flex: 1; }
+
+    .cta-card { background: var(--blue); color: #fff; border-radius: var(--radius-lg); padding: 2.5rem 2rem; text-align: center; margin-top: 2.5rem; }
+    .cta-card h2 { font-family: 'DM Serif Display', serif; font-size: 1.6rem; letter-spacing: -.02em; margin-bottom: .6rem; }
+    .cta-card p { opacity: .85; margin-bottom: 1.5rem; font-size: .92rem; line-height: 1.65; }
+    .cta-row { display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap; }
+    .cta-row .btn-white { background: #fff; color: var(--blue); }
+    .cta-row .btn-outline { background: transparent; color: #fff; border: 1.5px solid rgba(255,255,255,.5); }
+
+    .error-banner { background: rgba(229,55,61,.08); border: 1px solid rgba(229,55,61,.25); border-radius: var(--radius-sm); padding: .75rem 1rem; font-size: .85rem; color: var(--red); margin-top: .75rem; display: none; }
+    .error-banner.visible { display: block; }
+
+    footer { margin-top: 4rem; border-top: 1px solid rgba(0,0,0,.07); padding: 3rem 5% 2rem; }
+    .footer-inner { display: flex; gap: 3rem; margin-bottom: 2.5rem; flex-wrap: wrap; }
+    .footer-brand { flex: 0 0 220px; }
+    .footer-logo { font-family: 'DM Serif Display', serif; font-size: 1.3rem; letter-spacing: -.02em; color: var(--text); }
+    .footer-logo span { color: var(--blue); }
+    .footer-tagline { font-size: .78rem; color: var(--text-muted); margin-top: .5rem; line-height: 1.5; max-width: 180px; }
+    .footer-cols { display: flex; gap: 2.5rem; flex: 1; flex-wrap: wrap; }
+    .footer-col { display: flex; flex-direction: column; gap: .5rem; min-width: 140px; }
+    .footer-col h4 { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--text); margin-bottom: .25rem; }
+    .footer-col a { font-size: .8rem; color: var(--text-muted); text-decoration: none; transition: color .15s; }
+    .footer-col a:hover { color: var(--blue); }
+    .footer-bottom { border-top: 1px solid rgba(0,0,0,.06); padding-top: 1.25rem; font-size: .74rem; color: var(--text-muted); }
+    .footer-bottom a { color: var(--blue); text-decoration: none; }
+    @media (max-width: 680px) { .footer-inner { flex-direction: column; gap: 2rem; } .footer-brand { flex: none; } .footer-cols { gap: 1.5rem; } }
+
+    @media (max-width: 480px) {
+        .step-header { padding: 1.25rem 1.25rem .75rem; }
+        .step-body { padding: 0 1.25rem 1.25rem; }
+        .container { padding: 2rem 1rem 5rem; }
+    }
+
+    /* ── Mobile: disable expensive blob/blur effects ── */
+    @media (max-width: 680px) {
+        .blob, .blob-2 { display: none; }
+        .bg { background: linear-gradient(160deg, #f0f4ff 0%, #edf0ff 100%); }
+        nav { background: rgba(255,255,255,.97); backdrop-filter: none; -webkit-backdrop-filter: none; border-bottom: 1px solid rgba(0,0,0,.08); }
+    }
+</style>
+</head>
+<body>
+<div class="bg"><div class="blob"></div><div class="blob-2"></div></div>
+
+<nav>
+    <a class="logo" href="/">AgentTrust<span>.</span></a>
+    <div class="nav-menu" id="nav-menu">
+        <a class="nav-link" href="/how-it-works/">How it Works</a>
+        <a class="nav-link" href="/use-cases/">Use Cases</a>
+        <a class="nav-link" href="/roadmap/">Roadmap</a>
+        <a class="nav-link" href="/guides/">Guides</a>
+        <a class="nav-link" href="/agents/">For Agents</a>
+        <a class="nav-link" href="/enterprise/">Pro</a>
+        <a class="nav-link" href="/marketplace/">Marketplace</a>
+        <a class="nav-link" href="/wallet-score/">Wallet Score</a>
+    </div>
+    <div class="nav-right">
+        <a class="badge-live" href="https://xrpl.org" target="_blank" rel="noopener">
+            <span class="ping-dot"></span> Live on XRPL
+        </a>
+        <button class="nav-toggle" id="nav-toggle" aria-label="Open menu"
+                onclick="document.getElementById('nav-menu').classList.toggle('open')">
+            <i data-lucide="menu"></i>
+        </button>
+    </div>
+</nav>
+
+<div class="page-header">
+    <div class="page-eyebrow"><span class="test-dot"></span> Test money &middot; XRPL Testnet</div>
+    <h1>See escrow payment work — no wallet needed.</h1>
+    <p class="page-lead">No real XRP. Click through 5 steps and watch money lock on-chain, work get checked automatically against the task, and payment release automatically.</p>
+</div>
+
+<div class="container">
+
+    <div class="steps-wrap" id="steps-wrap">
+
+    <!-- Step 1: Create wallets -->
+    <div class="step-row active" id="row-1">
+        <div class="step-rail" aria-hidden="true"><div class="step-dot" id="dot-1"></div><div class="step-connector"></div></div>
+    <div class="step" id="step-1">
+        <div class="step-header">
+            <div class="step-icon-wrap" id="num-1"><i data-lucide="wallet" style="width:18px;height:18px"></i></div>
+            <div>
+                <div class="step-title">Create two free test wallets</div>
+                <div class="step-desc">We create two throwaway test wallets — one acts as the buyer, one as the worker — and top them up with free test XRP from the XRPL faucet. Nothing is stored; the wallets disappear when you close the tab.</div>
+            </div>
+        </div>
+        <div class="step-body">
+            <button class="btn btn-primary" id="btn-start" onclick="step1()">
+                <i data-lucide="wallet" style="width:16px;height:16px"></i> Create test wallets
+            </button>
+            <div id="status-1" class="step-status"></div>
+            <div id="links-1"></div>
+            <div id="err-1" class="error-banner"></div>
+        </div>
+    </div>
+    </div><!-- /row-1 -->
+
+    <!-- Step 2: Lock escrow -->
+    <div class="step-row" id="row-2">
+        <div class="step-rail" aria-hidden="true"><div class="step-dot" id="dot-2"></div><div class="step-connector"></div></div>
+    <div class="step locked" id="step-2">
+        <div class="step-header">
+            <div class="step-icon-wrap" id="num-2"><i data-lucide="lock" style="width:18px;height:18px"></i></div>
+            <div>
+                <div class="step-title">Lock 5 test XRP in escrow</div>
+                <div class="step-desc">The buyer's 5 test XRP moves into a 'crypto-condition' escrow held by the XRP Ledger itself — not by us, not by the worker. Neither party can touch it until the work is checked.</div>
+            </div>
+        </div>
+        <div class="step-body">
+            <button class="btn btn-primary" id="btn-lock" onclick="step2()">
+                <i data-lucide="lock" style="width:16px;height:16px"></i> Lock 5 test XRP
+            </button>
+            <div id="status-2" class="step-status"></div>
+            <div id="links-2"></div>
+            <div id="err-2" class="error-banner"></div>
+        </div>
+    </div>
+    </div><!-- /row-2 -->
+
+    <!-- Step 3: Submit work -->
+    <div class="step-row" id="row-3">
+        <div class="step-rail" aria-hidden="true"><div class="step-dot" id="dot-3"></div><div class="step-connector"></div></div>
+    <div class="step locked" id="step-3">
+        <div class="step-header">
+            <div class="step-icon-wrap" id="num-3"><i data-lucide="send" style="width:18px;height:18px"></i></div>
+            <div>
+                <div class="step-title">Worker submits the work</div>
+                <div class="step-desc">The task is: reply with exactly <strong>HELLO AGENT</strong>. Edit the box below to see what happens when work doesn't match.</div>
+            </div>
+        </div>
+        <div class="step-body">
+            <textarea id="work-input" rows="3" maxlength="500" placeholder="HELLO AGENT">HELLO AGENT</textarea>
+            <p style="font-size:.75rem;color:var(--text-muted);margin-top:.35rem">Hint: change it to anything else to see what happens when work fails.</p>
+            <label style="display:flex;align-items:center;gap:.5rem;margin-top:.85rem;font-size:.85rem;cursor:pointer;user-select:none">
+                <input type="checkbox" id="use-ai" checked style="width:15px;height:15px;cursor:pointer">
+                Also ask the AI referee <span style="font-size:.75rem;color:var(--text-muted)">(free, limited per visitor, test XRP only)</span>
+            </label>
+            <div style="margin-top:.75rem">
+                <button class="btn btn-primary" id="btn-submit" onclick="step3()">
+                    <i data-lucide="send" style="width:16px;height:16px"></i> Check the work
+                </button>
+            </div>
+            <div id="status-3" class="step-status"></div>
+            <div id="err-3" class="error-banner"></div>
+        </div>
+    </div>
+    </div><!-- /row-3 -->
+
+    <!-- Step 4: Result -->
+    <div class="step-row" id="row-4">
+        <div class="step-rail" aria-hidden="true"><div class="step-dot" id="dot-4"></div><div class="step-connector"></div></div>
+    <div class="step locked" id="step-4">
+        <div class="step-header">
+            <div class="step-icon-wrap" id="num-4"><i data-lucide="bot" style="width:18px;height:18px"></i></div>
+            <div>
+                <div class="step-title">The referee checks the work</div>
+                <div class="step-desc">Code checks run first. If you ticked the AI referee, it then judges the same job. Payment releases only if every check passes.</div>
+            </div>
+        </div>
+        <div class="step-body">
+            <div id="verdict"></div>
+            <div id="retry-row" style="display:none;margin-top:.75rem;display:flex;gap:.75rem;flex-wrap:wrap;"></div>
+        </div>
+    </div>
+    </div><!-- /row-4 -->
+
+    <!-- Step 5: Payment -->
+    <div class="step-row" id="row-5">
+        <div class="step-rail" aria-hidden="true"><div class="step-dot" id="dot-5"></div><div class="step-connector"></div></div>
+    <div class="step locked" id="step-5">
+        <div class="step-header">
+            <div class="step-icon-wrap" id="num-5"><i data-lucide="circle-check" style="width:18px;height:18px"></i></div>
+            <div id="step-5-title">
+                <div class="step-title">Payment released automatically</div>
+                <div class="step-desc">On PASS, the XRP Ledger releases the escrowed funds directly to the worker — no one pressed 'pay'. On FAIL, the buyer can reclaim after 10 minutes.</div>
+            </div>
+        </div>
+        <div class="step-body">
+            <div id="step5-content"></div>
+        </div>
+    </div>
+    </div><!-- /row-5 -->
+
+    </div><!-- /steps-wrap -->
+
+    <!-- Timeline -->
+    <div class="timeline" id="timeline" style="display:none">
+        <h3>On-ledger events</h3>
+        <div id="tl-items"></div>
+    </div>
+
+    <!-- CTA -->
+    <div class="cta-card" id="cta" style="display:none">
+        <h2>Do it for real on XRPL mainnet</h2>
+        <p>Try Pro free for 30 days — no payment needed to start. The same flow, with real XRP and real work.</p>
+        <div class="cta-row">
+            <a href="https://app.cryptovault.co.uk/dashboard/" class="btn btn-white">Try Pro free for 30 days</a>
+            <a href="/guides/" class="btn btn-outline">Developers: integration guides &rarr;</a>
+        </div>
+    </div>
+</div>
+
+<footer>
+    <div class="footer-inner">
+        <div class="footer-brand">
+            <span class="footer-logo">AgentTrust<span>.</span></span>
+            <p class="footer-tagline">Trust-minimized escrow for autonomous agents and humans on the XRP Ledger.</p>
+        </div>
+        <div class="footer-cols">
+            <div class="footer-col">
+                <h4>Product</h4>
+                <a href="/how-it-works/">How it Works</a>
+                <a href="/use-cases/">Use Cases</a>
+                <a href="/roadmap/">Roadmap</a>
+                <a href="/agents/">For Agents</a>
+                <a href="/enterprise/">Pro</a>
+                <a href="/marketplace/">Marketplace</a>
+                <a href="/wallet-score/">Wallet Score</a>
+            </div>
+            <div class="footer-col">
+                <h4>Developers</h4>
+                <a href="/testnet/">Testnet sandbox (free)</a>
+
+                <a href="https://mcp.cryptovault.co.uk/docs" target="_blank" rel="noopener">API Docs</a>
+                <a href="https://mcp.cryptovault.co.uk/mcp/" target="_blank" rel="noopener">MCP Server</a>
+                <a href="/guides/">Guides</a>
+                <a href="/fees/">Fees &amp; Limits</a>
+                <a href="/audit/">Audit Report</a>
+            </div>
+            <div class="footer-col">
+                <h4>Legal</h4>
+                <a href="/compliance/">Compliance</a>
+                <a href="/trust-model/">Trust Model</a>
+                <a href="/terms/">Terms</a>
+                <a href="/privacy/">Privacy</a>
+                <a href="/disclosure/">Disclosure &amp; Risk Warnings</a>
+            </div>
+        </div>
+    </div>
+    <div class="footer-bottom">
+        <p>AgentTrust is a trading name of Boxclever Media Ltd, registered in England &amp; Wales, company no. 09394447. &nbsp;&middot;&nbsp; <a href="/disclosure/">Full disclosure &amp; risk warnings</a></p>
+    </div>
+</footer>
+
+<script>
+lucide.createIcons();
+
+const API = 'https://mcp.cryptovault.co.uk';
+let sid = null;
+let escrowId = null;
+let attemptsRemaining = 3;
+const tlItems = [];
+
+const BTN_IDS = {1: 'btn-start', 2: 'btn-lock', 3: 'btn-submit'};
+function disableBtn(n) {
+    const b = document.getElementById(BTN_IDS[n]);
+    if (b) b.disabled = true;
+}
+
+function setStatus(n, type, msg) {
+    const el = document.getElementById('status-' + n);
+    if (!el) return;
+    el.className = 'step-status ' + type;
+    if (type === 'running') el.innerHTML = `<span class="spinner"></span> ${msg}`;
+    else if (type === 'ok') el.innerHTML = `<i data-lucide="check-circle" style="width:14px;height:14px"></i> ${msg}`;
+    else if (type === 'err') el.innerHTML = `<i data-lucide="x-circle" style="width:14px;height:14px"></i> ${msg}`;
+    else el.innerHTML = msg;
+    lucide.createIcons();
+}
+
+function showErr(n, msg) {
+    const el = document.getElementById('err-' + n);
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.add('visible');
+}
+function hideErr(n) {
+    const el = document.getElementById('err-' + n);
+    if (el) el.classList.remove('visible');
+}
+
+function unlock(n) {
+    const el = document.getElementById('step-' + n);
+    if (el) el.classList.remove('locked');
+    const row = document.getElementById('row-' + n);
+    if (row) {
+        row.classList.remove('done');
+        row.classList.add('active');
+    }
+}
+
+function markDone(n) {
+    const step = document.getElementById('step-' + n);
+    if (step) step.classList.add('done');
+    const row = document.getElementById('row-' + n);
+    if (row) { row.classList.remove('active'); row.classList.add('done'); }
+}
+
+function addTimeline(label, explorerUrl, green) {
+    const now = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    tlItems.push({label, explorerUrl, now, green});
+    renderTimeline();
+    document.getElementById('timeline').style.display = 'block';
+}
+
+function renderTimeline() {
+    const el = document.getElementById('tl-items');
+    el.innerHTML = tlItems.map(t =>
+        `<div class="tl-item">
+            <div class="tl-dot${t.green?' green':''}"></div>
+            <span class="tl-time">${t.now}</span>
+            <span class="tl-label">${t.label}${t.explorerUrl
+                ? ` <a href="${t.explorerUrl}" target="_blank" rel="noopener" class="explorer-link"><i data-lucide="external-link" style="width:11px;height:11px"></i> testnet.xrpl.org</a>`
+                : ''}</span>
+        </div>`
+    ).join('');
+    lucide.createIcons();
+}
+
+function explorerTxUrl(hash) {
+    return `https://testnet.xrpl.org/transactions/${hash}`;
+}
+
+async function apiPost(url, body) {
+    let res;
+    try {
+        res = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: body || '{}'});
+    } catch(e) {
+        throw new Error('Could not reach the API — check your connection and retry.');
+    }
+    if (res.status === 429) throw Object.assign(new Error('The sandbox is busy — try again in a minute.'), {status: 429});
+    if (!res.ok) {
+        let msg = `Server error (${res.status})`;
+        try {
+            const j = await res.json();
+            const detail = j.detail;
+            if (detail?.reason) msg = detail.reason;
+            else if (detail?.error) msg = detail.error;
+            else if (typeof detail === 'string') msg = detail;
+        } catch(e2) {}
+        if (res.status === 502) msg = 'XRPL Testnet is busy — ' + msg + '. Please retry.';
+        else if (res.status === 404) msg = 'Session expired — please start over from step 1.';
+        throw Object.assign(new Error(msg), {status: res.status});
+    }
+    return res.json();
+}
+
+async function step1() {
+    disableBtn(1);
+    hideErr(1);
+    setStatus(1, 'running', 'Creating wallets and funding from testnet faucet…');
+    try {
+        const d = await apiPost(`${API}/testnet/try/start`);
+        sid = d.session_id;
+        setStatus(1, 'ok', 'Two test wallets created and funded with test XRP.');
+        const links1 = document.getElementById('links-1');
+        links1.innerHTML = `
+            <p style="font-size:.82rem;color:var(--text-muted);margin-top:.6rem">
+                Buyer: <code style="font-size:.78rem">${d.buyer_address}</code>
+                <a href="${d.buyer_explorer_url||'https://testnet.xrpl.org/accounts/'+d.buyer_address}" target="_blank" rel="noopener" class="explorer-link"><i data-lucide="external-link" style="width:11px;height:11px"></i></a>
+                &nbsp;&middot;&nbsp; Worker: <code style="font-size:.78rem">${d.worker_address}</code>
+                <a href="${d.worker_explorer_url||'https://testnet.xrpl.org/accounts/'+d.worker_address}" target="_blank" rel="noopener" class="explorer-link"><i data-lucide="external-link" style="width:11px;height:11px"></i></a>
+            </p>`;
+        lucide.createIcons();
+        addTimeline('Buyer wallet funded', d.buyer_explorer_url, true);
+        addTimeline('Worker wallet funded', d.worker_explorer_url, true);
+        markDone(1);
+        unlock(2);
+    } catch(e) {
+        showErr(1, e.message || 'Failed — please retry.');
+        setStatus(1, '', '');
+        document.getElementById('btn-start').disabled = false;
+    }
+}
+
+async function step2() {
+    if (!sid) return;
+    disableBtn(2);
+    hideErr(2);
+    setStatus(2, 'running', 'Signing and submitting EscrowCreate to XRPL Testnet…');
+    try {
+        const d = await apiPost(`${API}/testnet/try/${encodeURIComponent(sid)}/lock`);
+        escrowId = d.escrow_id;
+        const txUrl = d.escrow_explorer_url || (d.escrow_tx_hash ? explorerTxUrl(d.escrow_tx_hash) : null);
+        setStatus(2, 'ok', `5 test XRP locked in escrow ${d.escrow_id}`);
+        const links2 = document.getElementById('links-2');
+        links2.innerHTML = txUrl
+            ? `<a href="${txUrl}" target="_blank" rel="noopener" class="explorer-link"><i data-lucide="external-link" style="width:12px;height:12px"></i> View escrow on testnet.xrpl.org</a>`
+            : '';
+        lucide.createIcons();
+        addTimeline(`EscrowCreate locked (${d.escrow_id})`, txUrl, true);
+        markDone(2);
+        unlock(3);
+    } catch(e) {
+        showErr(2, e.message || 'Failed — please retry.');
+        setStatus(2, '', '');
+        document.getElementById('btn-lock').disabled = false;
+    }
+}
+
+async function step3() {
+    if (!sid || !escrowId) return;
+    const work = document.getElementById('work-input').value.trim();
+    if (!work) { showErr(3, 'Please enter some work to submit.'); return; }
+    disableBtn(3);
+    hideErr(3);
+    setStatus(3, 'running', 'Checking work against task criteria…');
+    try {
+        const useAi = document.getElementById('use-ai')?.checked ?? true;
+        const d = await apiPost(`${API}/testnet/try/${encodeURIComponent(sid)}/submit`, JSON.stringify({work, use_ai: useAi}));
+        attemptsRemaining = d.attempts_remaining ?? (attemptsRemaining - 1);
+        setStatus(3, d.verdict === 'PASS' ? 'ok' : 'err', d.verdict === 'PASS' ? 'Work accepted!' : 'Work rejected.');
+        renderVerdict(d);
+        markDone(3);
+        unlock(4);
+    } catch(e) {
+        showErr(3, e.message || 'Failed — please retry.');
+        setStatus(3, '', '');
+        document.getElementById('btn-submit').disabled = false;
+    }
+}
+
+function escHtml(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function renderVerdict(d) {
+    // Handle HELD verdict (AI unavailable/capped)
+    if (d.verdict === 'HELD') {
+        const aiMsg = (d.ai && d.ai.message) ? d.ai.message : 'The AI referee was not available. Try again or untick the AI box.';
+        document.getElementById('verdict').innerHTML = `<div class="verdict-card verdict-fail" data-verdict="HELD">
+            <div class="verdict-label"><i data-lucide="pause-circle" style="width:20px;height:20px"></i> Held — not released</div>
+            <div class="verdict-summary">${escHtml(aiMsg)}</div>
+        </div>`;
+        lucide.createIcons();
+        markDone(4);
+        const retryRow = document.getElementById('retry-row');
+        retryRow.style.display = 'flex';
+        retryRow.innerHTML = '';
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-primary';
+        btn.innerHTML = `<i data-lucide="rotate-ccw" style="width:15px;height:15px"></i> Try again`;
+        btn.onclick = () => { document.getElementById('btn-submit').disabled = false; unlock(3); retryRow.style.display = 'none'; };
+        retryRow.appendChild(btn);
+        lucide.createIcons();
+        addTimeline('Held — AI unavailable', null, false);
+        return;
+    }
+    const pass = d.verdict === 'PASS';
+    const score = d.score != null ? d.score : null;
+    const criteria = Array.isArray(d.criteria) ? d.criteria : [];
+
+    let html = `<div class="verdict-card ${pass ? 'verdict-pass' : 'verdict-fail'}" data-verdict="${pass?'PASS':'FAIL'}">
+        <div class="verdict-label">
+            <i data-lucide="${pass ? 'check-circle' : 'x-circle'}" style="width:20px;height:20px"></i>
+            ${pass ? 'PASS' : 'FAIL'}
+        </div>`;
+    if (score != null) html += `<div class="verdict-score">Score: ${score} / 100</div>`;
+    if (d.summary) html += `<div class="verdict-summary">${escHtml(d.summary)}</div>`;
+    criteria.forEach(c => {
+        if (c.type === 'ai') {
+            const ok = (c.verdict||'').toUpperCase() === 'PASS';
+            const skip = (c.verdict||'').toUpperCase() === 'SKIP';
+            html += `<div class="criteria-row" style="border-top:1px dashed var(--border);padding-top:.5rem;margin-top:.25rem">
+                <span class="${skip ? '' : (ok ? 'criteria-result-pass' : 'criteria-result-fail')}" style="${skip?'color:var(--text-muted)':''}">🤖</span>
+                <div>
+                    <div style="font-size:.8rem;color:var(--text-muted)">AI referee (${escHtml(c.model||'Gemini')}${c.cached?' · cached':''})</div>
+                    <div>${skip ? '<em>Not available this session</em>' : (ok ? 'PASS' : 'FAIL')}</div>
+                    ${c.reason ? `<div class="criteria-reasoning">${escHtml(c.reason)}</div>` : ''}
+                </div>
+            </div>`;
+            return;
+        }
+        const ok = (c.verdict||c.result||'').toUpperCase() === 'PASS';
+        html += `<div class="criteria-row">
+            <span class="${ok ? 'criteria-result-pass' : 'criteria-result-fail'}">${ok ? '✓' : '✗'}</span>
+            <div>
+                <div>${escHtml(c.description||'')} </div>
+                ${c.reasoning ? `<div class="criteria-reasoning">${escHtml(c.reasoning)}</div>` : ''}
+            </div>
+        </div>`;
+    });
+    html += '</div>';
+
+    document.getElementById('verdict').innerHTML = html;
+    lucide.createIcons();
+    markDone(4);
+
+    const retryRow = document.getElementById('retry-row');
+    retryRow.style.display = 'flex';
+    retryRow.innerHTML = '';
+
+    if (pass) {
+        showStep5Pass(d);
+        document.getElementById('cta').style.display = 'block';
+    } else {
+        if (attemptsRemaining > 0) {
+            const btn = document.createElement('button');
+            btn.className = 'btn btn-primary';
+            btn.innerHTML = `<i data-lucide="rotate-ccw" style="width:15px;height:15px"></i> Try again (${attemptsRemaining} attempt${attemptsRemaining===1?'':'s'} left)`;
+            btn.onclick = () => { document.getElementById('btn-submit').disabled = false; unlock(3); retryRow.style.display = 'none'; };
+            retryRow.appendChild(btn);
+            lucide.createIcons();
+        }
+        const refundBtn = document.createElement('button');
+        refundBtn.className = 'btn btn-danger';
+        refundBtn.innerHTML = `<i data-lucide="undo-2" style="width:15px;height:15px"></i> Give up and refund the buyer`;
+        refundBtn.onclick = () => { startRefund(refundBtn); };
+        retryRow.appendChild(refundBtn);
+        lucide.createIcons();
+    }
+
+    addTimeline(`Verdict: ${d.verdict}${score!=null?' ('+score+'/100)':''}`, null, pass);
+}
+
+function showStep5Pass(d) {
+    const step5 = document.getElementById('step-5');
+    step5.classList.remove('locked');
+    step5.querySelector('.step-title').textContent = 'Payment released!';
+    step5.querySelector('.step-desc').textContent = "The worker got paid automatically — nobody had to press 'pay'.";
+
+    const content = document.getElementById('step5-content');
+    let html = `<p style="color:var(--green);font-weight:600;margin-bottom:.75rem">🎉 Payment released to the worker automatically on PASS.</p>`;
+
+    const releaseHash = d.release_tx_hash;
+    const releaseUrl = d.release_explorer_url || (releaseHash ? explorerTxUrl(releaseHash) : null);
+    if (releaseUrl) {
+        html += `<a href="${releaseUrl}" target="_blank" rel="noopener" class="explorer-link" id="release-link"><i data-lucide="external-link" style="width:12px;height:12px"></i> View release transaction on testnet.xrpl.org</a>`;
+        addTimeline('EscrowFinish — payment released', releaseUrl, true);
+    } else if (d.release_status === 'pending') {
+        html += `<p style="font-size:.85rem;color:var(--text-muted)" id="release-pending">Release pending — checking...</p>`;
+        pollRelease(d.poll_url || `${API}/escrow/${escrowId}`);
+    }
+    content.innerHTML = html;
+    lucide.createIcons();
+    markDone(5);
+}
+
+async function pollRelease(pollUrl) {
+    for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 2500));
+        try {
+            const res = await fetch(pollUrl);
+            if (!res.ok) continue;
+            const d = await res.json();
+            const escrow = d.escrow || d;
+            const hash = escrow.release_tx_hash || escrow.finish_tx_hash;
+            if (hash) {
+                const url = explorerTxUrl(hash);
+                const el = document.getElementById('release-pending');
+                if (el) el.outerHTML = `<a href="${url}" target="_blank" rel="noopener" class="explorer-link"><i data-lucide="external-link" style="width:12px;height:12px"></i> View release transaction on testnet.xrpl.org</a>`;
+                lucide.createIcons();
+                addTimeline('EscrowFinish — payment released', url, true);
+                return;
+            }
+        } catch(e) {}
+    }
+}
+
+async function startRefund(btn) {
+    if (!sid) return;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span> Requesting refund…`;
+
+    const step5 = document.getElementById('step-5');
+    if (step5) step5.classList.remove('locked');
+    const title5 = step5 && step5.querySelector('.step-title');
+    const desc5  = step5 && step5.querySelector('.step-desc');
+    if (title5) title5.textContent = 'Refund in progress';
+    if (desc5)  desc5.textContent  = 'Escrows on XRPL can only be refunded after their deadline — this one is 10 minutes.';
+
+    const content = document.getElementById('step5-content');
+    content.innerHTML = `
+        <p style="font-size:.85rem;color:var(--text-muted)" id="refund-status">Requesting refund…</p>
+        <span id="refund-countdown" style="font-size:.82rem;color:var(--text-muted);display:block;margin-top:.3rem"></span>
+        <div id="refund-result" style="margin-top:.5rem"></div>`;
+
+    addTimeline('Refund requested', null, false);
+
+    let _countdownInterval = null;
+
+    function showRefundCountdown(readyAtMs) {
+        if (_countdownInterval) clearInterval(_countdownInterval);
+        _countdownInterval = setInterval(() => {
+            const remaining = Math.max(0, Math.ceil((readyAtMs - Date.now()) / 1000));
+            const el = document.getElementById('refund-countdown');
+            if (!el) { clearInterval(_countdownInterval); return; }
+            if (remaining <= 0) {
+                el.textContent = 'Refund window open — retrying…';
+                clearInterval(_countdownInterval);
+                return;
+            }
+            const mins = Math.floor(remaining / 60);
+            const secs = remaining % 60;
+            el.textContent = `Refund available in ${mins}m ${String(secs).padStart(2,'0')}s`;
+        }, 1000);
+    }
+
+    async function attemptRefund() {
+        try {
+            const r = await fetch(`${API}/testnet/try/${encodeURIComponent(sid)}/refund`, { method: 'POST' });
+            if (r.ok) {
+                const d = await r.json();
+                if (_countdownInterval) clearInterval(_countdownInterval);
+                const cdEl = document.getElementById('refund-countdown');
+                if (cdEl) cdEl.textContent = '';
+                const url = d.cancel_explorer_url || (d.cancel_tx_hash ? explorerTxUrl(d.cancel_tx_hash) : null);
+                const statusEl = document.getElementById('refund-status');
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--green);font-weight:600">Refund complete.</span>';
+                const resultEl = document.getElementById('refund-result');
+                if (resultEl && url) {
+                    resultEl.innerHTML = `<a href="${url}" target="_blank" rel="noopener" class="explorer-link"><i data-lucide="external-link" style="width:12px;height:12px"></i> View EscrowCancel on testnet.xrpl.org</a>`;
+                    lucide.createIcons();
+                }
+                addTimeline('EscrowCancel — buyer refunded', url, true);
+                markDone(5);
+                document.getElementById('cta').style.display = 'block';
+                return true;
+            } else if (r.status === 425) {
+                const d = await r.json();
+                const readyAt = d.detail?.refund_ready_at || d.refund_ready_at;
+                const statusEl = document.getElementById('refund-status');
+                if (statusEl) statusEl.textContent = 'Waiting for the 10-minute cancel window to open…';
+                if (readyAt) showRefundCountdown(typeof readyAt === 'number' ? readyAt * 1000 : new Date(readyAt).getTime());
+                return false;
+            } else {
+                const txt = await r.text().catch(() => '');
+                const statusEl = document.getElementById('refund-status');
+                if (statusEl) statusEl.textContent = '❌ ' + txt.slice(0, 100);
+                return false;
+            }
+        } catch(e) { return false; }
+    }
+
+    const done = await attemptRefund();
+    if (!done) {
+        const poll = setInterval(async () => {
+            const success = await attemptRefund();
+            if (success) clearInterval(poll);
+        }, 15000);
+    }
+}
+
+</script>
+</body>
+</html>
