@@ -6,6 +6,23 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.7] - 2026-11-09
+### Changed
+- Unified verification pipeline: proof gates → code criteria → AI; gates always run first
+- HELD status when AI selected but unavailable/capped — no silent fallback
+- Durable atomic free-AI: free_ai_usage DB table, _free_ai_reserve()
+- Testnet AI: Flash-only, maxOutputTokens=768, 15s timeout, no retry
+- /status calls_today is now an int + "commit" SHA field; GET /stats/free-ai endpoint
+- _normalise_domain hardened (strips repeated schemes, validates chars)
+### Fixed
+- Double AI call on /try (was _try_ai_judge + evaluate_work; now evaluate_work only)
+- Release before AI verdict on /try
+- calls_today was returning the date string not an integer
+- Code criteria skipped when proof gates pass + require_ai_audit=False (mainnet behaviour change)
+- AI was no-op on code-only criteria with require_ai_audit=True (mainnet behaviour change)
+
+---
+
 ## v7.0.5 — 2026-11-03
 
 ### Changed
