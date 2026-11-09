@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.6"
+APP_VERSION = "7.0.7"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -129,6 +129,9 @@ async def _lifespan(app):
             _load_ofac_from_db()
             _db_available = True
             logger.info("✅ Database ready")
+            # Seed free-AI mirror from DB
+            with SessionLocal() as _seed_db:
+                _seed_free_ai_mirror(_seed_db)
         except Exception as _db_err:
             logger.error(f"⚠️ Database unavailable at startup — DB-backed routes will return 503: {_db_err}")
             _db_available = False
@@ -786,6 +789,14 @@ async def _release_sweep_loop():
                         asyncio.create_task(_cancel_challenge_fee_escrow(_v.escrow_id))
                         logger.info(f"[sweep] auto-cancelling REFUNDABLE challenge fee for {_v.escrow_id}")
 
+                    # Prune old free_ai_usage rows (35 day TTL)
+                    try:
+                        _db.execute(text(
+                            "DELETE FROM free_ai_usage WHERE day < :cutoff"
+                        ), {"cutoff": (datetime.now(timezone.utc).date() - timedelta(days=35)).isoformat()})
+                    except Exception as _prune_e:
+                        logger.debug(f"[sweep] free_ai_usage prune skipped: {_prune_e}")
+
                     # Recompute next due time in the same session
                     _new_due = _compute_next_sweep_due(_db)
                     with _sweep_lock:
@@ -1140,10 +1151,13 @@ def health_check():
         "ofac_addresses_loaded": len(_ofac_sanctioned_xrpl),
         "ofac_stale": ofac_age_s is None or ofac_age_s > 172800,
         "sanctions_source": "ofac_sdn_xml",
+        "commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
         "free_ai": {
-            "enabled": _TRY_AI_ENABLED,
-            "calls_today": _free_ai_today(),
+            "enabled": os.getenv("TRY_AI_ENABLED", "true").lower() == "true",
+            "calls_today": _free_ai_mirror.get("calls_today", 0),
             "daily_cap": _TRY_AI_DAILY_CAP,
+            "as_of": _free_ai_mirror.get("as_of", ""),
+            "source": "process_mirror",
         },
     }
 
@@ -3354,6 +3368,17 @@ def run_migrations():
         "ALTER TABLE free_audit_usage ADD COLUMN IF NOT EXISTS status VARCHAR(16) DEFAULT 'used'",
         # CSRF guard: track which Privy account created each vault
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS created_by_account_id VARCHAR",
+        # v7.0.7 — durable free-AI usage table
+        """CREATE TABLE IF NOT EXISTS free_ai_usage (
+            day DATE NOT NULL,
+            scope TEXT NOT NULL,
+            calls INT NOT NULL DEFAULT 0,
+            failed INT NOT NULL DEFAULT 0,
+            prompt_tokens BIGINT DEFAULT 0,
+            output_tokens BIGINT DEFAULT 0,
+            thought_tokens BIGINT DEFAULT 0,
+            PRIMARY KEY (day, scope)
+        )""",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -3444,100 +3469,182 @@ _domain_toml_cache: dict = {}
 _testnet_audit_counter: dict = {}
 
 # ---------------------------------------------------------------------------
-# FREE AI BUDGET — in-memory, resets at UTC midnight, no DB writes
+# FREE AI BUDGET — durable, DB-backed (v7.0.7)
 # ---------------------------------------------------------------------------
-import threading as _threading_ai
-_TRY_AI_ENABLED: bool = os.getenv("TRY_AI_ENABLED", "true").lower() == "true"
+import threading
+import contextvars as _contextvars
+import secrets as _secrets_ai
+
+_current_request_ip: _contextvars.ContextVar[str | None] = _contextvars.ContextVar("_current_request_ip", default=None)
+
 _TRY_AI_DAILY_CAP: int = int(os.getenv("TRY_AI_DAILY_CAP", "100"))
 TRY_AI_MODEL: str = os.getenv("TRY_AI_MODEL", "gemini-3.5-flash-lite")
-_free_ai_budget: dict = {
-    "date": "", "try": 0, "demo": 0, "testnet_audit": 0,
-    "challenge": 0, "cached_hits": 0, "capped": 0, "total_calls": 0,
-}
-_free_ai_lock = _threading_ai.Lock()
-_try_ai_cache: dict = {}           # {sha256_key: (result_dict, expires_ts)}
 _TRY_AI_CACHE_MAX = 2_000
-_free_ai_ip_hour: dict = {}        # {ip_hash: [timestamps]}
-_FREE_AI_IP_HOUR_LIMIT = 5
-_FREE_AI_IP_DAY_LIMIT = 20
+_try_ai_cache: dict = {}  # {sha256_key: (result_dict, expires_ts)}
+_try_ai_cache_lock = threading.Lock()
 
-def _free_ai_today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+# Process mirror (seeded at startup, updated per reservation)
+_free_ai_mirror: dict = {
+    "date": "",
+    "calls_today": 0,
+    "as_of": "",
+    "cached_hits": 0,
+    "capped": 0,
+    "disabled": 0,
+}
+_free_ai_mirror_lock = threading.Lock()
 
-def _free_ai_reset_if_needed():
-    """Call inside _free_ai_lock only."""
-    today = _free_ai_today()
-    if _free_ai_budget["date"] != today:
-        old = _free_ai_budget.copy()
-        _free_ai_budget.update({
-            "date": today, "try": 0, "demo": 0,
-            "testnet_audit": 0, "challenge": 0,
-            "cached_hits": 0, "capped": 0, "total_calls": 0,
-        })
-        _free_ai_ip_hour.clear()
-        logger.info(
-            f"free_ai daily: date={old.get('date')} try={old['try']} demo={old['demo']} "
-            f"testnet_audit={old['testnet_audit']} challenge={old['challenge']} "
-            f"cached_hits={old['cached_hits']} capped={old['capped']} "
-            f"total_calls={old['total_calls']}/{_TRY_AI_DAILY_CAP}"
-        )
+_FREE_AI_RESERVE_LIMITS = {
+    "global": int(os.getenv("TRY_AI_DAILY_CAP", "100")),
+    "ip_day": 20,
+    "ip_hour": 5,
+}
+_TESTNET_AI_MAX_OUTPUT = min(int(os.getenv("TESTNET_AI_MAX_OUTPUT_TOKENS", "768")), 1024)
 
-def _free_ai_allow(path: str, ip) -> tuple:
-    """Return (allowed: bool, status: str). path in {'try','demo','testnet_audit','challenge'}."""
-    with _free_ai_lock:
-        _free_ai_reset_if_needed()
-        if not _TRY_AI_ENABLED:
-            return False, "disabled"
-        if _free_ai_budget["total_calls"] >= _TRY_AI_DAILY_CAP:
-            _free_ai_budget["capped"] += 1
-            return False, "capped"
-        if ip:
-            _ip_hash = hashlib.sha256(str(ip).encode()).hexdigest()[:16]
-            _now_ts = time.time()
-            _hour_ago = _now_ts - 3600
-            _day_ago  = _now_ts - 86400
-            _ts = _free_ai_ip_hour.get(_ip_hash, [])
-            _ts = [t for t in _ts if t > _day_ago]
-            _hour_ts = [t for t in _ts if t > _hour_ago]
-            if len(_hour_ts) >= _FREE_AI_IP_HOUR_LIMIT:
-                _free_ai_budget["capped"] += 1
-                return False, "capped"
-            if len(_ts) >= _FREE_AI_IP_DAY_LIMIT:
-                _free_ai_budget["capped"] += 1
-                return False, "capped"
-        return True, "allowed"
 
-def _free_ai_record(path: str, ip):
-    with _free_ai_lock:
-        _free_ai_budget[path] = _free_ai_budget.get(path, 0) + 1
-        _free_ai_budget["total_calls"] += 1
-        if ip:
-            _ip_hash = hashlib.sha256(str(ip).encode()).hexdigest()[:16]
-            _free_ai_ip_hour.setdefault(_ip_hash, []).append(time.time())
-        logger.info(
-            f"free_ai record path={path} total={_free_ai_budget['total_calls']}/{_TRY_AI_DAILY_CAP}"
-        )
+def _seed_free_ai_mirror(db) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        row = db.execute(text(
+            "SELECT calls FROM free_ai_usage WHERE day=:d AND scope='global'"
+        ), {"d": today}).fetchone()
+        with _free_ai_mirror_lock:
+            _free_ai_mirror["calls_today"] = row[0] if row else 0
+            _free_ai_mirror["date"] = today
+            _free_ai_mirror["as_of"] = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        logger.warning(f"_seed_free_ai_mirror: {e}")
 
-def _free_ai_record_cache_hit():
-    with _free_ai_lock:
-        _free_ai_budget["cached_hits"] += 1
 
-def _try_ai_cache_key(model: str, task: str, work: str) -> str:
-    return hashlib.sha256(f"{model}|{task}|{work.strip()}".encode()).hexdigest()
+def _try_ai_cache_key(model: str, task: str, criteria_json: str, work: str) -> str:
+    return hashlib.sha256(f"{model}|{PROMPT_VERSION}|{task}|{criteria_json}|{work.strip()}".encode()).hexdigest()
+
 
 def _try_ai_cache_get(key: str):
-    entry = _try_ai_cache.get(key)
-    if entry and time.time() < entry[1]:
-        return entry[0]
-    if entry:
-        _try_ai_cache.pop(key, None)
-    return None
+    with _try_ai_cache_lock:
+        entry = _try_ai_cache.get(key)
+        if entry and time.time() < entry[1]:
+            return entry[0]
+        if entry:
+            _try_ai_cache.pop(key, None)
+        return None
 
-def _try_ai_cache_set(key: str, result: dict):
-    if len(_try_ai_cache) >= _TRY_AI_CACHE_MAX:
-        oldest = min(_try_ai_cache, key=lambda k: _try_ai_cache[k][1])
-        _try_ai_cache.pop(oldest, None)
-    _try_ai_cache[key] = (result, time.time() + 86400)
+
+def _try_ai_cache_set(key: str, result) -> None:
+    with _try_ai_cache_lock:
+        if len(_try_ai_cache) >= _TRY_AI_CACHE_MAX:
+            oldest = min(_try_ai_cache, key=lambda k: _try_ai_cache[k][1])
+            _try_ai_cache.pop(oldest, None)
+        _try_ai_cache[key] = (result, time.time() + 86400)
+
+
+async def _free_ai_reserve(path: str, ip: str | None) -> tuple[bool, str, str | None]:
+    """Reserve one free AI call atomically. Returns (ok, status, reservation_id)."""
+    if os.getenv("TRY_AI_ENABLED", "true").lower() != "true":
+        with _free_ai_mirror_lock:
+            _free_ai_mirror["disabled"] = _free_ai_mirror.get("disabled", 0) + 1
+        return False, "disabled", None
+
+    if not _db_available:
+        return False, "unavailable", None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    hour = datetime.now(timezone.utc).strftime("%H")
+    reservation_id = _secrets_ai.token_hex(8)
+
+    ip_hash = None
+    if ip:
+        ip_hash = hashlib.sha256(str(ip).encode()).hexdigest()[:16]
+
+    try:
+        with SessionLocal() as db:
+            scopes = [
+                ("global", _FREE_AI_RESERVE_LIMITS["global"]),
+                (f"path:{path}", None),
+            ]
+            if ip_hash:
+                scopes += [
+                    (f"ip_day:{ip_hash}", _FREE_AI_RESERVE_LIMITS["ip_day"]),
+                    (f"ip_hour:{ip_hash}:{hour}", _FREE_AI_RESERVE_LIMITS["ip_hour"]),
+                ]
+
+            global_calls = None
+            for scope_key, limit in scopes:
+                if limit is not None:
+                    result = db.execute(text(
+                        "INSERT INTO free_ai_usage(day, scope, calls) VALUES(:d, :s, 1) "
+                        "ON CONFLICT(day, scope) DO UPDATE SET calls = free_ai_usage.calls + 1 "
+                        "WHERE free_ai_usage.calls < :limit RETURNING calls"
+                    ), {"d": today, "s": scope_key, "limit": limit}).fetchone()
+                    if result is None:
+                        db.rollback()
+                        with _free_ai_mirror_lock:
+                            _free_ai_mirror["capped"] = _free_ai_mirror.get("capped", 0) + 1
+                        return False, "capped", None
+                    if scope_key == "global":
+                        global_calls = result[0]
+                else:
+                    db.execute(text(
+                        "INSERT INTO free_ai_usage(day, scope, calls) VALUES(:d, :s, 1) "
+                        "ON CONFLICT(day, scope) DO UPDATE SET calls = free_ai_usage.calls + 1"
+                    ), {"d": today, "s": scope_key})
+
+            db.commit()
+
+            cap = _FREE_AI_RESERVE_LIMITS["global"]
+            with _free_ai_mirror_lock:
+                if global_calls is not None:
+                    _free_ai_mirror["calls_today"] = global_calls
+                    _free_ai_mirror["date"] = today
+                    _free_ai_mirror["as_of"] = datetime.now(timezone.utc).isoformat()
+
+            logger.info(f"free_ai reserve path={path} calls={global_calls}/{cap} rid={reservation_id}")
+            return True, "ok", reservation_id
+
+    except Exception as e:
+        logger.warning(f"_free_ai_reserve error: {e}")
+        return False, "unavailable", None
+
+
+async def _free_ai_complete(reservation_id: str, path: str,
+                             success: bool, usage: dict) -> None:
+    """Record token counts and failures after the AI call."""
+    if not reservation_id or not _db_available:
+        return
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pt = usage.get("promptTokenCount", 0) or 0
+    ot = usage.get("candidatesTokenCount", 0) or 0
+    tt = usage.get("thoughtsTokenCount", 0) or 0
+    f = 0 if success else 1
+    try:
+        with SessionLocal() as db:
+            for s in [f"path:{path}", "global"]:
+                db.execute(text(
+                    "UPDATE free_ai_usage SET "
+                    "prompt_tokens=prompt_tokens+:pt, output_tokens=output_tokens+:ot, "
+                    "thought_tokens=thought_tokens+:tt, failed=failed+:f "
+                    "WHERE day=:d AND scope=:s"
+                ), {"pt": pt, "ot": ot, "tt": tt, "f": f, "d": today, "s": s})
+            db.commit()
+    except Exception as e:
+        logger.warning(f"_free_ai_complete error: {e}")
+
+
+# Legacy shims — keep existing callers working during transition
+def _free_ai_allow(path: str, ip) -> tuple:
+    """Synchronous shim: returns (True, 'allowed') always; real gating is in _free_ai_reserve."""
+    if os.getenv("TRY_AI_ENABLED", "true").lower() != "true":
+        return False, "disabled"
+    return True, "allowed"
+
+
+def _free_ai_record(path: str, ip):
+    pass  # accounting now done in _free_ai_reserve / _free_ai_complete
+
+
+def _free_ai_record_cache_hit():
+    with _free_ai_mirror_lock:
+        _free_ai_mirror["cached_hits"] = _free_ai_mirror.get("cached_hits", 0) + 1
 
 OPERATOR_WALLETS: set = set(filter(None, os.getenv("OPERATOR_WALLETS", PROTOCOL_WALLET).split(",")))
 MIN_FEE_USD        = 0.10   # target fee in USD — used to derive XRP amount dynamically
@@ -6237,13 +6344,23 @@ async def _fetch_activity_90d(wallet_address: str, xrpl_url: str) -> int:
     return count
 
 
-def _normalise_domain(d: str) -> str:
-    """Strip any leading scheme and trailing slashes from a domain string."""
-    d = (d or "").strip()
-    for scheme in ("https://", "http://"):
-        if d.lower().startswith(scheme):
-            d = d[len(scheme):]
-    return d.rstrip("/").lower()
+def _normalise_domain(d: str | None) -> str | None:
+    """Strip schemes, paths, trailing dots; validate hostname chars. Returns None on bad input."""
+    import re as _re_dn
+    if not d:
+        return None
+    d = d.strip()
+    # Strip repeated schemes (e.g. "https://https://x")
+    while _re_dn.match(r'(?i)https?://', d):
+        d = _re_dn.sub(r'(?i)^https?://', '', d)
+    # Strip path/query/fragment
+    d = d.split('/')[0].split('?')[0].split('#')[0]
+    # Strip trailing dots
+    d = d.rstrip('.').lower()
+    # Validate: must have a dot, only valid hostname chars, no spaces
+    if not d or '.' not in d or not _re_dn.match(r'^[a-z0-9][a-z0-9.\-]*$', d):
+        return None
+    return d
 
 
 async def _fetch_domain_toml(domain: str, wallet_address: str) -> tuple[bool, bool, str | None]:
@@ -6254,6 +6371,8 @@ async def _fetch_domain_toml(domain: str, wallet_address: str) -> tuple[bool, bo
     """
     import time as _time
     domain = _normalise_domain(domain)
+    if not domain:
+        return False, False, None
     toml_url = f"https://{domain}/.well-known/xrp-ledger.toml"
     cached = _domain_toml_cache.get(domain)
     if cached and cached["expires"] > _time.time():
@@ -8373,9 +8492,10 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
         # On testnet: use Flash (not Pro), apply global free AI cap (1 per vault)
         _challenge_network = getattr(vault, "network", "mainnet") or "mainnet"
         _is_testnet_challenge = (_challenge_network == "testnet")
+        _challenge_reservation_id: str | None = None
         if _is_testnet_challenge:
-            _ch_allowed, _ch_status = _free_ai_allow("challenge", None)
-            if not _ch_allowed:
+            _ch_ok, _ch_status, _challenge_reservation_id = await _free_ai_reserve("challenge", None)
+            if not _ch_ok:
                 logger.warning(f"_run_challenge_review: global cap reached ({_ch_status}) for {escrow_id}")
                 vault.challenge_outcome = "REVIEW_INCONCLUSIVE"
                 vault.challenge_verdict = None
@@ -8440,8 +8560,8 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
                 except Exception as e2:
                     logger.error(f"_run_challenge_review: second attempt failed for {escrow_id}: {e2}")
                     pro_result = None
-            if _is_testnet_challenge and pro_result is not None:
-                _free_ai_record("challenge", None)
+            if _is_testnet_challenge and pro_result is not None and _challenge_reservation_id:
+                asyncio.create_task(_free_ai_complete(_challenge_reservation_id, "challenge", True, {}))
 
         # Determine outcome
         if pro_result:
@@ -11024,20 +11144,24 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
 
         # B6: Testnet AI audit rate limit — 5/buyer/day, flash only, no consensus upgrade, global cap
         _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
+        _ai_reservation_id: str | None = None
         if _vault_network == "testnet":
             _today_key = f"testnet_audit_{vault.buyer_address}_{datetime.utcnow().date()}"
             _audit_count = _testnet_audit_counter.get(_today_key, 0)
             if _audit_count >= 5:
                 raise HTTPException(status_code=429, detail={"error": "testnet_audit_limit", "reason": "5 AI audits per buyer per day on testnet"})
-            # Also check global free AI cap
-            _ai_allowed, _ai_status = _free_ai_allow("testnet_audit", None)
-            if not _ai_allowed:
-                raise HTTPException(status_code=429, detail={
-                    "error": "testnet_ai_daily_cap",
-                    "reason": f"Free testnet AI audits are used up for today ({_ai_status}). Try again after 00:00 UTC, or use require_ai_audit=False with a code/proof gate.",
+            # Reserve one free AI call atomically (DB-backed)
+            _ip_for_reserve = _current_request_ip.get()
+            _ai_ok, _ai_status, _ai_reservation_id = await _free_ai_reserve("testnet_audit", _ip_for_reserve)
+            if not _ai_ok:
+                return JSONResponse(status_code=200, content={
+                    "verdict": "HELD",
+                    "status": "held",
+                    "ai": {"status": _ai_status, "message": f"Free testnet AI audits are used up for today ({_ai_status}). Try again after 00:00 UTC, or use require_ai_audit=False with a code/proof gate.", "requested": True},
+                    "attempts_remaining": (vault.max_submissions or 3) - (vault.submission_count or 0),
+                    "checks_run": [],
                 })
             _testnet_audit_counter[_today_key] = _audit_count + 1
-            _free_ai_record("testnet_audit", None)
 
         collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
         use_consensus = bool(vault.require_consensus) and _vault_network != "testnet"
@@ -16978,6 +17102,9 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
     if not sess:
         raise HTTPException(status_code=404, detail={"error": "session_not_found"})
 
+    # Set ContextVar so evaluate_work can pass IP to _free_ai_reserve
+    _current_request_ip.set(_client_ip(request))
+
     work    = str(body.get("work", ""))[:500]
     use_ai  = bool(body.get("use_ai", False))
     escrow_id = sess.get("escrow_id")
@@ -16985,31 +17112,33 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
     if not escrow_id or not evaluate_token:
         raise HTTPException(status_code=409, detail={"error": "lock_first", "message": "Call /lock before /submit"})
 
+    # Update vault require_ai_audit to match use_ai flag
+    with SessionLocal() as _db_upd:
+        _vupd = _db_upd.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+        if _vupd and bool(_vupd.require_ai_audit) != use_ai:
+            _vupd.require_ai_audit = use_ai
+            _db_upd.commit()
+
     try:
         verdict_data = await _evaluate_internal(escrow_id, work, evaluate_token)
     except Exception as _ev_err:
         logger.error(f"testnet_try_submit evaluate error: {_ev_err}")
         verdict_data = {}
 
-    # Optionally run AI judge in parallel (never blocks payment release)
-    ai_result: dict | None = None
-    if use_ai and _TRY_AI_ENABLED:
-        client_ip = _client_ip(request)
-        try:
-            ai_result = await asyncio.wait_for(_try_ai_judge(work, client_ip), 35.0)
-        except Exception as _ae:
-            logger.warning(f"testnet_try_submit AI judge error: {_ae}")
-            ai_result = {"verdict": "SKIP", "reason": "timeout", "model": TRY_AI_MODEL, "cached": False}
+    final_verdict = verdict_data.get("verdict", "UNKNOWN")
 
-    release_hash = verdict_data.get("release_tx_hash") or verdict_data.get("auto_finish_hash")
-    if not release_hash:
-        for _i in range(4):
-            await asyncio.sleep(5)
-            with SessionLocal() as _db:
-                _rv = _db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-                if _rv and (_rv.release_tx_hash or _rv.auto_finish_hash):
-                    release_hash = _rv.release_tx_hash or _rv.auto_finish_hash
-                    break
+    # Only poll for release when the verdict was PASS
+    release_hash = None
+    if final_verdict == "PASS":
+        release_hash = verdict_data.get("release_tx_hash") or verdict_data.get("auto_finish_hash")
+        if not release_hash:
+            for _i in range(4):
+                await asyncio.sleep(5)
+                with SessionLocal() as _db:
+                    _rv = _db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
+                    if _rv and (_rv.release_tx_hash or _rv.auto_finish_hash):
+                        release_hash = _rv.release_tx_hash or _rv.auto_finish_hash
+                        break
 
     sess["step"] = "submitted"
     sess["timeline"].append({"at": datetime.now(timezone.utc).isoformat(), "label": "Work submitted"})
@@ -17019,30 +17148,22 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
                                  "explorer_url": f"https://testnet.xrpl.org/transactions/{release_hash}"})
 
     criteria = verdict_data.get("criteria_results", [])
-    if ai_result and ai_result.get("verdict") != "SKIP":
-        criteria = list(criteria) + [{
-            "id": "ai",
-            "type": "ai",
-            "description": "AI referee opinion",
-            "verdict": ai_result["verdict"],
-            "result": ai_result["verdict"],
-            "reason": ai_result.get("reason", ""),
-            "model": ai_result.get("model", TRY_AI_MODEL),
-            "cached": ai_result.get("cached", False),
-        }]
+
+    # Build ai field from verdict_data for HELD responses
+    ai_field = verdict_data.get("ai")
+    if isinstance(ai_field, dict) and "status" not in ai_field:
+        ai_field = None
 
     return {
-        "verdict":          verdict_data.get("verdict", "UNKNOWN"),
+        "verdict":          final_verdict,
         "score":            verdict_data.get("score"),
         "summary":          verdict_data.get("summary", ""),
         "criteria":         criteria,
-        "ai_verdict":       ai_result.get("verdict") if ai_result else None,
-        "ai_reason":        ai_result.get("reason") if ai_result else None,
-        "ai_model":         ai_result.get("model") if ai_result else None,
+        "ai":               ai_field,
         "attempts_remaining": verdict_data.get("attempts_remaining", 0),
         "release_tx_hash":  release_hash,
         "release_explorer_url": f"https://testnet.xrpl.org/transactions/{release_hash}" if release_hash else None,
-        "release_status":   "released" if release_hash else "pending",
+        "release_status":   "released" if release_hash else ("pending" if final_verdict == "PASS" else "not_applicable"),
         "test_money": True,
         "note": "Test XRP on XRPL Testnet — no real value.",
     }
@@ -17209,6 +17330,33 @@ async def stats_testnet(days: int = 1, db: Session = Depends(get_db)):
         logger.warning(f"stats_testnet DB query failed: {_e}")
         total = sum(_testnet_demo_counter.values())
         return {"total_demo_runs_today": total, "network": "testnet", "error": "db_unavailable"}
+
+
+@app.get("/stats/free-ai", tags=["stats"])
+async def stats_free_ai(days: int = 7, request: Request = None):
+    """v7.0.7: Per-day free AI usage stats (global + per-path, no IP rows)."""
+    days = min(max(1, days), 31)
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+    with SessionLocal() as db:
+        rows = db.execute(text(
+            "SELECT day, scope, calls, failed, prompt_tokens, output_tokens, thought_tokens "
+            "FROM free_ai_usage "
+            "WHERE day >= :since AND scope NOT LIKE 'ip_%' "
+            "ORDER BY day DESC, scope"
+        ), {"since": since}).fetchall()
+    result = {}
+    for row in rows:
+        day = str(row[0])
+        if day not in result:
+            result[day] = {"calls": 0, "failed": 0, "prompt_tokens": 0,
+                           "output_tokens": 0, "thought_tokens": 0, "paths": {}}
+        scope = row[1]
+        if scope == "global":
+            result[day].update({"calls": row[2], "failed": row[3],
+                                "prompt_tokens": row[4], "output_tokens": row[5], "thought_tokens": row[6]})
+        elif scope.startswith("path:"):
+            result[day]["paths"][scope[5:]] = {"calls": row[2], "failed": row[3]}
+    return result
 
 
 # ---------------------------------------------------------------------------
