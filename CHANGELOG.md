@@ -6,6 +6,34 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.8] - 2026-11-14
+### Changed
+- Unified evaluation pipeline: code gates always run before AI; `skip_ai` now based on determinism, not proof-gate status (T8, T9)
+- HELD response helper replaces 503 on testnet when AI is capped/disabled/unavailable (T5, T6, T7, T12)
+- `/try` B2 single UPDATE for `require_ai_audit` — no SELECT+commit round trip (T22)
+- Free-AI guard: `_free_ai_reservations` dict tracks active reservations; `_free_ai_complete` uses single SQL UPDATE (T15, T16)
+- Testnet AI call: `free_tier=True` path — `thinkingBudget=0`, `maxOutputTokens=512`, 15s timeout, single attempt (T14)
+- Cache hit calls `_free_ai_mirror_cache_hit()` and returns `ai.status "cached"` (T18)
+- `/testnet/demo` HELD on cap/disabled — HTTP 200, no release (T12)
+- Challenge review: one AI call, no retry on testnet; capped/disabled → `REVIEW_INCONCLUSIVE` (T13)
+- `/stats/free-ai` rate-limited, DB-guarded, zero-filled days, never returns `ip_` scope rows (T21)
+- `criteria_results` shape standardised: `criterion_id`, `type`, `verdict`, `reasoning`, `model?`, `cached?` (T2, T3)
+- Synthetic `task` criterion added when `require_ai_audit=True` and no non-code criterion present (T10)
+- ContextVars `_current_request_ip` and `_current_ai_path` set in `/try`, `/demo`, `POST /evaluate` (T17)
+### Fixed
+- `_try_ai_judge` double-call eliminated — evaluate_work is the single AI path on `/try` (T2)
+- `use_ai` plumbing removed from `_evaluate_internal`, `run_testnet_flow`, `AuditRequest` (T25)
+- Per-buyer testnet counter cap (5/day) now returns HELD instead of raising 429 (T6)
+- `attemptsRemaining` not decremented on HELD responses; `submission_count` not written (T5, T6, T7)
+### Removed
+- `_try_ai_judge` function deleted (T25)
+- `_free_ai_allow` shim deleted (T25)
+- `_free_ai_record` shim deleted (T25)
+- `use_ai` field removed from `AuditRequest` model (T25)
+- `try/index.html` from xrpl-referee repo (F1)
+
+---
+
 ## [7.0.7] - 2026-11-09
 ### Changed
 - Unified verification pipeline: proof gates → code criteria → AI; gates always run first
@@ -20,6 +48,8 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 - calls_today was returning the date string not an integer
 - Code criteria skipped when proof gates pass + require_ai_audit=False (mainnet behaviour change)
 - AI was no-op on code-only criteria with require_ai_audit=True (mainnet behaviour change)
+
+Note: F3/F4 fixes, _try_ai_judge removal and evaluate-path caching listed above actually landed in 7.0.8.
 
 ---
 
