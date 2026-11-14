@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.9."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.10."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.9", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.9"
+    assert APP_VERSION == "7.0.10", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.10"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.9", f"server.json version={sj['version']!r}, expected 7.0.9"
+        assert sj["version"] == "7.0.10", f"server.json version={sj['version']!r}, expected 7.0.10"
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +286,7 @@ def test_t2_pass_with_ai(env):
     rows = usage_rows(env)
     assert rows["global"][:5] == (1, 0, 700, 90, 5)
     assert rows["path:try"][:2] == (1, 0)
-    assert "checks_run" in b and "code:c1" in b["checks_run"]
+    assert b["checks_run"] == ["code_exact_match", "ai_referee"]
 
 
 # T3 -------------------------------------------------------------------------
@@ -379,6 +379,7 @@ def test_t8_unticked(env):
     sid, eid = seed_try_session(env)
     b = submit(env, sid, "HELLO AGENT", False).json()
     assert b["verdict"] == "PASS" and b["ai"]["status"] == "not_requested"
+    assert b["checks_run"] == ["code_exact_match"]
     assert env.finishes == [eid]
     assert guard_stmts(env) == []
     assert len(env.gemini_calls) == 0 and usage_rows(env) == {}
@@ -459,8 +460,7 @@ def test_t11_injection(env):
 
 
 # T12 ------------------------------------------------------------------------
-def test_t12_demo_capped_held(env, monkeypatch):
-    monkeypatch.setenv("TRY_AI_DAILY_CAP", "0")
+def _demo_mocks(monkeypatch):
     monkeypatch.setattr(R, "XRPL_TESTNET_SEED", "sEdTestOnlyNotReal")
 
     async def ok_fund(addr, timeout=30.0):
@@ -484,6 +484,11 @@ def test_t12_demo_capped_held(env, monkeypatch):
     monkeypatch.setattr(R, "autofill", fake_autofill)
     monkeypatch.setattr(R, "async_submit_and_wait", fake_submit)
     monkeypatch.setattr(R.asyncio, "sleep", fast_sleep)
+
+
+def test_t12_demo_capped_held(env, monkeypatch):
+    monkeypatch.setenv("TRY_AI_DAILY_CAP", "0")
+    _demo_mocks(monkeypatch)
     reserves = []
     orig = R._free_ai_reserve
 
@@ -498,6 +503,19 @@ def test_t12_demo_capped_held(env, monkeypatch):
     assert "release_tx_hash" not in b and "poll_url" not in b
     assert reserves == ["demo"]
     assert env.finishes == [] and len(env.gemini_calls) == 0
+
+
+# T26 ------------------------------------------------------------------------
+def test_t26_demo_pass_returns_ai_and_checks(env, monkeypatch):
+    _demo_mocks(monkeypatch)
+    r = env.client.post("/testnet/demo")
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["verdict"] == "PASS", b
+    assert b["ai"]["status"] == "ran" and b["ai"]["model"] == R.TRY_AI_MODEL
+    assert "ai_referee" in b["checks_run"]
+    assert any(c.get("type") == "ai" for c in b["criteria_results"])
+    assert len(env.gemini_calls) == 1
 
 
 # T13 ------------------------------------------------------------------------
