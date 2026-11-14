@@ -269,7 +269,8 @@ def test_t1_gate_fail_no_ai_call(env):
     assert vault(env, eid).submission_count == 1
     assert env.finishes == []
     assert "release_tx_hash" not in b
-    assert b["criteria"] == [{"id": "c1", "type": "code", "result": "FAIL", "reasoning": b["criteria"][0]["reasoning"]}]
+    c = b["criteria"][0]
+    assert (c["id"], c["type"], c["result"], c["verdict"]) == ("c1", "code", "FAIL", "FAIL")
 
 
 # T2 -------------------------------------------------------------------------

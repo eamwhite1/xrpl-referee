@@ -17467,6 +17467,10 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
             "result":    _cr.get("verdict"),
             "reasoning": _cr.get("reasoning", ""),
         }
+        # compat aliases read by the live agent-trust /try page
+        _item["verdict"] = _item["result"]
+        _item["reason"] = _item["reasoning"]
+        _item["description"] = "AI referee" if _cr.get("type") == "ai" else ("Code check: " + str(_item["id"]))
         if _cr.get("type") == "ai":
             _item["model"] = _cr.get("model")
             _item["cached"] = bool(_cr.get("cached"))
