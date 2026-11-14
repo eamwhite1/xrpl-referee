@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.8."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.9."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.8", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.8"
+    assert APP_VERSION == "7.0.9", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.9"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.8", f"server.json version={sj['version']!r}, expected 7.0.8"
+        assert sj["version"] == "7.0.9", f"server.json version={sj['version']!r}, expected 7.0.9"
 
 
 # ---------------------------------------------------------------------------

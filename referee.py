@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.8"
+APP_VERSION = "7.0.9"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -16829,6 +16829,27 @@ async def _faucet_fund(addr: str, timeout: float = 30.0) -> bool:
         return False
 
 
+async def _wait_accounts_funded(client, addrs: list, timeout: float = 20.0, interval: float = 1.5) -> bool:
+    """Faucet 200 means 'submitted', not 'validated'. Poll until every account exists on a validated ledger."""
+    deadline = time.monotonic() + timeout
+    pending = list(addrs)
+    while True:
+        still = []
+        for a in pending:
+            try:
+                r = await client.request(AccountInfo(account=a, ledger_index="validated"))
+                if not r.is_successful():
+                    still.append(a)
+            except Exception:
+                still.append(a)
+        pending = still
+        if not pending:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(interval)
+
+
 async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str) -> dict:
     """Call evaluate_work in-process — no loopback HTTP."""
     req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token)
@@ -17298,6 +17319,9 @@ async def testnet_try_lock(sid: str):
         "Condition":       final_condition,
         "CancelAfter":     cancel_ripple,
     }
+    if not await _wait_accounts_funded(_tn_client, [buyer_addr, worker_addr]):
+        raise HTTPException(status_code=503, detail={"error": "wallets_not_ready", "message": "Test wallets are still being funded. Try again in a few seconds."})
+
     tx_hash = ""
     sequence = None
     _last_err = None
