@@ -158,10 +158,11 @@ def test_trust_score_not_found_hint():
         respx.get(f"{mcp.REFEREE_BASE}/wallet/score/{wallet}").mock(
             return_value=httpx.Response(200, json=fake_response)
         )
-        result = asyncio.get_event_loop().run_until_complete(
-            mcp.get_wallet_trust_score.__wrapped__(wallet, "mainnet")
-            if hasattr(mcp.get_wallet_trust_score, "__wrapped__")
-            else mcp.get_wallet_trust_score._func(wallet, "mainnet")
+        result = asyncio.run(
+            (getattr(mcp.get_wallet_trust_score, "__wrapped__", None)
+             or getattr(mcp.get_wallet_trust_score, "_func", None)
+             or getattr(mcp.get_wallet_trust_score, "fn", None)
+             or mcp.get_wallet_trust_score)(wallet, "mainnet")
         )
 
     assert "hint" in result, f"Expected 'hint' in result, got: {result}"
@@ -176,7 +177,7 @@ def test_ssrf_did_web_localhost_rejected():
     import asyncio
     import referee as ref
 
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         ref.verify_w3c_credential(
             "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJkaWQ6d2ViOmxvY2FsaG9zdCIsInN1YiI6InJUZXN0IiwiaWF0IjoxNzAwMDAwMDAwfQ.AAAA",
             None, None
@@ -196,7 +197,7 @@ def test_ssrf_did_web_link_local_rejected():
 
     # Mock gethostbyname to return a link-local address
     with patch("socket.gethostbyname", return_value="169.254.169.254"):
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             ref.verify_w3c_credential(
                 "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJkaWQ6d2ViOjE2OS4yNTQuMTY5LjI1NCIsInN1YiI6InJUZXN0IiwiaWF0IjoxNzAwMDAwMDAwfQ.AAAA",
                 None, None

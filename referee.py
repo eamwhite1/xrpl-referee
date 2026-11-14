@@ -1155,7 +1155,7 @@ def health_check():
         "free_ai": {
             "enabled": os.getenv("TRY_AI_ENABLED", "true").lower() == "true",
             "calls_today": _free_ai_mirror.get("calls_today", 0),
-            "daily_cap": _TRY_AI_DAILY_CAP,
+            "daily_cap": _free_ai_daily_cap(),
             "as_of": _free_ai_mirror.get("as_of", ""),
             "source": "process_mirror",
         },
@@ -3472,10 +3472,13 @@ _testnet_audit_counter: dict = {}
 # FREE AI BUDGET — durable, DB-backed (v7.0.7)
 # ---------------------------------------------------------------------------
 import threading
+import copy
 import contextvars as _contextvars
 import secrets as _secrets_ai
 
 _current_request_ip: _contextvars.ContextVar[str | None] = _contextvars.ContextVar("_current_request_ip", default=None)
+# v7.0.8 B3: which free-AI path a testnet evaluate call is billed to ("try", "demo", "testnet_audit", ...)
+_current_ai_path: _contextvars.ContextVar[str] = _contextvars.ContextVar("_current_ai_path", default="testnet_audit")
 
 _TRY_AI_DAILY_CAP: int = int(os.getenv("TRY_AI_DAILY_CAP", "100"))
 TRY_AI_MODEL: str = os.getenv("TRY_AI_MODEL", "gemini-3.5-flash-lite")
@@ -3483,7 +3486,7 @@ _TRY_AI_CACHE_MAX = 2_000
 _try_ai_cache: dict = {}  # {sha256_key: (result_dict, expires_ts)}
 _try_ai_cache_lock = threading.Lock()
 
-# Process mirror (seeded at startup, updated per reservation)
+# Process mirror (seeded at startup, updated per reservation / completion)
 _free_ai_mirror: dict = {
     "date": "",
     "calls_today": 0,
@@ -3491,15 +3494,47 @@ _free_ai_mirror: dict = {
     "cached_hits": 0,
     "capped": 0,
     "disabled": 0,
+    "failed": 0,
+    "prompt_tokens": 0,
+    "output_tokens": 0,
+    "thought_tokens": 0,
 }
 _free_ai_mirror_lock = threading.Lock()
+# v7.0.8 C1: reservation id -> (day, path); popped by _free_ai_complete
+_free_ai_reservations: dict = {}
 
 _FREE_AI_RESERVE_LIMITS = {
     "global": int(os.getenv("TRY_AI_DAILY_CAP", "100")),
     "ip_day": 20,
     "ip_hour": 5,
 }
-_TESTNET_AI_MAX_OUTPUT = min(int(os.getenv("TESTNET_AI_MAX_OUTPUT_TOKENS", "768")), 1024)
+# D3: default sized for a 2-criterion verdict from _build_response_schema (see CHANGELOG 7.0.8)
+_TESTNET_AI_MAX_OUTPUT = min(int(os.getenv("TESTNET_AI_MAX_OUTPUT_TOKENS", "512")), 1024)
+# D1: Gemini 3.x thinking control. thinkingLevel and thinkingBudget must not be sent together.
+_TESTNET_AI_THINKING_LEVEL = os.getenv("TESTNET_AI_THINKING_LEVEL", "minimal")
+_FREE_AI_TIMEOUT_S = 15.0
+
+_FREE_AI_MESSAGES = {
+    "capped": "Free AI limit reached for today, so nothing was released. Untick the AI box to run code checks only, or try again after 00:00 UTC.",
+    "disabled": "The free AI referee is switched off right now, so nothing was released. Untick the AI box to run code checks only.",
+    "unavailable": "The AI referee didn't answer, so nothing was released. Try again in a minute.",
+    "skipped_gate_failed": "Code check failed, so the AI was not asked.",
+}
+
+
+class _FreeAIUnavailable(Exception):
+    """Free-tier AI call failed (non-200, timeout, bad JSON, MAX_TOKENS, schema). Carries token usage."""
+    def __init__(self, reason: str, usage: dict | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.usage = usage or {}
+
+
+def _free_ai_daily_cap() -> int:
+    try:
+        return int(os.getenv("TRY_AI_DAILY_CAP", str(_FREE_AI_RESERVE_LIMITS["global"])))
+    except ValueError:
+        return _FREE_AI_RESERVE_LIMITS["global"]
 
 
 def _seed_free_ai_mirror(db) -> None:
@@ -3524,7 +3559,7 @@ def _try_ai_cache_get(key: str):
     with _try_ai_cache_lock:
         entry = _try_ai_cache.get(key)
         if entry and time.time() < entry[1]:
-            return entry[0]
+            return copy.deepcopy(entry[0])
         if entry:
             _try_ai_cache.pop(key, None)
         return None
@@ -3535,31 +3570,64 @@ def _try_ai_cache_set(key: str, result) -> None:
         if len(_try_ai_cache) >= _TRY_AI_CACHE_MAX:
             oldest = min(_try_ai_cache, key=lambda k: _try_ai_cache[k][1])
             _try_ai_cache.pop(oldest, None)
-        _try_ai_cache[key] = (result, time.time() + 86400)
+        _try_ai_cache[key] = (copy.deepcopy(result), time.time() + 86400)
 
 
 async def _free_ai_reserve(path: str, ip: str | None) -> tuple[bool, str, str | None]:
-    """Reserve one free AI call atomically. Returns (ok, status, reservation_id)."""
+    """Reserve one free AI call atomically. Returns (ok, status, reservation_id).
+
+    status: ok | disabled | capped | unavailable. Fails closed (unavailable) when the DB is down.
+    On the first reservation of a new UTC day, logs the previous day's summary (C5).
+    """
+    cap = _free_ai_daily_cap()
     if os.getenv("TRY_AI_ENABLED", "true").lower() != "true":
         with _free_ai_mirror_lock:
             _free_ai_mirror["disabled"] = _free_ai_mirror.get("disabled", 0) + 1
+            _calls = _free_ai_mirror.get("calls_today", 0)
+        logger.info(f"free_ai reserve path={path} status=disabled calls={_calls}/{cap}")
         return False, "disabled", None
 
     if not _db_available:
+        logger.info(f"free_ai reserve path={path} status=unavailable reason=db_unavailable")
         return False, "unavailable", None
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    hour = datetime.now(timezone.utc).strftime("%H")
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    hour = now.strftime("%H")
     reservation_id = _secrets_ai.token_hex(8)
 
     ip_hash = None
     if ip:
         ip_hash = hashlib.sha256(str(ip).encode()).hexdigest()[:16]
 
+    # C5: claim the day rollover exactly once (mirror counters are snapshotted and reset)
+    rollover_prev = None
+    with _free_ai_mirror_lock:
+        if _free_ai_mirror.get("date") and _free_ai_mirror["date"] != today:
+            rollover_prev = {k: _free_ai_mirror.get(k, 0) for k in
+                             ("date", "cached_hits", "capped", "disabled")}
+            for k in ("cached_hits", "capped", "disabled", "failed",
+                      "prompt_tokens", "output_tokens", "thought_tokens", "calls_today"):
+                _free_ai_mirror[k] = 0
+            _free_ai_mirror["date"] = today
+
     try:
         with SessionLocal() as db:
+            if rollover_prev is not None:
+                prev_row = db.execute(text(
+                    "SELECT calls, failed, prompt_tokens, output_tokens, thought_tokens "
+                    "FROM free_ai_usage WHERE day=:d AND scope='global'"
+                ), {"d": rollover_prev["date"]}).fetchone()
+                p = tuple(prev_row) if prev_row else (0, 0, 0, 0, 0)
+                logger.info(
+                    f"free_ai daily: date={rollover_prev['date']} calls={p[0] or 0} failed={p[1] or 0} "
+                    f"cached_hits={rollover_prev['cached_hits']} capped={rollover_prev['capped']} "
+                    f"disabled={rollover_prev['disabled']} prompt_tokens={p[2] or 0} "
+                    f"output_tokens={p[3] or 0} thought_tokens={p[4] or 0}"
+                )
+
             scopes = [
-                ("global", _FREE_AI_RESERVE_LIMITS["global"]),
+                ("global", cap),
                 (f"path:{path}", None),
             ]
             if ip_hash:
@@ -3576,10 +3644,13 @@ async def _free_ai_reserve(path: str, ip: str | None) -> tuple[bool, str, str | 
                         "ON CONFLICT(day, scope) DO UPDATE SET calls = free_ai_usage.calls + 1 "
                         "WHERE free_ai_usage.calls < :limit RETURNING calls"
                     ), {"d": today, "s": scope_key, "limit": limit}).fetchone()
-                    if result is None:
+                    if result is None or (limit is not None and result[0] > limit):
                         db.rollback()
                         with _free_ai_mirror_lock:
                             _free_ai_mirror["capped"] = _free_ai_mirror.get("capped", 0) + 1
+                            _calls = _free_ai_mirror.get("calls_today", 0)
+                        _which = "global" if scope_key == "global" else "per_client"
+                        logger.info(f"free_ai reserve path={path} status=capped scope={_which} calls={_calls}/{cap}")
                         return False, "capped", None
                     if scope_key == "global":
                         global_calls = result[0]
@@ -3591,46 +3662,60 @@ async def _free_ai_reserve(path: str, ip: str | None) -> tuple[bool, str, str | 
 
             db.commit()
 
-            cap = _FREE_AI_RESERVE_LIMITS["global"]
-            with _free_ai_mirror_lock:
-                if global_calls is not None:
-                    _free_ai_mirror["calls_today"] = global_calls
-                    _free_ai_mirror["date"] = today
-                    _free_ai_mirror["as_of"] = datetime.now(timezone.utc).isoformat()
-
-            logger.info(f"free_ai reserve path={path} calls={global_calls}/{cap} rid={reservation_id}")
-            return True, "ok", reservation_id
+        with _free_ai_mirror_lock:
+            if global_calls is not None:
+                _free_ai_mirror["calls_today"] = global_calls
+                _free_ai_mirror["date"] = today
+                _free_ai_mirror["as_of"] = datetime.now(timezone.utc).isoformat()
+        _free_ai_reservations[reservation_id] = (today, path)
+        logger.info(f"free_ai reserve path={path} status=ok calls={global_calls}/{cap}")
+        return True, "ok", reservation_id
 
     except Exception as e:
-        logger.warning(f"_free_ai_reserve error: {e}")
+        logger.warning(f"free_ai reserve path={path} status=unavailable error={type(e).__name__}")
         return False, "unavailable", None
 
 
-async def _free_ai_complete(reservation_id: str, path: str,
-                             success: bool, usage: dict) -> None:
-    """Record token counts and failures after the AI call."""
-    if not reservation_id or not _db_available:
+async def _free_ai_complete(reservation_id: str | None, success: bool, usage: dict | None) -> None:
+    """Record token counts and failure for one reservation (C2). One UPDATE, one commit.
+
+    Uses the reservation's own day, so a call that straddles 00:00 UTC is booked to the day it
+    was reserved on. Never refunds the reserved call.
+    """
+    res = _free_ai_reservations.pop(reservation_id, None) if reservation_id else None
+    if not res:
         return
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    pt = usage.get("promptTokenCount", 0) or 0
-    ot = usage.get("candidatesTokenCount", 0) or 0
-    tt = usage.get("thoughtsTokenCount", 0) or 0
+    day, path = res
+    usage = usage or {}
+    pt = int(usage.get("promptTokenCount", 0) or 0)
+    ot = int(usage.get("candidatesTokenCount", 0) or 0)
+    tt = int(usage.get("thoughtsTokenCount", 0) or 0)
     f = 0 if success else 1
+    with _free_ai_mirror_lock:
+        if _free_ai_mirror.get("date") == day:
+            _free_ai_mirror["failed"] = _free_ai_mirror.get("failed", 0) + f
+            _free_ai_mirror["prompt_tokens"] = _free_ai_mirror.get("prompt_tokens", 0) + pt
+            _free_ai_mirror["output_tokens"] = _free_ai_mirror.get("output_tokens", 0) + ot
+            _free_ai_mirror["thought_tokens"] = _free_ai_mirror.get("thought_tokens", 0) + tt
+        _calls = _free_ai_mirror.get("calls_today", 0)
     try:
         with SessionLocal() as db:
-            for s in [f"path:{path}", "global"]:
-                db.execute(text(
-                    "UPDATE free_ai_usage SET "
-                    "prompt_tokens=prompt_tokens+:pt, output_tokens=output_tokens+:ot, "
-                    "thought_tokens=thought_tokens+:tt, failed=failed+:f "
-                    "WHERE day=:d AND scope=:s"
-                ), {"pt": pt, "ot": ot, "tt": tt, "f": f, "d": today, "s": s})
+            db.execute(text(
+                "UPDATE free_ai_usage SET "
+                "prompt_tokens=prompt_tokens+:pt, output_tokens=output_tokens+:ot, "
+                "thought_tokens=thought_tokens+:tt, failed=failed+:f "
+                "WHERE day=:d AND scope IN ('global', :p)"
+            ), {"pt": pt, "ot": ot, "tt": tt, "f": f, "d": day, "p": f"path:{path}"})
             db.commit()
     except Exception as e:
-        logger.warning(f"_free_ai_complete error: {e}")
+        logger.warning(f"free_ai complete path={path} error={type(e).__name__}")
+    logger.info(
+        f"free_ai complete path={path} outcome={'success' if success else 'failed'} "
+        f"calls={_calls}/{_free_ai_daily_cap()} prompt_tokens={pt} output_tokens={ot} thought_tokens={tt}"
+    )
 
 
-def _free_ai_record_cache_hit():
+def _free_ai_mirror_cache_hit():
     with _free_ai_mirror_lock:
         _free_ai_mirror["cached_hits"] = _free_ai_mirror.get("cached_hits", 0) + 1
 
@@ -7632,6 +7717,71 @@ def _build_response_schema() -> dict:
     }
 
 
+def _free_tier_payload(prompt_text: str) -> dict:
+    """D1: Free-tier generationConfig (testnet only). Mainnet uses its own payload unchanged."""
+    return {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseSchema": _build_response_schema(),
+            "maxOutputTokens": _TESTNET_AI_MAX_OUTPUT,
+            "thinkingConfig": {"thinkingLevel": _TESTNET_AI_THINKING_LEVEL},
+        },
+    }
+
+
+async def _call_free_tier_gemini(prompt_text: str) -> dict:
+    """D1: One free-tier call to TRY_AI_MODEL: 15s timeout, no retry, no Pro.
+
+    Returns the parsed verdict with result["_usage"] attached (caller must strip it).
+    Raises _FreeAIUnavailable(reason, usage) on non-200 / timeout / bad JSON / MAX_TOKENS / schema.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise _FreeAIUnavailable("no_api_key", {})
+    payload = _free_tier_payload(prompt_text)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{TRY_AI_MODEL}:generateContent"
+
+    async def _post():
+        async with httpx.AsyncClient(timeout=_FREE_AI_TIMEOUT_S) as client:
+            return await client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+
+    try:
+        res = await asyncio.wait_for(_post(), _FREE_AI_TIMEOUT_S)
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        raise _FreeAIUnavailable("timeout", {})
+    except Exception as e:
+        raise _FreeAIUnavailable(f"network:{type(e).__name__}", {})
+    if res.status_code != 200:
+        raise _FreeAIUnavailable(f"http_{res.status_code}", {})
+    try:
+        body = res.json()
+    except Exception:
+        raise _FreeAIUnavailable("bad_json", {})
+    usage = body.get("usageMetadata") or {} if isinstance(body, dict) else {}
+    try:
+        cand = body["candidates"][0]
+    except Exception:
+        raise _FreeAIUnavailable("no_candidates", usage)
+    if cand.get("finishReason") == "MAX_TOKENS":
+        raise _FreeAIUnavailable("max_tokens", usage)
+    try:
+        raw = cand["content"]["parts"][0]["text"].strip()
+        result = json.loads(raw)
+    except Exception:
+        raise _FreeAIUnavailable("bad_json", usage)
+    if (not isinstance(result, dict)
+            or result.get("overall_verdict") not in ("PASS", "FAIL", "INCONCLUSIVE")
+            or not isinstance(result.get("criteria_results"), list)
+            or not all(isinstance(r, dict) and r.get("criterion_id") and
+                       r.get("verdict") in ("PASS", "FAIL", "INCONCLUSIVE")
+                       for r in result["criteria_results"])):
+        raise _FreeAIUnavailable("schema_invalid", usage)
+    result["_usage"] = usage
+    return result
+
+
 async def _run_structured_audit(
     task: str,
     work: str,
@@ -7640,8 +7790,15 @@ async def _run_structured_audit(
     require_consensus: bool,
     attempt_count: int,
     allow_pro: bool = True,
+    free_tier: bool = False,
 ) -> dict:
     """Run structured AI audit with criterion types, evidence, consensus logic."""
+    if free_tier:
+        # D1: testnet free tier — TRY_AI_MODEL only, never Pro, one attempt.
+        _ft_result = await _call_free_tier_gemini(_build_audit_prompt(task, work, criteria, evidence_items))
+        _ft_result["models_used"] = [TRY_AI_MODEL]
+        return _ft_result
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
@@ -8477,14 +8634,17 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
         api_key = os.getenv("GEMINI_API_KEY")
         pro_result = None
 
-        # On testnet: use Flash (not Pro), apply global free AI cap (1 per vault)
+        # On testnet: ONE free-tier TRY_AI_MODEL call (C8); mainnet unchanged (Pro, retry once)
         _challenge_network = getattr(vault, "network", "mainnet") or "mainnet"
         _is_testnet_challenge = (_challenge_network == "testnet")
         _challenge_reservation_id: str | None = None
         if _is_testnet_challenge:
+            if vault.challenge_verdict or vault.challenge_outcome:
+                logger.info(f"_run_challenge_review: {escrow_id} already reviewed — no second free review")
+                return
             _ch_ok, _ch_status, _challenge_reservation_id = await _free_ai_reserve("challenge", None)
             if not _ch_ok:
-                logger.warning(f"_run_challenge_review: global cap reached ({_ch_status}) for {escrow_id}")
+                logger.warning(f"_run_challenge_review: free AI {_ch_status} for {escrow_id}")
                 vault.challenge_outcome = "REVIEW_INCONCLUSIVE"
                 vault.challenge_verdict = None
                 vault.challenge_reviewed_at = datetime.now(timezone.utc)
@@ -8507,7 +8667,26 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
                 f"</UNTRUSTED_CLAIM>\n"
             )
 
-        if api_key:
+        if _is_testnet_challenge:
+            _ch_prompt = _build_audit_prompt(
+                vault.task_description or "", work, review_criteria, evidence_snapshots,
+            ) + buyer_claim_block
+            _ch_success = False
+            _ch_usage: dict = {}
+            try:
+                pro_result = await _call_free_tier_gemini(_ch_prompt)
+                _ch_usage = pro_result.pop("_usage", {}) or {}
+                _ch_success = True
+            except _FreeAIUnavailable as _fe:
+                _ch_usage = _fe.usage
+                logger.warning(f"_run_challenge_review: free AI call failed for {escrow_id}: {_fe.reason}")
+                pro_result = None
+            except Exception as _fe2:
+                logger.warning(f"_run_challenge_review: free AI call error for {escrow_id}: {type(_fe2).__name__}")
+                pro_result = None
+            finally:
+                await _free_ai_complete(_challenge_reservation_id, _ch_success, _ch_usage)
+        elif api_key:
             base_prompt = _build_audit_prompt(
                 vault.task_description or "",
                 work,
@@ -8525,11 +8704,7 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
                     "thinkingConfig": {"thinkingBudget": 8192},
                 },
             }
-            if _is_testnet_challenge:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{TRY_AI_MODEL}:generateContent"
-                payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
-            else:
-                url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
 
             async def _call_pro():
                 async with httpx.AsyncClient(timeout=150.0) as client:
@@ -8548,8 +8723,6 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
                 except Exception as e2:
                     logger.error(f"_run_challenge_review: second attempt failed for {escrow_id}: {e2}")
                     pro_result = None
-            if _is_testnet_challenge and pro_result is not None and _challenge_reservation_id:
-                asyncio.create_task(_free_ai_complete(_challenge_reservation_id, "challenge", True, {}))
 
         # Determine outcome
         if pro_result:
@@ -8587,7 +8760,7 @@ async def _run_challenge_review(escrow_id: str, buyer_reason: str = ""):
         vault.challenge_outcome = pro_verdict
         vault.challenge_verdict = verdict_json_str
         vault.challenge_verdict_hash = verdict_hash
-        vault.challenge_models_used = "gemini-2.5-pro"
+        vault.challenge_models_used = TRY_AI_MODEL if _is_testnet_challenge else "gemini-2.5-pro"
         vault.challenge_reviewed_at = now
 
         prev_status = vault.status
@@ -10836,8 +11009,41 @@ async def get_escrow_info(escrow_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # 16. EVALUATE — audit + auto-finish + server-side DEX quote
 # ---------------------------------------------------------------------------
+def _ai_block(requested: bool, status: str, model: str | None = None, message: str | None = None) -> dict:
+    """v7.0.8 A7: uniform "ai" block on every evaluate_work result."""
+    return {
+        "requested": bool(requested),
+        "status":    status,
+        "model":     model,
+        "message":   message if message is not None else _FREE_AI_MESSAGES.get(status),
+    }
+
+
+def _held_response(vault, status: str, message: str, gate_rows: list, checks_run: list):
+    """v7.0.8 A5: AI selected but unavailable on testnet — nothing released, attempt not consumed.
+
+    Writes nothing to the vault (no verdict fields, no counters, no commit); vault stays LOCKED.
+    """
+    _used = vault.submission_count or 0
+    _max = vault.max_submissions or 3
+    return JSONResponse(status_code=200, content={
+        "escrow_id":          vault.escrow_id,
+        "status":             "held",
+        "verdict":            "HELD",
+        "verdict_detail":     {"verdict": "HELD", "reason": status, "summary": message},
+        "summary":            message,
+        "message":            message,
+        "checks_run":         list(checks_run),
+        "ai":                 _ai_block(True, status, None, message),
+        "criteria_results":   list(gate_rows),
+        "attempts_used":      _used,
+        "attempts_remaining": max(0, _max - _used),
+        "model_used":         None,
+    })
+
+
 @app.post("/evaluate")
-async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
+async def evaluate_work(req: AuditRequest, request: Request = None, db: Session = Depends(get_db)):
     import asyncio, base64
 
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
@@ -11046,7 +11252,7 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 failure_msgs = "; ".join(r[2] for r in failed)
                 raise HTTPException(status_code=400, detail=f"Proof policy is ALL — all required proofs must pass. Failed: {failure_msgs}")
 
-    # Fetch evidence link snapshots now (at submission time = tamper-proof snapshot)
+    # Fetch evidence link snapshots now (submission-time snapshot)
     evidence_snapshots = None
     if req.evidence_links:
         logger.info(f"🔗 Fetching {len(req.evidence_links[:3])} evidence link(s) for {req.escrow_id}")
@@ -11062,145 +11268,246 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
     if extra_notes:
         work_with_nft = req.work + "\n\n" + "\n".join(extra_notes)
 
-    # ── AI AUDIT OPT-OUT ──
-    # When require_ai_audit=False AND at least one proof gate was configured and passed,
-    # skip the AI step entirely and treat it as an automatic PASS.
-    skip_ai = (not vault.require_ai_audit) and bool(proof_results) and all(r[1] for r in proof_results)
+    # ── v7.0.8 UNIFIED PIPELINE: proof gates → code gates → AI (only if selected / needed) ──
+    _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
+    _is_testnet = _vault_network == "testnet"
+    _ai_requested = bool(vault.require_ai_audit)
+
+    # A1: evaluation criteria are a private copy — vault.criteria_v2 is never mutated
+    _explicit_criteria = bool(vault.criteria_v2)
+    if _explicit_criteria:
+        eval_criteria = copy.deepcopy(list(vault.criteria_v2))
+    else:
+        eval_criteria = [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
+
+    _proof_rows = [
+        {"criterion_id": f"proof:{r[0].lower()}", "type": "proof", "verdict": "PASS", "reasoning": str(r[2])[:500]}
+        for r in proof_results if r[1]
+    ]
+    checks_run = [f"proof:{r[0].lower()}" for r in proof_results if r[1]]
+    checks_run += [f"code:{c['id']}" for c in eval_criteria if c.get("type") == "code" and c.get("gate")]
+
+    # A2: code gates ALWAYS run first, before any skip/AI decision
+    gate_failures = await asyncio.to_thread(_execute_code_gates, work_with_nft, eval_criteria)
+    _gate_fail_map = {f["criterion_id"]: f.get("reason", "") for f in (gate_failures or [])}
+    _code_rows = [
+        {
+            "criterion_id": c["id"],
+            "type":         "code",
+            "verdict":      "FAIL" if c["id"] in _gate_fail_map else "PASS",
+            "reasoning":    _gate_fail_map.get(c["id"], "code gate"),
+        }
+        for c in eval_criteria if c.get("type") == "code"
+    ]
+    if gate_failures:
+        verdict_dict = {
+            "verdict": "FAIL",
+            "score": 0,
+            "summary": f"{len(gate_failures)} automated gate(s) failed.",
+            "details": "; ".join(f["reason"] for f in gate_failures),
+            "criteria_failed": [f["criterion_id"] for f in gate_failures],
+            "criteria_met": [],
+            "gate_failures": gate_failures,
+        }
+        model_used = "code-gate"
+        vault.submission_count = current_count + 1
+        vault.ai_verdict = json.dumps(verdict_dict)
+        vault.model_used = model_used
+        vault.models_used = ["code-gate"]
+        vault.prompt_version = PROMPT_VERSION
+        vault.evaluation_verdicts = [
+            {"criterion_id": f["criterion_id"], "verdict": "FAIL", "reasoning": f["reason"]}
+            for f in gate_failures
+        ]
+        vault.verdict_hash = hashlib.sha256(json.dumps(verdict_dict, sort_keys=True).encode()).hexdigest()
+        db.commit()
+        _gate_explorer_base = "https://testnet.xrpl.org" if _is_testnet else "https://livenet.xrpl.org"
+        _gate_explorer_links = {}
+        if vault.escrow_tx_hash:
+            _gate_explorer_links["escrow_create"] = f"{_gate_explorer_base}/transactions/{vault.escrow_tx_hash}"
+        return {
+            "escrow_id": req.escrow_id,
+            "status": "rejected",
+            "verdict": "FAIL",
+            "verdict_detail": verdict_dict,
+            "score": 0,
+            "checks_run": checks_run,
+            "ai": _ai_block(_ai_requested, "skipped_gate_failed" if _ai_requested else "not_requested"),
+            "model_used": model_used,
+            "attempts_used": vault.submission_count,
+            "attempts_remaining": max(0, (vault.max_submissions or 3) - vault.submission_count),
+            "criteria_failed": verdict_dict["criteria_failed"],
+            "criteria_results": _code_rows + _proof_rows,
+            "summary": verdict_dict["summary"],
+            "poll_url": f"{SITE_URL}/escrow/?id={req.escrow_id}",
+            "explorer_links": _gate_explorer_links,
+        }
+
+    # A3: deterministic = every configured check is a proof or code gate (no explicit non-code criterion)
+    has_code = any(c.get("type") == "code" for c in eval_criteria)
+    has_proof = bool(proof_results)
+    _explicit_non_code = _explicit_criteria and any(c.get("type") != "code" for c in eval_criteria)
+    deterministic = (has_code or has_proof) and not _explicit_non_code
+    skip_ai = (not vault.require_ai_audit) and deterministic
     is_inconclusive = False
     evaluation_verdicts_json = None
     used_models_list = None
+    _resp_criteria = _code_rows + _proof_rows
+    _ai_info = _ai_block(_ai_requested, "not_requested")
     if skip_ai:
+        _passed_names = [r[0] for r in proof_results if r[1]] + [r["criterion_id"] for r in _code_rows]
         proof_summary = "; ".join(r[2] for r in proof_results if r[1])
         verdict_dict = {
             "verdict":       "PASS",
             "score":         100,
-            "summary":       f"All proof gates passed — AI audit not required. {proof_summary}",
-            "details":       proof_summary,
-            "criteria_met":  [r[0] for r in proof_results if r[1]],
+            "summary":       ("All deterministic checks passed — AI audit not required. " + proof_summary).strip(),
+            "details":       proof_summary or "All code gates passed.",
+            "criteria_met":  _passed_names,
             "criteria_failed": [],
+            "criteria_results": _resp_criteria,
             "ai_skipped":    True,
         }
-        model_used = "none (proof-gate release)"
-        logger.info(f"✅ AI SKIPPED (proof-gate release) for {req.escrow_id}: {proof_summary}")
+        model_used = "none (deterministic gates)"
+        evaluation_verdicts_json = [{"criterion_id": r["criterion_id"], "verdict": "PASS", "reasoning": r["reasoning"]} for r in _resp_criteria]
+        logger.info(f"✅ AI SKIPPED (deterministic gates) for {req.escrow_id}")
     else:
-        # ── STRUCTURED EVALUATION PIPELINE ──
-        if vault.criteria_v2:
-            eval_criteria = vault.criteria_v2
-        else:
-            eval_criteria = [{"id": "c1", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."}]
-
-        gate_failures = await asyncio.to_thread(_execute_code_gates, work_with_nft, eval_criteria)
-        if gate_failures:
-            verdict_dict = {
-                "verdict": "FAIL",
-                "score": 0,
-                "summary": f"{len(gate_failures)} automated gate(s) failed.",
-                "details": "; ".join(f["reason"] for f in gate_failures),
-                "criteria_failed": [f["criterion_id"] for f in gate_failures],
-                "criteria_met": [],
-                "gate_failures": gate_failures,
-            }
-            model_used = "code-gate"
-            vault.submission_count = current_count + 1
-            vault.ai_verdict = json.dumps(verdict_dict)
-            vault.model_used = model_used
-            vault.models_used = ["code-gate"]
-            vault.prompt_version = PROMPT_VERSION
-            vault.evaluation_verdicts = [
-                {"criterion_id": f["criterion_id"], "verdict": "FAIL", "reasoning": f["reason"]}
-                for f in gate_failures
-            ]
-            vault.verdict_hash = hashlib.sha256(json.dumps(verdict_dict, sort_keys=True).encode()).hexdigest()
-            db.commit()
-            _gate_explorer_base = "https://testnet.xrpl.org" if getattr(vault, "network", "mainnet") == "testnet" else "https://livenet.xrpl.org"
-            _gate_explorer_links = {}
-            if vault.escrow_tx_hash:
-                _gate_explorer_links["escrow_create"] = f"{_gate_explorer_base}/transactions/{vault.escrow_tx_hash}"
-            return {
-                "escrow_id": req.escrow_id,
-                "status": "rejected",
-                "verdict": verdict_dict,
-                "model_used": model_used,
-                "attempts_used": vault.submission_count,
-                "attempts_remaining": max(0, (vault.max_submissions or 3) - vault.submission_count),
-                "criteria_failed": verdict_dict["criteria_failed"],
-                "criteria_results": vault.evaluation_verdicts,
-                "summary": verdict_dict["summary"],
-                "poll_url": f"{SITE_URL}/escrow/?id={req.escrow_id}",
-                "explorer_links": _gate_explorer_links,
-            }
-
-        # B6: Testnet AI audit rate limit — 5/buyer/day, flash only, no consensus upgrade, global cap
-        _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
-        _ai_reservation_id: str | None = None
-        if _vault_network == "testnet":
-            _today_key = f"testnet_audit_{vault.buyer_address}_{datetime.utcnow().date()}"
-            _audit_count = _testnet_audit_counter.get(_today_key, 0)
-            if _audit_count >= 5:
-                raise HTTPException(status_code=429, detail={"error": "testnet_audit_limit", "reason": "5 AI audits per buyer per day on testnet"})
-            # Reserve one free AI call atomically (DB-backed)
-            _ip_for_reserve = _current_request_ip.get()
-            _ai_ok, _ai_status, _ai_reservation_id = await _free_ai_reserve("testnet_audit", _ip_for_reserve)
-            if not _ai_ok:
-                return JSONResponse(status_code=200, content={
-                    "verdict": "HELD",
-                    "status": "held",
-                    "ai": {"status": _ai_status, "message": f"Free testnet AI audits are used up for today ({_ai_status}). Try again after 00:00 UTC, or use require_ai_audit=False with a code/proof gate.", "requested": True},
-                    "attempts_remaining": (vault.max_submissions or 3) - (vault.submission_count or 0),
-                    "checks_run": [],
-                })
-            _testnet_audit_counter[_today_key] = _audit_count + 1
+        # A4: AI selected but only code criteria → judge the server-side task as a synthetic criterion
+        _synthetic_ids: set = set()
+        if vault.require_ai_audit and not any(c.get("type") != "code" for c in eval_criteria):
+            eval_criteria.append({"id": "task", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."})
+            _synthetic_ids.add("task")
+            checks_run.append("ai:task")
+        _non_code_ids = {c["id"] for c in eval_criteria if c.get("type") != "code"}
+        if not _synthetic_ids:
+            checks_run += [f"ai:{cid}" for cid in sorted(_non_code_ids)]
 
         collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
-        use_consensus = bool(vault.require_consensus) and _vault_network != "testnet"
-        _allow_pro = (_vault_network != "testnet")
-        try:
-            structured_result = await _run_structured_audit(
-                task=vault.task_description or "",
-                work=work_with_nft,
-                criteria=eval_criteria,
-                evidence_items=collected_evidence,
-                require_consensus=use_consensus,
-                attempt_count=current_count,
-                allow_pro=_allow_pro,
-            )
-        except HTTPException:
-            raise
-        except Exception:
-            logger.exception("referee error in _run_structured_audit escrow=%s", escrow_id)
-            return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
+        use_consensus = bool(vault.require_consensus) and not _is_testnet
+        _allow_pro = not _is_testnet
+        _ai_status = "ran"
+        _ai_cache_key = None
+        structured_result = None
 
-        # Overwrite code-criterion results with gate outcomes (model is not authoritative for code gates)
+        if _is_testnet:
+            # C7: cache lookup after gates pass, before per-buyer counter / reservation
+            if not collected_evidence and not req.evidence_links:
+                _ai_cache_key = _try_ai_cache_key(
+                    TRY_AI_MODEL, vault.task_description or "",
+                    json.dumps(eval_criteria, sort_keys=True, separators=(",", ":")), work_with_nft,
+                )
+                structured_result = _try_ai_cache_get(_ai_cache_key)
+            if structured_result is not None:
+                _free_ai_mirror_cache_hit()
+                _ai_status = "cached"
+            else:
+                # B6/A5(b): per-buyer testnet limit — HELD "capped", not 429
+                _today_key = f"testnet_audit_{vault.buyer_address}_{datetime.utcnow().date()}"
+                _audit_count = _testnet_audit_counter.get(_today_key, 0)
+                if _audit_count >= 5:
+                    return _held_response(vault, "capped", _FREE_AI_MESSAGES["capped"], _resp_criteria, checks_run)
+                # B3: request IP (last XFF hop) when called over HTTP, else the ContextVar
+                _ip_for_reserve = _client_ip(request) if request is not None else _current_request_ip.get()
+                _ai_ok, _ai_res_status, _ai_reservation_id = await _free_ai_reserve(_current_ai_path.get(), _ip_for_reserve)
+                if not _ai_ok:
+                    return _held_response(vault, _ai_res_status, _FREE_AI_MESSAGES.get(_ai_res_status, _FREE_AI_MESSAGES["unavailable"]), _resp_criteria, checks_run)
+                _testnet_audit_counter[_today_key] = _audit_count + 1
+                _ai_success = False
+                _ai_usage: dict = {}
+                try:
+                    try:
+                        structured_result = await _run_structured_audit(
+                            task=vault.task_description or "",
+                            work=work_with_nft,
+                            criteria=eval_criteria,
+                            evidence_items=collected_evidence,
+                            require_consensus=False,
+                            attempt_count=current_count,
+                            allow_pro=False,
+                            free_tier=True,
+                        )
+                    except _FreeAIUnavailable as _fe:
+                        _ai_usage = _fe.usage
+                        logger.warning(f"free AI unavailable for {req.escrow_id}: {_fe.reason}")
+                        return _held_response(vault, "unavailable", _FREE_AI_MESSAGES["unavailable"], _resp_criteria, checks_run)
+                    except Exception as _fe2:
+                        logger.warning(f"free AI error for {req.escrow_id}: {type(_fe2).__name__}")
+                        return _held_response(vault, "unavailable", _FREE_AI_MESSAGES["unavailable"], _resp_criteria, checks_run)
+                    _ai_usage = structured_result.pop("_usage", {}) or {}
+                    _got_ids = {r.get("criterion_id") for r in structured_result.get("criteria_results", [])}
+                    if _non_code_ids - _got_ids:
+                        # A5(e): a missing non-code criterion means the AI did not answer
+                        return _held_response(vault, "unavailable", _FREE_AI_MESSAGES["unavailable"], _resp_criteria, checks_run)
+                    _ai_success = True
+                finally:
+                    await _free_ai_complete(_ai_reservation_id, _ai_success, _ai_usage)
+        else:
+            try:
+                structured_result = await _run_structured_audit(
+                    task=vault.task_description or "",
+                    work=work_with_nft,
+                    criteria=eval_criteria,
+                    evidence_items=collected_evidence,
+                    require_consensus=use_consensus,
+                    attempt_count=current_count,
+                    allow_pro=_allow_pro,
+                    free_tier=False,
+                )
+            except HTTPException:
+                raise
+            except Exception:
+                logger.exception("referee error in _run_structured_audit escrow=%s", req.escrow_id)
+                return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
+            structured_result.pop("_usage", None)
+            _got_ids = {r.get("criterion_id") for r in structured_result.get("criteria_results", [])}
+            if _non_code_ids - _got_ids:
+                # A4/A5(e): missing non-code criterion → AI unavailable (never PASS)
+                logger.warning(f"⚠️ model omitted criteria {sorted(_non_code_ids - _got_ids)} for {req.escrow_id}")
+                return JSONResponse({"error": "referee_unavailable", "retry_after": 300}, status_code=503)
+
+        # C7: snapshot BEFORE the code-gate overwrite; stored only on a fully valid success below
+        _pre_overwrite = copy.deepcopy(structured_result) if (_ai_cache_key and _ai_status == "ran") else None
+
+        # Overwrite code-criterion results with gate outcomes (model is not authoritative for code gates).
+        # Only type=="code" criteria are touched — never the synthetic "task" or any judgment criterion.
         _code_crit_ids = {c["id"] for c in eval_criteria if c.get("type") == "code"}
-        _gate_fail_map = {f["criterion_id"]: f.get("reason", "") for f in (gate_failures or [])}
-        _gate_pass_ids = _code_crit_ids - set(_gate_fail_map.keys())
-        _all_crit_ids = {c["id"] for c in eval_criteria}
-        _results = structured_result.get("criteria_results", [])
-        _result_ids = {r["criterion_id"] for r in _results}
+        _results = [r for r in structured_result.get("criteria_results", []) if isinstance(r, dict)]
+        _result_ids = {r.get("criterion_id") for r in _results}
         for _r in _results:
-            if _r["criterion_id"] in _gate_fail_map:
-                _r["verdict"] = "FAIL"
-                _r["reasoning"] = _gate_fail_map[_r["criterion_id"]]
-                _r["evidence_quote"] = None
-            elif _r["criterion_id"] in _gate_pass_ids:
+            if _r.get("criterion_id") in _code_crit_ids:
                 _r["verdict"] = "PASS"
                 _r["reasoning"] = "code gate"
                 _r["evidence_quote"] = None
-        for _missing_cid in _all_crit_ids - _result_ids:
-            _results.append({"criterion_id": _missing_cid, "verdict": "INCONCLUSIVE", "reasoning": "criterion not evaluated by model", "evidence_quote": None, "score": 0})
+        for _missing_cid in sorted(_code_crit_ids - _result_ids):
+            _results.append({"criterion_id": _missing_cid, "verdict": "PASS", "reasoning": "code gate", "evidence_quote": None, "score": 100})
         structured_result["criteria_results"] = _results
-        # Recalculate overall from criteria (code gates take precedence; re-read after overwrite)
-        _all_verdicts = [_r["verdict"] for _r in _results]
+        # A4: PASS only if every criterion PASSes
+        _all_verdicts = [_r.get("verdict") for _r in _results]
         if "FAIL" in _all_verdicts:
             structured_result["overall_verdict"] = "FAIL"
         elif "INCONCLUSIVE" in _all_verdicts:
             structured_result["overall_verdict"] = "INCONCLUSIVE"
         elif all(v == "PASS" for v in _all_verdicts) and _all_verdicts:
             structured_result["overall_verdict"] = "PASS"
+        else:
+            structured_result["overall_verdict"] = "INCONCLUSIVE"
 
         used_models_list = structured_result.get("models_used", [])
         overall_verdict = structured_result.get("overall_verdict", "INCONCLUSIVE")
         overall_score = structured_result.get("overall_score", 0)
+        _ai_model = (used_models_list[-1] if used_models_list else (TRY_AI_MODEL if _is_testnet else "gemini-3.5-flash-lite"))
+        _ai_info = _ai_block(True, _ai_status, _ai_model, None)
+        _resp_criteria = []
+        _ai_rows_by_id = {r.get("criterion_id"): r for r in _results}
+        for c in eval_criteria:
+            _r = _ai_rows_by_id.get(c["id"], {})
+            if c.get("type") == "code":
+                _resp_criteria.append({"criterion_id": c["id"], "type": "code", "verdict": _r.get("verdict", "PASS"), "reasoning": "code gate"})
+            else:
+                _resp_criteria.append({
+                    "criterion_id": c["id"], "type": "ai", "verdict": _r.get("verdict", "INCONCLUSIVE"),
+                    "reasoning": _r.get("reasoning", ""), "model": _ai_model, "cached": _ai_status == "cached",
+                })
+        _resp_criteria += _proof_rows
 
         validation_errors = _validate_verdict(structured_result, eval_criteria, collected_evidence)
         if validation_errors:
@@ -11210,6 +11517,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
                 overall_verdict = "INCONCLUSIVE"
                 structured_result["overall_verdict"] = "INCONCLUSIVE"
             structured_result["validation_errors"] = validation_errors
+
+        # C7: cache only a fully valid, definitive (PASS/FAIL) fresh result
+        if _pre_overwrite is not None and not validation_errors and overall_verdict in ("PASS", "FAIL"):
+            _try_ai_cache_set(_ai_cache_key, _pre_overwrite)
 
         if overall_verdict == "INCONCLUSIVE":
             vault.evaluation_verdicts = structured_result.get("criteria_results")
@@ -11236,7 +11547,12 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             return JSONResponse({
                 "escrow_id": req.escrow_id,
                 "status": "inconclusive",
-                "verdict": structured_result,
+                "verdict": "INCONCLUSIVE",
+                "verdict_detail": structured_result,
+                "summary": structured_result.get("overall_reasoning", ""),
+                "checks_run": checks_run,
+                "ai": _ai_info,
+                "criteria_results": _resp_criteria,
                 "guidance": guidance,
                 "attempts_used": _used,
                 "attempts_remaining": max(0, (vault.max_submissions or 3) - _used),
@@ -11299,7 +11615,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             return {
                 "escrow_id":            req.escrow_id,
                 "status":               "pass_awaiting_nft",
-                "verdict":              verdict_dict,
+                "verdict":              "PASS",
+                "verdict_detail":       verdict_dict,
+                "checks_run":         checks_run,
+                "ai":                 _ai_info,
+                "criteria_results":   _resp_criteria,
                 "model_used":           model_used,
                 "fulfillment":          None,
                 "condition":            None,
@@ -11360,7 +11680,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             return {
                 "escrow_id":          req.escrow_id,
                 "status":             "approved",
-                "verdict":            verdict_dict,
+                "verdict":            "PASS",
+                "verdict_detail":     verdict_dict,
+                "checks_run":         checks_run,
+                "ai":                 _ai_info,
+                "criteria_results":   _resp_criteria,
                 "model_used":         model_used,
                 "auto_finish_queued": True,
                 "message":            "Remedy passed — escrow released immediately.",
@@ -11404,7 +11728,11 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
             return {
                 "escrow_id":            req.escrow_id,
                 "status":               "pass_challenge_window",
-                "verdict":              verdict_dict,
+                "verdict":              "PASS",
+                "verdict_detail":       verdict_dict,
+                "checks_run":         checks_run,
+                "ai":                 _ai_info,
+                "criteria_results":   _resp_criteria,
                 "model_used":           model_used,
                 "challenge_deadline":   vault.challenge_deadline.isoformat(),
                 "challenge_window_hrs": challenge_hrs,
@@ -11544,8 +11872,10 @@ async def evaluate_work(req: AuditRequest, db: Session = Depends(get_db)):
         "verdict":              verdict_dict.get("verdict"),
         "score":                verdict_dict.get("score"),
         "summary":              verdict_dict.get("details"),
-        "criteria_results":     verdict_dict.get("criteria_results"),
+        "criteria_results":     _resp_criteria,
         "verdict_detail":       verdict_dict,
+        "checks_run":           checks_run,
+        "ai":                   _ai_info,
         "model_used":           model_used,
         "fulfillment":          revealed_fulfillment if expose_fulfillment else None,
         "condition":            vault.condition if is_approved else None,
@@ -16504,7 +16834,7 @@ async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str) -> 
     req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token)
     with SessionLocal() as _db:
         try:
-            result = await evaluate_work(req, _db)
+            result = await evaluate_work(req, request=None, db=_db)
         except HTTPException as _he:
             return {"verdict": "ERROR", "summary": str(_he.detail), "score": 0}
         except Exception as _ex:
@@ -16681,11 +17011,25 @@ async def run_testnet_flow(
                 logger.error(f"run_testnet_flow evaluate error: {_ev_err}")
                 verdict_result = {}
 
-        # 8. Wait up to 20s for release hash
+        # C9: HELD (AI selected but unavailable) — nothing released, no poll
+        if verdict_result.get("verdict") == "HELD":
+            return {
+                "escrow_id":           escrow_id,
+                "verdict":             "HELD",
+                "ai":                  verdict_result.get("ai"),
+                "summary":             verdict_result.get("summary", ""),
+                "escrow_tx_hash":      tx_hash,
+                "escrow_explorer_url": f"https://testnet.xrpl.org/transactions/{tx_hash}" if tx_hash else None,
+                "network":             "testnet",
+                "test_money":          True,
+                "note":                "Test XRP on XRPL Testnet — no real value.",
+            }
+
+        # 8. Wait up to 20s for release hash (only on PASS)
         step = "wait_release"
         release_hash = verdict_result.get("release_tx_hash") or verdict_result.get("auto_finish_hash")
         poll_url = f"https://mcp.cryptovault.co.uk/escrow/{escrow_id}"
-        if not release_hash:
+        if not release_hash and verdict_result.get("verdict") == "PASS":
             for _i in range(4):
                 await asyncio.sleep(5)
                 with SessionLocal() as _db:
@@ -16796,6 +17140,8 @@ async def testnet_demo(
     except asyncio.TimeoutError:
         raise HTTPException(status_code=429, detail={"error": "busy", "retry_after_s": 20})
 
+    _ip_tok = _current_request_ip.set(raw_ip)
+    _path_tok = _current_ai_path.set("demo")
     try:
         result = await run_testnet_flow(auto_submit=auto_submit, source="demo")
         # A1: count only successful runs
@@ -16808,6 +17154,8 @@ async def testnet_demo(
         _step = _parts[1].replace("step=", "") if len(_parts) > 1 else "unknown"
         raise HTTPException(status_code=502, detail={"error": "demo_failed", "step": _step, "retryable": True})
     finally:
+        _current_ai_path.reset(_path_tok)
+        _current_request_ip.reset(_ip_tok)
         _testnet_demo_semaphore.release()
 
 
@@ -17034,36 +17382,60 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
     if not sess:
         raise HTTPException(status_code=404, detail={"error": "session_not_found"})
 
-    # Set ContextVar so evaluate_work can pass IP to _free_ai_reserve
-    _current_request_ip.set(_client_ip(request))
-
-    work    = str(body.get("work", ""))[:500]
-    use_ai  = bool(body.get("use_ai", False))
+    work = str(body.get("work", ""))[:500]
+    # B2: the AI box must be a real boolean from the body (strings like "false" are not truthy)
+    _raw_box = body.get("use_ai", False)
+    ai_box = _raw_box is True or (isinstance(_raw_box, str) and _raw_box.strip().lower() in ("true", "1", "on"))
     escrow_id = sess.get("escrow_id")
     evaluate_token = sess.get("evaluate_token")
     if not escrow_id or not evaluate_token:
         raise HTTPException(status_code=409, detail={"error": "lock_first", "message": "Call /lock before /submit"})
 
-    # B2: Single UPDATE for require_ai_audit (only when changed)
-    if use_ai is not None:
-        with SessionLocal() as _db_upd:
+    # B2/B5: one read; non try/testnet vault → 409; no attempts left → 409 before any AI work;
+    # one conditional UPDATE only when the AI box actually changed.
+    with SessionLocal() as _db_upd:
+        _row = _db_upd.execute(
+            text("SELECT source, network, submission_count, max_submissions, require_ai_audit "
+                 "FROM escrow_vault WHERE escrow_id=:id"), {"id": escrow_id}
+        ).fetchone()
+        if not _row:
+            raise HTTPException(status_code=404, detail={"error": "vault_not_found"})
+        if _row[0] != "try" or _row[1] != "testnet":
+            raise HTTPException(status_code=409, detail={"error": "not_a_try_vault"})
+        if (_row[2] or 0) >= (_row[3] or 3):
+            raise HTTPException(status_code=409, detail={"error": "no_attempts_left"})
+        if _row[4] is None or bool(_row[4]) != ai_box:
             _db_upd.execute(
                 text("UPDATE escrow_vault SET require_ai_audit=:v WHERE escrow_id=:id "
                      "AND source='try' AND network='testnet' "
                      "AND (require_ai_audit IS NULL OR require_ai_audit <> :v)"),
-                {"v": use_ai, "id": escrow_id}
+                {"v": ai_box, "id": escrow_id}
             )
             _db_upd.commit()
 
+    # B3: per-request ContextVars, always reset
+    _ip_tok = _current_request_ip.set(_client_ip(request))
+    _path_tok = _current_ai_path.set("try")
     try:
         verdict_data = await _evaluate_internal(escrow_id, work, evaluate_token)
     except Exception as _ev_err:
-        logger.error(f"testnet_try_submit evaluate error: {_ev_err}")
-        verdict_data = {}
+        logger.error(f"testnet_try_submit evaluate error: {type(_ev_err).__name__}")
+        verdict_data = {"verdict": "ERROR"}
+    finally:
+        _current_ai_path.reset(_path_tok)
+        _current_request_ip.reset(_ip_tok)
 
-    final_verdict = verdict_data.get("verdict", "UNKNOWN")
+    _raw_verdict = verdict_data.get("verdict")
+    if isinstance(_raw_verdict, dict):  # defensive: never expose a dict verdict
+        _raw_verdict = _raw_verdict.get("verdict")
+    if _raw_verdict in ("PASS", "FAIL", "HELD"):
+        final_verdict = _raw_verdict
+    elif _raw_verdict == "INCONCLUSIVE":
+        final_verdict = "HELD"   # nothing released, attempt not consumed (first 3)
+    else:
+        final_verdict = "ERROR"
 
-    # Only poll for release when the verdict was PASS
+    # B5: release poll only on PASS
     release_hash = None
     if final_verdict == "PASS":
         release_hash = verdict_data.get("release_tx_hash") or verdict_data.get("auto_finish_hash")
@@ -17077,32 +17449,63 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
                         break
 
     sess["step"] = "submitted"
+    sess["verdict"] = final_verdict
     sess["timeline"].append({"at": datetime.now(timezone.utc).isoformat(), "label": "Work submitted"})
     if release_hash:
         sess["timeline"].append({"at": datetime.now(timezone.utc).isoformat(),
                                  "label": "Payment released",
                                  "explorer_url": f"https://testnet.xrpl.org/transactions/{release_hash}"})
 
-    criteria = verdict_data.get("criteria_results", [])
+    # B4: criteria in the /try shape
+    criteria = []
+    for _cr in (verdict_data.get("criteria_results") or []):
+        if not isinstance(_cr, dict):
+            continue
+        _item = {
+            "id":        _cr.get("criterion_id"),
+            "type":      "ai" if _cr.get("type") == "ai" else "code",
+            "result":    _cr.get("verdict"),
+            "reasoning": _cr.get("reasoning", ""),
+        }
+        if _cr.get("type") == "ai":
+            _item["model"] = _cr.get("model")
+            _item["cached"] = bool(_cr.get("cached"))
+        criteria.append(_item)
 
-    # Build ai field from verdict_data for HELD responses
-    ai_field = verdict_data.get("ai")
-    if isinstance(ai_field, dict) and "status" not in ai_field:
-        ai_field = None
+    _ev_ai = verdict_data.get("ai") if isinstance(verdict_data.get("ai"), dict) else None
+    if _ev_ai:
+        ai_field = {
+            "requested": bool(_ev_ai.get("requested", ai_box)),
+            "status":    _ev_ai.get("status"),
+            "model":     _ev_ai.get("model"),
+            "message":   _ev_ai.get("message"),
+        }
+        if _raw_verdict == "INCONCLUSIVE":
+            ai_field["message"] = verdict_data.get("guidance") or ai_field["message"]
+    else:
+        ai_field = {
+            "requested": ai_box,
+            "status":    "unavailable" if ai_box else "not_requested",
+            "model":     None,
+            "message":   _FREE_AI_MESSAGES["unavailable"] if ai_box else None,
+        }
 
-    return {
-        "verdict":          final_verdict,
-        "score":            verdict_data.get("score"),
-        "summary":          verdict_data.get("summary", ""),
-        "criteria":         criteria,
-        "ai":               ai_field,
+    resp = {
+        "verdict":            final_verdict,
+        "score":              verdict_data.get("score"),
+        "summary":            verdict_data.get("summary", "") if final_verdict != "ERROR" else "The referee could not evaluate this submission.",
+        "checks_run":         verdict_data.get("checks_run") or [],
+        "criteria":           criteria,
+        "ai":                 ai_field,
         "attempts_remaining": verdict_data.get("attempts_remaining", 0),
-        "release_tx_hash":  release_hash,
-        "release_explorer_url": f"https://testnet.xrpl.org/transactions/{release_hash}" if release_hash else None,
-        "release_status":   "released" if release_hash else ("pending" if final_verdict == "PASS" else "not_applicable"),
         "test_money": True,
         "note": "Test XRP on XRPL Testnet — no real value.",
     }
+    if final_verdict == "PASS":
+        resp["release_tx_hash"] = release_hash
+        resp["release_explorer_url"] = f"https://testnet.xrpl.org/transactions/{release_hash}" if release_hash else None
+        resp["release_status"] = "released" if release_hash else "pending"
+    return resp
 
 
 @app.get("/testnet/try/{sid}", tags=["testnet-try"])
@@ -17269,30 +17672,41 @@ async def stats_testnet(days: int = 1, db: Session = Depends(get_db)):
 
 
 @app.get("/stats/free-ai", tags=["stats"])
-async def stats_free_ai(days: int = 7, request: Request = None):
-    """v7.0.7: Per-day free AI usage stats (global + per-path, no IP rows)."""
+async def stats_free_ai(request: Request, days: int = 7):
+    """v7.0.8 E2: Per-day free AI usage stats (global + per-path, never IP rows). SELECT only."""
+    _rl_key = "stats_free_ai:" + hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16]
+    if not _check_rate_limit(_rl_key):
+        return JSONResponse(status_code=429, content={"error": "rate_limited"})
+    if not _db_available:
+        return JSONResponse(status_code=503, content={"error": "db_unavailable"})
     days = min(max(1, days), 31)
-    since = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
-    with SessionLocal() as db:
-        rows = db.execute(text(
-            "SELECT day, scope, calls, failed, prompt_tokens, output_tokens, thought_tokens "
-            "FROM free_ai_usage "
-            "WHERE day >= :since AND scope NOT LIKE 'ip_%' "
-            "ORDER BY day DESC, scope"
-        ), {"since": since}).fetchall()
-    result = {}
+    today = datetime.now(timezone.utc).date()
+    day_list = [(today - timedelta(days=i)).isoformat() for i in range(days)]
+    try:
+        with SessionLocal() as db:
+            rows = db.execute(text(
+                "SELECT day, scope, calls, failed, prompt_tokens, output_tokens, thought_tokens "
+                "FROM free_ai_usage "
+                "WHERE day >= :since AND scope NOT LIKE 'ip\\_%' ESCAPE '\\' "
+                "ORDER BY day DESC, scope"
+            ), {"since": day_list[-1]}).fetchall()
+    except Exception as _e:
+        logger.warning(f"stats_free_ai query failed: {type(_e).__name__}")
+        return JSONResponse(status_code=503, content={"error": "db_unavailable"})
+    by_day = {d: {"day": d, "calls": 0, "failed": 0, "prompt_tokens": 0,
+                  "output_tokens": 0, "thought_tokens": 0, "paths": {}} for d in day_list}
     for row in rows:
-        day = str(row[0])
-        if day not in result:
-            result[day] = {"calls": 0, "failed": 0, "prompt_tokens": 0,
-                           "output_tokens": 0, "thought_tokens": 0, "paths": {}}
-        scope = row[1]
+        day = str(row[0])[:10]
+        scope = str(row[1])
+        if day not in by_day or scope.startswith("ip"):
+            continue
         if scope == "global":
-            result[day].update({"calls": row[2], "failed": row[3],
-                                "prompt_tokens": row[4], "output_tokens": row[5], "thought_tokens": row[6]})
+            by_day[day].update({"calls": int(row[2] or 0), "failed": int(row[3] or 0),
+                                "prompt_tokens": int(row[4] or 0), "output_tokens": int(row[5] or 0),
+                                "thought_tokens": int(row[6] or 0)})
         elif scope.startswith("path:"):
-            result[day]["paths"][scope[5:]] = {"calls": row[2], "failed": row[3]}
-    return result
+            by_day[day]["paths"][scope[5:]] = {"calls": int(row[2] or 0), "failed": int(row[3] or 0)}
+    return {"days": [by_day[d] for d in day_list], "daily_cap": _free_ai_daily_cap()}
 
 
 # ---------------------------------------------------------------------------

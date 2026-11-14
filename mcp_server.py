@@ -634,11 +634,20 @@ async def evaluate_escrow_work(
     Response shape on INCONCLUSIVE (attempt NOT consumed):
 
         {
-          "status":   "inconclusive",
-          "verdict":  {...},
-          "guidance": "what to fix before resubmitting",
-          "attempts_used": 0
+          "status":         "inconclusive",
+          "verdict":        "INCONCLUSIVE",
+          "verdict_detail": {...},
+          "guidance":       "what to fix before resubmitting",
+          "attempts_used":  0
         }
+
+    Response shape on HELD (testnet only — AI selected but capped/disabled/unavailable;
+    nothing released, attempt NOT consumed):
+
+        {"status": "held", "verdict": "HELD", "ai": {"status": "capped", "message": "..."}}
+
+    Every response also carries "verdict_detail" (full verdict object), "checks_run",
+    "ai" {requested, status, model, message} and "criteria_results" with a "type" per row.
 
     Attempt limits: workers get 3 attempts by default. Buyers can raise this via
     max_submissions (1–10) on create_escrow_vault / hire_and_pay — each slot above

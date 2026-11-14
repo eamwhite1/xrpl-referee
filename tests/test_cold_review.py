@@ -50,11 +50,11 @@ def test_fees_includes_rlusd_escrow_available():
 # ---------------------------------------------------------------------------
 
 def test_version_headers_present():
-    """mcp_smithery_compat middleware should set X-AgentTrust-Version and X-AgentTrust-Server to 7.0.1."""
+    """mcp_smithery_compat middleware should set X-AgentTrust-Version and X-AgentTrust-Server to APP_VERSION."""
     import inspect
     import referee as ref
     src = inspect.getsource(ref.mcp_smithery_compat)
-    assert '"7.0.1"' in src
+    assert "APP_VERSION" in src
     assert "X-AgentTrust-Server" in src
 
 
