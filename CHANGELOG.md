@@ -6,6 +6,11 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.9] - 2026-11-14
+### Fixed
+- /try lock: wait (up to 20 s) for both faucet-funded test wallets to appear on a validated ledger before building the EscrowCreate. The faucet returns 200 when it submits the funding, not when it is validated, so a quick lock failed with a 502 (L1, L2)
+- If the wallets still aren't funded, /try lock returns 503 `wallets_not_ready` with a retry message, submits nothing, and keeps the session usable (L3)
+
 ## [7.0.8] - 2026-11-14
 ### Changed
 - evaluate_work: code gates always run first on a private copy of the criteria; a gate FAIL consumes the attempt and makes no AI call or free-AI DB write (T1, T22)
