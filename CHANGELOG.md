@@ -6,6 +6,11 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.10] - 2026-11-14
+### Changed
+- `checks_run` uses stable names: `proof_nft` / `proof_domain` / `proof_vc`, `code_<gate>` (e.g. `code_exact_match`, once per gate type) and a single `ai_referee` when the AI judged the work (T2, T8, T26)
+- `/testnet/demo` returns `ai`, `checks_run` and `criteria_results` on PASS/FAIL, not only on HELD (T26)
+
 ## [7.0.9] - 2026-11-14
 ### Fixed
 - /try lock: wait (up to 20 s) for both faucet-funded test wallets to appear on a validated ledger before building the EscrowCreate. The faucet returns 200 when it submits the funding, not when it is validated, so a quick lock failed with a 502 (L1, L2)
