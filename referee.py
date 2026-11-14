@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.7"
+APP_VERSION = "7.0.8"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -3628,18 +3628,6 @@ async def _free_ai_complete(reservation_id: str, path: str,
             db.commit()
     except Exception as e:
         logger.warning(f"_free_ai_complete error: {e}")
-
-
-# Legacy shims — keep existing callers working during transition
-def _free_ai_allow(path: str, ip) -> tuple:
-    """Synchronous shim: returns (True, 'allowed') always; real gating is in _free_ai_reserve."""
-    if os.getenv("TRY_AI_ENABLED", "true").lower() != "true":
-        return False, "disabled"
-    return True, "allowed"
-
-
-def _free_ai_record(path: str, ip):
-    pass  # accounting now done in _free_ai_reserve / _free_ai_complete
 
 
 def _free_ai_record_cache_hit():
@@ -16511,9 +16499,9 @@ async def _faucet_fund(addr: str, timeout: float = 30.0) -> bool:
         return False
 
 
-async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str, use_ai: bool = True) -> dict:
+async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str) -> dict:
     """Call evaluate_work in-process — no loopback HTTP."""
-    req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token, use_ai=use_ai)
+    req = AuditRequest(escrow_id=escrow_id, work=work, evaluate_token=evaluate_token)
     with SessionLocal() as _db:
         try:
             result = await evaluate_work(req, _db)
@@ -16541,7 +16529,6 @@ async def run_testnet_flow(
     cancel_after_hrs: float = 1.0,
     buyer_seed_override: str = None,
     worker_seed_override: str = None,
-    use_ai: bool = True,
 ) -> dict:
     """
     A1: Internal async service for testnet escrow flow — no loopback HTTP.
@@ -16689,7 +16676,7 @@ async def run_testnet_flow(
         if auto_submit:
             step = "evaluate"
             try:
-                verdict_result = await _evaluate_internal(escrow_id, work, evaluate_token, use_ai=use_ai)
+                verdict_result = await _evaluate_internal(escrow_id, work, evaluate_token)
             except Exception as _ev_err:
                 logger.error(f"run_testnet_flow evaluate error: {_ev_err}")
                 verdict_result = {}
@@ -16800,8 +16787,6 @@ async def testnet_demo(
     if count >= 10:
         raise HTTPException(status_code=429, detail={"error": "demo_limit_reached", "reason": "10 testnet demos per IP per day"})
 
-    _demo_ai_allowed, _ = _free_ai_allow("demo", raw_ip)
-
     if not XRPL_TESTNET_SEED:
         raise HTTPException(status_code=503, detail={"error": "testnet_unavailable", "reason": "XRPL_TESTNET_SEED not configured"})
 
@@ -16812,11 +16797,9 @@ async def testnet_demo(
         raise HTTPException(status_code=429, detail={"error": "busy", "retry_after_s": 20})
 
     try:
-        result = await run_testnet_flow(auto_submit=auto_submit, source="demo", use_ai=_demo_ai_allowed)
+        result = await run_testnet_flow(auto_submit=auto_submit, source="demo")
         # A1: count only successful runs
         _testnet_demo_counter[day_key] = count + 1
-        if _demo_ai_allowed:
-            _free_ai_record("demo", raw_ip)
         # Cache for idempotency (10s)
         _testnet_demo_idempotency[_idem_key] = (result, datetime.now(timezone.utc).timestamp() + 10)
         return result
@@ -17042,57 +17025,6 @@ async def testnet_try_lock(sid: str):
     }
 
 
-async def _try_ai_judge(work: str, ip: str) -> dict:
-    """
-    Call Gemini Flash to judge whether the /try work passes _TESTNET_TRY_TASK.
-    Returns {"verdict": "PASS"|"FAIL"|"SKIP", "reason": str, "model": str, "cached": bool}.
-    Flash-only, thinkingBudget=0, 24h result cache, per-IP rate limit enforced by _free_ai_allow.
-    """
-    cache_key = _try_ai_cache_key(TRY_AI_MODEL, _TESTNET_TRY_TASK, work)
-    cached = _try_ai_cache_get(cache_key)
-    if cached:
-        _free_ai_record_cache_hit()
-        return {**cached, "cached": True}
-
-    allowed, status = _free_ai_allow("try", ip)
-    if not allowed:
-        return {"verdict": "SKIP", "reason": f"free AI quota reached ({status})", "model": TRY_AI_MODEL, "cached": False}
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return {"verdict": "SKIP", "reason": "AI judge not configured", "model": TRY_AI_MODEL, "cached": False}
-
-    prompt = (
-        f"Task: {_TESTNET_TRY_TASK}\n\n"
-        f"Worker submission:\n{work}\n\n"
-        "Reply with valid JSON: {\"verdict\": \"PASS\" or \"FAIL\", \"reason\": \"one sentence\"}"
-    )
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{TRY_AI_MODEL}:generateContent"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as _c:
-            r = await _c.post(url, json=payload, headers={"x-goog-api-key": api_key})
-        if r.status_code != 200:
-            return {"verdict": "SKIP", "reason": f"AI HTTP {r.status_code}", "model": TRY_AI_MODEL, "cached": False}
-        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        parsed = json.loads(raw)
-        verdict = "PASS" if str(parsed.get("verdict", "")).upper() == "PASS" else "FAIL"
-        reason = str(parsed.get("reason", ""))[:300]
-        result = {"verdict": verdict, "reason": reason, "model": TRY_AI_MODEL, "cached": False}
-        _try_ai_cache_set(cache_key, result)
-        _free_ai_record("try", ip)
-        return result
-    except Exception as _e:
-        logger.warning(f"_try_ai_judge error: {_e}")
-        return {"verdict": "SKIP", "reason": "AI judge error", "model": TRY_AI_MODEL, "cached": False}
-
 
 @app.post("/testnet/try/{sid}/submit", tags=["testnet-try"])
 async def testnet_try_submit(request: Request, sid: str, body: dict = Body(default={})):
@@ -17112,11 +17044,15 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
     if not escrow_id or not evaluate_token:
         raise HTTPException(status_code=409, detail={"error": "lock_first", "message": "Call /lock before /submit"})
 
-    # Update vault require_ai_audit to match use_ai flag
-    with SessionLocal() as _db_upd:
-        _vupd = _db_upd.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
-        if _vupd and bool(_vupd.require_ai_audit) != use_ai:
-            _vupd.require_ai_audit = use_ai
+    # B2: Single UPDATE for require_ai_audit (only when changed)
+    if use_ai is not None:
+        with SessionLocal() as _db_upd:
+            _db_upd.execute(
+                text("UPDATE escrow_vault SET require_ai_audit=:v WHERE escrow_id=:id "
+                     "AND source='try' AND network='testnet' "
+                     "AND (require_ai_audit IS NULL OR require_ai_audit <> :v)"),
+                {"v": use_ai, "id": escrow_id}
+            )
             _db_upd.commit()
 
     try:
