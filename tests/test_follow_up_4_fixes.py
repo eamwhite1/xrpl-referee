@@ -44,7 +44,7 @@ def test_list_marketplace_jobs_next_step():
         assert "create_testnet_wallet" in result["next_step"]
         assert "hire_and_pay" in result["next_step"]
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
 
 @respx.mock
@@ -69,7 +69,7 @@ def test_list_open_jobs_next_step():
         assert "next_step" in result
         assert "create_testnet_wallet" in result["next_step"]
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
 
 @respx.mock
@@ -94,7 +94,7 @@ def test_view_job_next_step():
         assert "next_step" in result
         assert "hire_and_pay" in result["next_step"]
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,10 @@ def test_server_json_title_and_domain():
     data = json.loads(path.read_text())
     assert data.get("title") == "AgentTrust XRPL"
     assert "agenttrustxrpl.com" in data.get("websiteUrl", "")
-    assert data.get("version") == "7.0.2"
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    from referee import APP_VERSION
+    assert data.get("version") == APP_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +134,21 @@ def test_server_json_title_and_domain():
 def test_stats_testnet_excludes_internal():
     """GET /stats/testnet must return outside_vaults counting only non-internal vaults."""
     client = _get_client()
-    resp = client.get("/stats/testnet")
+    import referee as ref
+    from sqlalchemy import create_engine, text as _t
+    from sqlalchemy.orm import sessionmaker
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=__import__("sqlalchemy.pool", fromlist=["StaticPool"]).StaticPool)
+    with eng.connect() as c:
+        c.execute(_t("CREATE TABLE escrow_vault (escrow_id TEXT, network TEXT, is_internal BOOLEAN, "
+                     "buyer_address TEXT, status TEXT, source TEXT, created_at TIMESTAMP)"))
+        c.commit()
+    _orig = ref.SessionLocal
+    ref.SessionLocal = sessionmaker(bind=eng)
+    try:
+        resp = client.get("/stats/testnet")
+    finally:
+        ref.SessionLocal = _orig
     # Should succeed (even with empty DB) and return outside_vaults key
     assert resp.status_code == 200
     data = resp.json()

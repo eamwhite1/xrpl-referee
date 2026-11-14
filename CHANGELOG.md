@@ -8,29 +8,27 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ## [7.0.8] - 2026-11-14
 ### Changed
-- Unified evaluation pipeline: code gates always run before AI; `skip_ai` now based on determinism, not proof-gate status (T8, T9)
-- HELD response helper replaces 503 on testnet when AI is capped/disabled/unavailable (T5, T6, T7, T12)
-- `/try` B2 single UPDATE for `require_ai_audit` — no SELECT+commit round trip (T22)
-- Free-AI guard: `_free_ai_reservations` dict tracks active reservations; `_free_ai_complete` uses single SQL UPDATE (T15, T16)
-- Testnet AI call: `free_tier=True` path — `thinkingBudget=0`, `maxOutputTokens=512`, 15s timeout, single attempt (T14)
-- Cache hit calls `_free_ai_mirror_cache_hit()` and returns `ai.status "cached"` (T18)
-- `/testnet/demo` HELD on cap/disabled — HTTP 200, no release (T12)
-- Challenge review: one AI call, no retry on testnet; capped/disabled → `REVIEW_INCONCLUSIVE` (T13)
-- `/stats/free-ai` rate-limited, DB-guarded, zero-filled days, never returns `ip_` scope rows (T21)
-- `criteria_results` shape standardised: `criterion_id`, `type`, `verdict`, `reasoning`, `model?`, `cached?` (T2, T3)
-- Synthetic `task` criterion added when `require_ai_audit=True` and no non-code criterion present (T10)
-- ContextVars `_current_request_ip` and `_current_ai_path` set in `/try`, `/demo`, `POST /evaluate` (T17)
-### Fixed
-- `_try_ai_judge` double-call eliminated — evaluate_work is the single AI path on `/try` (T2)
-- `use_ai` plumbing removed from `_evaluate_internal`, `run_testnet_flow`, `AuditRequest` (T25)
-- Per-buyer testnet counter cap (5/day) now returns HELD instead of raising 429 (T6)
-- `attemptsRemaining` not decremented on HELD responses; `submission_count` not written (T5, T6, T7)
+- evaluate_work: code gates always run first on a private copy of the criteria; a gate FAIL consumes the attempt and makes no AI call or free-AI DB write (T1, T22)
+- AI is skipped only when every check is a deterministic proof/code gate and the AI box is off; PASS then reports `model_used "none (deterministic gates)"` (T8, T9)
+- AI selected with code-only criteria: a synthetic `task` criterion with the verbatim server task is judged too, and every criterion must PASS (T2, T3, T10)
+- Every evaluate_work result now has a string `verdict` (PASS/FAIL/HELD/INCONCLUSIVE), `verdict_detail` (the old dict), `checks_run`, `ai` and `criteria_results` with `type` (T2, T4, T9)
+- Testnet: AI selected but capped/disabled/unavailable (incl. 500, timeout, bad JSON, MAX_TOKENS, missing criterion) returns HTTP 200 HELD; nothing released, attempt not consumed (T5, T6, T7)
+- Mainnet: provider failure or a missing AI criterion returns 503 and never PASS (T10)
+- Testnet free-tier call: TRY_AI_MODEL only (no Pro, even on INCONCLUSIVE/attempt 3), `maxOutputTokens` 512 (env TESTNET_AI_MAX_OUTPUT_TOKENS), `thinkingConfig.thinkingLevel "minimal"` (env TESTNET_AI_THINKING_LEVEL), 15 s timeout, one attempt (T14)
+- `/try` submit: one AI call at most; response `verdict` PASS/FAIL/HELD/ERROR, `criteria` typed code/ai, `ai.status`; release fields only on PASS; the require_ai_audit UPDATE runs only when the box changes (T1, T2, T8, T22)
+- Testnet evaluate path caches valid PASS/FAIL AI results (never errors or INCONCLUSIVE); a hit makes no provider call and no guard DB statement and reports `ai.status "cached"` (T18)
+- Free-AI guard: reservations carry their own day/path; completion is one UPDATE, awaited in `finally` on every outcome, and records tokens/failures (T2, T7, T19)
+- Per-client limits use the last X-Forwarded-For hop (5/hour, 20/day); public POST /evaluate passes it through (T17)
+- Daily cap is atomic under concurrency and survives a process restart (T15, T16)
+- Previous UTC day's summary is logged once on the first reservation of a new day, with no IP or hash (T19)
+- `/testnet/demo` returns 200 HELD with no release when the free AI is capped (T12)
+- Testnet challenge review: one free-tier call, no retry, at most one review per vault; capped gives REVIEW_INCONCLUSIVE (T13)
+- `/stats/free-ai`: rate-limited, 503 when the DB is unavailable, zero-filled days, never returns `ip_` rows (T21)
+- `/status` and `/health` stay DB-free; `calls_today` is an int (T20)
 ### Removed
-- `_try_ai_judge` function deleted (T25)
-- `_free_ai_allow` shim deleted (T25)
-- `_free_ai_record` shim deleted (T25)
-- `use_ai` field removed from `AuditRequest` model (T25)
-- `try/index.html` from xrpl-referee repo (F1)
+- `_try_ai_judge`, `_free_ai_allow`, `_free_ai_record` (T25)
+### Other
+- Version 7.0.8 in referee.py and server.json (T24); domain normalisation regression (T23)
 
 ---
 
