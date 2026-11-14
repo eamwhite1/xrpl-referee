@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.9"
+APP_VERSION = "7.0.10"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -11284,8 +11284,10 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
         {"criterion_id": f"proof:{r[0].lower()}", "type": "proof", "verdict": "PASS", "reasoning": str(r[2])[:500]}
         for r in proof_results if r[1]
     ]
-    checks_run = [f"proof:{r[0].lower()}" for r in proof_results if r[1]]
-    checks_run += [f"code:{c['id']}" for c in eval_criteria if c.get("type") == "code" and c.get("gate")]
+    checks_run = [f"proof_{r[0].lower()}" for r in proof_results if r[1]]
+    for _c in eval_criteria:
+        if _c.get("type") == "code" and _c.get("gate") and f"code_{_c['gate']}" not in checks_run:
+            checks_run.append(f"code_{_c['gate']}")
 
     # A2: code gates ALWAYS run first, before any skip/AI decision
     gate_failures = await asyncio.to_thread(_execute_code_gates, work_with_nft, eval_criteria)
@@ -11372,14 +11374,11 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
         logger.info(f"✅ AI SKIPPED (deterministic gates) for {req.escrow_id}")
     else:
         # A4: AI selected but only code criteria → judge the server-side task as a synthetic criterion
-        _synthetic_ids: set = set()
         if vault.require_ai_audit and not any(c.get("type") != "code" for c in eval_criteria):
             eval_criteria.append({"id": "task", "type": "judgment", "description": vault.task_description or "Evaluate the submitted work."})
-            _synthetic_ids.add("task")
-            checks_run.append("ai:task")
         _non_code_ids = {c["id"] for c in eval_criteria if c.get("type") != "code"}
-        if not _synthetic_ids:
-            checks_run += [f"ai:{cid}" for cid in sorted(_non_code_ids)]
+        if _non_code_ids:
+            checks_run.append("ai_referee")
 
         collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
         use_consensus = bool(vault.require_consensus) and not _is_testnet
@@ -17068,6 +17067,9 @@ async def run_testnet_flow(
             "escrow_id":            escrow_id,
             "verdict":              verdict_result.get("verdict", "UNKNOWN"),
             "score":                verdict_result.get("score"),
+            "ai":                   verdict_result.get("ai"),
+            "checks_run":           verdict_result.get("checks_run") or [],
+            "criteria_results":     verdict_result.get("criteria_results") or [],
             "summary":              verdict_result.get("summary", ""),
             "escrow_tx":            tx_hash,
             "escrow_tx_hash":       tx_hash,
