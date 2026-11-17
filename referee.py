@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.10"
+APP_VERSION = "7.0.11"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -3172,6 +3172,7 @@ def run_migrations():
         )""",
         "CREATE INDEX IF NOT EXISTS kyc_record_wallet_idx ON kyc_record (wallet_address)",
         # trusted issuer registry extended fields
+        "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS wallet_addresses TEXT",
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS contact_email VARCHAR",
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS lei            VARCHAR",
         "ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS nft_types      VARCHAR",
@@ -5945,14 +5946,14 @@ async def extract_and_verify_xrpl_hashes(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 # 11c. XRPL NFT OWNERSHIP VERIFICATION
 # ---------------------------------------------------------------------------
-async def verify_nft_ownership(wallet_address: str, nft_token_id: str, required_issuer: str = None, required_metadata: dict = None) -> dict:
+async def verify_nft_ownership(wallet_address: str, nft_token_id: str, required_issuer: str = None, required_metadata: dict = None, xrpl_url: str = None) -> dict:
     """
     Verify an NFT exists on XRPL, is owned by wallet_address,
     optionally issued by required_issuer, and optionally contains required_metadata fields.
     Returns dict with verified bool and detail string.
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(XRPL_URL, json={
+        res = await client.post(xrpl_url or XRPL_URL, json={
             "method": "account_nfts",
             "params": [{"account": wallet_address, "limit": 400}]
         })
@@ -6041,15 +6042,16 @@ async def _verify_domain_via_bithomp(wallet_address: str, expected_domain: str =
         return None
 
 
-async def verify_domain_ownership(wallet_address: str, expected_domain: str = None) -> dict:
-    # Try Bithomp first
-    bithomp_result = await _verify_domain_via_bithomp(wallet_address, expected_domain)
-    if bithomp_result is not None:
-        return bithomp_result
+async def verify_domain_ownership(wallet_address: str, expected_domain: str = None, xrpl_url: str = None) -> dict:
+    # Bithomp indexes mainnet only, so it is skipped when a non-mainnet server is requested.
+    if xrpl_url is None or xrpl_url == XRPL_URL:
+        bithomp_result = await _verify_domain_via_bithomp(wallet_address, expected_domain)
+        if bithomp_result is not None:
+            return bithomp_result
 
     # Fallback: live TOML check
     async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(XRPL_URL, json={
+        res = await client.post(xrpl_url or XRPL_URL, json={
             "method": "account_info",
             "params": [{"account": wallet_address, "ledger_index": "current"}]
         })
@@ -11140,11 +11142,16 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
     proof_policy = (vault.proof_policy or "ALL").upper()
     proof_results = []   # list of (name, passed, note)
 
+    # Proof gates query the same network the vault lives on.
+    _proof_xrpl_url = XRPL_TESTNET_URL if (getattr(vault, "network", None) or "mainnet") == "testnet" else XRPL_URL
+
     # NFT proof
     if vault.require_nft_proof or vault.required_nft_issuer:
         if not req.nft_token_id:
             proof_results.append(("NFT", False, "NFT Token ID not provided — seller must supply an NFT Token ID as proof."))
         else:
+            if req.nft_wallet and req.nft_wallet not in (vault.worker_address, vault.buyer_address):
+                raise HTTPException(status_code=400, detail="nft_wallet must be the worker or buyer wallet")
             nft_wallet = req.nft_wallet or vault.worker_address
             required_meta = None
             if vault.required_nft_metadata:
@@ -11155,19 +11162,26 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
             # Resolve required_issuer: if it matches an issuer in the registry,
             # accept NFTs from ANY of that issuer's registered wallets.
             resolved_issuer = vault.required_nft_issuer
+            _nft_multi_handled = False
             try:
-                reg_issuer = db.query(NftIssuer).filter(
-                    NftIssuer.wallet_addresses.contains(vault.required_nft_issuer) |
-                    (NftIssuer.wallet_address == vault.required_nft_issuer)
-                ).first()
-                if reg_issuer and len(reg_issuer.all_wallets()) > 1:
+                _reg_wallets = []
+                if vault.required_nft_issuer:
+                    # Own short read-only session: a failed registry query must never abort the request's transaction.
+                    with SessionLocal() as _rdb:
+                        reg_issuer = _rdb.query(NftIssuer).filter(
+                            NftIssuer.wallet_addresses.contains(vault.required_nft_issuer) |
+                            (NftIssuer.wallet_address == vault.required_nft_issuer)
+                        ).first()
+                        _reg_wallets = reg_issuer.all_wallets() if reg_issuer else []
+                if len(_reg_wallets) > 1:
                     # Try each wallet; use first that passes
-                    for candidate in reg_issuer.all_wallets():
+                    for candidate in _reg_wallets:
                         _r = await verify_nft_ownership(
                             wallet_address=nft_wallet,
                             nft_token_id=req.nft_token_id,
                             required_issuer=candidate,
                             required_metadata=required_meta,
+                            xrpl_url=_proof_xrpl_url,
                         )
                         if _r["verified"]:
                             nft_result = _r
@@ -11180,30 +11194,32 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
                         proof_results.append(("NFT", True, note))
                     else:
                         proof_results.append(("NFT", False, f"NFT proof failed: {nft_result['detail']}"))
-                    resolved_issuer = None  # already handled
-            except Exception:
-                pass
+                    _nft_multi_handled = True
+            except Exception as _e:
+                logger.warning("nft_issuer lookup failed: %s", type(_e).__name__)
 
-            if resolved_issuer is not None:
+            if not _nft_multi_handled:
                 nft_result = await verify_nft_ownership(
                     wallet_address=nft_wallet,
                     nft_token_id=req.nft_token_id,
                     required_issuer=resolved_issuer,
                     required_metadata=required_meta,
+                    xrpl_url=_proof_xrpl_url,
                 )
             if nft_result["verified"]:
                 # Enrich with registry name so the AI sees "Maersk Line" not just rXXX...
                 issuer_wallet = nft_result.get("issuer", "")
                 issuer_label  = issuer_wallet
                 try:
-                    reg = db.query(NftIssuer).filter(
-                        NftIssuer.wallet_addresses.contains(issuer_wallet) |
-                        (NftIssuer.wallet_address == issuer_wallet)
-                    ).first()
-                    if reg:
-                        issuer_label = f"{reg.name} ({issuer_wallet}) [AgentTrust verified issuer]"
-                except Exception:
-                    pass
+                    with SessionLocal() as _rdb:
+                        reg = _rdb.query(NftIssuer).filter(
+                            NftIssuer.wallet_addresses.contains(issuer_wallet) |
+                            (NftIssuer.wallet_address == issuer_wallet)
+                        ).first()
+                        if reg:
+                            issuer_label = f"{reg.name} ({issuer_wallet}) [AgentTrust verified issuer]"
+                except Exception as _e:
+                    logger.warning("nft_issuer lookup failed: %s", type(_e).__name__)
                 note = (
                     f"🔗 NFT PROOF VERIFIED ON-CHAIN\n"
                     f"  Token ID : {req.nft_token_id}\n"
@@ -11218,7 +11234,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
     # Domain proof — "ANY" means any verified domain passes; specific value restricts to that domain
     if vault.required_domain:
         expected = None if vault.required_domain == "ANY" else vault.required_domain
-        domain_result = await verify_domain_ownership(vault.worker_address, expected)
+        domain_result = await verify_domain_ownership(vault.worker_address, expected, xrpl_url=_proof_xrpl_url)
         if domain_result["verified"]:
             note = f"🌐 DOMAIN VERIFIED: {domain_result['detail']}"
             proof_results.append(("Domain", True, note))
@@ -11290,7 +11306,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
             checks_run.append(f"code_{_c['gate']}")
 
     # A2: code gates ALWAYS run first, before any skip/AI decision
-    gate_failures = await asyncio.to_thread(_execute_code_gates, work_with_nft, eval_criteria)
+    gate_failures = await asyncio.to_thread(_execute_code_gates, req.work, eval_criteria)
     _gate_fail_map = {f["criterion_id"]: f.get("reason", "") for f in (gate_failures or [])}
     _code_rows = [
         {
@@ -11776,8 +11792,10 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
             try:
                 await asyncio.wait_for(asyncio.shield(finish_task), timeout=3.0)
                 db.refresh(vault)
-            except (asyncio.TimeoutError, Exception):
+            except asyncio.TimeoutError:
                 pass
+            except Exception as _e:
+                logger.warning("auto-finish wait/refresh failed for %s: %s", req.escrow_id, type(_e).__name__)
         else:
             logger.warning(
                 f"⚠️ AUTO-FINISH skipped for {req.escrow_id}: "

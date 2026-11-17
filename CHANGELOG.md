@@ -6,6 +6,16 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.11] - 2026-11-17
+### Fixed
+- Vaults with an NFT proof gate no longer return HTTP 500 on /evaluate. The registry lookups (`nft_issuer`) in `evaluate_work` ran on the request's own database session inside `except: pass`; on Postgres a failed statement aborts the transaction, so the later commit failed with `InFailedSqlTransaction`. Both lookups now use their own short read-only session and log `nft_issuer lookup failed: <ExceptionType>` (T29)
+- Root cause of the failed lookup: the `NftIssuer` model has a `wallet_addresses` column that no migration ever created, so the query raised an undefined-column error on the live table. `run_migrations` now adds `nft_issuer.wallet_addresses`; every other model column was already migrated (T33)
+- A vault that requires an NFT but names no issuer no longer fails with an unassigned-variable error (T27b)
+- Code gates (`exact_match`, `sha256_of`, `regex`) check the worker's raw work. Previously the proof notes were appended first, so they could never pass once a proof gate had passed (T27, T28)
+- NFT and domain proofs query the vault's own network: testnet vaults use `XRPL_TESTNET_URL`, mainnet vaults `XRPL_URL`. Bithomp, which indexes mainnet only, is skipped off mainnet (T30)
+- `nft_wallet` must be the vault's worker or buyer wallet, otherwise HTTP 400 `nft_wallet must be the worker or buyer wallet` with no attempt used. Before, a worker could cite any wallet's NFT (T31)
+- MCP `evaluate_escrow_work` accepts `nft_token_id`, `nft_wallet` and `vc_jwt` and forwards them, so MCP agents can satisfy NFT and VC proof gates (T32)
+
 ## [7.0.10] - 2026-11-14
 ### Changed
 - `checks_run` uses stable names: `proof_nft` / `proof_domain` / `proof_vc`, `code_<gate>` (e.g. `code_exact_match`, once per gate type) and a single `ai_referee` when the AI judged the work (T2, T8, T26)

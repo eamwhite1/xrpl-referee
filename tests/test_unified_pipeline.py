@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.10."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.11."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.10", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.10"
+    assert APP_VERSION == "7.0.11", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.11"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.10", f"server.json version={sj['version']!r}, expected 7.0.10"
+        assert sj["version"] == "7.0.11", f"server.json version={sj['version']!r}, expected 7.0.11"
 
 
 # ---------------------------------------------------------------------------
@@ -738,3 +738,187 @@ def test_t22_statement_budget(env):
     assert all(s.lstrip().upper().startswith(("INSERT", "UPDATE")) for s in g)
     b2_updates = [s for s in env.stmts[n0:] if s.lstrip().startswith("UPDATE escrow_vault SET require_ai_audit")]
     assert len(b2_updates) == 1  # only on the first (box changed False→True)
+
+
+# ---------------------------------------------------------------------------
+# v7.0.11 — proof gates (T27-T33)
+# ---------------------------------------------------------------------------
+import pytest  # noqa: E402
+
+HELLO_CRIT = [{"id": "c1", "type": "code", "gate": "exact_match", "expected_value": "HELLO AGENT",
+               "description": "is HELLO AGENT"}]
+
+
+def _fake_nft_ok(monkeypatch, calls=None):
+    async def fake_nft(**kw):
+        if calls is not None:
+            calls.append(kw)
+        return {"verified": True, "detail": "ok", "issuer": "rIssuer", "uri": ""}
+    monkeypatch.setattr(R, "verify_nft_ownership", fake_nft)
+
+
+def _eval(e, eid, tok, work, **extra):
+    return e.client.post("/evaluate", json={"escrow_id": eid, "work": work, "evaluate_token": tok, **extra})
+
+
+def _nft_vault(e, *, network="testnet", criteria=None, **kw):
+    return seed_vault(e, network=network, source="api" if network == "testnet" else None,
+                      criteria=criteria or HELLO_CRIT, task="Say HELLO AGENT",
+                      require_nft_proof=True, required_nft_issuer="rIssuer", **kw)
+
+
+# T27 ------------------------------------------------------------------------
+def test_t27_nft_proof_then_exact_match_on_raw_work(env, monkeypatch):
+    _fake_nft_ok(monkeypatch)
+    eid, tok = _nft_vault(env)
+    r = _eval(env, eid, tok, "HELLO WORLD", nft_token_id="00AB")
+    assert r.status_code == 200 and r.json()["verdict"] == "FAIL", r.text
+    assert vault(env, eid).submission_count == 1 and env.finishes == []
+    b = _eval(env, eid, tok, "HELLO AGENT", nft_token_id="00AB").json()
+    assert b["verdict"] == "PASS", b
+    assert env.finishes == [eid]
+    assert len(env.gemini_calls) == 0
+    assert "proof_nft" in b["checks_run"] and "code_exact_match" in b["checks_run"]
+
+
+def test_t27b_nft_proof_without_named_issuer_does_not_500(env, monkeypatch):
+    _fake_nft_ok(monkeypatch)
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT, task="Say HELLO AGENT",
+                          require_nft_proof=True)
+    b = _eval(env, eid, tok, "HELLO AGENT", nft_token_id="00AB").json()
+    assert b["verdict"] == "PASS", b
+    assert env.finishes == [eid]
+
+
+# T28 ------------------------------------------------------------------------
+def test_t28_nft_proof_then_sha256_on_raw_work(env, monkeypatch):
+    _fake_nft_ok(monkeypatch)
+    crit = [{"id": "c1", "type": "code", "gate": "sha256_of",
+             "expected_hash": hashlib.sha256(b"the deliverable").hexdigest(), "description": "hash"}]
+    eid, tok = _nft_vault(env, criteria=crit)
+    b = _eval(env, eid, tok, "the deliverable", nft_token_id="00AB").json()
+    assert b["verdict"] == "PASS", b
+    assert env.finishes == [eid] and len(env.gemini_calls) == 0
+
+
+# T29 ------------------------------------------------------------------------
+def test_t29_registry_failure_cannot_break_the_request(env, monkeypatch, caplog):
+    from sqlalchemy.orm import Session
+    _fake_nft_ok(monkeypatch)
+    request_sessions, registry_sessions = [], []
+
+    def get_db_spy():
+        s = env.SL()
+        request_sessions.append(s)
+        try:
+            yield s
+        finally:
+            s.close()
+
+    R.app.dependency_overrides[R.get_db] = get_db_spy
+
+    def on_orm(state):
+        if "FROM nft_issuer" in str(state.statement):
+            registry_sessions.append(state.session)
+
+    def boom(conn, cur, st, params, ctx, many):
+        if "FROM nft_issuer" in st:
+            raise RuntimeError("registry down")
+
+    event.listen(Session, "do_orm_execute", on_orm)
+    event.listen(env.engine, "before_cursor_execute", boom)
+    try:
+        eid, tok = _nft_vault(env)
+        with caplog.at_level(logging.WARNING):
+            b = _eval(env, eid, tok, "HELLO AGENT", nft_token_id="00AB").json()
+    finally:
+        event.remove(Session, "do_orm_execute", on_orm)
+        event.remove(env.engine, "before_cursor_execute", boom)
+        R.app.dependency_overrides.pop(R.get_db, None)
+    assert b["verdict"] == "PASS", b
+    assert vault(env, eid).submission_count == 1 and env.finishes == [eid]
+    assert "nft_issuer lookup failed" in caplog.text
+    assert registry_sessions, "the registry lookup should still have been attempted"
+    assert not any(s is r for s in registry_sessions for r in request_sessions)
+
+
+# T30 ------------------------------------------------------------------------
+@pytest.mark.parametrize("network,expected", [("testnet", "XRPL_TESTNET_URL"), ("mainnet", "XRPL_URL")])
+def test_t30_proof_gates_use_the_vault_network(env, monkeypatch, network, expected):
+    nft_calls, dom_calls = [], []
+    _fake_nft_ok(monkeypatch, nft_calls)
+
+    async def fake_domain(wallet, expected_domain=None, xrpl_url=None):
+        dom_calls.append(xrpl_url)
+        return {"verified": True, "detail": "ok"}
+    monkeypatch.setattr(R, "verify_domain_ownership", fake_domain)
+    eid, tok = _nft_vault(env, network=network, required_domain="ANY")
+    b = _eval(env, eid, tok, "HELLO AGENT", nft_token_id="00AB").json()
+    assert b["verdict"] == "PASS", b
+    want = getattr(R, expected)
+    assert [c["xrpl_url"] for c in nft_calls] == [want]
+    assert dom_calls == [want]
+
+
+def test_t30_verifiers_post_to_the_given_server_and_skip_bithomp_off_mainnet(monkeypatch):
+    monkeypatch.setattr(R, "BITHOMP_API_KEY", "not-a-real-key")
+    url = "https://testnet.example.invalid"
+    nfts = {"result": {"account_nfts": [{"NFTokenID": "00AB", "Issuer": "rI", "URI": ""}]}}
+    acct = {"result": {"account_data": {"Domain": b"example.com".hex()}}}
+    with respx.mock(assert_all_mocked=True) as m:
+        nft_route = m.post(url).mock(side_effect=[httpx.Response(200, json=nfts), httpx.Response(200, json=acct)])
+        toml_route = m.get("https://example.com/.well-known/xrp-ledger.toml").mock(
+            return_value=httpx.Response(200, text="address = 'rW'"))
+        nft = asyncio.run(R.verify_nft_ownership("rW", "00AB", "rI", xrpl_url=url))
+        dom = asyncio.run(R.verify_domain_ownership("rW", None, xrpl_url=url))
+        assert nft["verified"] and dom["verified"]
+        assert nft_route.call_count == 2 and toml_route.called  # no bithomp.com call (it would be unmocked)
+
+
+# T31 ------------------------------------------------------------------------
+def test_t31_nft_wallet_must_be_worker_or_buyer(env, monkeypatch):
+    calls = []
+    _fake_nft_ok(monkeypatch, calls)
+    eid, tok = _nft_vault(env)
+    r = _eval(env, eid, tok, "HELLO AGENT", nft_token_id="00AB", nft_wallet="rStranger111")
+    assert r.status_code == 400 and "worker or buyer" in r.text
+    assert vault(env, eid).submission_count == 0 and calls == [] and env.finishes == []
+    for who in ("worker", "buyer"):
+        eid2, tok2 = _nft_vault(env)
+        v = vault(env, eid2)
+        wallet = v.worker_address if who == "worker" else v.buyer_address
+        r = _eval(env, eid2, tok2, "HELLO AGENT", nft_token_id="00AB", nft_wallet=wallet)
+        assert r.status_code == 200 and r.json()["verdict"] == "PASS", (who, r.text)
+        assert calls[-1]["wallet_address"] == wallet
+
+
+# T32 ------------------------------------------------------------------------
+@respx.mock
+def test_t32_mcp_forwards_proof_fields():
+    import mcp_server
+    route = respx.post("https://mcp.cryptovault.co.uk/evaluate").mock(
+        return_value=httpx.Response(200, json={"verdict": "PASS"}))
+    asyncio.run(mcp_server.evaluate_escrow_work(
+        escrow_id="RT-1", work="HELLO AGENT", evaluate_token="tok",
+        nft_token_id="00AB", nft_wallet="rWorker1", vc_jwt="a.b.c"))
+    body = json.loads(route.calls.last.request.content)
+    assert (body["nft_token_id"], body["nft_wallet"], body["vc_jwt"]) == ("00AB", "rWorker1", "a.b.c")
+    assert body["escrow_id"] == "RT-1" and body["evaluate_token"] == "tok"
+    asyncio.run(mcp_server.evaluate_escrow_work(escrow_id="RT-2", work="x"))
+    body = json.loads(route.calls.last.request.content)
+    assert not {"nft_token_id", "nft_wallet", "vc_jwt"} & set(body)
+
+
+# T33 ------------------------------------------------------------------------
+def test_t33_every_nft_issuer_column_is_migrated():
+    import inspect
+    src = inspect.getsource(R.run_migrations)
+    create_stmt = src[src.index("CREATE TABLE IF NOT EXISTS nft_issuer"):]
+    create_stmt = create_stmt[:create_stmt.index(")\"\"\"")]
+    for col in R.NftIssuer.__table__.columns:
+        in_create = f" {col.name} " in create_stmt or f"\n            {col.name} " in create_stmt
+        has_alter = f"ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS {col.name}" in " ".join(src.split()).replace(
+            "IF NOT EXISTS ", "IF NOT EXISTS ") or any(
+            line.strip().startswith(f'"ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS {col.name} ')
+            for line in src.splitlines())
+        assert in_create or has_alter, f"nft_issuer.{col.name} has no CREATE TABLE or ADD COLUMN IF NOT EXISTS migration"

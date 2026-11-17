@@ -590,9 +590,22 @@ async def evaluate_escrow_work(
         title="Evaluate Token",
         description="The evaluate_token returned by create_escrow_vault() or hire_and_pay(). The buyer must share this with the worker before submission. Required for vaults created after v2.8.0.",
     )] = None,
+    nft_token_id: Annotated[str | None, Field(
+        title="NFT Token ID",
+        description="Proof for vaults with require_nft_proof or required_nft_issuer: the 64-char NFTokenID, checked on the vault's own network (testnet or mainnet).",
+    )] = None,
+    nft_wallet: Annotated[str | None, Field(
+        title="NFT Wallet",
+        description="Wallet holding the NFT. Must be the vault's worker or buyer wallet; defaults to the worker wallet.",
+    )] = None,
+    vc_jwt: Annotated[str | None, Field(
+        title="Verifiable Credential JWT",
+        description="W3C Verifiable Credential (JWT) for vaults that require a VC proof (required_vc_issuer_did).",
+    )] = None,
 ) -> dict:
     """
     Submit proof of completed work against an existing escrow vault.
+    Vaults with proof gates also need nft_token_id (and optionally nft_wallet) and/or vc_jwt.
 
     On PASS, payment releases automatically — no EscrowFinish needed.
     XRPL transaction hashes (64-char hex) in the work field are automatically
@@ -690,6 +703,12 @@ async def evaluate_escrow_work(
         }
         if evaluate_token:
             body["evaluate_token"] = evaluate_token
+        if nft_token_id:
+            body["nft_token_id"] = nft_token_id
+        if nft_wallet:
+            body["nft_wallet"] = nft_wallet
+        if vc_jwt:
+            body["vc_jwt"] = vc_jwt
         res = await client.post(f"{REFEREE_BASE}/evaluate", json=body)
         if res.status_code == 429:
             data = res.json()
