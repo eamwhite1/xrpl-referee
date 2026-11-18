@@ -6,6 +6,13 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.12] - 2026-11-18
+### Fixed
+- The AI referee now judges only the worker's raw deliverable. Before, the "NFT PROOF VERIFIED" notes were appended to the work it was given, so any proof gate plus AI on an exact-output task (e.g. "HELLO AGENT") could FAIL correct work as "including unrelated blockchain metadata". Proof gates are decided deterministically and their notes no longer enter the AI prompt, the evidence collection or the cache key (T34)
+- The testnet AI result cache is keyed on the raw work, so the same work with different proof-note text is a cache hit (T35)
+- `/status` and `/health` `free_ai.calls_today` reads 0 when the in-memory count was last written on an earlier UTC day, instead of showing yesterday's number; still no database access (T36)
+- `models_used` on the vault now reflects the latest verdict. A FAIL followed by a PASS no longer leaves `["code-gate"]`: an AI PASS records the model, a deterministic PASS records `none (deterministic gates)` (T37)
+
 ## [7.0.11] - 2026-11-17
 ### Fixed
 - Vaults with an NFT proof gate no longer return HTTP 500 on /evaluate. The registry lookups (`nft_issuer`) in `evaluate_work` ran on the request's own database session inside `except: pass`; on Postgres a failed statement aborts the transaction, so the later commit failed with `InFailedSqlTransaction`. Both lookups now use their own short read-only session and log `nft_issuer lookup failed: <ExceptionType>` (T29)
