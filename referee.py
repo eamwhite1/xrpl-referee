@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.11"
+APP_VERSION = "7.0.12"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1154,7 +1154,7 @@ def health_check():
         "commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
         "free_ai": {
             "enabled": os.getenv("TRY_AI_ENABLED", "true").lower() == "true",
-            "calls_today": _free_ai_mirror.get("calls_today", 0),
+            "calls_today": _free_ai_calls_today_view(),
             "daily_cap": _free_ai_daily_cap(),
             "as_of": _free_ai_mirror.get("as_of", ""),
             "source": "process_mirror",
@@ -3536,6 +3536,13 @@ def _free_ai_daily_cap() -> int:
         return int(os.getenv("TRY_AI_DAILY_CAP", str(_FREE_AI_RESERVE_LIMITS["global"])))
     except ValueError:
         return _FREE_AI_RESERVE_LIMITS["global"]
+
+
+def _free_ai_calls_today_view() -> int:
+    """In-memory count for /status; a mirror last written on an earlier UTC day reads as 0 (no DB touch)."""
+    if _free_ai_mirror.get("date") != datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+        return 0
+    return _free_ai_mirror.get("calls_today", 0)
 
 
 def _seed_free_ai_mirror(db) -> None:
@@ -11279,10 +11286,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
         failed_links = sum(1 for s in evidence_snapshots if s.get("error"))
         logger.info(f"🔗 Evidence links: {ok} fetched, {failed_links} failed for {req.escrow_id}")
 
-    work_with_nft = req.work
-    extra_notes = [r[2] for r in proof_results if r[1]]  # notes from passed proofs
-    if extra_notes:
-        work_with_nft = req.work + "\n\n" + "\n".join(extra_notes)
+    # Proof gates are decided deterministically above; their notes never go into the AI's input.
 
     # ── v7.0.8 UNIFIED PIPELINE: proof gates → code gates → AI (only if selected / needed) ──
     _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
@@ -11396,7 +11400,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
         if _non_code_ids:
             checks_run.append("ai_referee")
 
-        collected_evidence = await _collect_evidence(work_with_nft, eval_criteria)
+        collected_evidence = await _collect_evidence(req.work, eval_criteria)
         use_consensus = bool(vault.require_consensus) and not _is_testnet
         _allow_pro = not _is_testnet
         _ai_status = "ran"
@@ -11408,7 +11412,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
             if not collected_evidence and not req.evidence_links:
                 _ai_cache_key = _try_ai_cache_key(
                     TRY_AI_MODEL, vault.task_description or "",
-                    json.dumps(eval_criteria, sort_keys=True, separators=(",", ":")), work_with_nft,
+                    json.dumps(eval_criteria, sort_keys=True, separators=(",", ":")), req.work,
                 )
                 structured_result = _try_ai_cache_get(_ai_cache_key)
             if structured_result is not None:
@@ -11432,7 +11436,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
                     try:
                         structured_result = await _run_structured_audit(
                             task=vault.task_description or "",
-                            work=work_with_nft,
+                            work=req.work,
                             criteria=eval_criteria,
                             evidence_items=collected_evidence,
                             require_consensus=False,
@@ -11459,7 +11463,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
             try:
                 structured_result = await _run_structured_audit(
                     task=vault.task_description or "",
-                    work=work_with_nft,
+                    work=req.work,
                     criteria=eval_criteria,
                     evidence_items=collected_evidence,
                     require_consensus=use_consensus,
@@ -11587,8 +11591,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
 
     # Increment submission count only after a verdict is produced (server-side failures don't consume attempts)
     vault.submission_count = current_count + 1
-    if used_models_list:
-        vault.models_used = used_models_list
+    vault.models_used = used_models_list or [model_used]
     if evaluation_verdicts_json is not None:
         vault.evaluation_verdicts = evaluation_verdicts_json
     vault.prompt_version = PROMPT_VERSION

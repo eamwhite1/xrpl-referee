@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.11."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.12."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.11", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.11"
+    assert APP_VERSION == "7.0.12", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.12"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.11", f"server.json version={sj['version']!r}, expected 7.0.11"
+        assert sj["version"] == "7.0.12", f"server.json version={sj['version']!r}, expected 7.0.12"
 
 
 # ---------------------------------------------------------------------------
@@ -922,3 +922,73 @@ def test_t33_every_nft_issuer_column_is_migrated():
             line.strip().startswith(f'"ALTER TABLE nft_issuer ADD COLUMN IF NOT EXISTS {col.name} ')
             for line in src.splitlines())
         assert in_create or has_alter, f"nft_issuer.{col.name} has no CREATE TABLE or ADD COLUMN IF NOT EXISTS migration"
+
+
+# ---------------------------------------------------------------------------
+# v7.0.12 — AI sees the raw deliverable only (T34-T37)
+# ---------------------------------------------------------------------------
+def _nft_with_uri(monkeypatch, uris):
+    it = iter(uris)
+
+    async def fake_nft(**kw):
+        return {"verified": True, "detail": "ok", "issuer": "rIssuer", "uri": next(it)}
+    monkeypatch.setattr(R, "verify_nft_ownership", fake_nft)
+
+
+# T34 ------------------------------------------------------------------------
+def test_t34_ai_input_is_the_raw_work_only(env, monkeypatch):
+    import re
+    _nft_with_uri(monkeypatch, ["ipfs://secret-metadata"])
+    eid, tok = _nft_vault(env, require_ai=True)
+    b = _eval(env, eid, tok, "HELLO AGENT", nft_token_id="00AB").json()
+    assert b["verdict"] == "PASS", b
+    assert b["ai"]["status"] == "ran" and len(env.gemini_calls) == 1
+    assert env.finishes == [eid]
+    prompt = sent_prompt(env)
+    m = re.search(r"<(UNTRUSTED_WORK_[0-9A-F]+)>\n(.*?)\n</\1>", prompt, re.S)
+    assert m and m.group(2) == "HELLO AGENT"
+    assert "NFT PROOF VERIFIED" not in prompt and "ipfs://secret-metadata" not in prompt
+
+
+# T35 ------------------------------------------------------------------------
+def test_t35_cache_key_ignores_proof_note_text(env, monkeypatch):
+    _nft_with_uri(monkeypatch, ["ipfs://first", "ipfs://second"])
+    eid1, tok1 = _nft_vault(env, require_ai=True)
+    b1 = _eval(env, eid1, tok1, "HELLO AGENT", nft_token_id="00AB").json()
+    assert b1["verdict"] == "PASS" and b1["ai"]["status"] == "ran"
+    assert len(env.gemini_calls) == 1
+    eid2, tok2 = _nft_vault(env, require_ai=True)
+    b2 = _eval(env, eid2, tok2, "HELLO AGENT", nft_token_id="00AB").json()
+    assert b2["verdict"] == "PASS" and b2["ai"]["status"] == "cached"
+    assert len(env.gemini_calls) == 1
+    assert env.finishes == [eid1, eid2]
+
+
+# T36 ------------------------------------------------------------------------
+def test_t36_status_reads_zero_when_mirror_is_from_an_earlier_day(env, monkeypatch):
+    now = datetime.now(timezone.utc)
+    monkeypatch.setitem(R._free_ai_mirror, "date", (now - timedelta(days=1)).strftime("%Y-%m-%d"))
+    monkeypatch.setitem(R._free_ai_mirror, "calls_today", 4)
+    monkeypatch.setitem(R._free_ai_mirror, "as_of", "2026-11-17T23:59:00+00:00")
+    n0 = len(env.stmts)
+    for path in ("/status", "/health"):
+        f = env.client.get(path).json()["free_ai"]
+        assert f["calls_today"] == 0 and f["as_of"] == "2026-11-17T23:59:00+00:00"
+    assert env.stmts[n0:] == []
+    monkeypatch.setitem(R._free_ai_mirror, "date", now.strftime("%Y-%m-%d"))
+    assert env.client.get("/status").json()["free_ai"]["calls_today"] == 4
+    assert env.stmts[n0:] == []
+
+
+# T37 ------------------------------------------------------------------------
+@pytest.mark.parametrize("ai", [False, True])
+def test_t37_models_used_reflects_the_latest_attempt(env, ai):
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT, task="Say HELLO AGENT",
+                          require_ai=ai)
+    b = _eval(env, eid, tok, "HELLO WORLD").json()
+    assert b["verdict"] == "FAIL"
+    assert vault(env, eid).models_used == ["code-gate"]
+    b = _eval(env, eid, tok, "HELLO AGENT").json()
+    assert b["verdict"] == "PASS", b
+    want = [R.TRY_AI_MODEL] if ai else ["none (deterministic gates)"]
+    assert vault(env, eid).models_used == want
