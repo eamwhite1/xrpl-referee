@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.12"
+APP_VERSION = "7.0.13"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -387,7 +387,7 @@ def _wrap_mcp_with_logger(asgi_app):
             duration_ms = int((_time_mod.monotonic() - t0) * 1000)
             headers = dict(scope.get("headers", []))
             forwarded = headers.get(b"x-forwarded-for", b"").decode()
-            raw_ip = (forwarded.split(",")[0].strip() if forwarded
+            raw_ip = (forwarded.split(",")[-1].strip() if forwarded
                       else (scope.get("client") or ("",))[0])
             ip_hash = _hashlib.sha256(raw_ip.encode()).hexdigest()[:12]
             status_str = "ok" if ok else "error"
@@ -1328,6 +1328,17 @@ async def serve_agent_json():
         await _prime_server_card_cache()
     return _build_agent_card()
 
+@app.get("/.well-known/security.txt", include_in_schema=False)
+def serve_security_txt():
+    """RFC 9116 contact for vulnerability reports."""
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        "Contact: mailto:hello@cryptovault.co.uk\n"
+        "Expires: 2027-11-21T00:00:00.000Z\n"
+        "Preferred-Languages: en\n"
+        "Canonical: https://mcp.cryptovault.co.uk/.well-known/security.txt\n"
+    )
+
 @app.get("/.well-known/agent.json_legacy", include_in_schema=False)
 def _agent_json_legacy_unused():
     return {
@@ -1335,7 +1346,7 @@ def _agent_json_legacy_unused():
         "name": "AgentTrust Referee",
         "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT, domain, W3C VC, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and x402 payment protocol.",
         "url": "https://mcp.cryptovault.co.uk",
-        "agentVersion": "9.0.0",
+        "agentVersion": APP_VERSION,
         "protocolVersion": "0.6.0",
         "provider": {"organization": "Boxclever Media Ltd (trading as AgentTrust)", "url": "https://agenttrustxrpl.com"},
         "capabilities": {"streaming": False, "pushNotifications": False, "multimodal": True, "escrow": True, "autoFinish": True, "rlusd": True, "jobBoard": True, "bidding": True, "delegation": True},
@@ -2014,10 +2025,27 @@ SCORE_RATE_LIMIT   = 20   # free single-lookup requests per window
 SCORE_RATE_WINDOW  = 3600  # seconds (1 hour)
 SCORE_BATCH_MAX    = 50   # max addresses per paid batch request
 
+_RATE_BUCKET_MAX_KEYS = 20_000
+
+
+def _bucket_for(buckets: dict, key: str, window: float, now: float) -> deque:
+    """Per-key timestamp queue; the dict is bounded so a flood of distinct keys cannot grow memory without limit."""
+    bucket = buckets.get(key)
+    if bucket is None:
+        if len(buckets) >= _RATE_BUCKET_MAX_KEYS:
+            for k in [k for k, b in buckets.items() if not b or now - b[-1] > window]:
+                del buckets[k]
+            if len(buckets) >= _RATE_BUCKET_MAX_KEYS:  # all keys active: drop the least recently seen quarter
+                for k in sorted(buckets, key=lambda k: buckets[k][-1])[: _RATE_BUCKET_MAX_KEYS // 4]:
+                    del buckets[k]
+        bucket = buckets[key] = deque()
+    return bucket
+
+
 def _check_score_rate_limit(ip: str) -> bool:
     """Return True if the IP is within the free-tier rate limit, False if exceeded."""
     now = time.time()
-    bucket = _score_rate_buckets.setdefault(ip, deque())
+    bucket = _bucket_for(_score_rate_buckets, ip, SCORE_RATE_WINDOW, now)
     while bucket and now - bucket[0] > SCORE_RATE_WINDOW:
         bucket.popleft()
     if len(bucket) >= SCORE_RATE_LIMIT:
@@ -2038,7 +2066,7 @@ BUYER_RATE_WINDOW = 86400  # seconds
 def _check_rate_limit(key: str) -> bool:
     """Return True if the key (ip or wallet) is within the request rate limit, False if exceeded."""
     now = time.time()
-    bucket = _request_rate_buckets.setdefault(key, deque())
+    bucket = _bucket_for(_request_rate_buckets, key, REQUEST_RATE_WINDOW, now)
     while bucket and now - bucket[0] > REQUEST_RATE_WINDOW:
         bucket.popleft()
     if len(bucket) >= REQUEST_RATE_LIMIT:
@@ -2050,7 +2078,7 @@ def _check_rate_limit(key: str) -> bool:
 def _check_buyer_rate_limit(buyer_address: str) -> bool:
     """Return True if buyer_address has not received too many seller-initiated requests today."""
     now = time.time()
-    bucket = _buyer_rate_buckets.setdefault(buyer_address, deque())
+    bucket = _bucket_for(_buyer_rate_buckets, buyer_address, BUYER_RATE_WINDOW, now)
     while bucket and now - bucket[0] > BUYER_RATE_WINDOW:
         bucket.popleft()
     if len(bucket) >= BUYER_RATE_LIMIT:
@@ -2782,8 +2810,8 @@ async def check_value_threshold(amount_xrp: Optional[float], amount_rlusd: Optio
                 KycRecord.status == "verified"
             ).first()
             kyc_verified = kyc_row is not None
-        except Exception:
-            pass
+        except Exception as _e:
+            _db_recover(db, "check_value_threshold.kyc", _e)
         if not kyc_verified:
             # No live fallback — KYC status is set by the Didit webhook at /kyc/webhook
             pass
@@ -3849,6 +3877,129 @@ def _client_ip(request) -> str:
             return hops[-1]
     return request.client.host if request.client else "unknown"
 
+
+def _client_safe_error(exc) -> str:
+    """Text for an HTTP error response: the exception class only. str(exc) of an httpx error can contain the
+    upstream URL, and an XRPL/Base node URL may embed an API key. The URL-redacted message goes to the log."""
+    import re as _re_local
+    logger.warning("upstream error %s: %s", type(exc).__name__, _re_local.sub(r"https?://\S+", "<url>", str(exc))[:200])
+    return type(exc).__name__
+
+
+def _db_recover(db, where: str, exc) -> None:
+    """A best-effort query failed on a request session. On Postgres that aborts the whole transaction, so later
+    statements and the commit fail too: roll back so the rest of the request can proceed, and say so in the log."""
+    logger.warning("db error in %s: %s", where, type(exc).__name__)
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Outbound requests to user-influenced URLs (evidence links, webhooks, domain TOML)
+# ---------------------------------------------------------------------------
+import ipaddress as _ipaddress
+from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit, urljoin as _urljoin
+
+
+class UnsafeURLError(Exception):
+    """The URL does not point at a public internet destination."""
+
+
+_SSRF_BLOCKED_PORTS = frozenset({22, 23, 25, 110, 143, 445, 3306, 5432, 6379, 9200, 11211, 27017})
+_SSRF_NAT64 = _ipaddress.ip_network("64:ff9b::/96")
+
+
+def _ip_is_public(ip) -> bool:
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return _ip_is_public(ip.ipv4_mapped)
+        if ip.sixtofour is not None and not _ip_is_public(ip.sixtofour):
+            return False
+        if ip.teredo is not None and not all(_ip_is_public(x) for x in ip.teredo):
+            return False
+        if ip in _SSRF_NAT64:
+            return False
+    return ip.is_global and not ip.is_multicast
+
+
+def _resolve_public_ips(host: str) -> list:
+    """Blocking. Return every address the host resolves to, or raise UnsafeURLError unless ALL are globally routable."""
+    import socket as _socket
+    host = (host or "").strip().strip("[]").rstrip(".")
+    if not host:
+        raise UnsafeURLError("empty host")
+    try:
+        ips = [_ipaddress.ip_address(host.split("%")[0])]
+    except ValueError:
+        try:
+            infos = _socket.getaddrinfo(host, None, type=_socket.SOCK_STREAM)
+        except (_socket.gaierror, UnicodeError):
+            raise UnsafeURLError("host did not resolve")
+        ips = [_ipaddress.ip_address(i[4][0].split("%")[0]) for i in infos]
+    if not ips or not all(_ip_is_public(i) for i in ips):
+        raise UnsafeURLError("destination is not a public address")
+    return ips
+
+
+async def _safe_request(method: str, url: str, *, max_redirects: int = 0, timeout: float = 10.0,
+                        headers: dict = None, content: bytes = None, json_body=None,
+                        max_bytes: int = 1_000_000, _transport=None) -> httpx.Response:
+    """HTTP request that can only reach public addresses.
+
+    Every hop (the first URL and each redirect) is resolved here, checked against the public-address rule and
+    then connected to by IP (Host header and TLS SNI keep the original name), so a DNS answer that changes
+    between the check and the connection cannot redirect the request. Redirects are followed manually.
+    The body is read up to max_bytes. Raises UnsafeURLError for blocked destinations.
+    """
+    current = url
+    for hop in range(max_redirects + 1):
+        parts = _urlsplit(current)
+        https = parts.scheme == "https"
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise UnsafeURLError("only http/https URLs are allowed")
+        try:
+            port = parts.port
+        except ValueError:
+            raise UnsafeURLError("invalid port")
+        default_port = 443 if https else 80
+        if (port or default_port) in _SSRF_BLOCKED_PORTS:
+            raise UnsafeURLError("port not allowed")
+        hostname = parts.hostname
+        ips = await asyncio.to_thread(_resolve_public_ips, hostname)
+        ip = str(ips[0])
+        netloc = (f"[{ip}]" if ":" in ip else ip) + (f":{port}" if port and port != default_port else "")
+        pinned = _urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))
+        try:
+            ascii_host = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise UnsafeURLError("invalid host")
+        host_header = (f"[{ascii_host}]" if ":" in ascii_host else ascii_host) + (f":{port}" if port and port != default_port else "")
+        req_headers = {**(headers or {}), "Host": host_header}
+        ext = {"sni_hostname": ascii_host} if https else {}
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=_transport) as client:
+            async with client.stream(method, pinned, headers=req_headers, content=content, json=json_body,
+                                     extensions=ext) as resp:
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body += chunk
+                    if len(body) >= max_bytes:
+                        del body[max_bytes:]
+                        break
+                status, resp_headers = resp.status_code, resp.headers.multi_items()
+        location = next((v for k, v in resp_headers if k.lower() == "location"), None)
+        if status in (301, 302, 303, 307, 308) and location:
+            if hop < max_redirects:
+                current = _urljoin(current, location)
+                continue
+            if max_redirects > 0:
+                raise httpx.TooManyRedirects("too many redirects")
+        kept = [(k, v) for k, v in resp_headers if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")]
+        return httpx.Response(status, headers=kept, content=bytes(body), request=httpx.Request(method, current))
+    raise httpx.TooManyRedirects("too many redirects")
+
+
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
     logger.info("✅ Resend email configured")
@@ -4292,7 +4443,7 @@ async def verify_usdc_base_payment(tx_hash: str, escrow_id: str, db: Session, re
             })
         receipt = resp.json().get("result")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Base RPC lookup failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Base RPC lookup failed: {_client_safe_error(e)}")
 
     if not receipt:
         raise HTTPException(status_code=400, detail="Transaction not found on Base — it may still be pending. Wait for confirmation and retry.")
@@ -4555,9 +4706,12 @@ class EscrowSetupRequest(BaseModel):
             values['require_consensus_vault'] = True
         return values
 
+MAX_WORK_CHARS = 100_000   # the AI is billed per token; larger deliverables go in attachments or evidence links
+
+
 class AuditRequest(BaseModel):
     escrow_id:           str
-    work:                str
+    work:                str = PydanticField(..., max_length=MAX_WORK_CHARS)
     worker_attachments:  Optional[list[Attachment]] = None
     callback_url:        Optional[str]  = None
     task_category:       str            = "default"
@@ -4627,8 +4781,8 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
                 vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == escrow_id).first()
                 if vault and vault.buyer_address:
                     free_wallet = vault.buyer_address
-            except Exception:
-                pass
+            except Exception as _e:
+                _db_recover(db, "verify_fee_payment.vault", _e)
 
         if free_wallet:
             bootstrapped = db.query(BootstrappedWallet).filter(BootstrappedWallet.wallet_address == free_wallet).first()
@@ -4721,7 +4875,7 @@ async def verify_fee_payment(fee_hash: str, escrow_id: str, db: Session, min_xrp
     try:
         tx_res = await client.request(Tx(transaction=fee_hash))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ledger lookup failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Ledger lookup failed: {_client_safe_error(e)}")
 
     if not tx_res.is_successful():
         _raise_402(resource, "Transaction hash not found on the XRPL ledger.", min_xrp=required_xrp)
@@ -5374,9 +5528,10 @@ async def fire_new_bid_buyer_webhook(
         "total_bids":     total_bids,
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(callback_url, json=payload)
-            logger.info(f"📡 New-bid webhook delivered to {callback_url} (HTTP {r.status_code}) for job {job_id}")
+        r = await _safe_request("POST", callback_url, json_body=payload, timeout=10.0, max_bytes=1024)
+        logger.info(f"📡 New-bid webhook delivered to {callback_url} (HTTP {r.status_code}) for job {job_id}")
+    except UnsafeURLError:
+        logger.warning(f"New-bid webhook blocked for job {job_id}: destination is not a public address")
     except Exception as e:
         logger.error(f"❌ New-bid webhook failed for job {job_id} → {callback_url}: {e}")
 
@@ -5473,9 +5628,10 @@ async def fire_bid_awarded_webhook(
         "worker_address": worker_address,
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(callback_url, json=payload)
-            logger.info(f"📡 Award webhook delivered to {callback_url} (HTTP {r.status_code}) for bid {bid_id}")
+        r = await _safe_request("POST", callback_url, json_body=payload, timeout=10.0, max_bytes=1024)
+        logger.info(f"📡 Award webhook delivered to {callback_url} (HTTP {r.status_code}) for bid {bid_id}")
+    except UnsafeURLError:
+        logger.warning(f"Award webhook blocked for bid {bid_id}: destination is not a public address")
     except Exception as e:
         logger.error(f"❌ Award webhook failed for bid {bid_id} → {callback_url}: {e}")
 
@@ -5578,18 +5734,7 @@ async def _fire_vault_webhook(payload: dict, callback_url: str):
     """POST pre-built status-change notification to callback_url (fire-and-forget, SSRF-protected, HMAC-signed)."""
     if not callback_url:
         return
-    import socket as _socket
     url = callback_url
-    try:
-        hostname = url.split("/")[2]
-        addrs = _socket.getaddrinfo(hostname, 443)
-        for _, _, _, _, sockaddr in addrs:
-            ip = sockaddr[0]
-            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
-                logger.warning(f"Vault webhook SSRF blocked for {payload.get('escrow_id')}: {url}")
-                return
-    except Exception:
-        return
     body_bytes = json.dumps(payload).encode()
     ts = str(int(time.time()))
     headers = {"Content-Type": "application/json", "X-AgentTrust-Timestamp": ts}
@@ -5598,9 +5743,10 @@ async def _fire_vault_webhook(payload: dict, callback_url: str):
         sig = _hmac.new(WEBHOOK_SIGNING_SECRET.encode(), msg, hashlib.sha256).hexdigest()
         headers["X-AgentTrust-Signature"] = f"sha256={sig}"
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-            r = await client.post(url, content=body_bytes, headers=headers)
-            logger.info(f"📡 Vault webhook delivered to {url} (HTTP {r.status_code}) for {payload.get('escrow_id')}")
+        r = await _safe_request("POST", url, content=body_bytes, headers=headers, timeout=10.0, max_bytes=1024)
+        logger.info(f"📡 Vault webhook delivered to {url} (HTTP {r.status_code}) for {payload.get('escrow_id')}")
+    except UnsafeURLError:
+        logger.warning(f"Vault webhook blocked for {payload.get('escrow_id')}: destination is not a public address")
     except Exception as e:
         logger.warning(f"Vault webhook failed for {payload.get('escrow_id')} → {url}: {e}")
 
@@ -5703,19 +5849,6 @@ async def send_delivery_email(
 # ---------------------------------------------------------------------------
 # 10b. URL SNAPSHOT FETCHER
 # ---------------------------------------------------------------------------
-# Blocked TLDs / patterns — private networks, localhost, cloud metadata
-_BLOCKED_URL_PATTERNS = [
-    r"^https?://localhost",
-    r"^https?://127\.",
-    r"^https?://10\.",
-    r"^https?://192\.168\.",
-    r"^https?://172\.(1[6-9]|2[0-9]|3[01])\.",
-    r"^https?://169\.254\.",           # link-local / AWS metadata
-    r"^https?://metadata\.google",
-    r"^https?://0\.",
-    r"file://",
-]
-
 # Max content we inject per URL (chars) — keeps token usage sane
 _URL_SNAPSHOT_MAX_CHARS = 8_000
 
@@ -5754,50 +5887,44 @@ async def fetch_url_snapshot(url: str) -> dict:
         result["error"] = "Only http/https URLs are supported."
         return result
 
-    for pattern in _BLOCKED_URL_PATTERNS:
-        if _re.search(pattern, url, _re.IGNORECASE):
-            result["error"] = "URL resolves to a blocked network range."
+    try:
+        resp = await _safe_request(
+            "GET", url, max_redirects=3, timeout=10.0, max_bytes=512 * 1024,
+            headers={"User-Agent": "AgentTrust-Referee/1.0 (evidence-snapshot)"},
+        )
+        content_type = resp.headers.get("content-type", "")
+        result["content_type"] = content_type
+
+        # Only process text content — no binary, no PDFs (those go via attachments)
+        if not any(t in content_type for t in ["text/", "application/json", "application/xml"]):
+            result["error"] = f"Non-text content type '{content_type[:60]}' — use file attachments for binary content."
             return result
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=True,
-            max_redirects=3,
-            headers={"User-Agent": "AgentTrust-Referee/1.0 (evidence-snapshot)"},
-        ) as client:
-            resp = await client.get(url)
-            content_type = resp.headers.get("content-type", "")
-            result["content_type"] = content_type
+        raw = resp.text
 
-            # Only process text content — no binary, no PDFs (those go via attachments)
-            if not any(t in content_type for t in ["text/", "application/json", "application/xml"]):
-                result["error"] = f"Non-text content type '{content_type[:60]}' — use file attachments for binary content."
-                return result
+        # Strip HTML tags to plain text
+        if "text/html" in content_type:
+            # Remove scripts and styles entirely
+            raw = _re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", raw,
+                          flags=_re.DOTALL | _re.IGNORECASE)
+            raw = _re.sub(r"<[^>]+>", " ", raw)
+            raw = _re.sub(r"\s{3,}", "\n", raw).strip()
 
-            raw = resp.text
+        # Truncate
+        if len(raw) > _URL_SNAPSHOT_MAX_CHARS:
+            raw = raw[:_URL_SNAPSHOT_MAX_CHARS] + f"\n[... truncated at {_URL_SNAPSHOT_MAX_CHARS} chars]"
 
-            # Strip HTML tags to plain text
-            if "text/html" in content_type:
-                # Remove scripts and styles entirely
-                raw = _re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", raw,
-                              flags=_re.DOTALL | _re.IGNORECASE)
-                raw = _re.sub(r"<[^>]+>", " ", raw)
-                raw = _re.sub(r"\s{3,}", "\n", raw).strip()
+        # Prompt injection detection — neutralise rather than reject
+        lower = raw.lower()
+        injection_detected = any(marker in lower for marker in _INJECTION_MARKERS)
+        if injection_detected:
+            logger.warning(f"⚠️ Potential prompt injection in URL snapshot: {url}")
+            raw = "[CONTENT SANITISED: this page contained text that could interfere with AI evaluation. It has been removed. The AI will evaluate based on the seller's written submission only.]"
 
-            # Truncate
-            if len(raw) > _URL_SNAPSHOT_MAX_CHARS:
-                raw = raw[:_URL_SNAPSHOT_MAX_CHARS] + f"\n[... truncated at {_URL_SNAPSHOT_MAX_CHARS} chars]"
+        result["content"] = raw
 
-            # Prompt injection detection — neutralise rather than reject
-            lower = raw.lower()
-            injection_detected = any(marker in lower for marker in _INJECTION_MARKERS)
-            if injection_detected:
-                logger.warning(f"⚠️ Potential prompt injection in URL snapshot: {url}")
-                raw = "[CONTENT SANITISED: this page contained text that could interfere with AI evaluation. It has been removed. The AI will evaluate based on the seller's written submission only.]"
-
-            result["content"] = raw
-
+    except UnsafeURLError:
+        result["error"] = "URL resolves to a blocked network range."
     except httpx.TimeoutException:
         result["error"] = "Request timed out after 10 seconds."
     except httpx.TooManyRedirects:
@@ -6078,12 +6205,11 @@ async def verify_domain_ownership(wallet_address: str, expected_domain: str = No
         return {"verified": False, "detail": f"Wallet domain is '{domain}', expected '{expected_domain}'."}
 
     toml_url = f"https://{domain}/.well-known/xrp-ledger.toml"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            toml_res = await client.get(toml_url, follow_redirects=True)
-            toml_content = toml_res.text
-        except Exception as e:
-            return {"verified": False, "detail": f"Could not fetch {toml_url}: {e}"}
+    try:
+        toml_res = await _safe_request("GET", toml_url, max_redirects=3, timeout=10.0, max_bytes=256 * 1024)
+        toml_content = toml_res.text
+    except Exception as e:
+        return {"verified": False, "detail": f"Could not fetch {toml_url}: {e}"}
 
     if wallet_address not in toml_content:
         return {"verified": False, "detail": f"Wallet {wallet_address} not found in {toml_url}. The domain has not listed this wallet."}
@@ -6144,9 +6270,8 @@ async def domain_preview(domain: str, db: Session = Depends(get_db)):
     for scheme in ("https", "http"):
         toml_url = f"{scheme}://{clean}/.well-known/xrp-ledger.toml"
         try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True,
-                                         headers={"User-Agent": "AgentTrust/1.0"}) as client:
-                r = await client.get(toml_url)
+            r = await _safe_request("GET", toml_url, max_redirects=3, timeout=10.0, max_bytes=256 * 1024,
+                                    headers={"User-Agent": "AgentTrust/1.0"})
             toml_status = r.status_code
             if r.status_code == 200 and r.text.strip():
                 toml_content = r.text
@@ -6596,8 +6721,8 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None, netw
                 if kyc_row:
                     agentrust_kyc_verified = True
                     agentrust_kyc_score = 10
-            except Exception:
-                pass
+            except Exception as _e:
+                _db_recover(db, "trust_score.kyc", _e)
 
         # On-chain signals
         age_score      = min(20, int(age_days / 30) * 2)          # 2 pts/month, max 20
@@ -6646,8 +6771,8 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None, netw
                 else:
                     peer_score = 0
                 peer_stats = {"rating_count": rating_count, "avg_rating": round(avg_rating, 2)}
-            except Exception:
-                pass
+            except Exception as _e:
+                _db_recover(db, "trust_score.escrow_history", _e)
 
         # Wallet ownership verification (on-chain AccountSet proof)
         wallet_sig_score = 0
@@ -6662,8 +6787,8 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None, netw
                     wallet_sig_verified = True
                     wallet_sig_score = 8
                     verification_tx_hash = vrow.tx_hash
-            except Exception:
-                pass
+            except Exception as _e:
+                _db_recover(db, "trust_score.wallet_verification", _e)
 
         # OFAC SDN sanctions check
         # Hard zero if sanctioned; +7 pts if clean
@@ -6693,8 +6818,8 @@ async def compute_xrpl_trust_score(wallet_address: str, db: Session = None, netw
                 ), {"w": wallet_address}).fetchone()
                 if row and row[2] == "verified":
                     verified_issuer = {"name": row[0], "domain": row[1], "source": "agenttrust"}
-            except Exception:
-                pass
+            except Exception as _e:
+                _db_recover(db, "trust_score.issuer", _e)
         if not verified_issuer:
             bithomp = await _verify_domain_via_bithomp(wallet_address)
             if bithomp and bithomp.get("verified"):
@@ -6922,8 +7047,7 @@ async def bootstrap_wallet(address: str, request: Request, db: Session = Depends
         raise HTTPException(status_code=403, detail="Invalid or missing X-Bootstrap-Secret.")
 
     # Rate-limit by IP: max 3 new bootstrapped wallets per IP per 24 h
-    forwarded = request.headers.get("x-forwarded-for", "")
-    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    ip = _client_ip(request)
     now = time.time()
     # Evict stale IPs if dict is too large
     if len(_bootstrap_rate) >= _BOOTSTRAP_RATE_MAX_IPS:
@@ -6967,8 +7091,7 @@ async def register_wallet_free_tier(address: str, body: dict, request: Request, 
         raise HTTPException(status_code=400, detail="tx_hash must be a 64-char XRPL transaction hash.")
 
     # Rate-limit same as bootstrap (with same size cap)
-    forwarded = request.headers.get("x-forwarded-for", "")
-    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    ip = _client_ip(request)
     now = time.time()
     if len(_bootstrap_rate) >= _BOOTSTRAP_RATE_MAX_IPS:
         cutoff = now - _BOOTSTRAP_WINDOW - 3600
@@ -6994,7 +7117,7 @@ async def register_wallet_free_tier(address: str, body: dict, request: Request, 
             tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash}]})
         tx_data = tx_res.json().get("result", {})
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {_client_safe_error(e)}")
 
     if tx_data.get("status") == "error" or not tx_data:
         raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
@@ -7519,38 +7642,17 @@ def _validate_criteria_v2(criteria: list):
 
 
 async def _fetch_url_content(url: str):
-    """Fetch a URL with SSRF protection and 500KB cap. Returns text or None."""
-    import socket as _socket
+    """Fetch an https URL (public addresses only, redirects re-checked) with a 500KB cap. Returns text or None."""
     if not url.startswith("https://"):
         return None
     # Convert GitHub blob URLs to raw
     if "github.com" in url and "/blob/" in url:
         url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-    # SSRF: resolve and block private IPs
     try:
-        hostname = url.split("/")[2]
-        addrs = _socket.getaddrinfo(hostname, 443)
-        for _, _, _, _, sockaddr in addrs:
-            ip = sockaddr[0]
-            if any(ip.startswith(pfx) for pfx in _PRIVATE_IP_PREFIXES):
-                return None
-    except Exception:
-        return None
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=5.0) as client:
-            async with client.stream("GET", url) as resp:
-                if resp.status_code != 200:
-                    return None
-                chunks = []
-                total = 0
-                async for chunk in resp.aiter_bytes(4096):
-                    total += len(chunk)
-                    if total > 500 * 1024:
-                        chunks.append(chunk[:500*1024 - (total - len(chunk))])
-                        break
-                    chunks.append(chunk)
-                raw = b"".join(chunks)
-                return raw.decode("utf-8", errors="replace")
+        resp = await _safe_request("GET", url, max_redirects=3, timeout=5.0, max_bytes=500 * 1024)
+        if resp.status_code != 200:
+            return None
+        return resp.content.decode("utf-8", errors="replace")
     except Exception:
         return None
 
@@ -9651,7 +9753,7 @@ async def confirm_escrow_tx(escrow_id: str, body: dict, db: Session = Depends(ge
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not verify transaction on XRPL: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not verify transaction on XRPL: {_client_safe_error(e)}")
 
     vault.escrow_tx_hash  = tx_hash
     vault.escrow_sequence = sequence
@@ -9708,7 +9810,7 @@ async def reissue_evaluate_token_endpoint(escrow_id: str, body: dict, db: Sessio
             tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": tx_hash}]})
         tx_data = tx_res.json().get("result", {})
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {_client_safe_error(e)}")
 
     if tx_data.get("status") == "error" or not tx_data:
         raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
@@ -10364,8 +10466,8 @@ def _verify_seller_ownership(seller_address: str, buyer_address: str, amount_xrp
                     ).first()
                     if _linked:
                         return True
-            except Exception:
-                pass
+            except Exception as _e:
+                _db_recover(db, "verify_seller_ownership.linked_wallet", _e)
     raise HTTPException(
         status_code=401,
         detail=(
@@ -10591,7 +10693,7 @@ async def fund_escrow_request(escrow_id: str, body: FundEscrowBody, db: Session 
             tx_res = await client.post(XRPL_URL, json={"method": "tx", "params": [{"transaction": body.tx_hash}]})
         tx_data = tx_res.json().get("result", {})
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not reach XRPL node: {_client_safe_error(e)}")
 
     if tx_data.get("status") == "error" or not tx_data:
         raise HTTPException(status_code=400, detail="Transaction not found on ledger.")
@@ -10728,7 +10830,7 @@ async def prepare_escrow(req: PrepareEscrowRequest, db: Session = Depends(get_db
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not fetch XRPL account info: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not fetch XRPL account info: {_client_safe_error(e)}")
 
     currency = req.currency.upper()
     if currency == "RLUSD" and req.amount_rlusd:
@@ -10847,7 +10949,7 @@ async def submit_escrow_transaction(escrow_id: str, body: dict, db: Session = De
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to submit to XRPL: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to submit to XRPL: {_client_safe_error(e)}")
 
     # A9: poll for validated tx up to 8s before reporting confirmed
     _vault_network = getattr(vault, "network", "mainnet") or "mainnet"
@@ -11057,8 +11159,7 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
 
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if not vault:
-        all_ids = [v.escrow_id for v in db.query(EscrowVault).all()]
-        logger.error(f"❌ VAULT MISS: '{req.escrow_id}' | stored: {all_ids}")
+        logger.warning("VAULT MISS: id_len=%d", len(req.escrow_id or ""))
         raise HTTPException(status_code=404, detail=f"Project ID '{req.escrow_id}' not found.")
 
     if vault.status == "RELEASED":
@@ -11857,9 +11958,10 @@ async def evaluate_work(req: AuditRequest, request: Request = None, db: Session 
                 "escrow_id": req.escrow_id,
             }
         try:
-            async with httpx.AsyncClient() as client:
-                await client.post(req.callback_url, json=webhook_payload, timeout=10.0)
+            await _safe_request("POST", req.callback_url, json_body=webhook_payload, timeout=10.0, max_bytes=1024)
             logger.info(f"📡 Webhook delivered to {req.callback_url}")
+        except UnsafeURLError:
+            logger.warning(f"⚠️ Webhook blocked for {req.escrow_id}: destination is not a public address")
         except Exception as e:
             logger.warning(f"⚠️ Webhook failed delivery to {req.callback_url}: {e}")
 
@@ -12212,7 +12314,7 @@ async def get_batch_dvp_payload(escrow_id: str, db: Session = Depends(get_db)):
     try:
         plaintext_fulfillment = decrypt_fulfillment(vault.fulfillment)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not decrypt fulfillment: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not decrypt fulfillment: {_client_safe_error(e)}")
 
     escrow_owner  = vault.escrow_owner or vault.buyer_address
     finish_fee    = _calc_finish_fee(plaintext_fulfillment)
@@ -12891,8 +12993,8 @@ async def get_job(job_id: str, db: Session = Depends(get_db)):
                     "verdict_hash":        vault.verdict_hash,
                     "evaluation_verdicts": vault.evaluation_verdicts,
                 }
-        except Exception:
-            pass
+        except Exception as _e:
+            _db_recover(db, "get_job.escrow_proof", _e)
 
     return {
         "id":            job.id,
@@ -14014,8 +14116,8 @@ async def confirm_wallet_ownership(req: WalletVerifyConfirmRequest, db: Session 
                 {"id": req.issuer_id, "w": wallet},
             )
             db.commit()
-        except Exception:
-            pass
+        except Exception as _e:
+            _db_recover(db, "confirm_wallet_ownership.issuer", _e)
 
     del _verify_challenges[wallet]
     return {
@@ -14146,8 +14248,8 @@ async def company_xrpl_lookup(q: str, db: Session = Depends(get_db)):
                 "register_url":  None,
                 "message":       None,
             })
-    except Exception:
-        pass
+    except Exception as _e:
+        _db_recover(db, "company_xrpl_lookup", _e)
     if not results:
         results.append({
             "name":          q,
@@ -14857,7 +14959,7 @@ async def privy_lock_escrow(escrow_id: str, request: Request, db: Session = Depe
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"XRPL pre-flight failed: {e}")
+            raise HTTPException(status_code=502, detail=f"XRPL pre-flight failed: {_client_safe_error(e)}")
         # Build EscrowCreate
         tx = {
             "TransactionType": "EscrowCreate",
@@ -15770,7 +15872,7 @@ async def enterprise_wallet_delegations(
         ))
         objects = res.result.get("account_objects", [])
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"XRPL lookup failed: {e}")
+        raise HTTPException(status_code=502, detail=f"XRPL lookup failed: {_client_safe_error(e)}")
 
     delegations = [
         {
@@ -16439,12 +16541,13 @@ async def _backfill_escrow_hashes(db):
                     db.commit()
                     logger.info(f"Backfill miss: {vault.escrow_id} owner={real_owner} seq={real_seq} attempts={vault.backfill_attempts}")
             except Exception as e:
+                _db_recover(db, "backfill_released", e)
                 logger.warning(f"Backfill RELEASED failed for {vault.escrow_id}: {e}")
                 try:
                     vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                     db.commit()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _db_recover(db, "backfill_released.attempts", e2)
 
         cancelled = db.query(EscrowVault).filter(
             EscrowVault.status == "CANCELLED",
@@ -16480,12 +16583,13 @@ async def _backfill_escrow_hashes(db):
                     db.commit()
                     logger.info(f"Backfill miss: {vault.escrow_id} owner={real_owner} seq={real_seq} attempts={vault.backfill_attempts}")
             except Exception as e:
+                _db_recover(db, "backfill_cancelled", e)
                 logger.warning(f"Backfill CANCELLED failed for {vault.escrow_id}: {e}")
                 try:
                     vault.backfill_attempts = (vault.backfill_attempts or 0) + 1
                     db.commit()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _db_recover(db, "backfill_cancelled.attempts", e2)
     except Exception as e:
         logger.warning(f"_backfill_escrow_hashes failed: {e}")
 

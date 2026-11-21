@@ -165,101 +165,66 @@ def test_build_webhook_payload_no_metadata():
 # P2 — _fire_vault_webhook sends signed payload
 # ---------------------------------------------------------------------------
 
+def _public_resolver(monkeypatch, ref, addr="93.184.216.34"):
+    import ipaddress
+    monkeypatch.setattr(ref, "_resolve_public_ips", lambda host: [ipaddress.ip_address(addr)])
+
+
 @pytest.mark.asyncio
 async def test_fire_vault_webhook_sends_signed_payload(monkeypatch):
-    """_fire_vault_webhook posts body with X-AgentTrust-Signature header when secret is set."""
+    """_fire_vault_webhook posts to the resolved public IP (Host header kept) with a valid signature."""
     import referee as ref
     import hmac, hashlib
+    import httpx, respx
 
     monkeypatch.setattr(ref, "WEBHOOK_SIGNING_SECRET", "test-secret-key")
-    monkeypatch.setattr(ref, "_PRIVATE_IP_PREFIXES", ())
-
-    captured = {}
-
-    class FakeResponse:
-        status_code = 200
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *a):
-            pass
-        async def post(self, url, content, headers):
-            captured["url"] = url
-            captured["content"] = content
-            captured["headers"] = headers
-            return FakeResponse()
-
-    import socket as _socket
-    monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **kw: [(None, None, None, None, ("203.0.113.1", 443))])
-
-    with patch("httpx.AsyncClient", return_value=FakeClient()):
+    _public_resolver(monkeypatch, ref)
+    with respx.mock(assert_all_mocked=True) as m:
+        route = m.post("https://93.184.216.34/hook").mock(return_value=httpx.Response(200))
         payload = {"event": "escrow.status_changed", "escrow_id": "esc-789", "status": "RELEASED", "ts": 1000}
         await ref._fire_vault_webhook(payload, "https://receiver.example.com/hook")
-
-    assert "url" in captured
-    assert captured["url"] == "https://receiver.example.com/hook"
-    sig_header = captured["headers"].get("X-AgentTrust-Signature", "")
+        assert route.call_count == 1
+        sent = route.calls.last.request
+    assert sent.headers["host"] == "receiver.example.com"
+    sig_header = sent.headers.get("X-AgentTrust-Signature", "")
     assert sig_header.startswith("sha256=")
-    # Signing format is "{ts}.{body}" — extract ts from X-AgentTrust-Timestamp header
-    ts_header = captured["headers"].get("X-AgentTrust-Timestamp", "")
-    msg = f"{ts_header}.{captured['content'].decode()}".encode()
-    expected = "sha256=" + hmac.new(b"test-secret-key", msg, hashlib.sha256).hexdigest()
-    assert sig_header == expected
+    # Signing format is "{ts}.{body}" — ts comes from the X-AgentTrust-Timestamp header
+    msg = f"{sent.headers['X-AgentTrust-Timestamp']}.{sent.content.decode()}".encode()
+    assert sig_header == "sha256=" + hmac.new(b"test-secret-key", msg, hashlib.sha256).hexdigest()
+    assert json.loads(sent.content)["escrow_id"] == "esc-789"
 
 
 @pytest.mark.asyncio
 async def test_fire_vault_webhook_no_secret_no_sig(monkeypatch):
-    """_fire_vault_webhook posts without signature header when WEBHOOK_SIGNING_SECRET is empty."""
+    """_fire_vault_webhook posts without a signature header when WEBHOOK_SIGNING_SECRET is empty."""
     import referee as ref
+    import httpx, respx
 
     monkeypatch.setattr(ref, "WEBHOOK_SIGNING_SECRET", "")
-    monkeypatch.setattr(ref, "_PRIVATE_IP_PREFIXES", ())
-
-    captured = {}
-
-    class FakeResponse:
-        status_code = 200
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *a):
-            pass
-        async def post(self, url, content, headers):
-            captured["headers"] = headers
-            return FakeResponse()
-
-    import socket as _socket
-    monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **kw: [(None, None, None, None, ("203.0.113.1", 443))])
-
-    with patch("httpx.AsyncClient", return_value=FakeClient()):
+    _public_resolver(monkeypatch, ref)
+    with respx.mock(assert_all_mocked=True) as m:
+        route = m.post("https://93.184.216.34/hook").mock(return_value=httpx.Response(200))
         await ref._fire_vault_webhook({"escrow_id": "x"}, "https://receiver.example.com/hook")
-
-    assert "X-AgentTrust-Signature" not in captured.get("headers", {})
+        assert route.call_count == 1
+        sent = route.calls.last.request
+    assert "X-AgentTrust-Signature" not in sent.headers
 
 
 @pytest.mark.asyncio
-async def test_fire_vault_webhook_ssrf_blocked(monkeypatch):
-    """_fire_vault_webhook blocks private IP destinations."""
+@pytest.mark.parametrize("url", [
+    "https://192.168.1.1/hook",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://[::1]/hook",
+    "http://localhost/hook",
+    "http://2130706433/hook",
+])
+async def test_fire_vault_webhook_ssrf_blocked(monkeypatch, url):
+    """_fire_vault_webhook never connects to private, loopback or metadata destinations."""
     import referee as ref
+    import httpx, respx
 
     monkeypatch.setattr(ref, "WEBHOOK_SIGNING_SECRET", "")
-
-    import socket as _socket
-    monkeypatch.setattr(_socket, "getaddrinfo", lambda *a, **kw: [(None, None, None, None, ("192.168.1.1", 443))])
-
-    posted = []
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *a):
-            pass
-        async def post(self, *a, **kw):
-            posted.append(True)
-
-    with patch("httpx.AsyncClient", return_value=FakeClient()):
-        await ref._fire_vault_webhook({"escrow_id": "x"}, "https://internal.example.com/hook")
-
-    assert not posted, "SSRF should have been blocked"
+    with respx.mock(assert_all_called=False, assert_all_mocked=False) as m:
+        any_call = m.route().mock(return_value=httpx.Response(200))
+        await ref._fire_vault_webhook({"escrow_id": "x"}, url)
+        assert any_call.call_count == 0, "SSRF should have been blocked"

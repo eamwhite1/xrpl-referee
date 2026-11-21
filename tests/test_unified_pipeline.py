@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.12."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.13."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.12", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.12"
+    assert APP_VERSION == "7.0.13", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.13"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.12", f"server.json version={sj['version']!r}, expected 7.0.12"
+        assert sj["version"] == "7.0.13", f"server.json version={sj['version']!r}, expected 7.0.13"
 
 
 # ---------------------------------------------------------------------------
@@ -861,13 +861,15 @@ def test_t30_proof_gates_use_the_vault_network(env, monkeypatch, network, expect
 
 
 def test_t30_verifiers_post_to_the_given_server_and_skip_bithomp_off_mainnet(monkeypatch):
+    import ipaddress
     monkeypatch.setattr(R, "BITHOMP_API_KEY", "not-a-real-key")
+    monkeypatch.setattr(R, "_resolve_public_ips", lambda host: [ipaddress.ip_address("93.184.216.34")])
     url = "https://testnet.example.invalid"
     nfts = {"result": {"account_nfts": [{"NFTokenID": "00AB", "Issuer": "rI", "URI": ""}]}}
     acct = {"result": {"account_data": {"Domain": b"example.com".hex()}}}
     with respx.mock(assert_all_mocked=True) as m:
         nft_route = m.post(url).mock(side_effect=[httpx.Response(200, json=nfts), httpx.Response(200, json=acct)])
-        toml_route = m.get("https://example.com/.well-known/xrp-ledger.toml").mock(
+        toml_route = m.get("https://93.184.216.34/.well-known/xrp-ledger.toml").mock(
             return_value=httpx.Response(200, text="address = 'rW'"))
         nft = asyncio.run(R.verify_nft_ownership("rW", "00AB", "rI", xrpl_url=url))
         dom = asyncio.run(R.verify_domain_ownership("rW", None, xrpl_url=url))
@@ -992,3 +994,279 @@ def test_t37_models_used_reflects_the_latest_attempt(env, ai):
     assert b["verdict"] == "PASS", b
     want = [R.TRY_AI_MODEL] if ai else ["none (deterministic gates)"]
     assert vault(env, eid).models_used == want
+
+
+# ---------------------------------------------------------------------------
+# v7.0.13 — outbound-request guard, client IP, vault miss (T38-T42)
+# ---------------------------------------------------------------------------
+import ipaddress as _ipa  # noqa: E402
+
+PUBLIC_IP = "93.184.216.34"
+
+
+def _resolver(monkeypatch, mapping):
+    def fake(host):
+        if host not in mapping:
+            raise R.UnsafeURLError("host did not resolve")
+        return [_ipa.ip_address(a) for a in mapping[host]]
+    monkeypatch.setattr(R, "_resolve_public_ips", fake)
+
+
+# T38 ------------------------------------------------------------------------
+@pytest.mark.parametrize("host", [
+    "127.0.0.1", "localhost", "::1", "0.0.0.0", "10.1.2.3", "172.16.5.4", "192.168.1.1", "169.254.169.254",
+    "100.64.1.1", "198.18.0.1", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+    "64:ff9b::7f00:1", "2130706433", "0x7f000001", "224.0.0.1",
+])
+def test_t38_non_public_hosts_are_refused(host):
+    with pytest.raises(R.UnsafeURLError):
+        R._resolve_public_ips(host)
+
+
+def test_t38_public_hosts_and_mixed_answers(monkeypatch):
+    for lit in ("8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"):
+        assert R._resolve_public_ips(lit)
+    import socket
+
+    def gai(answers):
+        return lambda host, *a, **k: [(None, None, None, None, (x, 0)) for x in answers]
+    monkeypatch.setattr(socket, "getaddrinfo", gai([PUBLIC_IP]))
+    assert [str(i) for i in R._resolve_public_ips("files.example.com")] == [PUBLIC_IP]
+    monkeypatch.setattr(socket, "getaddrinfo", gai([PUBLIC_IP, "10.0.0.5"]))  # one private answer blocks the host
+    with pytest.raises(R.UnsafeURLError):
+        R._resolve_public_ips("files.example.com")
+
+    def boom(*a, **k):
+        raise socket.gaierror("nope")
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+    with pytest.raises(R.UnsafeURLError):
+        R._resolve_public_ips("no-such-host.example.com")
+
+
+# T39 ------------------------------------------------------------------------
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_t39_connection_is_pinned_to_the_checked_address(monkeypatch):
+    _resolver(monkeypatch, {"files.example.com": [PUBLIC_IP]})
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, text="hello", headers={"content-type": "text/plain"})
+    r = _run(R._safe_request("GET", "https://files.example.com:8443/a/b?x=1", headers={"User-Agent": "t"},
+                             _transport=httpx.MockTransport(handler)))
+    assert r.status_code == 200 and r.text == "hello"
+    q = seen[0]
+    assert q.url.host == PUBLIC_IP and q.url.port == 8443 and q.url.path == "/a/b" and q.url.query == b"x=1"
+    assert q.headers["host"] == "files.example.com:8443" and q.headers["user-agent"] == "t"
+    assert q.extensions["sni_hostname"] == "files.example.com"
+
+
+def test_t39_redirects_are_rechecked_per_hop(monkeypatch):
+    _resolver(monkeypatch, {"a.example.com": [PUBLIC_IP], "b.example.com": ["93.184.216.35"]})
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        if request.url.host == PUBLIC_IP:
+            return httpx.Response(302, headers={"location": "https://b.example.com/next"})
+        if request.url.host == "93.184.216.35":
+            return httpx.Response(200, text="final")
+        return httpx.Response(500)
+    tr = httpx.MockTransport(handler)
+    r = _run(R._safe_request("GET", "https://a.example.com/start", max_redirects=3, _transport=tr))
+    assert r.text == "final" and hosts == [PUBLIC_IP, "93.184.216.35"]
+    # redirect into the metadata service: refused before any connection is made
+    hosts.clear()
+
+    def to_metadata(request):
+        hosts.append(request.url.host)
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+    with pytest.raises(R.UnsafeURLError):
+        _run(R._safe_request("GET", "https://a.example.com/start", max_redirects=3,
+                             _transport=httpx.MockTransport(to_metadata)))
+    assert hosts == [PUBLIC_IP]
+    # redirects are not followed unless asked (webhooks)
+    r = _run(R._safe_request("POST", "https://a.example.com/hook", json_body={"x": 1}, _transport=httpx.MockTransport(
+        lambda req: httpx.Response(302, headers={"location": "https://b.example.com/"}))))
+    assert r.status_code == 302
+    # too many hops
+    with pytest.raises(httpx.TooManyRedirects):
+        _run(R._safe_request("GET", "https://a.example.com/", max_redirects=2, _transport=httpx.MockTransport(
+            lambda req: httpx.Response(302, headers={"location": "https://a.example.com/again"}))))
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://files.example.com/x", "file:///etc/passwd", "gopher://files.example.com/", "http:///nohost",
+    "http://93.184.216.34:25/", "http://93.184.216.34:6379/", "http://169.254.169.254/latest/",
+    "http://user@169.254.169.254/", "http://[::1]:80/", "https://localhost/", "http://2130706433/",
+])
+def test_t39_unsafe_urls_never_reach_the_transport(url):
+    called = []
+    tr = httpx.MockTransport(lambda req: called.append(req) or httpx.Response(200))
+    with pytest.raises(R.UnsafeURLError):
+        _run(R._safe_request("GET", url, _transport=tr))
+    assert called == []
+
+
+def test_t39_body_is_capped(monkeypatch):
+    _resolver(monkeypatch, {"files.example.com": [PUBLIC_IP]})
+    tr = httpx.MockTransport(lambda req: httpx.Response(200, content=b"x" * 5000))
+    r = _run(R._safe_request("GET", "https://files.example.com/", max_bytes=1000, _transport=tr))
+    assert len(r.content) == 1000
+
+
+# T40 ------------------------------------------------------------------------
+@pytest.mark.parametrize("url", [
+    "http://169.254.169.254/latest/meta-data/", "http://localhost:8000/admin", "http://[::1]/", "http://0.0.0.0/",
+    "http://10.0.0.5/", "http://2130706433/", "file:///etc/passwd", "http://metadata.google.internal/",
+])
+def test_t40_evidence_links_to_internal_hosts_are_refused(url):
+    with respx.mock(assert_all_called=False, assert_all_mocked=False) as m:
+        anything = m.route().mock(return_value=httpx.Response(200, text="secret"))
+        r = _run(R.fetch_url_snapshot(url))
+        assert anything.call_count == 0
+    assert r["content"] is None and r["error"]
+
+
+def test_t40_evidence_redirect_to_metadata_is_refused(monkeypatch):
+    _resolver(monkeypatch, {"docs.example.com": [PUBLIC_IP]})
+    with respx.mock(assert_all_called=False, assert_all_mocked=False) as m:
+        m.get(f"https://{PUBLIC_IP}/page").mock(return_value=httpx.Response(
+            302, headers={"location": "http://169.254.169.254/latest/meta-data/"}))
+        meta = m.route(host="169.254.169.254").mock(return_value=httpx.Response(200, text="iam-credentials"))
+        r = _run(R.fetch_url_snapshot("https://docs.example.com/page"))
+        assert meta.call_count == 0
+    assert r["content"] is None and "blocked" in r["error"]
+
+
+def test_t40_evidence_public_page_is_snapshotted(monkeypatch):
+    _resolver(monkeypatch, {"docs.example.com": [PUBLIC_IP]})
+    with respx.mock(assert_all_called=True) as m:
+        route = m.get(f"https://{PUBLIC_IP}/page").mock(return_value=httpx.Response(
+            200, text="<html><script>x()</script><p>proof of work</p></html>", headers={"content-type": "text/html"}))
+        r = _run(R.fetch_url_snapshot("https://docs.example.com/page"))
+        assert route.calls.last.request.headers["host"] == "docs.example.com"
+    assert r["error"] is None and "proof of work" in r["content"] and "x()" not in r["content"]
+
+
+def test_t40_callback_url_is_checked_and_never_blocks_the_verdict(env, monkeypatch):
+    checked = []
+    orig = R._resolve_public_ips
+
+    def spy(host):
+        checked.append(host)
+        return orig(host)
+    monkeypatch.setattr(R, "_resolve_public_ips", spy)
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT, task="Say HELLO AGENT")
+    b = _eval(env, eid, tok, "HELLO AGENT", callback_url="http://169.254.169.254/latest/meta-data/").json()
+    assert b["verdict"] == "PASS" and env.finishes == [eid]
+    assert "169.254.169.254" in checked
+
+
+# T41 ------------------------------------------------------------------------
+def test_t41_unknown_escrow_id_does_not_scan_the_table_or_log_other_ids(env, caplog):
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT)
+    n0 = len(env.stmts)
+    with caplog.at_level(logging.INFO):
+        r = env.client.post("/evaluate", json={"escrow_id": "TN-NOPE-X", "work": "x", "evaluate_token": tok})
+    assert r.status_code == 404
+    vault_selects = [s for s in env.stmts[n0:] if "FROM escrow_vault" in s]
+    assert len(vault_selects) == 1 and "WHERE" in vault_selects[0]
+    assert eid not in caplog.text
+
+
+# T42 ------------------------------------------------------------------------
+def test_t42_rate_limits_use_the_last_forwarded_hop_not_the_first(env, monkeypatch):
+    monkeypatch.setenv("BOOTSTRAP_SECRET", "s3cret")
+    monkeypatch.setattr(R, "_bootstrap_rate", {})
+    codes = []
+    for i in range(4):
+        r = env.client.post(f"/wallet/rWallet{i}/bootstrap", headers={
+            "X-Bootstrap-Secret": "s3cret", "X-Forwarded-For": f"198.51.100.{i}, 203.0.113.9"})
+        codes.append(r.status_code)
+    assert codes == [200, 200, 200, 429]
+    # a different last hop is a different client
+    r = env.client.post("/wallet/rWalletZ/bootstrap", headers={
+        "X-Bootstrap-Secret": "s3cret", "X-Forwarded-For": "198.51.100.0, 203.0.113.77"})
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# v7.0.13 — robustness and hygiene (T43-T47)
+# ---------------------------------------------------------------------------
+# T43 ------------------------------------------------------------------------
+def test_t43_failed_best_effort_query_rolls_back_the_session_and_is_logged(env, monkeypatch, caplog):
+    from sqlalchemy.orm import Session
+    rollbacks = []
+    orig = Session.rollback
+    monkeypatch.setattr(Session, "rollback", lambda self: (rollbacks.append(1), orig(self))[1])
+
+    def boom(conn, cur, st, params, ctx, many):
+        if "FROM nft_issuer" in st:
+            raise RuntimeError("registry down")
+    # healthy lookup: no rollback
+    with caplog.at_level(logging.WARNING):
+        r = env.client.get("/gleif/xrpl-lookup", params={"q": "Acme"})
+    assert r.status_code == 200 and rollbacks == []
+    event.listen(env.engine, "before_cursor_execute", boom)
+    try:
+        with caplog.at_level(logging.WARNING):
+            r = env.client.get("/gleif/xrpl-lookup", params={"q": "Acme"})
+    finally:
+        event.remove(env.engine, "before_cursor_execute", boom)
+    assert r.status_code == 200 and r.json()["results"][0]["xrpl_wallet"] is None
+    assert rollbacks == [1]
+    assert "db error in company_xrpl_lookup: RuntimeError" in caplog.text
+
+
+# T44 ------------------------------------------------------------------------
+def test_t44_client_errors_never_carry_the_upstream_url(caplog):
+    secret_url = "https://node.example.net/v2/KEY-12345-SECRET"
+    exc = httpx.HTTPStatusError(f"Client error '401 Unauthorized' for url '{secret_url}'",
+                                request=httpx.Request("POST", secret_url), response=httpx.Response(401))
+    with caplog.at_level(logging.WARNING):
+        shown = R._client_safe_error(exc)
+    assert shown == "HTTPStatusError"
+    assert "KEY-12345-SECRET" not in caplog.text and "HTTPStatusError" in caplog.text
+
+
+# T45 ------------------------------------------------------------------------
+def test_t45_rate_limit_buckets_are_bounded_and_still_limit(monkeypatch):
+    monkeypatch.setattr(R, "_RATE_BUCKET_MAX_KEYS", 50)
+    monkeypatch.setattr(R, "_request_rate_buckets", {})
+    for i in range(400):
+        assert R._check_rate_limit(f"ip{i}") is True
+        assert len(R._request_rate_buckets) <= 50
+    allowed = [R._check_rate_limit("hot") for _ in range(R.REQUEST_RATE_LIMIT + 2)]
+    assert allowed == [True] * R.REQUEST_RATE_LIMIT + [False, False]
+    # expired keys are the first to go
+    monkeypatch.setattr(R, "_request_rate_buckets", {f"old{i}": R.deque([1.0]) for i in range(50)})
+    assert R._check_rate_limit("fresh") is True
+    assert "fresh" in R._request_rate_buckets and len(R._request_rate_buckets) <= 50
+
+
+# T46 ------------------------------------------------------------------------
+def test_t46_work_text_is_capped(env):
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT, task="Say HELLO AGENT")
+    r = _eval(env, eid, tok, "x" * (R.MAX_WORK_CHARS + 1))
+    assert r.status_code == 422
+    assert vault(env, eid).submission_count == 0
+    r = _eval(env, eid, tok, "x" * R.MAX_WORK_CHARS)
+    assert r.status_code == 200 and r.json()["verdict"] == "FAIL"
+    assert vault(env, eid).submission_count == 1
+
+
+# T47 ------------------------------------------------------------------------
+def test_t47_discovery_files_are_current(env):
+    r = env.client.get("/.well-known/security.txt")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/plain")
+    assert "Contact: mailto:" in r.text and "Expires:" in r.text
+    card = env.client.get("/.well-known/agent.json").json()
+    assert card["version"] == R.APP_VERSION
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert json.load(open(os.path.join(root, "openapi.json")))["info"]["version"] == R.APP_VERSION
+    assert json.load(open(os.path.join(root, "agent.json")))["agentVersion"] == R.APP_VERSION
+    assert not os.path.exists(os.path.join(root, "smithery.yaml"))
