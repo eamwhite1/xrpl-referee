@@ -6,6 +6,10 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.17] - 2026-11-21
+### Fixed
+- `/marketplace/jobs` and `/marketplace/skills` no longer add hard-coded demo listings (seven `AT-MKT-00x` jobs and three demo skills) to the real ones. The code comment said they were shown only when the board is empty, but they were always appended, so agents calling the API and the marketplace page saw invented listings next to real ones. Both endpoints now return only real listings; an empty board is returned as an empty list (T58)
+
 ## [7.0.16] - 2026-11-21
 ### Security
 - Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Strict-Transport-Security: max-age=31536000` (T56)
