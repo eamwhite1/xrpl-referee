@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.14."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.15."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.14", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.14"
+    assert APP_VERSION == "7.0.15", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.15"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.14", f"server.json version={sj['version']!r}, expected 7.0.14"
+        assert sj["version"] == "7.0.15", f"server.json version={sj['version']!r}, expected 7.0.15"
 
 
 # ---------------------------------------------------------------------------
@@ -1383,3 +1383,107 @@ def test_t50_every_escrow_vault_column_has_a_migration():
     for col in R.EscrowVault.__table__.columns:
         if col.name not in original:
             assert f"ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS {col.name} " in flat, col.name
+
+
+# ---------------------------------------------------------------------------
+# v7.0.15 — core MCP profile at /mcp-core (T51-T54)
+# ---------------------------------------------------------------------------
+def _rpc(client, path, method, params=None, rid=1):
+    r = client.post(path, headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                    json={"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
+    body = r.text
+    if body.startswith("event:"):
+        body = [ln[5:].strip() for ln in body.splitlines() if ln.startswith("data:")][0]
+    return r.status_code, json.loads(body)
+
+
+# T51 ------------------------------------------------------------------------
+def test_t51_core_profile_is_small_and_keeps_the_safety_hints():
+    import mcp_server as ms
+    from fastmcp import Client
+
+    async def run():
+        async with Client(ms.core_mcp) as c:
+            core = await c.list_tools()
+        full = await ms.mcp.list_tools()
+        return core, full
+    core, full = asyncio.run(run())
+    assert [t.name for t in core] == ms.CORE_TOOL_NAMES and len(core) == 10
+    core_bytes = len(json.dumps([t.model_dump() for t in core], default=str))
+    full_bytes = len(json.dumps([t.model_dump() for t in full], default=str))
+    assert core_bytes < 15_000 and core_bytes < full_bytes * 0.2
+    assert all(0 < len(t.description) <= 400 for t in core)
+    by_name = {t.name: t for t in full}
+    for t in core:  # same read-only / destructive hints as the full server, so clients prompt the same way
+        a, b = t.annotations, by_name[t.name].annotations
+        assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint) == (b.readOnlyHint, b.destructiveHint, b.idempotentHint), t.name
+    hire = next(t for t in core if t.name == "hire_and_pay")
+    assert set(hire.inputSchema["required"]) == {"task", "buyer_address", "amount_xrp", "worker_address"}
+
+
+# T52 ------------------------------------------------------------------------
+def test_t52_core_endpoint_serves_mcp_over_http():
+    with TestClient(R.app) as c:
+        for path in ("/mcp-core", "/mcp-core/"):
+            st, init = _rpc(c, path, "initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                                                    "clientInfo": {"name": "t", "version": "1"}})
+            assert st == 200 and init["result"]["serverInfo"]["name"] == "AgentTrust Referee (core)"
+            st, tl = _rpc(c, path, "tools/list", rid=2)
+            assert st == 200 and len(tl["result"]["tools"]) == 10
+        st, tl = _rpc(c, "/mcp", "tools/list", rid=3)         # the full server is unchanged
+        assert st == 200 and len(tl["result"]["tools"]) > 40
+        r = c.get("/mcp/core-tools").json()
+        assert r["count"] == 10 and r["endpoint"].endswith("/mcp-core")
+
+
+# T53 ------------------------------------------------------------------------
+def test_t53_core_wrappers_forward_to_the_full_tools(monkeypatch):
+    import mcp_server as ms
+    seen = {}
+
+    async def fake_hire(**kw):
+        seen["hire"] = kw
+        return {"ok": True}
+    monkeypatch.setattr(ms, "hire_and_pay", fake_hire)
+    asyncio.run(ms._core_hire_and_pay(task="t", buyer_address="rB", amount_xrp=5.0, worker_address="rW"))
+    assert seen["hire"] == {"task": "t", "buyer_address": "rB", "amount_xrp": 5.0, "worker_address": "rW",
+                            "network": "mainnet", "criteria": None, "fee_hash": "", "cancel_after_hrs": 168}
+    asyncio.run(ms._core_hire_and_pay(task="t", buyer_address="rB", amount_xrp=1, worker_address="rW",
+                                      network="testnet", criteria=[{"id": "c1"}], fee_hash="AA", cancel_after_hrs=2))
+    assert seen["hire"]["network"] == "testnet" and seen["hire"]["criteria"] == [{"id": "c1"}]
+    monkeypatch.undo()
+    from fastmcp import Client
+    with respx.mock(assert_all_called=True) as m:
+        route = m.post("https://mcp.cryptovault.co.uk/evaluate").mock(return_value=httpx.Response(200, json={"verdict": "PASS"}))
+
+        async def call():
+            async with Client(ms.core_mcp) as c:
+                return await c.call_tool("evaluate_escrow_work", {
+                    "escrow_id": "RT-1", "work": "HELLO AGENT", "evaluate_token": "tok",
+                    "nft_token_id": "00AB", "nft_wallet": "rWorker1"})
+        asyncio.run(call())
+        body = json.loads(route.calls.last.request.content)
+    assert (body["escrow_id"], body["work"], body["evaluate_token"]) == ("RT-1", "HELLO AGENT", "tok")
+    assert (body["nft_token_id"], body["nft_wallet"]) == ("00AB", "rWorker1")
+
+
+# T54 ------------------------------------------------------------------------
+def test_t54_every_core_tool_exists_on_the_full_server():
+    import mcp_server as ms
+    full = {t.name for t in asyncio.run(ms.mcp.list_tools())}
+    assert set(ms.CORE_TOOL_NAMES) <= full
+    assert sorted(ms.CORE_TOOL_NAMES) == R.CORE_TOOLS
+
+
+# T55 ------------------------------------------------------------------------
+def test_t55_try_submit_while_one_is_running_gets_a_clear_message(env):
+    sid, eid = seed_try_session(env)
+    assert R._claim_evaluation(eid) is True               # the first submission is still being checked
+    r = submit(env, sid, "HELLO AGENT", False)
+    assert r.status_code == 409 and r.headers["retry-after"] == "15"
+    d = r.json()["detail"]
+    assert d["error"] == "evaluation_in_progress" and "already being checked" in d["message"]
+    assert vault(env, eid).submission_count == 0 and env.finishes == []
+    R._release_evaluation(eid)
+    b = submit(env, sid, "HELLO AGENT", False).json()
+    assert b["verdict"] == "PASS" and env.finishes == [eid]

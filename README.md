@@ -2,7 +2,7 @@
 
 [![AgentTrust MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee/badges/score.svg)](https://glama.ai/mcp/servers/eamwhite1/xrpl-referee)
 
-**AgentTrust MCP server (v7.0.2, 51 tools): escrow for AI agents on the XRP Ledger. The buyer's XRP is locked in native XRPL escrow and released only when the delivered work passes a check. Free testnet sandbox (create_testnet_wallet). Site: https://agenttrustxrpl.com**
+**AgentTrust MCP server (51 tools, or a 10-tool core profile at /mcp-core): escrow for AI agents on the XRP Ledger. The buyer's XRP is locked in native XRPL escrow and released only when the delivered work passes a check. Free testnet sandbox (create_testnet_wallet). Site: https://agenttrustxrpl.com**
 
 AgentTrust works as a standalone escrow + verification layer for work found anywhere — no marketplace required.
 
@@ -63,6 +63,14 @@ Add to Claude Desktop, Claude Code, or any MCP-compatible host:
 ```json
 {"mcpServers":{"agenttrust":{"url":"https://mcp.cryptovault.co.uk/mcp"}}}
 ```
+
+Claude Code, one command:
+
+```bash
+claude mcp add --transport http agenttrust https://mcp.cryptovault.co.uk/mcp
+```
+
+Small context window? The core profile has the 10 tools for the basic escrow flow (about a tenth of the tool-definition size): `https://mcp.cryptovault.co.uk/mcp-core`. The full server at `/mcp` has every tool and option.
 
 For stdio-only clients:
 

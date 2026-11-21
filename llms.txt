@@ -93,7 +93,8 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
 ## MCP endpoint
 
-    https://mcp.cryptovault.co.uk/mcp
+    https://mcp.cryptovault.co.uk/mcp          (all tools and options)
+    https://mcp.cryptovault.co.uk/mcp-core     (core profile: the 10 tools for the basic escrow flow, a tenth of the tool-definition size)
 
 ## Webhooks
 
