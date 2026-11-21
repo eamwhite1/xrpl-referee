@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.15."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.16."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.15", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.15"
+    assert APP_VERSION == "7.0.16", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.16"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.15", f"server.json version={sj['version']!r}, expected 7.0.15"
+        assert sj["version"] == "7.0.16", f"server.json version={sj['version']!r}, expected 7.0.16"
 
 
 # ---------------------------------------------------------------------------
@@ -1487,3 +1487,32 @@ def test_t55_try_submit_while_one_is_running_gets_a_clear_message(env):
     R._release_evaluation(eid)
     b = submit(env, sid, "HELLO AGENT", False).json()
     assert b["verdict"] == "PASS" and env.finishes == [eid]
+
+
+# ---------------------------------------------------------------------------
+# v7.0.16 — response headers, dependency bounds (T56-T57)
+# ---------------------------------------------------------------------------
+# T56 ------------------------------------------------------------------------
+def test_t56_every_response_carries_the_security_headers(env):
+    for method, path in (("get", "/health"), ("get", "/openapi.json"), ("get", "/no-such-page"),
+                         ("post", "/evaluate")):
+        r = getattr(env.client, method)(path) if method == "get" else env.client.post(
+            path, json={"escrow_id": "TN-NOPE-X", "work": "x", "evaluate_token": "t"})
+        assert r.headers["x-content-type-options"] == "nosniff", path
+        assert r.headers["referrer-policy"] == "no-referrer", path
+        assert r.headers["strict-transport-security"].startswith("max-age="), path
+        assert r.headers["x-agenttrust-version"] == R.APP_VERSION, path
+
+
+# T57 ------------------------------------------------------------------------
+def test_t57_requirements_have_a_ceiling_and_installed_versions_satisfy_them():
+    from importlib.metadata import version
+    from packaging.requirements import Requirement
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    reqs = [Requirement(ln.split("#")[0].strip()) for ln in open(os.path.join(root, "requirements.txt")) if ln.split("#")[0].strip()]
+    names = {r.name.lower() for r in reqs}
+    assert {"fastmcp", "sqlalchemy", "xrpl-py", "pyjwt", "pydantic"} <= names
+    for r in reqs:
+        assert r.specifier.contains(version(r.name), prereleases=True), f"{r.name} {version(r.name)} outside {r.specifier}"
+    ceilings = {r.name.lower() for r in reqs if "<" in str(r.specifier)}
+    assert {"fastmcp", "sqlalchemy", "xrpl-py", "fastapi", "pydantic"} <= ceilings

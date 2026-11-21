@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.15"
+APP_VERSION = "7.0.16"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -340,6 +340,9 @@ async def mcp_smithery_compat(request, call_next):
 
     response.headers["X-AgentTrust-Version"] = APP_VERSION
     response.headers["X-AgentTrust-Server"] = APP_VERSION
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
 
     return response
 

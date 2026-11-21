@@ -3,7 +3,7 @@
   "info": {
     "title": "AgentTrust Referee",
     "description": "AI task verification and autonomous payment rail on XRPL. Each escrow records the verdict hash, timestamp, and XRPL transaction hashes. Pass your compliance policy as task_description or invoice_requirements; the AI evaluator checks work against your specific requirements. Free testnet sandbox (no real XRP).",
-    "version": "7.0.15",
+    "version": "7.0.16",
     "x-ai-service-type": "auditor",
     "x-payment-requirement": {
       "currency": "XRP",
