@@ -23,7 +23,7 @@ def _read_referee_src():
 
 def test_pass_challenge_window_returns_explorer_url():
     import referee as ref
-    src = inspect.getsource(ref.evaluate_work)
+    src = inspect.getsource(ref._evaluate_work_inner)
     # The pass_challenge_window return block must include explorer_url
     assert "pass_challenge_window" in src
     assert "explorer_url" in src, "evaluate_work must return explorer_url in pass_challenge_window block"

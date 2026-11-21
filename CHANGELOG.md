@@ -6,6 +6,15 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.14] - 2026-11-21
+Money-path fixes from the 21 Nov audit.
+### Fixed
+- A PASS marks the vault RELEASED before the EscrowFinish is sent. If the process restarted in that window nothing ever sent it: the stuck-release sweeper only handles RELEASING and the hash backfill only records a finish that already exists, so the worker was not paid and the funds returned to the buyer at the cancel time. The backfill now re-sends the finish for a RELEASED vault that has no EscrowFinish on the ledger once the vault is 10 minutes old (at most 5 release attempts). Repeating a finish is safe: a second one fails with tecNO_TARGET and is resolved from the ledger history. It does not retry when the finish exists, when the escrow was cancelled, or while the original finish may still be in flight (T48)
+- One `/evaluate` at a time per vault. Parallel submissions with the same token all passed the attempt check together, so a worker could exceed `max_submissions` (extra attempts are paid for) and run AI calls in parallel. The second call now gets HTTP 409 `evaluation_in_progress` with `Retry-After: 15`. The marker is cleared on every exit and expires after 5 minutes if the process dies mid-evaluation (T49)
+- New column `escrow_vault.evaluating_since` with its migration; every `EscrowVault` column is now checked against the migration list (T50)
+### Behaviour change
+- A second `/evaluate` for a vault that is already being evaluated returns 409 instead of running in parallel
+
 ## [7.0.13] - 2026-11-21
 Security and robustness fixes from the 21 Nov audit.
 ### Security

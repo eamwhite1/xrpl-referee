@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.13."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.14."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.13", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.13"
+    assert APP_VERSION == "7.0.14", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.14"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.13", f"server.json version={sj['version']!r}, expected 7.0.13"
+        assert sj["version"] == "7.0.14", f"server.json version={sj['version']!r}, expected 7.0.14"
 
 
 # ---------------------------------------------------------------------------
@@ -1174,7 +1174,7 @@ def test_t41_unknown_escrow_id_does_not_scan_the_table_or_log_other_ids(env, cap
         r = env.client.post("/evaluate", json={"escrow_id": "TN-NOPE-X", "work": "x", "evaluate_token": tok})
     assert r.status_code == 404
     vault_selects = [s for s in env.stmts[n0:] if "FROM escrow_vault" in s]
-    assert len(vault_selects) == 1 and "WHERE" in vault_selects[0]
+    assert vault_selects and all("WHERE" in s for s in vault_selects)  # never an unfiltered scan
     assert eid not in caplog.text
 
 
@@ -1270,3 +1270,116 @@ def test_t47_discovery_files_are_current(env):
     assert json.load(open(os.path.join(root, "openapi.json")))["info"]["version"] == R.APP_VERSION
     assert json.load(open(os.path.join(root, "agent.json")))["agentVersion"] == R.APP_VERSION
     assert not os.path.exists(os.path.join(root, "smithery.yaml"))
+
+
+# ---------------------------------------------------------------------------
+# v7.0.14 — money path: unsent finishes are re-sent, one evaluation per vault (T48-T51)
+# ---------------------------------------------------------------------------
+def _age_vault(e, eid, minutes):
+    with e.SL() as d:
+        d.execute(text("UPDATE escrow_vault SET updated_at = :t WHERE escrow_id = :i"),
+                  {"t": datetime.now(timezone.utc) - timedelta(minutes=minutes), "i": eid})
+        d.commit()
+
+
+def _released_without_finish(e, *, minutes_old=60, **kw):
+    eid, tok = seed_vault(e, network="mainnet", source=None, status="RELEASED", criteria=HELLO_CRIT, **kw)
+    _age_vault(e, eid, minutes_old)
+    return eid
+
+
+def _run_backfill(e, monkeypatch, final_tx):
+    async def info(tx_hash):
+        return {"owner": "rBuyerOwner", "sequence": 7}
+
+    async def final(owner, seq):
+        return final_tx
+    monkeypatch.setattr(R, "_get_escrow_create_info", info)
+    monkeypatch.setattr(R, "_fetch_escrow_final_tx", final)
+
+    async def main():
+        with e.SL() as d:
+            await R._backfill_escrow_hashes(d)
+        for _ in range(5):
+            await asyncio.sleep(0)
+    asyncio.run(main())
+
+
+# T48 ------------------------------------------------------------------------
+def test_t48_released_vault_with_no_finish_on_the_ledger_is_finished(env, monkeypatch):
+    eid = _released_without_finish(env)
+    _run_backfill(env, monkeypatch, None)
+    assert env.finishes == [eid]
+    assert vault(env, eid).release_tx_hash == "AB" * 32 and vault(env, eid).status == "RELEASED"
+
+
+def test_t48_not_retried_when_it_should_not_be(env, monkeypatch):
+    young = _released_without_finish(env, minutes_old=1)            # the original finish may still be in flight
+    capped = _released_without_finish(env, release_attempts=5)      # already retried enough
+    _run_backfill(env, monkeypatch, None)
+    assert env.finishes == []
+    cancelled = _released_without_finish(env)                       # the ledger shows the escrow was cancelled
+    _run_backfill(env, monkeypatch, {"TransactionType": "EscrowCancel", "hash": "CC" * 32})
+    assert env.finishes == []
+    finished = _released_without_finish(env)                        # the finish exists: only the hash is recorded
+    _run_backfill(env, monkeypatch, {"TransactionType": "EscrowFinish", "hash": "DD" * 32})
+    assert env.finishes == [] and vault(env, finished).release_tx_hash == "DD" * 32
+    assert young and capped and cancelled
+
+
+# T49 ------------------------------------------------------------------------
+def test_t49_second_evaluation_of_the_same_vault_is_refused_while_one_runs(env, monkeypatch):
+    from fastapi import HTTPException
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT, task="Say HELLO AGENT",
+                          require_ai=True)
+    started = asyncio.Event()
+
+    async def slow_evidence(work, criteria):
+        started.set()
+        await asyncio.sleep(0.3)
+        return []
+    monkeypatch.setattr(R, "_collect_evidence", slow_evidence)
+    req = R.AuditRequest(escrow_id=eid, work="HELLO AGENT", evaluate_token=tok)
+
+    async def main():
+        with env.SL() as d1, env.SL() as d2:
+            first = asyncio.create_task(R.evaluate_work(req, None, d1))
+            await started.wait()
+            with pytest.raises(HTTPException) as ei:
+                await R.evaluate_work(req, None, d2)
+            return ei.value, await first
+    err, result = asyncio.run(main())
+    assert err.status_code == 409 and err.detail["error"] == "evaluation_in_progress"
+    assert err.headers["Retry-After"] == "15"
+    assert result["verdict"] == "PASS" and env.finishes == [eid]
+    assert len(env.gemini_calls) == 1 and vault(env, eid).submission_count == 1
+
+
+def test_t49_claim_is_released_on_every_exit_and_stale_claims_expire(env, monkeypatch):
+    eid, tok = seed_vault(env, network="testnet", source="api", criteria=HELLO_CRIT, require_ai=True)
+
+    async def broken(work, criteria):
+        raise RuntimeError("evidence fetch exploded")
+    monkeypatch.setattr(R, "_collect_evidence", broken)
+    req = R.AuditRequest(escrow_id=eid, work="HELLO AGENT", evaluate_token=tok)
+    with pytest.raises(RuntimeError):
+        asyncio.run(R.evaluate_work(req, None, env.SL()))
+    assert R._claim_evaluation(eid) is True          # was released by the failed call
+    assert R._claim_evaluation(eid) is False         # held now
+    with env.SL() as d:                              # a crashed evaluation frees the vault after the TTL
+        d.execute(text("UPDATE escrow_vault SET evaluating_since = :t WHERE escrow_id = :i"),
+                  {"t": datetime.utcnow() - R._EVAL_CLAIM_TTL - timedelta(seconds=5), "i": eid})
+        d.commit()
+    assert R._claim_evaluation(eid) is True
+    R._release_evaluation(eid)
+    assert R._claim_evaluation("TN-NOPE-X") is None  # unknown vault: the endpoint still returns its 404
+
+
+# T50 ------------------------------------------------------------------------
+def test_t50_every_escrow_vault_column_has_a_migration():
+    import inspect
+    flat = " ".join(inspect.getsource(R.run_migrations).split())
+    original = {"escrow_id", "condition", "fulfillment", "status"}   # created with the table
+    for col in R.EscrowVault.__table__.columns:
+        if col.name not in original:
+            assert f"ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS {col.name} " in flat, col.name
