@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.17."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.18."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.17", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.17"
+    assert APP_VERSION == "7.0.18", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.18"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.17", f"server.json version={sj['version']!r}, expected 7.0.17"
+        assert sj["version"] == "7.0.18", f"server.json version={sj['version']!r}, expected 7.0.18"
 
 
 # ---------------------------------------------------------------------------
@@ -1541,3 +1541,75 @@ def test_t58_marketplace_never_adds_hard_coded_demo_listings(env, monkeypatch):
         d.commit()
     s = env.client.get("/marketplace/skills").json()
     assert [x["id"] for x in s["skills"]] == ["SK-REAL-1"] and s["real_skills"] == 1 and s["demo_skills"] == 0
+
+
+# ---------------------------------------------------------------------------
+# v7.0.18 — POST /jobs validation and rate limit (T59-T60)
+# ---------------------------------------------------------------------------
+def _job(**over):
+    from xrpl.wallet import Wallet
+    base = {"id": "JOB-TEST-0001", "title": "Write a haiku", "description": "Three lines about escrow.",
+            "buyer_address": Wallet.create().address, "budget_xrp": 25}
+    base.update(over)
+    return {k: v for k, v in base.items() if v is not _DROP}
+
+
+_DROP = object()
+
+
+def _job_count(e):
+    with e.SL() as d:
+        return d.query(R.JobPosting).count()
+
+
+# T59 ------------------------------------------------------------------------
+@pytest.mark.parametrize("over,needle", [
+    ({"id": "ab"}, "id must be"), ({"id": "has space"}, "id must be"), ({"id": "x" * 65}, "id"),
+    ({"id": _DROP}, "id is required"), ({"title": ""}, "title is required"), ({"title": "x" * 141}, "title must be at most"),
+    ({"description": "x" * 5001}, "description must be at most"), ({"title": 123}, "title must be text"),
+    ({"buyer_address": "mcp-connectivity-fixture-does-not-exist"}, "valid XRPL address"),
+    ({"buyer_address": "rNotARealAddress"}, "valid XRPL address"), ({"buyer_address": _DROP}, "buyer_address is required"),
+    ({"budget_xrp": 0}, "budget_xrp"), ({"budget_xrp": -5}, "budget_xrp"), ({"budget_xrp": "abc"}, "budget_xrp"),
+    ({"budget_xrp": True}, "budget_xrp"), ({"budget_xrp": 1e12}, "budget_xrp"), ({"budget_xrp": "nan"}, "budget_xrp"),
+    ({"expires_hrs": "abc"}, "expires_hrs"), ({"expires_hrs": 0}, "expires_hrs"), ({"expires_hrs": -5}, "expires_hrs"),
+    ({"expires_hrs": 100000}, "expires_hrs"), ({"expires_hrs": 1.5}, "expires_hrs"),
+    ({"tags": "notalist"}, "tags"), ({"tags": ["t"] * 11}, "tags"), ({"tags": ["x" * 33]}, "tags"), ({"tags": [""]}, "tags"),
+    ({"buyer_callback_url": "ftp://example.com/hook"}, "buyer_callback_url"), ({"buyer_email": "nope"}, "buyer_email"),
+])
+def test_t59_invalid_job_posts_are_rejected_with_a_clear_message(env, monkeypatch, over, needle):
+    monkeypatch.setattr(R, "_request_rate_buckets", {})
+    r = env.client.post("/jobs", json=_job(**over))
+    assert r.status_code == 400, r.text
+    assert needle in r.json()["detail"], r.json()
+    assert _job_count(env) == 0
+
+
+def test_t59_valid_job_posts_are_accepted(env, monkeypatch):
+    monkeypatch.setattr(R, "_request_rate_buckets", {})
+    r = env.client.post("/jobs", json=_job())
+    assert r.status_code == 200 and r.json()["status"] == "posted" and len(r.json()["award_token"]) > 20
+    # budget is optional, numeric strings are fine, optional fields are stored
+    r = env.client.post("/jobs", json=_job(id="JOB-TEST-0002", budget_xrp=_DROP, expires_hrs="48", tags=["python", "data"],
+                                           category="code", buyer_name="Acme", buyer_email="a@example.com",
+                                           buyer_callback_url="https://example.com/hook"))
+    assert r.status_code == 200, r.text
+    r = env.client.post("/jobs", json=_job(id="JOB-TEST-0003", budget_xrp="25.5"))
+    assert r.status_code == 200, r.text
+    with env.SL() as d:
+        j = d.query(R.JobPosting).filter(R.JobPosting.id == "JOB-TEST-0002").one()
+        assert j.budget_xrp is None and json.loads(j.tags) == ["python", "data"] and j.category == "code"
+        assert d.query(R.JobPosting).filter(R.JobPosting.id == "JOB-TEST-0003").one().budget_xrp == 25.5
+    assert env.client.post("/jobs", json=_job(id="JOB-TEST-0001")).status_code == 400   # duplicate id still refused
+
+
+# T60 ------------------------------------------------------------------------
+def test_t60_job_posting_is_rate_limited_per_client(env, monkeypatch):
+    monkeypatch.setattr(R, "_request_rate_buckets", {})
+    hdr = lambda first, last: {"X-Forwarded-For": f"{first}, {last}"}
+    for i in range(R.REQUEST_RATE_LIMIT):
+        r = env.client.post("/jobs", json=_job(id=f"JOB-RL-{i:04d}"), headers=hdr(f"198.51.100.{i}", "203.0.113.9"))
+        assert r.status_code == 200, (i, r.text)
+    r = env.client.post("/jobs", json=_job(id="JOB-RL-9999"), headers=hdr("198.51.100.200", "203.0.113.9"))
+    assert r.status_code == 429          # rotating the client-controlled first hop does not reset the limit
+    r = env.client.post("/jobs", json=_job(id="JOB-RL-9998"), headers=hdr("198.51.100.1", "203.0.113.77"))
+    assert r.status_code == 200          # a different last hop is a different client
