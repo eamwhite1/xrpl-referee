@@ -6,6 +6,15 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.15] - 2026-11-21
+### Added
+- Core MCP profile at `https://mcp.cryptovault.co.uk/mcp-core` (also `/mcp-core/`): the 10 tools for the basic escrow flow (`create_testnet_wallet`, `try_testnet_demo`, `get_fees`, `get_wallet_setup_guide`, `assess_counterparty_and_job`, `hire_and_pay`, `submit_escrow_transaction`, `evaluate_escrow_work`, `get_escrow_info`, `get_wallet_trust_score`). Same tool names and behaviour, short descriptions, and a slimmer `hire_and_pay` and `evaluate_escrow_work`. Its `tools/list` is about 10 KB against about 96 KB for the full server at `/mcp`, so an agent spends roughly a tenth of the context on tool definitions. Safety hints (read-only, destructive) match the full server (T51, T52, T53, T54)
+- `/mcp/core-tools` now lists the same 10 tools and the endpoint URL (T52, T54)
+### Changed
+- `/try` submit while the previous submission is still being checked returns a clear 409 "already being checked" message instead of the generic "referee could not evaluate" error (T55)
+### Docs
+- README: removed the hard-coded version, added the one-line `claude mcp add` command and the core profile; `llms.txt` lists both endpoints
+
 ## [7.0.14] - 2026-11-21
 Money-path fixes from the 21 Nov audit.
 ### Fixed

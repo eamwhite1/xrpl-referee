@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.14"
+APP_VERSION = "7.0.15"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -97,6 +97,16 @@ try:
 except Exception as e:
     logger.error(f"❌ MCP server failed to load: {e}", exc_info=True)
 
+# Core profile: a small second MCP server at /mcp-core (10 tools, short descriptions).
+_core_http_app = None
+_raw_core_http_app = None
+try:
+    from mcp_server import core_mcp
+    _core_http_app = core_mcp.http_app(path="/", stateless_http=True)
+    _raw_core_http_app = _core_http_app
+except Exception as e:
+    logger.error(f"❌ MCP core profile failed to load: {e}", exc_info=True)
+
 
 class PaymentRequired(Exception):
     """Carries an x402-compliant JSONResponse. Registered with FastAPI below."""
@@ -121,6 +131,14 @@ async def _lifespan(app):
                 logger.info("✅ FastMCP lifespan started")
             except Exception as _mcp_ls_err:
                 logger.error(f"FastMCP lifespan start failed: {_mcp_ls_err}", exc_info=True)
+        if _raw_core_http_app is not None:
+            try:
+                await _stack.enter_async_context(
+                    _raw_core_http_app.router.lifespan_context(_raw_core_http_app)
+                )
+                logger.info("✅ FastMCP core-profile lifespan started")
+            except Exception as _core_ls_err:
+                logger.error(f"FastMCP core-profile lifespan start failed: {_core_ls_err}", exc_info=True)
         # Run DB migrations — wrapped so a quota/unreachable DB doesn't crash startup
         try:
             Base.metadata.create_all(bind=engine)
@@ -304,7 +322,7 @@ async def mcp_smithery_compat(request, call_next):
         return _SR(status_code=404)
 
     # Inject text/event-stream into Accept for MCP endpoint requests
-    if path.rstrip("/") == "/mcp" or path.startswith("/mcp/"):
+    if path.rstrip("/") in ("/mcp", "/mcp-core") or path.startswith("/mcp/"):
         accept = request.headers.get("accept", "")
         if "text/event-stream" not in accept:
             new_hdrs = [(k, v) for k, v in request.scope["headers"] if k.lower() != b"accept"]
@@ -1028,37 +1046,48 @@ if _mcp_http_app is not None:
     _mcp_http_app = _wrap_mcp_with_logger(_mcp_http_app)
     logger.info("✅ MCP server ready (with tool-call logging)")
 
-    async def _dispatch_to_mcp(request: Request):
-        """Return an ASGI pass-through that rewrites path to '/' and streams directly.
+    def _make_mcp_dispatch(get_app):
+        async def _dispatch(request: Request):
+            """Return an ASGI pass-through that rewrites path to '/' and streams directly.
 
-        Critically, this never buffers the response body — SSE and JSON-RPC streaming
-        both work because send() is passed straight through to the underlying transport.
-        After replaying the buffered request body, receive() delegates to the real ASGI
-        connection receive so FastMCP can detect genuine client disconnect.
-        """
-        body = await request.body()
+            Critically, this never buffers the response body — SSE and JSON-RPC streaming
+            both work because send() is passed straight through to the underlying transport.
+            After replaying the buffered request body, receive() delegates to the real ASGI
+            connection receive so FastMCP can detect genuine client disconnect.
+            """
+            body = await request.body()
 
-        class _MCPPassthrough:
-            async def __call__(self, scope, receive, send):
-                body_idx = [0]
-                async def replay():
-                    if body_idx[0] == 0:
-                        body_idx[0] = 1
-                        return {"type": "http.request", "body": body, "more_body": False}
-                    # Delegate to real ASGI receive — lets FastMCP block on disconnect
-                    return await receive()
-                new_scope = dict(scope)
-                new_scope["path"] = "/"
-                new_scope["raw_path"] = b"/"
-                await _mcp_http_app(new_scope, replay, send)
+            class _MCPPassthrough:
+                async def __call__(self, scope, receive, send):
+                    body_idx = [0]
+                    async def replay():
+                        if body_idx[0] == 0:
+                            body_idx[0] = 1
+                            return {"type": "http.request", "body": body, "more_body": False}
+                        # Delegate to real ASGI receive — lets FastMCP block on disconnect
+                        return await receive()
+                    new_scope = dict(scope)
+                    new_scope["path"] = "/"
+                    new_scope["raw_path"] = b"/"
+                    await get_app()(new_scope, replay, send)
 
-        return _MCPPassthrough()
+            return _MCPPassthrough()
+        return _dispatch
+
+    _dispatch_to_mcp = _make_mcp_dispatch(lambda: _mcp_http_app)
 
     # Serve /mcp and /mcp/ without any redirect — both go straight to the MCP app.
     _mcp_methods = ["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"]
     app.add_route("/mcp",  _dispatch_to_mcp, methods=_mcp_methods, include_in_schema=False)
     app.add_route("/mcp/", _dispatch_to_mcp, methods=_mcp_methods, include_in_schema=False)
     logger.info("✅ MCP server routed at /mcp and /mcp/")
+
+    if _core_http_app is not None:
+        _core_http_app = _wrap_mcp_with_logger(_core_http_app)
+        _dispatch_to_core = _make_mcp_dispatch(lambda: _core_http_app)
+        app.add_route("/mcp-core",  _dispatch_to_core, methods=_mcp_methods, include_in_schema=False)
+        app.add_route("/mcp-core/", _dispatch_to_core, methods=_mcp_methods, include_in_schema=False)
+        logger.info("✅ MCP core profile routed at /mcp-core")
 
     # POST / routes directly to the MCP app — agents that POST to the bare host connect here.
     app.add_route("/", _dispatch_to_mcp, methods=["POST"], include_in_schema=False)
@@ -1470,16 +1499,16 @@ async def serve_mcp_server_card():
 
 
 CORE_TOOLS = sorted([
-    "get_wallet_setup_guide",
+    "create_testnet_wallet",
+    "try_testnet_demo",
     "get_fees",
+    "get_wallet_setup_guide",
     "assess_counterparty_and_job",
     "hire_and_pay",
+    "submit_escrow_transaction",
     "evaluate_escrow_work",
+    "get_escrow_info",
     "get_wallet_trust_score",
-    "list_marketplace_jobs",
-    "claim_job",
-    "submit_bid",
-    "audit_task",
 ])
 
 @app.get("/mcp/core-tools")
@@ -1501,6 +1530,7 @@ async def mcp_core_profile():
     return {
         "tools": enriched,
         "count": len(enriched),
+        "endpoint": "https://mcp.cryptovault.co.uk/mcp-core",
         "full_schema_url": "/mcp",
     }
 
@@ -17056,6 +17086,8 @@ async def _evaluate_internal(escrow_id: str, work: str, evaluate_token: str) -> 
         try:
             result = await evaluate_work(req, request=None, db=_db)
         except HTTPException as _he:
+            if isinstance(_he.detail, dict) and _he.detail.get("error") == "evaluation_in_progress":
+                return {"verdict": "ERROR", "error": "evaluation_in_progress", "summary": _he.detail.get("message", ""), "score": 0}
             return {"verdict": "ERROR", "summary": str(_he.detail), "score": 0}
         except Exception as _ex:
             logger.error(f"_evaluate_internal error: {_ex}")
@@ -17650,6 +17682,11 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
     finally:
         _current_ai_path.reset(_path_tok)
         _current_request_ip.reset(_ip_tok)
+
+    if verdict_data.get("error") == "evaluation_in_progress":   # a double click: the first submission is still being checked
+        raise HTTPException(status_code=409, headers={"Retry-After": "15"}, detail={
+            "error": "evaluation_in_progress",
+            "message": "Your submission is already being checked. Wait for that result, then try again if needed."})
 
     _raw_verdict = verdict_data.get("verdict")
     if isinstance(_raw_verdict, dict):  # defensive: never expose a dict verdict

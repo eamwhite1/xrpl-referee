@@ -3939,3 +3939,95 @@ def post_bounty(
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# CORE PROFILE — a second, small MCP server at /mcp-core.
+# Same tool names and behaviour for the basic escrow flow, with short descriptions and a slimmer
+# hire_and_pay / evaluate_escrow_work, so an agent spends a fraction of the context on tool definitions.
+# The full server at /mcp keeps all tools and every option.
+# ---------------------------------------------------------------------------
+CORE_TOOL_NAMES = [
+    "create_testnet_wallet", "try_testnet_demo", "get_fees", "get_wallet_setup_guide",
+    "assess_counterparty_and_job", "hire_and_pay", "submit_escrow_transaction",
+    "evaluate_escrow_work", "get_escrow_info", "get_wallet_trust_score",
+]
+
+_CORE_DESCRIPTIONS = {
+    "create_testnet_wallet": "Create a free funded XRPL testnet wallet (test XRP, no real value). Call it twice for a buyer and a worker. Returns the address and seed; keep the seed local.",
+    "try_testnet_demo": "Run a complete testnet escrow in one call: create, audit and release. The fastest way to see the flow. Free, no wallet needed.",
+    "get_fees": "Live fee schedule (audit fee, premium consensus fee, limits). Call before any paid action; amounts follow the XRP price.",
+    "get_wallet_setup_guide": "How to generate and store an XRPL wallet safely. The seed stays on your machine.",
+    "assess_counterparty_and_job": "Pre-flight check before locking funds: trust score, sanctions screening and job risk for the worker and amount. Returns proceed=true or false; stop if false.",
+    "hire_and_pay": "Lock XRP in XRPL escrow for a worker and get the EscrowCreate transaction to sign. Use network='testnet' to try it free. Sign the returned transaction, then call submit_escrow_transaction. Advanced options (NFT, domain and credential proof gates, callbacks, challenge windows) are on the full server at /mcp.",
+    "submit_escrow_transaction": "Submit your signed EscrowCreate (tx_blob) so the escrow becomes active.",
+    "evaluate_escrow_work": "Submit the work for an escrow. Code checks run first, then the AI referee if the vault uses one. PASS releases the payment automatically; FAIL returns the reasons and uses one of the worker's attempts (3 by default). Needs the evaluate_token returned by hire_and_pay.",
+    "get_escrow_info": "Look up an escrow's status, release transaction and verdict by escrow_id.",
+    "get_wallet_trust_score": "Trust score for an XRPL wallet from on-chain history, wallet verification and sanctions screening.",
+}
+
+_CORE_ANNOTATIONS = {
+    "create_testnet_wallet": dict(readOnlyHint=False, openWorldHint=True),
+    "try_testnet_demo": dict(title="Try Testnet Demo", readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+    "get_fees": dict(title="Get Fee Schedule", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    "get_wallet_setup_guide": dict(title="Get Wallet Setup Guide", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    "assess_counterparty_and_job": dict(title="Assess Counterparty and Job", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    "hire_and_pay": dict(title="Hire and Pay", readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+    "submit_escrow_transaction": dict(title="Submit Escrow Transaction", readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+    "evaluate_escrow_work": dict(title="Evaluate Escrow Work", readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+    "get_escrow_info": dict(title="Get Escrow Info", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    "get_wallet_trust_score": dict(title="Get Wallet Trust Score", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+}
+
+_CORE_INSTRUCTIONS = (
+    "AgentTrust core profile: escrow for agent work on the XRP Ledger.\n"
+    "Try it free: create_testnet_wallet() twice (buyer, worker), then hire_and_pay(..., network='testnet'), "
+    "sign the returned transaction, submit_escrow_transaction(), then evaluate_escrow_work(). "
+    "try_testnet_demo() runs the whole flow in one call.\n"
+    "On mainnet: get_fees(), assess_counterparty_and_job(), hire_and_pay(), submit_escrow_transaction(), "
+    "evaluate_escrow_work(). PASS releases payment automatically.\n"
+    "More tools and options (marketplace, proof gates, KYC, challenges): https://mcp.cryptovault.co.uk/mcp"
+)
+
+
+async def _core_hire_and_pay(
+    task: Annotated[str, Field(description="What the worker must deliver, in plain words. The referee judges the work against this, so be precise.")],
+    buyer_address: Annotated[str, Field(description="Your XRPL address (r...). You are the buyer.")],
+    amount_xrp: Annotated[float, Field(description="XRP to lock in escrow.")],
+    worker_address: Annotated[str, Field(description="The worker's XRPL address (r...). Paid automatically on PASS.")],
+    network: Annotated[str, Field(description="'testnet' (free, test XRP) or 'mainnet'.", enum=["mainnet", "testnet"])] = "mainnet",
+    criteria: Annotated[Optional[list], Field(description="Optional pass/fail checks. A code check is deterministic and needs no AI call, e.g. {\"id\":\"c1\",\"type\":\"code\",\"gate\":\"exact_match\",\"expected_value\":\"DONE\"}. Gates: exact_match, regex, sha256_of, json_schema. Plain strings are judged by the AI.")] = None,
+    fee_hash: Annotated[str, Field(description="Mainnet only: transaction hash of the audit fee payment. Leave blank on testnet or when you have free escrows left.")] = "",
+    cancel_after_hrs: Annotated[int, Field(description="Hours until the escrow can be cancelled if no work passes. Default 168 (7 days).")] = 168,
+) -> dict:
+    return await hire_and_pay(
+        task=task, buyer_address=buyer_address, amount_xrp=amount_xrp, worker_address=worker_address,
+        network=network, criteria=criteria, fee_hash=fee_hash, cancel_after_hrs=cancel_after_hrs,
+    )
+
+
+async def _core_evaluate_escrow_work(
+    escrow_id: Annotated[str, Field(description="The escrow ID returned by hire_and_pay.")],
+    work: Annotated[str, Field(description="The deliverable, or proof of it (up to 100,000 characters). XRPL transaction hashes in the text are verified on the ledger.")],
+    evaluate_token: Annotated[Optional[str], Field(description="The evaluate_token returned by hire_and_pay. Required for vaults created after v2.8.0.")] = None,
+    nft_token_id: Annotated[Optional[str], Field(description="Only for vaults with an NFT proof gate: the NFTokenID to check.")] = None,
+    nft_wallet: Annotated[Optional[str], Field(description="Wallet holding that NFT: the worker or the buyer. Defaults to the worker.")] = None,
+    evidence_links: Annotated[Optional[list[str]], Field(description="Up to 3 URLs fetched as supporting evidence.")] = None,
+) -> dict:
+    return await evaluate_escrow_work(
+        escrow_id=escrow_id, work=work, evaluate_token=evaluate_token,
+        nft_token_id=nft_token_id, nft_wallet=nft_wallet, evidence_links=evidence_links,
+    )
+
+
+def build_core_mcp() -> FastMCP:
+    core = FastMCP(name="AgentTrust Referee (core)", version=APP_VERSION, instructions=_CORE_INSTRUCTIONS)
+    functions = {"hire_and_pay": _core_hire_and_pay, "evaluate_escrow_work": _core_evaluate_escrow_work}
+    for name in CORE_TOOL_NAMES:
+        fn = functions.get(name) or globals()[name]
+        core.tool(fn, name=name, description=_CORE_DESCRIPTIONS[name],
+                  annotations=ToolAnnotations(**_CORE_ANNOTATIONS[name]))
+    return core
+
+
+core_mcp = build_core_mcp()
