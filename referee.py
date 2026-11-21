@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.13"
+APP_VERSION = "7.0.14"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -2154,6 +2154,7 @@ class EscrowVault(Base):
     submission_count  = Column(Integer, default=0)          # how many times seller has submitted
     max_submissions   = Column(Integer, default=3)          # configurable per-vault
     inconclusive_count = Column(Integer, default=0, nullable=True)  # free INCONCLUSIVEs; >3 counts as attempt
+    evaluating_since   = Column(DateTime, nullable=True)    # set while an /evaluate call is running (UTC); stops parallel submissions
     # Marketplace — v8
     category          = Column(String,  default="default")  # task category for filtering
     marketplace_tags  = Column(Text,    nullable=True)      # JSON array of tags
@@ -3334,6 +3335,7 @@ def run_migrations():
         )""",
         # P1-2: release retry counter
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS release_attempts INT DEFAULT 0",
+        "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS evaluating_since TIMESTAMP",
         # P0-1: updated_at for RELEASING sweeper
         "ALTER TABLE escrow_vault ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
         # AuditLog created_at
@@ -11153,8 +11155,51 @@ def _held_response(vault, status: str, message: str, gate_rows: list, checks_run
     })
 
 
+_EVAL_CLAIM_TTL = timedelta(minutes=5)   # a crashed evaluation frees the vault after this
+
+
+def _claim_evaluation(escrow_id: str):
+    """Atomically mark the vault as being evaluated, in its own short transaction.
+    True = claimed, False = another evaluation of this vault is running, None = no such vault."""
+    now = datetime.utcnow()
+    with SessionLocal() as s:
+        res = s.execute(text(
+            "UPDATE escrow_vault SET evaluating_since = :now WHERE escrow_id = :id "
+            "AND (evaluating_since IS NULL OR evaluating_since < :cutoff)"
+        ), {"now": now, "id": escrow_id, "cutoff": now - _EVAL_CLAIM_TTL})
+        s.commit()
+        if res.rowcount:
+            return True
+        return False if s.execute(text("SELECT 1 FROM escrow_vault WHERE escrow_id = :id"), {"id": escrow_id}).first() else None
+
+
+def _release_evaluation(escrow_id: str) -> None:
+    try:
+        with SessionLocal() as s:
+            s.execute(text("UPDATE escrow_vault SET evaluating_since = NULL WHERE escrow_id = :id"), {"id": escrow_id})
+            s.commit()
+    except Exception as e:
+        logger.warning("could not clear evaluating_since for %s: %s", escrow_id, type(e).__name__)
+
+
 @app.post("/evaluate")
 async def evaluate_work(req: AuditRequest, request: Request = None, db: Session = Depends(get_db)):
+    """One evaluation per vault at a time. Parallel submissions used to pass the attempt check together, so a worker
+    could exceed max_submissions (each extra attempt is paid for) and spend AI quota in parallel."""
+    claimed = _claim_evaluation(req.escrow_id)
+    if claimed is False:
+        raise HTTPException(status_code=409, headers={"Retry-After": "15"}, detail={
+            "error": "evaluation_in_progress",
+            "message": "This escrow is already being evaluated. Wait for that result, then submit again if needed.",
+        })
+    try:
+        return await _evaluate_work_inner(req, request, db)
+    finally:
+        if claimed:
+            _release_evaluation(req.escrow_id)
+
+
+async def _evaluate_work_inner(req: AuditRequest, request: Request, db: Session):
     import asyncio, base64
 
     vault = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
@@ -16502,6 +16547,33 @@ async def _one_off_backfill_correction(db):
         _one_off_backfill_done = False  # allow retry on next tick if it crashed
 
 
+_UNSENT_FINISH_AGE = timedelta(minutes=10)
+
+
+def _requeue_unsent_finish(vault, last_change) -> bool:
+    """RELEASED in the database but no EscrowFinish on the ledger: the finish was never sent (for example the process
+    restarted right after the verdict), so the worker has not been paid. Send it again. Repeating it is safe:
+    finishing an escrow that is already gone fails with tecNO_TARGET, which auto_finish_escrow resolves from the
+    ledger history."""
+    if not (vault.escrow_sequence and vault.condition and vault.fulfillment and vault.worker_address and vault.escrow_owner):
+        return False
+    if (vault.release_attempts or 0) >= 5:
+        return False
+    ts = last_change   # updated_at as it was BEFORE the backfill's own commits touched the row
+    if ts is None:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - ts < _UNSENT_FINISH_AGE:
+        return False
+    asyncio.create_task(auto_finish_escrow(
+        vault.escrow_id, vault.escrow_sequence, vault.escrow_owner,
+        decrypt_fulfillment(vault.fulfillment), vault.condition, vault.worker_address, SessionLocal,
+    ))
+    logger.warning("backfill: re-sending EscrowFinish for %s (RELEASED, no finish on the ledger)", vault.escrow_id)
+    return True
+
+
 async def _backfill_escrow_hashes(db):
     """Backfill release_tx_hash / cancel_tx_hash for RELEASED/CANCELLED vaults missing them.
     Always re-fetches owner from EscrowCreate tx (never trusts cached escrow_owner).
@@ -16514,6 +16586,7 @@ async def _backfill_escrow_hashes(db):
             (EscrowVault.backfill_attempts == None) | (EscrowVault.backfill_attempts < 3),
         ).limit(20).all()
         for vault in released:
+            _last_change = vault.updated_at
             try:
                 # Always fetch real owner from EscrowCreate tx — never trust cached escrow_owner
                 info = await _get_escrow_create_info(vault.escrow_tx_hash)
@@ -16540,6 +16613,8 @@ async def _backfill_escrow_hashes(db):
                 else:
                     db.commit()
                     logger.info(f"Backfill miss: {vault.escrow_id} owner={real_owner} seq={real_seq} attempts={vault.backfill_attempts}")
+                    if tx is None:
+                        _requeue_unsent_finish(vault, _last_change)
             except Exception as e:
                 _db_recover(db, "backfill_released", e)
                 logger.warning(f"Backfill RELEASED failed for {vault.escrow_id}: {e}")
