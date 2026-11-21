@@ -6,6 +6,13 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.18] - 2026-11-21
+### Security
+- `POST /jobs` (the open, free, unauthenticated job board) now validates what it stores and is rate limited. Before, anything was accepted: any text as the buyer address (a placeholder record `audit-fixture` from a connectivity check reached the public board this way), no budget check, no length limits, and a non-numeric `expires_hrs` caused a 500. Now: `buyer_address` must be a valid XRPL address; `id` is 3-64 characters (letters, digits, `.`, `_`, `-`); `title` is at most 140 and `description` at most 5,000 characters; `budget_xrp`, if given, is a positive number; `expires_hrs` is a whole number from 1 to 720; `tags` is at most 10 short tags; `buyer_callback_url` must be http(s); each error names the field (T59)
+- At most 10 job posts per hour per client, using the last forwarded hop so rotating a header does not reset it (T60)
+### Behaviour change
+- Job posts with an invalid buyer address, budget, expiry or oversized fields now get HTTP 400, and the eleventh post in an hour from one client gets HTTP 429
+
 ## [7.0.17] - 2026-11-21
 ### Fixed
 - `/marketplace/jobs` and `/marketplace/skills` no longer add hard-coded demo listings (seven `AT-MKT-00x` jobs and three demo skills) to the real ones. The code comment said they were shown only when the board is empty, but they were always appended, so agents calling the API and the marketplace page saw invented listings next to real ones. Both endpoints now return only real listings; an empty board is returned as an empty list (T58)

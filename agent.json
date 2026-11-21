@@ -3,7 +3,7 @@
   "name": "AgentTrust Referee",
   "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
   "url": "https://mcp.cryptovault.co.uk",
-  "agentVersion": "7.0.17",
+  "agentVersion": "7.0.18",
   "protocolVersion": "0.6.0",
   "provider": {
     "organization": "Boxclever Media Ltd (trading as AgentTrust)",

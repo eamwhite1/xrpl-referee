@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.17"
+APP_VERSION = "7.0.18"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -12738,33 +12738,96 @@ async def marketplace_jobs(
 # JOB BOARD — post jobs, bid, negotiate, award (no funds held by referee)
 # ---------------------------------------------------------------------------
 
+def _clean_job_post(body) -> dict:
+    """Validate and normalise a POST /jobs body. Raises HTTPException 400 with a specific message."""
+    import math
+    import re as _re_job
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+    def text(key: str, max_len: int, required: bool = False, default: str = "") -> str:
+        value = body.get(key)
+        if value is None or value == "":
+            if required:
+                raise HTTPException(status_code=400, detail=f"{key} is required.")
+            return default
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"{key} must be text.")
+        value = value.strip()
+        if required and not value:
+            raise HTTPException(status_code=400, detail=f"{key} is required.")
+        if len(value) > max_len:
+            raise HTTPException(status_code=400, detail=f"{key} must be at most {max_len} characters.")
+        return value
+
+    job_id = text("id", 64, required=True)
+    if not _re_job.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}", job_id):
+        raise HTTPException(status_code=400, detail="id must be 3-64 characters: letters, digits, '.', '_' or '-' (e.g. JOB-XXXX-YYYY).")
+    title = text("title", 140, required=True)
+    description = text("description", 5000, required=True)
+    buyer_address = text("buyer_address", 64, required=True)
+    if not is_valid_classic_address(buyer_address):
+        raise HTTPException(status_code=400, detail="buyer_address must be a valid XRPL address (starts with r).")
+
+    budget = body.get("budget_xrp")
+    if budget is None or budget == "":
+        budget = None
+    else:
+        try:
+            budget = float(budget) if not isinstance(budget, bool) else float("nan")
+        except (TypeError, ValueError):
+            budget = float("nan")
+        if not math.isfinite(budget) or budget <= 0 or budget > 100_000_000:
+            raise HTTPException(status_code=400, detail="budget_xrp must be a positive number of XRP.")
+
+    expires = body.get("expires_hrs")
+    if expires is None or expires == "":
+        expires_hrs = 168
+    else:
+        try:
+            expires_hrs = int(expires) if not isinstance(expires, bool) and float(expires) == int(float(expires)) else 0
+        except (TypeError, ValueError, OverflowError):
+            expires_hrs = 0
+        if not 1 <= expires_hrs <= 720:
+            raise HTTPException(status_code=400, detail="expires_hrs must be a whole number from 1 to 720.")
+
+    tags = body.get("tags") or []
+    if not isinstance(tags, list) or len(tags) > 10 or any(not isinstance(t, str) or not t.strip() or len(t) > 32 for t in tags):
+        raise HTTPException(status_code=400, detail="tags must be a list of up to 10 short text tags (32 characters each).")
+
+    callback = text("buyer_callback_url", 2048)
+    if callback and not callback.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="buyer_callback_url must start with http:// or https://.")
+    email = text("buyer_email", 254)
+    if email and "@" not in email:
+        raise HTTPException(status_code=400, detail="buyer_email must be an email address.")
+
+    return {
+        "job_id": job_id, "title": title, "description": description, "buyer_address": buyer_address,
+        "budget_xrp": budget, "expires_hrs": expires_hrs, "tags": [t.strip() for t in tags],
+        "buyer_name": text("buyer_name", 100), "category": text("category", 40, default="default") or "default",
+        "buyer_email": email or None, "buyer_callback_url": callback or None,
+    }
+
+
 @app.post("/jobs")
-async def post_job(body: dict, db: Session = Depends(get_db)):
+async def post_job(body: dict, request: Request, db: Session = Depends(get_db)):
     """
     Post a job to the marketplace. No fee, no escrow — purely a request for bids.
     Once a bid is accepted via /jobs/{id}/award, the buyer creates a bilateral
     escrow via POST /escrow/generate using the worker's address.
     """
-    job_id        = (body.get("id") or "").strip()
-    title         = (body.get("title") or "").strip()
-    description   = (body.get("description") or "").strip()
-    buyer_address = (body.get("buyer_address") or "").strip()
-
-    if not job_id:
-        raise HTTPException(status_code=400, detail="id is required (e.g. JOB-XXXX-YYYY).")
-    if not title:
-        raise HTTPException(status_code=400, detail="title is required.")
-    if not description:
-        raise HTTPException(status_code=400, detail="description is required.")
-    if not buyer_address:
-        raise HTTPException(status_code=400, detail="buyer_address is required.")
+    # Open and free, so limited per client (the last forwarded hop) to keep the public board usable.
+    if not _check_rate_limit("post_job:" + hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16]):
+        raise HTTPException(status_code=429, detail="Too many jobs posted from this address. Try again in an hour.")
+    clean = _clean_job_post(body)
+    job_id, title, description, buyer_address = clean["job_id"], clean["title"], clean["description"], clean["buyer_address"]
 
     existing = db.query(JobPosting).filter(JobPosting.id == job_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Job ID '{job_id}' already exists.")
 
-    expires_hrs = int(body.get("expires_hrs") or 168)
-    expires_at  = datetime.now(timezone.utc) + timedelta(hours=expires_hrs)
+    expires_at  = datetime.now(timezone.utc) + timedelta(hours=clean["expires_hrs"])
 
     award_token      = secrets.token_urlsafe(32)
     award_token_hash = hashlib.sha256(award_token.encode()).hexdigest()
@@ -12778,14 +12841,14 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
         id                 = job_id,
         title              = title,
         description        = description,
-        budget_xrp         = body.get("budget_xrp"),
+        budget_xrp         = clean["budget_xrp"],
         buyer_address      = buyer_address,
-        buyer_name         = body.get("buyer_name") or "",
-        category           = body.get("category") or "default",
-        tags               = json.dumps(body.get("tags") or []),
+        buyer_name         = clean["buyer_name"],
+        category           = clean["category"],
+        tags               = json.dumps(clean["tags"]),
         expires_at         = expires_at,
-        buyer_email        = body.get("buyer_email") or None,
-        buyer_callback_url = body.get("buyer_callback_url") or None,
+        buyer_email        = clean["buyer_email"],
+        buyer_callback_url = clean["buyer_callback_url"],
         award_token_hash   = award_token_hash,
         required_nft_issuer   = body.get("required_nft_issuer") or None,
         required_nft_metadata = json.dumps(body.get("required_nft_metadata")) if body.get("required_nft_metadata") else None,
@@ -12803,7 +12866,7 @@ async def post_job(body: dict, db: Session = Depends(get_db)):
     db.commit()
     _cache_invalidate_jobs()
 
-    logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={body.get('budget_xrp')} XRP")
+    logger.info(f"📋 JOB POSTED: {job_id} | buyer={buyer_address} | budget={clean['budget_xrp']} XRP")
 
     import asyncio
     if job.buyer_email:
