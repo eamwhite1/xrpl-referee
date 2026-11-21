@@ -6,6 +6,12 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.16] - 2026-11-21
+### Security
+- Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Strict-Transport-Security: max-age=31536000` (T56)
+### Changed
+- `requirements.txt` has a ceiling at the next major version for the packages whose majors have broken APIs (`fastmcp`, `sqlalchemy`, `xrpl-py`, `fastapi`, `pydantic` and others), with floors at the versions the test suite runs on, so a surprise major release cannot break a deploy. PyJWT, which the code imports, is now listed explicitly instead of arriving only through another package (T57)
+
 ## [7.0.15] - 2026-11-21
 ### Added
 - Core MCP profile at `https://mcp.cryptovault.co.uk/mcp-core` (also `/mcp-core/`): the 10 tools for the basic escrow flow (`create_testnet_wallet`, `try_testnet_demo`, `get_fees`, `get_wallet_setup_guide`, `assess_counterparty_and_job`, `hire_and_pay`, `submit_escrow_transaction`, `evaluate_escrow_work`, `get_escrow_info`, `get_wallet_trust_score`). Same tool names and behaviour, short descriptions, and a slimmer `hire_and_pay` and `evaluate_escrow_work`. Its `tools/list` is about 10 KB against about 96 KB for the full server at `/mcp`, so an agent spends roughly a tenth of the context on tool definitions. Safety hints (read-only, destructive) match the full server (T51, T52, T53, T54)
