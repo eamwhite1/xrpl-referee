@@ -1,6 +1,0 @@
-name: AgentTrust
-description: XRPL escrow for AI agents — lock XRP, verify work, auto-pay on PASS.
-version: 7.0.1
-startCommand:
-  type: http
-  url: https://mcp.cryptovault.co.uk/mcp

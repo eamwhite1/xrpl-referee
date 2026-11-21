@@ -6,6 +6,22 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.13] - 2026-11-21
+Security and robustness fixes from the 21 Nov audit.
+### Security
+- One guard for every outbound request to a URL a user can influence (evidence links and evidence-criteria URLs, vault / new-bid / award / `/evaluate` `callback_url` webhooks, domain `xrp-ledger.toml` lookups). It resolves the host, refuses unless every address is publicly routable (loopback, private, link-local/cloud metadata, 100.64/10, IPv4-mapped / 6to4 / NAT64 IPv6, decimal and hex IPv4 forms), connects to the checked address (so DNS cannot change between the check and the connection), re-checks every redirect hop and blocks ports such as 22, 25 and 6379. The bid, award and `/evaluate` callback webhooks previously had no check at all (T38, T39, T40)
+- Rate limits and the MCP log use the last X-Forwarded-For hop (the one Render's proxy appends), not the client-controlled first hop, so the bootstrap and wallet-verification limits cannot be bypassed by rotating a header (T42)
+- A wrong escrow id on `/evaluate` no longer loads the whole escrow table and writes every escrow id to the log (T41)
+- Errors returned for failed XRPL/Base node calls name only the exception class; the node URL, which can embed an API key, is no longer returned or logged (T44)
+- Work text is capped at 100,000 characters (HTTP 422 above that), bounding the per-call AI cost (T46)
+### Fixed
+- Best-effort database lookups on request sessions (KYC, fee check, wallet trust score signals, job escrow proof, seller ownership, issuer lookup, escrow-hash backfill) no longer leave a Postgres transaction aborted after a failed statement: the session is rolled back and the failure is logged. Before, a later signal or the commit could fail silently or return a 500 (T43)
+- In-memory rate-limit tables are bounded and evict expired keys first (T45)
+### Docs and discovery
+- Added `/.well-known/security.txt`; the repo's `agent.json` and `openapi.json` now carry the app version (checked every release); removed the dead `smithery.yaml` (T47)
+### Behaviour changes
+- Webhooks to non-public addresses are no longer delivered; `/evaluate` rejects `work` over 100,000 characters
+
 ## [7.0.12] - 2026-11-18
 ### Fixed
 - The AI referee now judges only the worker's raw deliverable. Before, the "NFT PROOF VERIFIED" notes were appended to the work it was given, so any proof gate plus AI on an exact-output task (e.g. "HELLO AGENT") could FAIL correct work as "including unrelated blockchain metadata". Proof gates are decided deterministically and their notes no longer enter the AI prompt, the evidence collection or the cache key (T34)
