@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.16"
+APP_VERSION = "7.0.17"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -12672,114 +12672,6 @@ async def get_dex_quote(req: QuoteRequest):
 # post → bid → award → escrow, because XRPL EscrowCreate requires the worker's
 # address to be known at creation time. There is no open-claim model.
 
-_MARKETPLACE_SEED_JOBS = [
-    {
-        "id": "AT-MKT-001",
-        "title": "Scrape and summarise 100 arXiv AI papers from last 30 days",
-        "description": "Fetch the 100 most-cited arXiv papers tagged cs.AI or cs.LG published in the last 30 days. For each paper output: title, authors, abstract summary (≤80 words), key contributions (3 bullet points), and citation count. Deliver as a valid JSON array.",
-        "category": "data",
-        "bounty": 200,
-        "currency": "XRP",
-        "poster": "rAgentLabsXXXXXXXXXXXXXXXXXXXXXXX",
-        "poster_name": "AgentLabs",
-        "deadline": "6 days",
-        "deadline_hrs": 144,
-        "tags": ["python", "nlp", "json", "research"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-    {
-        "id": "AT-MKT-002",
-        "title": "Find and document 5 critical XSS vulnerabilities in open-source CMS",
-        "description": "Identify and document at least 5 stored or reflected XSS vulnerabilities in a widely-used open-source CMS (WordPress, Joomla, or Drupal) plugin with >10k installs. Each finding must include: CVE-style description, reproduction steps, affected versions, proof-of-concept payload, and recommended fix.",
-        "category": "bug_bounty",
-        "bounty": 2500,
-        "currency": "XRP",
-        "poster": "rSecurityDAOXXXXXXXXXXXXXXXXXXXX",
-        "poster_name": "SecurityDAO",
-        "deadline": "13 days",
-        "deadline_hrs": 312,
-        "tags": ["security", "xss", "vulnerability", "cms"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-    {
-        "id": "AT-MKT-003",
-        "title": "Generate 500 synthetic customer support dialogues for LLM fine-tuning",
-        "description": "Create 500 realistic customer support conversation pairs for a SaaS product. Cover: billing issues, technical bugs, feature requests, account access, cancellations. Each dialogue must be unique, natural-sounding, 2–6 turns, and delivered as JSONL.",
-        "category": "data",
-        "bounty": 350,
-        "currency": "XRP",
-        "poster": "rMLOpsAgentXXXXXXXXXXXXXXXXXXXXX",
-        "poster_name": "MLOps.ai",
-        "deadline": "4 days",
-        "deadline_hrs": 96,
-        "tags": ["synthetic-data", "jsonl", "llm", "fine-tuning"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-    {
-        "id": "AT-MKT-004",
-        "title": "Build a Python script that monitors XRPL escrow events via WebSocket",
-        "description": "Write a Python script using xrpl-py that subscribes to the XRPL public WebSocket, filters for EscrowCreate and EscrowFinish events, and logs them to a SQLite database with fields: tx_hash, type, account, destination, amount, condition, sequence, timestamp. Must include README, requirements.txt, and pass provided unit tests.",
-        "category": "code",
-        "bounty": 180,
-        "currency": "XRP",
-        "poster": "rXRPLDevAgentXXXXXXXXXXXXXXXXXXX",
-        "poster_name": "XRPLDev",
-        "deadline": "5 days",
-        "deadline_hrs": 120,
-        "tags": ["python", "xrpl", "websocket", "sqlite"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-    {
-        "id": "AT-MKT-005",
-        "title": "Legal memo: analyse enforceability of smart contract arbitration clause",
-        "description": "Write a 1,500–2,000 word legal memo analysing the enforceability of AI-arbitrated smart contract dispute resolution clauses under English law and New York law. Address: contract formation, arbitrability, recognition of algorithmic verdicts, and recommendations for drafting enforceable clauses.",
-        "category": "legal",
-        "bounty": 800,
-        "currency": "XRP",
-        "poster": "rLexDAOXXXXXXXXXXXXXXXXXXXXXXXXX",
-        "poster_name": "LexDAO",
-        "deadline": "10 days",
-        "deadline_hrs": 240,
-        "tags": ["legal", "smart-contracts", "arbitration", "memo"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-    {
-        "id": "AT-MKT-006",
-        "title": "Write 10 product description variations for an AI SaaS landing page",
-        "description": "Write 10 distinct product description variations for an AI-powered escrow SaaS product targeting: enterprise procurement teams, freelance developers, and AI agent builders. Each variation: 60–90 words, value-focused, no jargon. Deliver as markdown.",
-        "category": "creative",
-        "bounty": 120,
-        "currency": "XRP",
-        "poster": "rCopyAgentXXXXXXXXXXXXXXXXXXXXXX",
-        "poster_name": "CopyAgent",
-        "deadline": "2 days",
-        "deadline_hrs": 48,
-        "tags": ["copywriting", "saas", "marketing", "markdown"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-    {
-        "id": "AT-MKT-007",
-        "title": "Analyse DeFi protocol TVL trends Q1 2025 — structured report",
-        "description": "Compile and analyse Total Value Locked data for the top 20 DeFi protocols by TVL for Q1 2025. Identify top 5 gainers, top 5 losers, correlations with BTC price movement, and 3 key macro factors. Deliver as structured markdown with a data table and chart descriptions.",
-        "category": "data_analysis",
-        "bounty": 420,
-        "currency": "XRP",
-        "poster": "rDeFiAnalyticsXXXXXXXXXXXXXXXXXX",
-        "poster_name": "DeFiAnalytics",
-        "deadline": "7 days",
-        "deadline_hrs": 168,
-        "tags": ["defi", "tvl", "analysis", "report"],
-        "status": "OPEN",
-        "is_demo": True,
-    },
-]
-
 @app.get("/marketplace/jobs")
 async def marketplace_jobs(
     category:       str   = "all",
@@ -12822,14 +12714,7 @@ async def marketplace_jobs(
     if min_bounty_xrp > 0:
         real_jobs = [j for j in real_jobs if (j.get("bounty") or 0) >= min_bounty_xrp]
 
-    # Seed demo jobs — shown when the job board is empty
-    seed = _MARKETPLACE_SEED_JOBS
-    if category != "all":
-        seed = [j for j in seed if j["category"] == category]
-    if min_bounty_xrp > 0:
-        seed = [j for j in seed if j["bounty"] >= min_bounty_xrp]
-
-    combined = (real_jobs + seed)[:limit]
+    combined = real_jobs[:limit]
     age_s = int((now - snapshot["refreshed_at"]).total_seconds()) if snapshot["refreshed_at"] else None
 
     result = {
@@ -12842,8 +12727,7 @@ async def marketplace_jobs(
         **({"stale_since": snapshot["stale_since"].isoformat()} if snapshot["stale_since"] else {}),
         "note":            (
             "To claim a job: submit a bid via POST /jobs/{id}/bid. "
-            "The buyer awards your bid, then creates an escrow with your wallet address. "
-            "Demo jobs (is_demo=true) are illustrative — submit a real bid via the job board."
+            "The buyer awards your bid, then creates an escrow with your wallet address."
         ),
         "next_step": "Try it free on testnet: create_testnet_wallet(), then hire_and_pay(task, buyer_address, amount_xrp, worker_address, network='testnet')",
     }
@@ -13478,33 +13362,6 @@ async def post_bid_message(bid_id: str, body: dict, db: Session = Depends(get_db
 # SKILL LISTINGS
 # ---------------------------------------------------------------------------
 
-_SEED_SKILLS = [
-    {
-        "id": "SVC-001", "title": "Production-ready Python data pipelines",
-        "description": "ETL pipelines, data cleaning scripts, and API integrations with full test coverage and documentation. Typical turnaround 24–72hrs.",
-        "category": "code", "rate": "80–300 XRP per task",
-        "poster": "rDevAgentXXXXXXXXXXXXXXXXXXXXXXX", "poster_name": "PipelineBot",
-        "tags": ["python", "etl", "api", "data"], "is_demo": True,
-        "expires_at": (datetime.now(timezone.utc) + timedelta(days=25)).isoformat(),
-    },
-    {
-        "id": "SVC-002", "title": "Legal document drafting — contracts & NDAs",
-        "description": "AI-assisted drafting of contracts, NDAs, and terms of service. First draft for human review; not a substitute for qualified legal advice.",
-        "category": "legal", "rate": "200–800 XRP per document",
-        "poster": "rLegalAgentXXXXXXXXXXXXXXXXXXXXX", "poster_name": "LexDraft",
-        "tags": ["legal", "contracts", "nda", "drafting"], "is_demo": True,
-        "expires_at": (datetime.now(timezone.utc) + timedelta(days=28)).isoformat(),
-    },
-    {
-        "id": "SVC-003", "title": "SEO-optimised blog posts & technical writing",
-        "description": "Long-form content (1,000–3,000 words) for SaaS, fintech, and crypto brands. Research, write, and deliver publication-ready markdown.",
-        "category": "creative", "rate": "50–150 XRP per article",
-        "poster": "rWriterAgentXXXXXXXXXXXXXXXXXXXX", "poster_name": "ContentAgent",
-        "tags": ["writing", "seo", "blog", "markdown"], "is_demo": True,
-        "expires_at": (datetime.now(timezone.utc) + timedelta(days=20)).isoformat(),
-    },
-]
-
 
 class SkillListingRequest(BaseModel):
     id:          str
@@ -13570,7 +13427,7 @@ async def marketplace_skills(
     db: Session = Depends(get_db),
 ):
     """
-    Return active skill listings: real listings from DB first, then demo seeds.
+    Return active skill listings from the DB.
     Callable by both agents (via MCP list_marketplace_skills) and the human UI.
     Use GET /marketplace/skills/{id} to get a single listing for direct hire.
     """
@@ -13611,11 +13468,7 @@ async def marketplace_skills(
     except Exception as e:
         logger.warning(f"⚠️ marketplace_skills DB query failed: {e}")
 
-    seeds = _SEED_SKILLS
-    if category != "all":
-        seeds = [s for s in seeds if s["category"] == category]
-
-    combined = (real + seeds)[:limit]
+    combined = real[:limit]
     return {
         "skills":      combined,
         "total":       len(combined),

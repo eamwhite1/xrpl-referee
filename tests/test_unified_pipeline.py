@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.16."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.17."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.16", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.16"
+    assert APP_VERSION == "7.0.17", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.17"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.16", f"server.json version={sj['version']!r}, expected 7.0.16"
+        assert sj["version"] == "7.0.17", f"server.json version={sj['version']!r}, expected 7.0.17"
 
 
 # ---------------------------------------------------------------------------
@@ -1516,3 +1516,28 @@ def test_t57_requirements_have_a_ceiling_and_installed_versions_satisfy_them():
         assert r.specifier.contains(version(r.name), prereleases=True), f"{r.name} {version(r.name)} outside {r.specifier}"
     ceilings = {r.name.lower() for r in reqs if "<" in str(r.specifier)}
     assert {"fastmcp", "sqlalchemy", "xrpl-py", "fastapi", "pydantic"} <= ceilings
+
+
+# ---------------------------------------------------------------------------
+# v7.0.17 — marketplace returns only real listings (T58)
+# ---------------------------------------------------------------------------
+def test_t58_marketplace_never_adds_hard_coded_demo_listings(env, monkeypatch):
+    snap = {"marketplace_jobs": [], "open_jobs": [], "refreshed_at": datetime.now(timezone.utc), "stale_since": None}
+    monkeypatch.setattr(R, "_jobs_snapshot", snap)
+    b = env.client.get("/marketplace/jobs").json()
+    assert b["jobs"] == [] and b["total"] == 0 and b["real_jobs"] == 0 and b["demo_jobs"] == 0
+    snap["marketplace_jobs"] = [{"id": "JOB-REAL-1", "title": "Real job", "category": "default", "bounty": 10, "is_demo": False}]
+    b = env.client.get("/marketplace/jobs").json()
+    assert [j["id"] for j in b["jobs"]] == ["JOB-REAL-1"] and b["total"] == 1 and b["demo_jobs"] == 0
+    assert "AT-MKT" not in json.dumps(b) and "illustrative" not in json.dumps(b)
+    # the category and minimum-bounty filters apply to real jobs only
+    assert env.client.get("/marketplace/jobs", params={"category": "legal"}).json()["jobs"] == []
+    assert env.client.get("/marketplace/jobs", params={"min_bounty_xrp": 100}).json()["jobs"] == []
+
+    s = env.client.get("/marketplace/skills").json()
+    assert s["skills"] == [] and s["total"] == 0 and s["demo_skills"] == 0
+    with env.SL() as d:
+        d.add(R.SkillListing(id="SK-REAL-1", title="Real skill", description="d", fee_hash="FEE1", poster="rWorker1"))
+        d.commit()
+    s = env.client.get("/marketplace/skills").json()
+    assert [x["id"] for x in s["skills"]] == ["SK-REAL-1"] and s["real_skills"] == 1 and s["demo_skills"] == 0
