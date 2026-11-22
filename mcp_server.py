@@ -328,7 +328,7 @@ async def create_escrow_vault(
     )] = 3,
     require_ai_audit: Annotated[bool, Field(
         title="Require AI Audit",
-        description="Default True. Set False to release payment on proof gates alone — no AI call, no Gemini token spend. Requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did). Use for machine-verifiable deliverables: NFT delivery, domain verification, W3C credentials.",
+        description="Default True. Set False to release payment on proof gates and/or code gates alone — no AI call, no Gemini token spend. Requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did), or criteria that are all code gates (exact_match, regex, sha256_of, json_schema). Use for machine-verifiable deliverables: NFT delivery, domain verification, W3C credentials, output that code can fully test.",
     )] = True,
     require_consensus: Annotated[bool, Field(
         title="Premium Consensus Audit",
@@ -432,7 +432,7 @@ async def create_escrow_vault(
 
     Three release modes:
     - AI audit (default): worker submits text/files; AI referee scores against task_description or criteria.
-    - Proof-gate only (require_ai_audit=False): payment releases when all configured proof gates pass. No AI call.
+    - Mechanical only (require_ai_audit=False): payment releases when all configured proof gates and code gates pass. No AI call. Needs a proof gate or code-gate-only criteria.
     - Delayed release (release_mode='challenge_window_hrs:N'): PASS holds for N hours then auto-releases. During the window, the buyer can challenge via prepare_challenge_escrow + challenge_escrow_verdict. Challenge fee ~$1 USD in XRP locked to the seller; paid to seller if PASS upheld, refundable if overturned or inconclusive.
 
     Structured criteria (recommended for complex work):
@@ -3702,7 +3702,7 @@ async def explain_agenttrust_trust_model() -> dict:
             "how_to_set": "Pass criteria=[{\"id\":\"c1\",\"type\":\"code\",\"gate\":\"regex\",\"pattern\":\"...\"}] to hire_and_pay or create_escrow_vault. Deterministic, free, and the same answer every time.",
         },
         "proof_policy": "Set proof_policy='ALL' (all selected gates must pass) or 'ANY' (any one suffices).",
-        "skip_ai_audit": "Set require_ai_audit=false with at least one proof gate to release on proof alone. Returns HTTP 400 if no proof gate is configured.",
+        "skip_ai_audit": "Set require_ai_audit=false with at least one proof gate, or with criteria that are all code gates, to release without the AI. Returns HTTP 400 otherwise.",
         "enterprise": {
             "summary": "AgentTrust is designed for enterprise deployment from the ground up.",
             "audit_trail": "Each escrow records the verdict hash, timestamp and XRPL transaction hashes on the public XRP Ledger. Anyone can verify the outcome independently without involving AgentTrust.",

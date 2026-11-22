@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.19"
+APP_VERSION = "7.0.20"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -9346,23 +9346,26 @@ async def create_challenge_fee_cancel_payload(req: ChallengeFeeCancelPayloadRequ
 # ---------------------------------------------------------------------------
 # 15. ESCROW GENERATE — supports XRP and RLUSD
 # ---------------------------------------------------------------------------
+def _ai_off_allowed(req) -> bool:
+    """True when the AI step can be skipped: a proof gate is set, or every criterion is a code gate."""
+    if any([req.require_nft_proof, req.required_nft_issuer, req.required_domain, req.required_vc_issuer_did]):
+        return True
+    crits = getattr(req, "criteria", None) or []
+    return bool(crits) and all(isinstance(c, dict) and c.get("type") == "code" and c.get("gate") for c in crits)
+
+
 @app.post("/escrow/generate")
 async def generate_escrow(req: EscrowSetupRequest, request: Request, db: Session = Depends(get_db), x_reviewer_token: Optional[str] = Header(None), payment_signature: Optional[str] = Header(None, alias="PAYMENT-SIGNATURE"), response: Response = None):
     existing = db.query(EscrowVault).filter(EscrowVault.escrow_id == req.escrow_id).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"Project ID '{req.escrow_id}' already exists.")
 
-    # Validate: require_ai_audit=False only makes sense with at least one proof gate
-    if not req.require_ai_audit:
-        has_proof_gate = any([
-            req.require_nft_proof, req.required_nft_issuer,
-            req.required_domain, req.required_vc_issuer_did,
-        ])
-        if not has_proof_gate:
-            raise HTTPException(
-                status_code=400,
-                detail="require_ai_audit=False requires at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did)."
-            )
+    # require_ai_audit=False needs fully mechanical checks: a proof gate, or code gates only
+    if not req.require_ai_audit and not _ai_off_allowed(req):
+        raise HTTPException(
+            status_code=400,
+            detail="require_ai_audit=False requires fully mechanical checks: at least one proof gate (require_nft_proof, required_nft_issuer, required_domain, or required_vc_issuer_did), or criteria made up only of code gates (exact_match, regex, sha256_of, json_schema)."
+        )
 
     # Validate XRPL addresses before fee check
     for _addr_field, _addr_val in [("buyer_address", req.buyer_address), ("worker_address", req.worker_address)]:

@@ -6,6 +6,11 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.20] - 2026-11-22
+### Changed
+- `require_ai_audit=false` is now accepted when the escrow's criteria are all code gates (exact_match, regex, sha256_of, json_schema), not only when a proof gate is set. A judgment criterion without a proof gate is still rejected with HTTP 400 (T64)
+- Tool descriptions, trust-model text and docs updated to match
+
 ## [7.0.19] - 2026-11-22
 ### Changed
 - The `/try` demo now shows both verification layers. The task is "Write one sentence that explains what XRPL escrow is." The code check is a pattern test (one sentence of 30 to 300 characters that starts with a capital letter, mentions escrow and ends with a full stop), so it needs no AI. With the AI box ticked the AI then judges whether the sentence is accurate, which the old "reply exactly HELLO AGENT" task could never show. A fluent but wrong sentence ("Escrow is a kind of pasta from Italy.") passes the code check, is paid when the AI box is unticked, and is rejected by the AI when ticked (T61, T63)
