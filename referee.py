@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.18"
+APP_VERSION = "7.0.19"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1376,7 +1376,7 @@ def _agent_json_legacy_unused():
     return {
         "schemaVersion": "1.0",
         "name": "AgentTrust Referee",
-        "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT, domain, W3C VC, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and x402 payment protocol.",
+        "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT, domain, W3C VC, NFT DvP) and code gates (exact match, regex, SHA-256, JSON schema), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and x402 payment protocol.",
         "url": "https://mcp.cryptovault.co.uk",
         "agentVersion": APP_VERSION,
         "protocolVersion": "0.6.0",
@@ -1908,12 +1908,12 @@ def serve_ai_plugin():
         "name_for_model": "agenttrust_escrow",
         "description_for_human": (
             "Lock XRP in crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. "
-            "Supports NFT, domain, W3C VC proof gates and dual-model consensus audit. MCP at https://mcp.cryptovault.co.uk/mcp."
+            "Supports NFT, domain and W3C VC proof gates, code gates and dual-model consensus audit. MCP at https://mcp.cryptovault.co.uk/mcp."
         ),
         "description_for_model": (
             "Trust-minimized escrow for agent-to-agent work on the XRP Ledger. "
             "Flow: buyer calls /escrow/generate to lock funds → seller submits proof to /evaluate → AI referee audits against criteria → PASS auto-releases XRP/RLUSD to seller. "
-            "Proof gates (NFT ownership, XRPL domain, W3C VC, NFT DvP) can gate release before AI audit. "
+            "Proof gates (NFT ownership, XRPL domain, W3C VC, NFT DvP) and code gates (criteria of type code: exact_match, regex, sha256_of, json_schema) are checked before the AI audit. "
             "Set require_consensus_vault=true for dual-model audit (Gemini Flash + Pro, $0.25 one-time vault fee). "
             "INCONCLUSIVE does not consume an attempt for the first 3 per vault; later ones count. "
             "Implements x402: call any paid endpoint without payment to receive 402 with X-Payment-Required describing how to pay. "
@@ -7528,6 +7528,7 @@ def _execute_code_gates(work: str, criteria: list) -> list:
         if not gate:
             continue
         cid = c["id"]
+        _n_before = len(failures)
         try:
             if gate == "sha256_of":
                 expected = c.get("expected_hash", "").lower()
@@ -7568,6 +7569,9 @@ def _execute_code_gates(work: str, criteria: list) -> list:
                 failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": "xrpl_tx gate is not yet implemented"})
         except Exception as e:
             failures.append({"criterion_id": cid, "verdict": "FAIL", "reason": f"Gate check error: {e}"})
+        if c.get("fail_message"):
+            for _f in failures[_n_before:]:
+                _f["reason"] = c["fail_message"]
     return failures
 
 
@@ -17340,14 +17344,15 @@ _testnet_try_sessions: dict = {}  # {session_id: {..., expires_at}}
 _testnet_try_counter: dict = {}   # {ip_hash_date: count}
 _TESTNET_TRY_MAX_SESSIONS = 200
 _TESTNET_TRY_TTL_S = 1800  # 30 min
-_TESTNET_TRY_TASK = "Reply with exactly: HELLO AGENT"
+_TESTNET_TRY_TASK = "Write one sentence that explains what XRPL escrow is."
 _TESTNET_TRY_CRITERIA = [
     {
         "id": "c1",
         "type": "code",
-        "gate": "exact_match",
-        "expected_value": "HELLO AGENT",
-        "description": "Reply is exactly HELLO AGENT",
+        "gate": "regex",
+        "pattern": r"^(?=.*[Ee]scrow)[A-Z][^\n]{28,298}[.!?]$",
+        "description": "One sentence of 30 to 300 characters that mentions escrow",
+        "fail_message": "Needs one sentence of 30 to 300 characters that starts with a capital letter, mentions escrow and ends with a full stop.",
     }
 ]
 
@@ -17652,7 +17657,9 @@ async def testnet_try_submit(request: Request, sid: str, body: dict = Body(defau
         # compat aliases read by the live agent-trust /try page
         _item["verdict"] = _item["result"]
         _item["reason"] = _item["reasoning"]
-        _item["description"] = "AI referee" if _cr.get("type") == "ai" else ("Code check: " + str(_item["id"]))
+        _item["description"] = "AI referee" if _cr.get("type") == "ai" else next(
+            (c.get("description") for c in _TESTNET_TRY_CRITERIA if c["id"] == _item["id"] and c.get("description")),
+            "Code check: " + str(_item["id"]))
         if _cr.get("type") == "ai":
             _item["model"] = _cr.get("model")
             _item["cached"] = bool(_cr.get("cached"))

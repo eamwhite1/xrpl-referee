@@ -1,9 +1,9 @@
 {
   "schemaVersion": "1.0",
   "name": "AgentTrust Referee",
-  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
+  "description": "Trust-minimized payment and verification rail for agent-to-agent work. Lock XRP in XRPL crypto-condition escrow, submit proof of work, and receive automatic payment on AI-verified PASS. Supports proof gates (NFT ownership, domain, W3C VCs, NFT DvP) and code gates (exact match, regex, SHA-256, JSON schema), XLS-56 atomic Batch DvP (live mainnet), XLS-75 delegated signing, marketplace job board, wallet trust scoring, and OFAC sanctions screening. Implements the x402 payment protocol.",
   "url": "https://mcp.cryptovault.co.uk",
-  "agentVersion": "7.0.18",
+  "agentVersion": "7.0.19",
   "protocolVersion": "0.6.0",
   "provider": {
     "organization": "Boxclever Media Ltd (trading as AgentTrust)",
@@ -49,7 +49,7 @@
     "releaseConditions": {
       "aiAudit": "AI verdict (Gemini) against task_description — default mode for qualitative deliverables",
       "proofGates": "Machine-verifiable on-chain proofs: NFT ownership, domain verification, W3C Verifiable Credential, NFT DvP atomic swap",
-      "combined": "AI audit AND/OR proof gates simultaneously — configure with proof_policy=ALL|ANY"
+      "combined": "Proof gates, code gates and AI audit together — checked in that order; configure proof gates with proof_policy=ALL|ANY"
     },
     "whiteLabel": {
       "callback_url": "HTTPS endpoint to receive webhook POSTs on escrow state changes (funded/PASS/FAIL/expired)",
@@ -68,7 +68,7 @@
     {
       "id": "escrow-create",
       "name": "Create Escrow Vault",
-      "description": "Lock XRP in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), or both. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping. Use /escrow/prepare with delegate_address for XLS-75 delegated signing.",
+      "description": "Lock XRP in a crypto-condition escrow vault. Release conditions: AI audit (default), proof gates (NFT, domain, VC, NFT DvP), code gates (exact match, regex, SHA-256, JSON schema via criteria), or a combination, checked in that order. Supports callback_url for webhook notifications and metadata for white-label reference ID round-tripping. Use /escrow/prepare with delegate_address for XLS-75 delegated signing.",
       "endpoint": "/escrow/generate",
       "method": "POST",
       "tags": ["escrow", "payment", "xrpl"]
