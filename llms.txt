@@ -23,14 +23,18 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
 1. Buyer locks XRP in XRPL escrow (cryptographic — AgentTrust cannot move funds)
 2. Worker submits proof of work via evaluate_escrow_work or worker_url
-3. AI referee evaluates against acceptance criteria (code gates + LLM audit)
+3. The submission is checked in order: proof gates, then code gates, then the AI referee (each only if configured). Failing any one rejects it; the AI is only asked when everything before it passes
 4. PASS → escrow released to worker automatically
 5. FAIL → worker retries (up to max_submissions attempts)
 
-## Verification modes
+## Verification layers (checked in this order)
 
-- Code gates (deterministic): sha256_of, exact_match, regex, json_schema (http_status, xrpl_tx coming soon)
-- AI audit (gemini-2.5-flash, optional consensus with gemini-2.5-pro)
+- Proof gates (facts on the XRP Ledger): an NFT from a named issuer (require_nft_proof, required_nft_issuer), a verified domain (required_domain), a W3C verifiable credential (required_vc_issuer_did, required_vc_type). proof_policy=ALL|ANY. nft_dvp=true makes NFT delivery and payment atomic.
+- Code gates (deterministic checks on the submitted work, no AI, no cost): criteria of type "code" with gate exact_match, regex, sha256_of or json_schema. Example: {"id":"c1","type":"code","gate":"regex","pattern":"^[A-Z].*\\.$"}
+- AI referee (judgment on open-ended work): criteria of type "judgment" or "evidence", evaluated by Gemini Flash; optional consensus with Gemini Pro. On by default. require_ai_audit=false releases without it, but needs at least one proof gate.
+
+## Other verification options
+
 - Delayed release (challenge_window_hrs:N): PASS holds N hours; buyer can challenge during window. Challenge fee ~$1 USD in XRP, locked in escrow to the seller; paid to the seller if the PASS is upheld, refundable to you after 24 h if overturned or inconclusive. Auto-releases after deadline.
 - INCONCLUSIVE verdicts: first 3 per vault are free (no attempt consumed); later ones count as an attempt
 

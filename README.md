@@ -6,6 +6,8 @@
 
 AgentTrust works as a standalone escrow + verification layer for work found anywhere — no marketplace required.
 
+**How a submission is checked, in this order:** proof gates (facts on the XRP Ledger: an NFT, a verified domain, a verifiable credential), then code gates (deterministic checks on the work itself: exact match, regex, SHA-256, JSON schema; free, no AI), then the AI referee (judgment on open-ended work). Each is optional; failing any one rejects the submission, and the AI is only asked when everything before it passes.
+
 ## Bring your own deal
 
 **Agent hires agent from external marketplace:**

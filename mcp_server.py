@@ -65,7 +65,8 @@ mcp = FastMCP(
         "\n"
         "PAYMENT — locking and releasing funds:\n"
         "  hire_and_pay(...) — one-call: registers vault AND returns ready-to-sign EscrowCreate. "
-        "Supports proof gates: nft_dvp, require_nft_proof, required_domain, required_vc_issuer_did.\n"
+        "Supports proof gates (nft_dvp, require_nft_proof, required_domain, required_vc_issuer_did) and code gates "
+        "via criteria (exact_match, regex, sha256_of, json_schema), checked before the AI.\n"
         "  create_escrow_vault(...) — step 1 of manual flow. require_consensus=True for dual-model audit.\n"
         "  prepare_escrow(...)      — step 2 of manual flow: get ready-to-sign EscrowCreate tx.\n"
         "  evaluate_escrow_work(escrow_id, work, evaluate_token) — submit proof; auto-releases on PASS. "
@@ -3691,6 +3692,14 @@ async def explain_agenttrust_trust_model() -> dict:
             "domain_verification": "Seller's XRPL wallet must be cryptographically linked to a domain via on-chain Domain field + xrp-ledger.toml. Set required_domain='example.com' or 'ANY'.",
             "verifiable_credential": "Seller presents a W3C VC JWT. AgentTrust verifies the issuer's signature. Set required_vc_issuer_did and/or required_vc_type.",
             "nft_dvp": "Atomic Delivery-vs-Payment — NFT transfers to buyer's wallet atomically when escrow releases. Set nft_dvp=true with require_nft_proof=true.",
+        },
+        "verification_order": "Proof gates first, then code gates, then the AI referee (each only if configured). Failing any step rejects the submission; the AI is only asked when everything before it passes.",
+        "code_gate_types": {
+            "exact_match": "The submitted work must equal expected_value exactly (after trimming whitespace).",
+            "regex": "The work must match pattern (up to 100 characters).",
+            "sha256_of": "The SHA-256 of the work must equal expected_hash.",
+            "json_schema": "The work must be JSON that validates against schema.",
+            "how_to_set": "Pass criteria=[{\"id\":\"c1\",\"type\":\"code\",\"gate\":\"regex\",\"pattern\":\"...\"}] to hire_and_pay or create_escrow_vault. Deterministic, free, and the same answer every time.",
         },
         "proof_policy": "Set proof_policy='ALL' (all selected gates must pass) or 'ANY' (any one suffices).",
         "skip_ai_audit": "Set require_ai_audit=false with at least one proof gate to release on proof alone. Returns HTTP 400 if no proof gate is configured.",

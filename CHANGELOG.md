@@ -6,6 +6,14 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.19] - 2026-11-22
+### Changed
+- The `/try` demo now shows both verification layers. The task is "Write one sentence that explains what XRPL escrow is." The code check is a pattern test (one sentence of 30 to 300 characters that starts with a capital letter, mentions escrow and ends with a full stop), so it needs no AI. With the AI box ticked the AI then judges whether the sentence is accurate, which the old "reply exactly HELLO AGENT" task could never show. A fluent but wrong sentence ("Escrow is a kind of pasta from Italy.") passes the code check, is paid when the AI box is unticked, and is rejected by the AI when ticked (T61, T63)
+- The `/try` result row for the code check carries a plain-English description and failure message instead of "Code check: c1" and the raw pattern (T61)
+- Internal criteria can carry a `fail_message` that replaces the failure reason of their code gate. Criteria submitted for real escrows cannot set it: the existing allow-list rejects unknown keys (T62)
+### Docs
+- `llms.txt`, the MCP server instructions, `explain_agenttrust_trust_model`, the agent card and `agent.json` now describe all three layers in order (proof gates, code gates, AI referee). `llms.txt` previously never mentioned proof gates, named an old Gemini model and listed `http_status` / `xrpl_tx` as "coming soon" although they are rejected at creation. The README gains a short "how a submission is checked" paragraph
+
 ## [7.0.18] - 2026-11-21
 ### Security
 - `POST /jobs` (the open, free, unauthenticated job board) now validates what it stores and is rate limited. Before, anything was accepted: any text as the buyer address (a placeholder record `audit-fixture` from a connectivity check reached the public board this way), no budget check, no length limits, and a non-numeric `expires_hrs` caused a 500. Now: `buyer_address` must be a valid XRPL address; `id` is 3-64 characters (letters, digits, `.`, `_`, `-`); `title` is at most 140 and `description` at most 5,000 characters; `budget_xrp`, if given, is a positive number; `expires_hrs` is a whole number from 1 to 720; `tags` is at most 10 short tags; `buyer_callback_url` must be http(s); each error names the field (T59)
