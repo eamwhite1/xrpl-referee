@@ -31,7 +31,7 @@ No AgentTrust marketplace listing required. Works with any XRPL address.
 
 - Proof gates (facts on the XRP Ledger): an NFT from a named issuer (require_nft_proof, required_nft_issuer), a verified domain (required_domain), a W3C verifiable credential (required_vc_issuer_did, required_vc_type). proof_policy=ALL|ANY. nft_dvp=true makes NFT delivery and payment atomic.
 - Code gates (deterministic checks on the submitted work, no AI, no cost): criteria of type "code" with gate exact_match, regex, sha256_of or json_schema. Example: {"id":"c1","type":"code","gate":"regex","pattern":"^[A-Z].*\\.$"}
-- AI referee (judgment on open-ended work): criteria of type "judgment" or "evidence", evaluated by Gemini Flash; optional consensus with Gemini Pro. On by default. require_ai_audit=false releases without it, but needs at least one proof gate.
+- AI referee (judgment on open-ended work): criteria of type "judgment" or "evidence", evaluated by Gemini Flash; optional consensus with Gemini Pro. On by default. require_ai_audit=false releases without it, but needs at least one proof gate, or criteria that are all code gates.
 
 ## Other verification options
 
