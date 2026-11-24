@@ -7,7 +7,7 @@ import httpx
 from decimal import Decimal, InvalidOperation
 import logging
 
-APP_VERSION = "7.0.20"
+APP_VERSION = "7.0.21"
 CHALLENGES_ENABLED = os.getenv("CHALLENGES_ENABLED", "true").lower() == "true"
 PROMPT_VERSION = "v2.0"
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -15921,6 +15921,7 @@ async def enterprise_escrows(
         "escrows": [
             {
                 "escrow_id": e.escrow_id,
+                "network": getattr(e, "network", None) or "mainnet",
                 "status": e.status,
                 "amount": e.amount_rlusd or e.amount_xrp,
                 "currency": e.currency,
@@ -16894,6 +16895,64 @@ async def _poll_expired_escrows_once():
 # ---------------------------------------------------------------------------
 # TESTNET WALLET — free funded wallet (20 creates / ip-hash / day)
 # ---------------------------------------------------------------------------
+_enterprise_testnet_fund_counter: dict = {}
+TESTNET_FUND_MIN_XRP = 20.0
+TESTNET_FUND_PER_ACCOUNT_DAILY = 6
+
+
+async def _testnet_fund_address(address: str) -> dict:
+    """Make sure `address` exists on testnet with a usable balance. Returns {address, funded, balance_xrp}."""
+    from xrpl.models.requests import AccountInfo as _AI
+    client = AsyncJsonRpcClient(_xrpl_url_for_network("testnet"))
+    try:
+        r = await client.request(_AI(account=address, ledger_index="validated"))
+        if "account_data" in r.result:
+            bal = int(r.result["account_data"]["Balance"]) / 1_000_000
+            if bal >= TESTNET_FUND_MIN_XRP:
+                return {"address": address, "funded": False, "balance_xrp": bal}
+    except Exception:
+        pass
+    async with httpx.AsyncClient(timeout=30.0) as fc:
+        fr = await fc.post("https://faucet.altnet.rippletest.net/accounts", json={"destination": address},
+                           headers={"Content-Type": "application/json"})
+    if fr.status_code >= 400:
+        raise HTTPException(status_code=502, detail={"error": "faucet_unavailable"})
+    data = fr.json()
+    return {"address": address, "funded": True, "balance_xrp": data.get("amount", data.get("balance"))}
+
+
+class FundTestnetRequest(BaseModel):
+    addresses: list
+
+
+@app.post("/enterprise/testnet/fund", tags=["testnet"])
+async def enterprise_testnet_fund(req: FundTestnetRequest, request: Request, account=Depends(_get_current_account)):
+    """Fund up to two addresses (buyer and worker) with free test XRP so a signed-in account can run a testnet escrow."""
+    _check_csrf_origin_header(request)
+    addrs = []
+    for a in (req.addresses or [])[:2]:
+        if not isinstance(a, str) or not is_valid_classic_address(a):
+            raise HTTPException(status_code=422, detail={"error": "invalid_address"})
+        if a not in addrs:
+            addrs.append(a)
+    if not addrs:
+        raise HTTPException(status_code=422, detail={"error": "no_addresses"})
+    key = f"{account.id}_{datetime.utcnow().date()}"
+    used = _enterprise_testnet_fund_counter.get(key, 0)
+    if used + len(addrs) > TESTNET_FUND_PER_ACCOUNT_DAILY:
+        raise HTTPException(status_code=429, detail={"error": "testnet_fund_limit", "reason": f"{TESTNET_FUND_PER_ACCOUNT_DAILY} test-wallet top-ups per account per day"})
+    results = []
+    for a in addrs:
+        res = await _testnet_fund_address(a)
+        if res["funded"]:
+            _enterprise_testnet_fund_counter[key] = _enterprise_testnet_fund_counter.get(key, 0) + 1
+        results.append(res)
+    # Give the faucet-funded accounts a moment to validate
+    if any(r["funded"] for r in results):
+        await asyncio.sleep(6)
+    return {"network": "testnet", "results": results}
+
+
 _testnet_wallet_counter: dict = {}
 
 @app.post("/testnet/wallet", tags=["testnet"])

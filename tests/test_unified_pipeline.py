@@ -40,16 +40,16 @@ def test_t23_domain_normalisation():
 # ---------------------------------------------------------------------------
 
 def test_t24_version():
-    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.20."""
+    """T24: APP_VERSION in referee.py matches server.json and equals 7.0.21."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from referee import APP_VERSION
-    assert APP_VERSION == "7.0.20", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.20"
+    assert APP_VERSION == "7.0.21", f"referee.py APP_VERSION={APP_VERSION!r}, expected 7.0.21"
     server_json_path = os.path.join(repo_root, "server.json")
     if os.path.exists(server_json_path):
         with open(server_json_path) as f:
             sj = json.load(f)
-        assert sj["version"] == "7.0.20", f"server.json version={sj['version']!r}, expected 7.0.20"
+        assert sj["version"] == "7.0.21", f"server.json version={sj['version']!r}, expected 7.0.21"
 
 
 # ---------------------------------------------------------------------------
@@ -1700,3 +1700,25 @@ def test_t64_ai_off_rule():
     assert R._ai_off_allowed(_setup_req(criteria=[judg])) is False
     assert R._ai_off_allowed(_setup_req()) is False
     assert R._ai_off_allowed(_setup_req(criteria=[])) is False
+
+
+# ---------------------------------------------------------------------------
+# v7.0.21 — signed-in accounts can top up testnet wallets (T65-T66)
+# ---------------------------------------------------------------------------
+def test_t65_testnet_fund_requires_a_signed_in_account(env):
+    r = env.client.post("/enterprise/testnet/fund", json={"addresses": ["rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe"]})
+    assert r.status_code in (401, 403), r.text
+
+
+def test_t66_fund_skips_wallets_that_already_have_enough(monkeypatch):
+    import asyncio, types
+
+    class FakeClient:
+        def __init__(self, url): pass
+        async def request(self, req):
+            return types.SimpleNamespace(result={"account_data": {"Balance": str(500 * 1_000_000)}})
+
+    monkeypatch.setattr(R, "AsyncJsonRpcClient", FakeClient)
+    monkeypatch.setattr(R, "_xrpl_url_for_network", lambda n: "http://x")
+    res = asyncio.run(R._testnet_fund_address("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe"))
+    assert res["funded"] is False and res["balance_xrp"] == 500
