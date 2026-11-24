@@ -6,6 +6,11 @@ Protocol version header: `X-AgentTrust-Version: 0.1.0` on all responses since v2
 
 ---
 
+## [7.0.21] - 2026-11-24
+### Added
+- `POST /enterprise/testnet/fund`: a signed-in account can top up its buyer and worker addresses with free testnet XRP (max 6 top-ups per account per day) before running a testnet escrow from the dashboard (T65, T66)
+- `/enterprise/escrows` rows carry `network` ("mainnet" or "testnet")
+
 ## [7.0.20] - 2026-11-22
 ### Changed
 - `require_ai_audit=false` is now accepted when the escrow's criteria are all code gates (exact_match, regex, sha256_of, json_schema), not only when a proof gate is set. A judgment criterion without a proof gate is still rejected with HTTP 400 (T64)
